@@ -11,7 +11,7 @@
 | **RFC backlog** | [`docs/rfcs/`](../rfcs/) (RFC-0001 … RFC-0016) |
 | **MVP posture** | [`docs/architecture/rfc-architect-response.md`](../architecture/rfc-architect-response.md) §6 / §10 |
 
-**Rules:** Do not redesign Architecture V2. RFCs 0001–0016 are the unit of completion. Every milestone ships a **usable** system. Prefer vertical slices; delay complexity until justified. Sandbox before dogfood. Eval week-1 posture.
+**Rules:** Do not redesign Architecture V2. RFCs 0001–0016 are the unit of completion. Every milestone ships a **usable** system. Prefer vertical slices; delay complexity until justified. Sandbox before dogfood. Eval week-1 posture. An RFC is not “completed” for milestone accounting until it meets the series **[Definition of Done](../rfcs/README.md#definition-of-done-merge-gate)** (architecture PASS, 100% acceptance criteria, tests, docs, stable public APIs, clippy/fmt clean, no in-scope TODOs/placeholders, code review approved). Do not merge without that checklist.
 
 **V2 MVP posture (binding):** single-binary · ≤5 crates · hardcoded DAG templates · TextPatch EditEngine · thin ProjectGraph · in-process MCP builtins · sandbox-first · eval week 1 · ≤4 LLM capabilities · TOML tier map · `example.env` only (never overwrite `.env`).
 

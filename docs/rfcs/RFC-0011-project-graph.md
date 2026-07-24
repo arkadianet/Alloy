@@ -101,6 +101,21 @@ N/A for query API. Versioning: `GraphVersion` monotonic on rebuild/incremental; 
 - [ ] Stubs return empty for Callers/SimilarFixes
 - [ ] Persists under `.alloy/graph/` (or XDG)
 
+## Definition of Done
+
+Merge only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
+
+- [ ] Architecture compliance: **PASS**
+- [ ] RFC acceptance criteria: **100% satisfied**
+- [ ] Unit tests: **passing**
+- [ ] Integration tests: **passing** (if applicable)
+- [ ] Documentation: **complete**
+- [ ] Public APIs: **reviewed and stable**
+- [ ] Clippy: **clean**
+- [ ] Formatting: **clean**
+- [ ] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
+- [ ] Code review: **approved**
+
 ## Estimated implementation effort
 
 **6–10 person-days** (syn + metadata dominate).

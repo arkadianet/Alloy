@@ -1341,6 +1341,23 @@ Day 1: in-process `RuntimeMetrics` counters on `RuntimeHandle` (atomics). No OTL
 - [ ] Former RFC-0001 skeleton acceptance criteria absorbed and checked above
 - [ ] MSRV/edition/`async_trait` pinned in workspace manifests as specified here
 
+### Definition of Done
+
+This RFC is merge-complete only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
+
+- [ ] Architecture compliance: **PASS**
+- [ ] RFC acceptance criteria: **100% satisfied**
+- [ ] Unit tests: **passing**
+- [ ] Integration tests: **passing** (CLI smoke / workspace build paths applicable here)
+- [ ] Documentation: **complete**
+- [ ] Public APIs: **reviewed and stable**
+- [ ] Clippy: **clean**
+- [ ] Formatting: **clean**
+- [ ] No TODO or placeholder implementations left in this RFC’s scope (explicit **Stub** traits/impls only)
+- [ ] Code review: **approved**
+
+Do not merge until every item above is true.
+
 ---
 
 ## Decisions (formerly open questions)

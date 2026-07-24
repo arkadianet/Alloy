@@ -15,6 +15,6 @@ Related sources of truth:
 - [RFC index](../rfcs/README.md)
 - [Architect MVP posture](../architecture/rfc-architect-response.md)
 
-Do not redesign architecture here. Use the implementation roadmap for milestones, critical path, and RFC→milestone mapping.
+Do not redesign architecture here. Use the implementation roadmap for milestones, critical path, and RFC→milestone mapping. RFC merge quality gate: [Definition of Done](../rfcs/README.md#definition-of-done-merge-gate).
 
 Interactive critical-path view (Cursor canvas): open beside chat from the workspace canvases folder — `alloy-implementation-roadmap.canvas.tsx`.

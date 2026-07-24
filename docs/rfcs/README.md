@@ -17,6 +17,25 @@ This series decomposes the **frozen** Alloy Architecture V2 into independently i
 
 **Mental model:** `Runtime → Scheduler → Capability Workers`. Models are plugins behind `ModelRouter`.
 
+## Definition of Done (merge gate)
+
+An RFC implementation is **complete** and may be merged **only** when every item below is true. If any item fails, do not merge.
+
+| # | Gate | Requirement |
+| --- | --- | --- |
+| 1 | **Architecture compliance** | **PASS** — matches frozen [Architecture V2](../architecture/alloy-architecture-v2.md); no redesign; deferred items stay deferred |
+| 2 | **RFC acceptance criteria** | **100% satisfied** — every checkbox in that RFC’s Acceptance criteria is checked |
+| 3 | **Unit tests** | **Passing** for the RFC’s scope |
+| 4 | **Integration tests** | **Passing** when the RFC defines or inherits applicable integration coverage |
+| 5 | **Documentation** | **Complete** — RFC text, module/docs comments, and any user-facing notes required by the RFC are up to date |
+| 6 | **Public APIs** | **Reviewed and stable** for the milestone (signatures match the RFC; no silent surface drift) |
+| 7 | **Clippy** | **Clean** on touched crates / workspace policy for the change |
+| 8 | **Formatting** | **Clean** (`cargo fmt --check` or project equivalent) |
+| 9 | **No TODO / placeholders** | **None left** in the RFC’s in-scope implementation (stubs allowed only where the RFC explicitly marks **Stub** / deferred) |
+| 10 | **Code review** | **Approved** |
+
+This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs. Milestone exit in the [implementation roadmap](../roadmap/IMPLEMENTATION-ROADMAP.md) additionally requires the RFC DoD for every RFC claimed complete in that milestone.
+
 ## RFC index
 
 | RFC | Title | Status | Effort | Depends on | Critical path |

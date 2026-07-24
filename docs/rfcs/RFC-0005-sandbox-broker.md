@@ -98,6 +98,21 @@ N/A — request/response isolation. Security policy is immutable by repo text (p
 - [ ] Milestone-1 gate prerequisite documented for dogfood ban
 - [ ] Residual build-script risk documented
 
+## Definition of Done
+
+Merge only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
+
+- [ ] Architecture compliance: **PASS**
+- [ ] RFC acceptance criteria: **100% satisfied**
+- [ ] Unit tests: **passing**
+- [ ] Integration tests: **passing** (if applicable)
+- [ ] Documentation: **complete**
+- [ ] Public APIs: **reviewed and stable**
+- [ ] Clippy: **clean**
+- [ ] Formatting: **clean**
+- [ ] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
+- [ ] Code review: **approved**
+
 ## Estimated implementation effort
 
 **5–8 person-days** (platform variance dominates).
