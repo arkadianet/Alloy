@@ -10,6 +10,7 @@
 | **Related RFCs** | [0003](./RFC-0003-session-manager-run-controller.md) Session/RunController · [0009](./RFC-0009-task-dag-templates-planner.md) Task DAG · [0010](./RFC-0010-scheduler-runtime-adapters.md) Scheduler (plugs into Runtime host) |
 | **Supersedes** | `RFC-0001-workspace-skeleton-core-types.md` (workspace + core types absorbed here) |
 | **Product** | Alloy — AI Engineering Runtime |
+| **Review** | Principal systems review 2026-07-24 — required API/lifecycle/test gaps closed |
 
 **Mental model (V2):** `Runtime → Scheduler → Capability Workers`. Models are implementations behind `ModelRouter`, not the product center.
 
@@ -37,7 +38,7 @@ This RFC is the **foundation of the critical path**. It does **not** implement t
 | Workspace layout ≤5 crates (V2 §5.4) | SQLite event/artifact store → **0002** |
 | Shared IDs, budgets, Diagnostic/Failure IR, Grant shapes | SessionService / RunController behavior → **0003** |
 | `AlloyRuntime` host lifecycle + config load | Observability writers → **0004** |
-| Trait stubs / injection points for Scheduler, Session, adapters | Sandbox / MCP → **0005–0006** |
+| Trait stubs / injection points for Scheduler, Session, EventSink, adapters | Sandbox / MCP → **0005–0006** |
 | `example.env`, profile/router skeleton files | Model router impl → **0007** |
 | Binary stub in `alloy-cli` | EditEngine → **0008** |
 | Module map mirroring V2 component names | TaskDag persistence / templates → **0009** |
@@ -48,7 +49,8 @@ This RFC is the **foundation of the critical path**. It does **not** implement t
 
 - **Runtime** = process host + shared types + wiring + lifecycle + cancellation token + event emit surface.
 - **Scheduler** (RFC-0010) = ready-queue executor over a `TaskDag`; implements `Scheduler` and registers via `RuntimeHandle::set_scheduler`.
-- **Runtime adapters** (VerifyCompile / VerifyTest / GateHuman) are **defined as traits here**, implemented in RFC-0010 (and MCP wiring in 0006). MVP Runtime ships **no-op / `Unavailable` stubs** so the host compiles.
+- **`AlloyRuntime::run(dag_id)`** = thin forwarder to `Scheduler::run` only. Goal submission and run orchestration stay on `SessionService` / `RunController` (RFC-0003). CLI must not treat `AlloyRuntime::run` as the user-facing “run a prompt” API.
+- **Runtime adapters** (VerifyCompile / VerifyTest / GateHuman) are **defined as traits here**, implemented in RFC-0010 (and MCP wiring in 0006). MVP Runtime ships **Unavailable stubs** so the host compiles.
 
 ---
 
@@ -69,52 +71,135 @@ This RFC is the **foundation of the critical path**. It does **not** implement t
 
 All public items live in crate `alloy-runtime` unless noted. Marked **MVP** = implement now; **Stub** = trait + empty/Unavailable impl compiling today.
 
+**Edition / async decision (pinned):** Rust 2021, Tokio 1.x, public host traits use `async_trait` through M1. Do not mix RPITIT on public traits in the same milestone.
+
 ### Core IDs & value types — MVP
 
 Absorbed from former workspace-skeleton RFC; serde-stable; match V2 §§5.5, 9–14, Appendices D–E.
+
+**ID classes:**
+
+| Class | Representation | Examples |
+| --- | --- | --- |
+| Opaque instance IDs | `Uuid` newtype, serde as string UUID | `SessionId`, `RunId`, `DagId`, `NodeId`, … |
+| Named catalog IDs | Non-empty `String` newtype, serde as string | `ProfileId`, `LanguageId`, `CapabilityId`, `ProviderId` |
 
 ```rust
 // alloy-runtime/src/types/ids.rs  — MVP
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-macro_rules! id_newtype {
+macro_rules! uuid_id {
     ($name:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        pub struct $name(pub Uuid);
+        #[serde(transparent)]
+        pub struct $name(Uuid);
 
         impl $name {
             pub fn new() -> Self { Self(Uuid::new_v4()) }
+            pub fn as_uuid(&self) -> &Uuid { &self.0 }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
         }
     };
 }
 
-id_newtype!(SessionId);
-id_newtype!(RunId);
-id_newtype!(DagId);
-id_newtype!(NodeId);
-id_newtype!(GateId);
-id_newtype!(ArtifactId);
-id_newtype!(CapabilityId);
-id_newtype!(ProviderId);
-id_newtype!(LanguageId);
-id_newtype!(ProfileId);
-id_newtype!(TransactionId);
-id_newtype!(CheckpointId);
-id_newtype!(GraphNodeId);
-id_newtype!(DiagnosticId);
+macro_rules! name_id {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(s: impl Into<String>) -> Result<Self, IdError> {
+                let s = s.into();
+                if s.is_empty() || s.len() > 128 {
+                    return Err(IdError::InvalidName);
+                }
+                Ok(Self(s))
+            }
+            pub fn as_str(&self) -> &str { &self.0 }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                $name::new(s).map_err(serde::de::Error::custom)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
+uuid_id!(SessionId);
+uuid_id!(RunId);
+uuid_id!(DagId);
+uuid_id!(NodeId);
+uuid_id!(GateId);
+uuid_id!(ArtifactId);
+uuid_id!(TransactionId);
+uuid_id!(CheckpointId);
+uuid_id!(GraphNodeId);
+uuid_id!(DiagnosticId);
+
+name_id!(ProfileId);     // "default" | "autonomous" | "readonly"
+name_id!(LanguageId);    // MVP: "rust"
+name_id!(CapabilityId);  // "repair" | "edit" | …
+name_id!(ProviderId);    // router provider key
+
+#[derive(Debug, thiserror::Error)]
+pub enum IdError {
+    #[error("invalid name id")]
+    InvalidName,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GraphVersion(pub u64);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Digest(pub String); // hex sha256
+/// Lowercase hex SHA-256 (64 chars). Construct only via `Digest::sha256` / `try_from_hex`.
+/// `Deserialize` must call `try_from_hex` (never populate the inner `String` unchecked).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct Digest(String);
+
+impl Digest {
+    pub fn sha256(bytes: &[u8]) -> Self { /* hex encode sha2::Sha256 */ todo!() }
+    pub fn try_from_hex(s: impl AsRef<str>) -> Result<Self, DigestError> { /* validate len==64 + hex charset */ todo!() }
+    pub fn as_hex(&self) -> &str { &self.0 }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Digest::try_from_hex(s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DigestError {
+    #[error("digest must be 64 lowercase hex chars")]
+    InvalidHex,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EventSeq(pub u64);
 
+/// UTC timestamp. Serde: RFC3339 string to match Appendix A `format: date-time`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Timestamp(pub time::OffsetDateTime);
+pub struct Timestamp(#[serde(with = "time::serde::rfc3339")] pub time::OffsetDateTime);
+
+impl Timestamp {
+    pub fn now() -> Self { Self(time::OffsetDateTime::now_utc()) }
+}
 ```
 
 ### Budgets, session create, goals — MVP
@@ -123,6 +208,8 @@ pub struct Timestamp(pub time::OffsetDateTime);
 // alloy-runtime/src/types/budget.rs  — MVP
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BudgetPolicy {
+    /// USD limit for the run. MVP stores `f64` for V2 parity; billing math in RFC-0004
+    /// must not rely on exact float equality (compare with epsilon or migrate to integer cents later).
     pub max_usd_per_run: f64,
     pub max_tokens_per_run: u64,
     pub max_parallel_nodes: u32,   // MVP: 1
@@ -144,14 +231,15 @@ pub struct BudgetSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelTier { Premium, Standard, Economy, Local }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSession {
     pub workspace_root: std::path::PathBuf,
-    pub profile: ProfileId,              // default | autonomous | readonly
+    pub profile: ProfileId,              // "default" | "autonomous" | "readonly"
     pub budget: BudgetPolicy,
-    pub language_backends: Vec<LanguageId>, // MVP: ["rust"]
+    pub language_backends: Vec<LanguageId>, // MVP: [LanguageId::new("rust")?]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +250,7 @@ pub struct Goal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Constraint {
     MaxUsd(f64),
     RequireCargoCheck,
@@ -175,6 +264,7 @@ pub enum Constraint {
 ```rust
 // alloy-runtime/src/types/diagnostic.rs  — MVP (V2 Appendix D)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DiagnosticLevel { Error, Warning, Note, Help }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +289,8 @@ pub struct DiagnosticEvent {
     pub raw_json: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
     Compile,
     Test,
@@ -235,6 +326,7 @@ pub struct ExecAllow { pub binary: String, pub args_glob: Option<String> }
 pub struct HostAllow { pub host: String }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Grant {
     FsRead(Glob),
     FsWrite(Glob),
@@ -292,8 +384,40 @@ pub struct SessionEvent {
 pub struct NewSessionEvent {
     pub session_id: SessionId,
     pub run_id: Option<RunId>,
+    #[serde(rename = "type")]
     pub type_: SessionEventType,
     pub payload: serde_json::Value,
+}
+```
+
+### Event sink injection — Stub trait (impl → RFC-0002)
+
+Runtime must not grow a second durable event store. Day 1 uses an in-memory sink; RFC-0002 replaces it with SQLite without changing `RuntimeHandle::emit`.
+
+```rust
+// alloy-runtime/src/events/sink.rs  — Stub
+#[async_trait]
+pub trait EventSink: Send + Sync {
+    async fn append_runtime(&self, ev: RuntimeEvent) -> Result<(), EventSinkError>;
+    async fn append_session(&self, ev: NewSessionEvent) -> Result<EventSeq, EventSinkError>;
+}
+
+/// Process-local buffer. Allocates an **independent** monotonic, gapless `EventSeq`
+/// **per `SessionId`**, each starting at 0. Interleaved sessions must not share a counter.
+/// RFC-0002 SQLite sink MUST continue the same per-session contract.
+pub struct InMemoryEventSink { /* Map<SessionId, next_seq> + buffers */ }
+
+#[async_trait]
+impl EventSink for InMemoryEventSink { /* … */ }
+
+#[derive(Debug, thiserror::Error)]
+pub enum EventSinkError {
+    #[error("io: {0}")]
+    Io(String),
+    #[error("busy")]
+    Busy,
+    #[error("internal: {0}")]
+    Internal(String),
 }
 ```
 
@@ -302,7 +426,7 @@ pub struct NewSessionEvent {
 ```rust
 // alloy-runtime/src/runtime/mod.rs
 use async_trait::async_trait;
-use tokio::sync::CancellationToken;
+use tokio_util::sync::CancellationToken;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -341,12 +465,29 @@ pub struct RuntimeHandle {
 impl RuntimeHandle {
     pub fn phase(&self) -> RuntimePhase { /* … */ }
     pub fn cancellation(&self) -> CancellationToken { /* … */ }
-    pub fn config(&self) -> &RuntimeConfig { /* … */ }
+    pub fn config(&self) -> Arc<RuntimeConfig> { /* clone Arc, never return & from lock */ }
 
-    /// Inject Scheduler once RFC-0010 impl exists. MVP accepts `NullScheduler`.
-    pub fn set_scheduler(&self, sched: Arc<dyn Scheduler>) { /* … */ }
+    /// Install or replace Scheduler.
+    /// - Allowed in `Configured` (pre-start inject) and `Running` when no DAG is active.
+    /// - Returns `InvalidPhase` if `Draining` | `Stopped` | `Failed` | `Starting`.
+    /// - Returns `SchedulerBusy` if a `run` is in flight.
+    pub fn set_scheduler(&self, sched: Arc<dyn Scheduler>) -> Result<(), RuntimeError> { /* … */ }
 
-    /// Emit a host-level RuntimeEvent (and, when EventStore wired, session events).
+    /// Swap event sink (RFC-0002 wires SQLite here).
+    /// - Phase: `Configured` or `Running` only.
+    /// - Takes the sink write lock and waits until no `emit` holds the async read/guard
+    ///   across `append_*` (emit acquires that guard for the full awaitable append).
+    /// - Returns `EventSinkBusy` if a replace is already in progress or wait policy times out.
+    /// - **Handoff:** if the current sink is `InMemoryEventSink`, RFC-0002’s installer must
+    ///   drain buffered runtime + session events and per-session seq maps into SQLite
+    ///   **atomically and losslessly** before the Arc swap becomes visible to new emits.
+    ///   Day-1 MVP may refuse swap until the buffer is empty if handoff is not yet wired.
+    /// Default after `start`: `InMemoryEventSink`.
+    pub async fn set_event_sink(&self, sink: Arc<dyn EventSink>) -> Result<(), RuntimeError> { /* … */ }
+
+    /// Emit a host-level RuntimeEvent; session-typed payloads go through `EventSink::append_session`.
+    /// Holds an async sink read-guard across the awaitable `append_*` so `set_event_sink` cannot
+    /// replace mid-append.
     pub async fn emit(&self, ev: RuntimeEvent) -> Result<(), RuntimeError> { /* … */ }
 }
 
@@ -355,26 +496,43 @@ pub struct AlloyRuntime {
 }
 
 impl AlloyRuntime {
-    /// Phase: Created
+    /// Phase: Created. No I/O.
     pub fn new() -> Self { /* … */ }
 
-    /// Phase: Created → Configured
+    /// Phase: Created → Configured. Rejects if not `Created` (`InvalidPhase`).
     pub fn configure(&mut self, cfg: RuntimeConfig) -> Result<&mut Self, RuntimeError> { /* … */ }
 
-    /// Phase: Configured → Starting → Running
+    /// Phase: Configured → Starting → Running.
     /// Spawns internal tasks; does not block on a user goal.
+    /// Rejects if not `Configured`. On failure → `Failed` (call `shutdown` to reap).
     pub async fn start(&mut self) -> Result<RuntimeHandle, RuntimeError> { /* … */ }
 
-    /// Drive one run if Scheduler is registered; else return `SchedulerUnavailable`.
-    /// CLI / Session call this after `submit_goal` (RFC-0003).
+    /// Thin forwarder to `Scheduler::run`. Not the user goal API (see RFC-0003).
+    /// Rejects unless phase is `Running`. MVP: at most one concurrent `run` (`SchedulerBusy`).
+    /// Maps `SchedError::Unavailable` → `RuntimeError::SchedulerUnavailable`; other scheduler
+    /// errors → `RuntimeError::Scheduler(...)`.
+    /// Does **not** emit `RuntimeEvent::RunAccepted` / `RunFinished` (no `RunId` on this API);
+    /// SessionService / RunController (RFC-0003) emit those when they have a `RunId`.
     pub async fn run(&self, dag_id: DagId) -> Result<DagOutcome, RuntimeError> { /* … */ }
 
     /// Phase: Running → Draining — stop accepting work; wait in-flight ≤ grace.
+    /// Idempotent if already `Draining`. Rejects from `Created`/`Configured`/`Stopped`.
     pub async fn drain(&self, grace: std::time::Duration) -> Result<(), RuntimeError> { /* … */ }
 
-    /// Phase: Draining → Stopped — cancel token; join tasks; flush logs.
+    /// Phase: → Stopped — cancel token; join tasks; flush logs; consume `self`.
+    /// Allowed from `Created` | `Configured` | `Running` | `Draining` | `Failed`.
+    /// From `Created` / `Configured`: no-op cleanup (no tasks), still reaches `Stopped`.
+    /// From `Starting`: wait for start to finish or return `InvalidPhase` (see matrix).
+    /// Second call is impossible (self consumed). Drop without shutdown → `tracing::warn`.
     pub async fn shutdown(self) -> Result<(), RuntimeError> { /* … */ }
 }
+
+// Drop glue (document + test):
+// impl Drop for AlloyRuntime {
+//   fn drop(&mut self) {
+//     if phase not Stopped { tracing::warn!("AlloyRuntime dropped without shutdown"); }
+//   }
+// }
 ```
 
 ### Scheduler host surface — Stub trait (impl in RFC-0010)
@@ -397,6 +555,7 @@ pub struct DagOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DagState {
     Pending,
     Running,
@@ -423,6 +582,8 @@ impl Scheduler for NullScheduler {
 
 ### Runtime adapters — Stub traits (impl in RFC-0010 + 0006)
 
+`NodeExecContext` is **not** serde. Persistable fields live on `NodeExecRef` for logs/events.
+
 ```rust
 // alloy-runtime/src/adapters/mod.rs  — Stub traits (V2 §10.4)
 #[async_trait]
@@ -441,13 +602,20 @@ pub trait GateHumanAdapter: Send + Sync {
     async fn wait_approval(&self, ctx: &NodeExecContext, gate: GateId) -> Result<Approval, AdapterError>;
 }
 
+/// Serde-safe identity of a node execution (events / logs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeExecContext {
+pub struct NodeExecRef {
     pub session_id: SessionId,
     pub run_id: RunId,
     pub dag_id: DagId,
     pub node_id: NodeId,
     pub workspace_root: std::path::PathBuf,
+}
+
+/// Runtime execution context. Not Serialize (holds CancellationToken).
+#[derive(Debug, Clone)]
+pub struct NodeExecContext {
+    pub meta: NodeExecRef,
     pub cancellation: CancellationToken,
 }
 
@@ -458,8 +626,15 @@ pub struct VerifyOutcome {
     pub raw_artifact: Option<ArtifactId>,
 }
 
+/// Shared approval decision (V2 gates). Defined once here; re-exported at crate root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Approval { Allow, Deny, AllowOnce }
+
+/// MVP stubs: always `AdapterError::Unavailable`.
+pub struct UnavailableVerifyCompile;
+pub struct UnavailableVerifyTest;
+pub struct UnavailableGateHuman;
 ```
 
 ### Session / RunController trait re-exports — Stub signatures (behavior → 0003)
@@ -495,6 +670,7 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReplanReason {
     FailureIr(FailureIr),
     UserRequested,
@@ -504,6 +680,8 @@ pub enum ReplanReason {
 ```
 
 ### DAG type sketches — Stub (full store → 0009)
+
+`timeout_ms` avoids `Duration` serde issues on sketches. `EdgeKind::Hint` is present for V2 schema parity but **ignored by MVP scheduler** (deferred behavior).
 
 ```rust
 // alloy-runtime/src/dag/types.rs  — Stub types for compile; persistence in 0009
@@ -530,22 +708,30 @@ pub struct TaskNode {
     pub budget: TokenBudget,
     pub model_tier: ModelTier,
     pub approval: Option<ApprovalSpec>,
-    pub timeout: std::time::Duration,
+    pub timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     Plan, Analyze, Edit, VerifyCompile, VerifyTest, Review, GateHuman, Aggregate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NodeState {
     Pending, Ready, Running, Succeeded, Failed, Skipped,
     Cancelled, WaitingApproval, CachedHit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EdgeKind { Data, Sequence, Hint }
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    Data,
+    Sequence,
+    /// Deferred: MVP scheduler treats Hint as non-scheduling (ignore for readiness).
+    Hint,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyEdge {
@@ -564,7 +750,11 @@ pub struct RetryPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Backoff { Fixed(std::time::Duration), Exponential { base: std::time::Duration, factor: f64 } }
+#[serde(rename_all = "snake_case")]
+pub enum Backoff {
+    Fixed { delay_ms: u64 },
+    Exponential { base_ms: u64, factor: f64 },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheKey(pub Digest);
@@ -605,6 +795,8 @@ pub struct RuntimeMetrics {
 
 ### Crate root re-exports — MVP
 
+Prefer **explicit** re-exports over `pub use types::*` to keep the public surface reviewable.
+
 ```rust
 // alloy-runtime/src/lib.rs
 pub mod types;
@@ -617,10 +809,27 @@ pub mod dag;
 pub mod config;
 pub mod error;
 
-pub use types::*;
+// IDs & IR
+pub use types::ids::{
+    SessionId, RunId, DagId, NodeId, GateId, ArtifactId, ProfileId, LanguageId,
+    CapabilityId, ProviderId, TransactionId, CheckpointId, GraphNodeId, DiagnosticId,
+    GraphVersion, Digest, DigestError, EventSeq, Timestamp, IdError,
+};
+pub use types::budget::{BudgetPolicy, TokenBudget, BudgetSnapshot, ModelTier, CreateSession, Goal, Constraint};
+pub use types::diagnostic::{DiagnosticLevel, SpanRef, DiagnosticEvent, ErrorClass, FailureIr};
+pub use types::permission::{Glob, ExecAllow, HostAllow, Grant, PermissionToken};
+pub use types::metrics::{WorkerMetrics, RuntimeMetrics};
+
+// Host
 pub use runtime::{AlloyRuntime, RuntimeConfig, RuntimeHandle, RuntimePhase, RuntimeEvent};
+pub use events::{SessionEventType, SessionEvent, NewSessionEvent, EventSink, InMemoryEventSink};
 pub use scheduler::{Scheduler, NullScheduler, DagOutcome, DagState};
-pub use session::{SessionService, RunController, Session, Approval, ReplanReason};
+pub use adapters::{
+    VerifyCompileAdapter, VerifyTestAdapter, GateHumanAdapter,
+    NodeExecRef, NodeExecContext, VerifyOutcome, Approval,
+};
+pub use session::{SessionService, RunController, Session, ReplanReason};
+pub use error::{RuntimeError, SchedError, SessionError, RunError, AdapterError};
 ```
 
 ---
@@ -632,22 +841,23 @@ crates/alloy-runtime/
   src/
     lib.rs
     types/
-      mod.rs          # re-exports
-      ids.rs           # SessionId, RunId, …
+      mod.rs          # submodule exports only (no glob at crate root)
+      ids.rs           # uuid_id! / name_id! families
       budget.rs        # BudgetPolicy, ModelTier, CreateSession, Goal
       diagnostic.rs    # DiagnosticEvent, FailureIr, ErrorClass
       permission.rs    # Grant, PermissionToken
       metrics.rs       # WorkerMetrics, RuntimeMetrics
     events/
       mod.rs           # SessionEventType, SessionEvent, NewSessionEvent
-      emit.rs          # in-memory ring until EventStore (0002)
+      sink.rs          # EventSink + InMemoryEventSink
     config/
       mod.rs           # ConfigPaths, load TOML + env
       profile.rs       # parse profiles/default.toml subset
     runtime/
       mod.rs           # AlloyRuntime, RuntimeHandle, phases
       lifecycle.rs     # start / drain / shutdown
-      handle.rs        # CancellationToken, scheduler slot
+      handle.rs        # CancellationToken, scheduler + sink slots
+      inner.rs         # RuntimeInner fields + locking notes
     scheduler/
       traits.rs        # Scheduler trait
       null.rs          # NullScheduler
@@ -657,10 +867,10 @@ crates/alloy-runtime/
       traits.rs        # SessionService, RunController signatures
     dag/
       types.rs         # TaskDag sketches (serde tests)
-    error.rs           # RuntimeError, SchedError, …
+    error.rs           # RuntimeError, SchedError, SessionError, RunError, AdapterError
     logging.rs         # tracing subscriber init helper
 
-crates/alloy-cli/      # binary: --help / --version; constructs AlloyRuntime
+crates/alloy-cli/      # binary: --help / --version; constructs AlloyRuntime; SIGINT→drain→shutdown
 crates/alloy-tools/    # empty lib stub
 crates/alloy-index/    # empty lib stub
 crates/alloy-eval/     # empty lib stub
@@ -669,7 +879,7 @@ crates/alloy-eval/     # empty lib stub
 | Module | Responsibility |
 | --- | --- |
 | `types` | Shared IR; only source of IDs/budgets/IR for other crates |
-| `events` | Appendix A enum + in-memory emit until 0002 |
+| `events` | Appendix A enum + `EventSink` (in-memory until 0002) |
 | `config` | TOML + env load; never writes `.env` |
 | `runtime` | Host lifecycle, handle, cancellation |
 | `scheduler` | Trait + `NullScheduler` |
@@ -678,11 +888,29 @@ crates/alloy-eval/     # empty lib stub
 | `dag` | Type sketches (store 0009) |
 | `logging` | `tracing` init from config |
 
+### `RuntimeInner` (locking contract)
+
+```text
+RuntimeInner {
+  phase: Atomic/Mutex<RuntimePhase>,
+  config: Arc<RuntimeConfig>,
+  cancel: CancellationToken,
+  scheduler: RwLock<Arc<dyn Scheduler>>,
+  event_sink: RwLock / async lock around Arc<dyn EventSink>,
+  emit_in_flight: guard count held across append await,
+  run_in_flight: AtomicBool,          // MVP single-flight
+  metrics: RuntimeMetrics,            // atomics
+  tasks: JoinSet or Vec<JoinHandle>,  // owned by AlloyRuntime, not cloned handles
+}
+```
+
+Handles clone cheaply (`Arc`). Only `AlloyRuntime::shutdown` joins tasks. `Failed` is terminal until `shutdown`.
+
 ### Workspace tree — MVP
 
 ```text
 alloy/
-  Cargo.toml                 # workspace members
+  Cargo.toml                 # workspace members; edition=2021; MSRV documented in README/Cargo.toml
   CODEOWNERS                 # arkadianet; required before substantive merges
   example.env
   router.toml.example
@@ -694,6 +922,8 @@ alloy/
     alloy-index/
     alloy-eval/
 ```
+
+Binary package: `alloy-cli` with `[[bin]] name = "alloy"`. Crates.io publish collision is out of scope for MVP (path dependency).
 
 ### Module dependency diagram
 
@@ -709,7 +939,7 @@ flowchart TB
     CFG[config]
     LIFE[runtime lifecycle]
     TYPES[types]
-    EV[events]
+    EV[events / EventSink]
     SCH[scheduler traits]
     AD[adapters stubs]
     SESS[session traits]
@@ -738,41 +968,51 @@ flowchart TB
 
 Runtime emits two channels:
 
-1. **`RuntimeEvent`** — host lifecycle (always available day 1; in-memory).
-2. **`SessionEvent`** — V2 Appendix A (enum + helpers day 1; durable append via RFC-0002 `EventStore`).
+1. **`RuntimeEvent`** — host lifecycle (always available day 1; via `EventSink`).
+2. **`SessionEvent`** — V2 Appendix A (enum + helpers day 1; durable append via RFC-0002 `EventStore` implementing `EventSink`).
 
-Until 0002, `RuntimeHandle::emit` records `RuntimeEvent` and optionally mirrors eligible session-typed events into an in-memory `Vec` for tests. After 0002, the same emit path appends through `EventStore`.
+Until 0002, default sink is `InMemoryEventSink` with a **per-session** monotonic, gapless
+`EventSeq` allocator (each `SessionId` starts at 0; sessions never share a counter).
+Interleaved appends across sessions must keep each session’s sequence independent and gapless.
+RFC-0002 must preserve that contract and, on sink swap, perform an atomic lossless handoff of
+buffered events + per-session next-seq state (see `set_event_sink`).
 
 ```mermaid
 sequenceDiagram
   participant CLI as alloy-cli
   participant RT as AlloyRuntime
   participant H as RuntimeHandle
-  participant MEM as InMemoryEventBuf
-  participant ES as EventStore (RFC-0002)
+  participant SINK as EventSink
+  participant ES as SQLite EventStore (RFC-0002)
+  participant RC as RunController (RFC-0003)
 
   CLI->>RT: new / configure / start
   RT->>H: Running + CancellationToken
-  RT->>MEM: RuntimeEvent::Started
+  RT->>SINK: RuntimeEvent::Started
   Note over CLI,ES: Session path (RFC-0003+)
-  CLI->>H: emit(SessionCreated) 
-  H->>MEM: buffer
+  CLI->>H: emit / append_session
+  H->>SINK: InMemoryEventSink (per-session seq)
+  Note over SINK,ES: set_event_sink atomic handoff → SQLite
   H-->>ES: append when wired
+  Note over CLI,RC: RunAccepted/RunFinished emitted by Session/RunController
+  RC->>H: emit(RunAccepted)
   Note over CLI,ES: Scheduler path (RFC-0010)
-  H->>H: run(dag) → Scheduler::run
-  H->>MEM: node_state / run_completed
+  H->>H: run(dag) → Scheduler::run (no RunAccepted)
   CLI->>RT: drain / shutdown
-  RT->>MEM: RuntimeEvent::Stopped
+  RT->>SINK: RuntimeEvent::Stopped
 ```
 
 ```rust
 // Host-only events (not Appendix A)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RuntimeEvent {
     Configured { data_dir: String },
     Started,
     SchedulerRegistered,
+    /// Emitted by Session/RunController (RFC-0003), not by `AlloyRuntime::run`.
     RunAccepted { run_id: RunId, dag_id: DagId },
+    /// Emitted by Session/RunController when a run completes; not by the DagId forwarder.
     RunFinished { run_id: RunId, outcome: DagOutcome },
     DrainStarted { grace_ms: u64 },
     Stopped,
@@ -791,6 +1031,7 @@ stateDiagram-v2
   [*] --> Created: AlloyRuntime::new
   Created --> Configured: configure(ok)
   Created --> Failed: configure(err)
+  Created --> Stopped: shutdown
   Configured --> Starting: start
   Starting --> Running: subsystems up
   Starting --> Failed: start(err)
@@ -799,6 +1040,8 @@ stateDiagram-v2
   Draining --> Stopped: shutdown
   Draining --> Stopped: grace elapsed + cancel
   Failed --> Stopped: shutdown best-effort
+  Configured --> Stopped: shutdown without start
+  Running --> Stopped: shutdown
   Stopped --> [*]
 ```
 
@@ -806,12 +1049,24 @@ stateDiagram-v2
 | --- | --- |
 | `new` | Allocate handle; phase `Created`; no I/O |
 | `configure` | Parse profile/router TOML; resolve `data_dir`; validate paths; **read** env for keys named in config; never write `.env` |
-| `start` | Init `tracing`; create `data_dir` if missing; install `NullScheduler` (or injected); emit `Started`; phase `Running` |
-| `run` | Forward to `Scheduler::run`; reject if not `Running` or draining |
+| `start` | Init `tracing`; create `data_dir` if missing; install `NullScheduler` + `InMemoryEventSink` unless already injected; emit `Started`; phase `Running` |
+| `run` | Single-flight forward to `Scheduler::run`; map `Unavailable` → `SchedulerUnavailable`; reject if not `Running` or draining; do not emit `RunAccepted` |
 | `drain` | Phase `Draining`; stop accepting `run`; wait in-flight ≤ grace |
-| `shutdown` | Cancel token; join tasks; flush tracing; phase `Stopped`; consume `self` |
+| `shutdown` | From any live phase including `Created`: cancel token if any; join tasks if any; flush tracing; phase `Stopped`; consume `self` |
 
-SIGINT/SIGTERM (CLI): call `drain` then `shutdown`. Double-shutdown is a no-op error `AlreadyStopped`.
+SIGINT/SIGTERM (`alloy-cli`): call `drain` then `shutdown`. Dropping `AlloyRuntime` without `shutdown` logs a warning and does not block (best-effort cancel only if feasible without async Drop).
+
+### Phase-guard matrix (normative)
+
+| Op | Created | Configured | Starting | Running | Draining | Failed | Stopped |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `configure` | ok | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | n/a (consumed) |
+| `start` | `InvalidPhase` | ok | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | n/a |
+| `run` | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | ok / `SchedulerBusy` | `InvalidPhase` | `InvalidPhase` | n/a |
+| `set_scheduler` | `InvalidPhase` | ok | `InvalidPhase` | ok if idle else `SchedulerBusy` | `InvalidPhase` | `InvalidPhase` | n/a |
+| `set_event_sink` | `InvalidPhase` | ok / `EventSinkBusy` | `InvalidPhase` | ok if no emit in flight else wait/`EventSinkBusy` | `InvalidPhase` | `InvalidPhase` | n/a |
+| `drain` | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | ok | ok (idempotent) | `InvalidPhase` | n/a |
+| `shutdown` | ok → `Stopped` | ok → `Stopped` | wait/`InvalidPhase` | ok | ok | ok | n/a |
 
 ---
 
@@ -826,8 +1081,16 @@ pub enum RuntimeError {
     Config(String),
     #[error("scheduler unavailable")]
     SchedulerUnavailable,
+    #[error("scheduler busy")]
+    SchedulerBusy,
+    /// Non-unavailable scheduler failures. Do **not** `#[from]` `SchedError`:
+    /// `AlloyRuntime::run` maps `SchedError::Unavailable` → `SchedulerUnavailable` explicitly.
     #[error("scheduler: {0}")]
-    Scheduler(#[from] SchedError),
+    Scheduler(SchedError),
+    #[error("event sink busy")]
+    EventSinkBusy,
+    #[error("event sink: {0}")]
+    EventSink(#[from] EventSinkError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("already stopped")]
@@ -842,10 +1105,43 @@ pub enum SchedError {
     Unavailable,
     #[error("cancelled")]
     Cancelled,
-    #[error("dag not found: {0:?}")]
+    #[error("dag not found: {0}")]
     DagNotFound(DagId),
-    #[error("other: {0}")]
-    Other(String),
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+/// Stub until RFC-0003 fills variants; must exist so traits compile.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error("not found: {0}")]
+    NotFound(SessionId),
+    #[error("invalid: {0}")]
+    Invalid(String),
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    #[error("not found: {0}")]
+    NotFound(RunId),
+    #[error("invalid phase: {0}")]
+    InvalidPhase(String),
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AdapterError {
+    #[error("unavailable")]
+    Unavailable,
+    #[error("cancelled")]
+    Cancelled,
+    #[error("tool: {0}")]
+    Tool(String),
+    #[error("internal: {0}")]
+    Internal(String),
 }
 ```
 
@@ -853,26 +1149,44 @@ pub enum SchedError {
 | --- | --- |
 | Bad TOML / missing profile | `RuntimeError::Config`; refuse `start` |
 | Missing API key in env | Config warning at load; hard fail deferred to provider call (0007) |
-| `run` with `NullScheduler` | `SchedulerUnavailable` (expected until 0010) |
+| `run` with `NullScheduler` | `SchedError::Unavailable` mapped to `RuntimeError::SchedulerUnavailable` (not `Scheduler(...)`) |
+| Second concurrent `run` | `SchedulerBusy` (MVP single-flight) |
+| `set_scheduler` during `run` | `SchedulerBusy` |
+| `set_event_sink` during emit / swap race | Wait for emit guard or `EventSinkBusy`; never tear mid-append |
+| Sink handoff data loss | Forbidden — RFC-0002 atomic drain of buffers + per-session seq before swap |
 | Panic in subsystem task | Catch via `JoinHandle`; emit `RuntimeEvent::Failed`; enter `Failed` |
 | Drain timeout | Cancel token; best-effort join; still reach `Stopped` |
+| `data_dir` create fails | `RuntimeError::Io`; `start` → `Failed` |
+| Partial `start` failure | Enter `Failed`; caller must `shutdown` to join/reap; no auto-rollback to `Configured` |
 | Budget / approval | Typed on Session/Scheduler RFCs; Runtime only forwards |
+| Drop without shutdown | `tracing::warn`; cancel token if still live; no async flush |
 
 ### Failure modes summary
 
 | Mode | Symptom | Mitigation |
 | --- | --- | --- |
 | Crate sprawl | Sixth crate PR | Reject; types stay in `alloy-runtime` |
-| Host does too much | Scheduler logic in Runtime | Keep only traits + `NullScheduler` |
+| Host does too much | Scheduler logic in Runtime | Keep only traits + `NullScheduler`; `run` is forwarder |
 | Silent `.env` write | Secrets clobbered | Config loader never opens `.env` for write; tests assert |
-| Phase skip | `run` before `start` | `InvalidPhase` |
+| Phase skip | `run` before `start` | `InvalidPhase` + matrix tests |
 | Hung shutdown | Task ignores cancel | Grace then abort join; log orphan |
+| Dual event stores | Memory + SQLite diverge | Single `EventSink` slot; 0002 atomic handoff, does not duplicate |
+| UUID profile ids | TOML `"default"` cannot parse | `name_id!` for Profile/Language/Capability/Provider |
+| Invalid serde IDs/digests | Empty/overlong names or bad hex enter via JSON | Deserialize via constructors; reject with errors |
 
 ---
 
 ## Configuration
 
 **Rules:** Load from TOML + process environment. Document keys in `example.env`. **Never create or overwrite `.env`.**
+
+### Data dir precedence (pinned)
+
+1. `ALLOY_DATA_DIR` if set and non-empty  
+2. else `<workspace_root>/.alloy` when a workspace root is known to the loader  
+3. else XDG data dir (`$XDG_DATA_HOME/alloy` or platform default)  
+
+Error messages must cite which rule won and the `example.env` hint path (never invent a `.env` path to write).
 
 ### `example.env`
 
@@ -933,13 +1247,14 @@ pub struct ConfigPaths {
     pub router: PathBuf,
     pub example_env: PathBuf, // for error messages only
     pub data_dir: Option<PathBuf>,
+    pub workspace_root: Option<PathBuf>,
 }
 
 // RuntimeConfig::load:
 // 1. read profile TOML
 // 2. read router TOML (may be incomplete until 0007)
 // 3. std::env::var for keys named in router — do not parse/write .env files
-// 4. resolve data_dir = ALLOY_DATA_DIR || workspace/.alloy || XDG
+// 4. resolve data_dir per precedence above
 ```
 
 ---
@@ -950,7 +1265,7 @@ pub struct ConfigPaths {
 | --- | --- |
 | Process | Single OS process (`alloy` binary) |
 | Worker threads | Tokio multi-thread runtime (CLI builds `tokio::runtime::Builder::new_multi_thread`) |
-| Shared state | `Arc<RuntimeInner>` + interior `tokio::sync` primitives |
+| Shared state | `Arc<RuntimeInner>` + interior `tokio::sync` / `std::sync` primitives as above |
 | Blocking I/O | `spawn_blocking` for sync FS/SQLite when 0002 lands; none required day 1 beyond config read |
 | CPU | No dedicated thread pool beyond Tokio; Scheduler linear MVP needs no fan-out |
 | FFI / signal | `tokio::signal` in `alloy-cli` only |
@@ -961,16 +1276,16 @@ Do not spawn unmanaged `std::thread` for control-plane work.
 
 ## Async model
 
-Per V2 control APIs: all host traits are `async` + `Send + Sync` via `async_trait` (or RPITIT if workspace MSRV allows—pick one and stick to it for MVP).
+Public host traits are `async` + `Send + Sync` via **`async_trait`** (pinned through M1).
 
 | Assumption | Detail |
 | --- | --- |
 | Runtime | Tokio 1.x multi-thread |
 | Attributes | `#[tokio::main]` on `alloy-cli`; library crates are runtime-agnostic except tests |
-| Cancellation | `tokio_util::sync::CancellationToken` (or tokio `CancellationToken` if available) cloned onto `NodeExecContext` |
+| Cancellation | `tokio_util::sync::CancellationToken` cloned onto `NodeExecContext` |
 | Time | `tokio::time` for grace / timeouts |
-| Channels | `tokio::sync::mpsc` for optional event subscribers; not required for MVP buffer |
-| No async drop | `shutdown` is explicit `async fn`; document that dropping `AlloyRuntime` without shutdown logs a warning |
+| Channels | optional later; MVP sink is sync-to-async mutex around `Vec` |
+| No async drop | `shutdown` is explicit `async fn`; dropping without shutdown warns |
 
 ---
 
@@ -1008,6 +1323,8 @@ Ordered steps:
 5. Join / abort remaining.
 6. Emit `Stopped`; flush logs; drop handle.
 
+`alloy-cli` must install `tokio::signal` handlers for SIGINT/SIGTERM that invoke this sequence (acceptance-tested with a unit/integration harness that calls the same path without real signals if needed).
+
 ---
 
 ## Logging
@@ -1044,43 +1361,82 @@ Day 1: in-process `RuntimeMetrics` counters on `RuntimeHandle` (atomics). No OTL
 | Test | Crate | Asserts |
 | --- | --- | --- |
 | Workspace compiles | workspace | `cargo check --workspace` |
-| Serde round-trip | `alloy-runtime` | `CreateSession`, `DiagnosticEvent`, `FailureIr`, `Grant`, `TaskDag` sketch, `SessionEventType` |
+| Exactly five members | workspace | parse `Cargo.toml` members == 5 |
+| Serde round-trip | `alloy-runtime` | `CreateSession`, `DiagnosticEvent`, `FailureIr`, `Grant`, `TaskDag` sketch, `SessionEventType`, `Timestamp` RFC3339 |
+| Name ids | `alloy-runtime` | `ProfileId::new("default")` ok; empty/overlong `new` errs; **serde rejects** `""` and overlong strings |
+| Digest | `alloy-runtime` | `try_from_hex` + **serde** reject bad length/charset |
 | Lifecycle happy path | `alloy-runtime` | `new → configure → start → drain → shutdown` |
-| Invalid phase | `alloy-runtime` | `run` before `start` → `InvalidPhase` |
-| NullScheduler | `alloy-runtime` | `run` → `SchedulerUnavailable` |
+| Shutdown from Created | `alloy-runtime` | `new → shutdown` → `Stopped` (no panic) |
+| Phase matrix | `alloy-runtime` | table above: double `configure`, `run` before `start`, `start` twice → `InvalidPhase` |
+| NullScheduler | `alloy-runtime` | `run` → **`RuntimeError::SchedulerUnavailable`** (not `Scheduler(Unavailable)`) |
+| Single-flight | `alloy-runtime` | overlapping `run` → `SchedulerBusy` |
+| set_scheduler busy | `alloy-runtime` | replace during in-flight `run` → `SchedulerBusy` |
+| set_event_sink vs emit | `alloy-runtime` | emit holds guard across append; concurrent swap waits or `EventSinkBusy` |
 | Cancel on shutdown | `alloy-runtime` | token cancelled after `shutdown` |
-| Config never writes `.env` | `alloy-runtime` | temp dir: load leaves no `.env` created |
+| Drop without shutdown | `alloy-runtime` | drop after `start` does not panic (warn path) |
+| Config never writes `.env` | `alloy-runtime` | temp dir: load leaves no `.env` created; even if `example.env` present |
+| EventSeq per session | `alloy-runtime` | interleaved sessions A/B: each starts at 0 and stays gapless independently |
 | Binary smoke | `alloy-cli` | `--help`, `--version` exit 0 |
+| CLI signal path | `alloy-cli` | drain+shutdown helper invoked (hook/test seam) |
 | Clippy | workspace | no warnings on public types |
 
 ---
 
 ## Acceptance criteria
 
-- [ ] Five crates exist and `cargo build --workspace` succeeds
+- [ ] Five crates exist and `cargo build --workspace` succeeds; workspace has **exactly** five members
 - [ ] `alloy-runtime` publishes all core IDs, budgets, Diagnostic/Failure IR, Grant/PermissionToken, SessionEventType matching V2
-- [ ] `AlloyRuntime` implements create → configure → start → run → drain → shutdown state machine
-- [ ] `Scheduler`, `SessionService`, `RunController`, Verify*/GateHuman adapter **traits** compile; `NullScheduler` registered by default
-- [ ] `run` with stub scheduler returns `SchedulerUnavailable` (defined, not panic)
-- [ ] `alloy --help` and `alloy --version` work via `alloy-cli`
-- [ ] `example.env`, `profiles/default.toml`, `router.toml.example` present; **`.env` never written**
-- [ ] Module map mirrors V2 component names under `alloy-runtime`
+- [ ] Named catalog IDs (`ProfileId`, `LanguageId`, `CapabilityId`, `ProviderId`) are string newtypes; instance IDs are UUID newtypes
+- [ ] `AlloyRuntime` implements create → configure → start → run → drain → shutdown state machine per the phase-guard matrix
+- [ ] `Scheduler`, `SessionService`, `RunController`, `EventSink`, Verify*/GateHuman adapter **traits** compile; `NullScheduler` + `InMemoryEventSink` registered by default
+- [ ] `run` with stub scheduler returns `SchedulerUnavailable` (defined, not panic); concurrent `run` returns `SchedulerBusy`
+- [ ] Catalog ID / `Digest` serde rejects invalid values via constructors
+- [ ] `EventSeq` is per-session (interleaved sessions independent); `set_event_sink` does not replace mid-emit
+- [ ] `NodeExecContext` is non-serde; `NodeExecRef` is serde-safe
+- [ ] `shutdown` from `Created` reaches `Stopped`; `AlloyRuntime::run` does not emit `RunAccepted`
+- [ ] `alloy --help` and `alloy --version` work via `alloy-cli`; SIGINT/SIGTERM path calls drain→shutdown
+- [ ] `example.env`, `profiles/default.toml`, `router.toml.example` present; **`.env` never written** (automated test)
+- [ ] Module map mirrors V2 component names under `alloy-runtime`; crate root uses explicit re-exports (no `pub use types::*`)
 - [ ] CODEOWNERS present (arkadianet) before substantive merges
-- [ ] Serde round-trip tests green for core IR
+- [ ] Serde round-trip tests green for core IR; `Timestamp` is RFC3339; Appendix A `type` field wire names match V2
+- [ ] Drop without shutdown does not panic; emits warning
 - [ ] No behavioral Session/Scheduler/MCP/Edit beyond stubs
 - [ ] Downstream RFCs can `use alloy_runtime::{SessionId, CreateSession, Scheduler, …}` without a sixth crate
 - [ ] Former RFC-0001 skeleton acceptance criteria absorbed and checked above
+- [ ] MSRV/edition/`async_trait` pinned in workspace manifests as specified here
+
+### Definition of Done
+
+This RFC is merge-complete only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
+
+- [ ] Architecture compliance: **PASS**
+- [ ] RFC acceptance criteria: **100% satisfied**
+- [ ] Unit tests: **passing**
+- [ ] Integration tests: **passing** (CLI smoke / workspace build paths applicable here)
+- [ ] Documentation: **complete**
+- [ ] Public APIs: **reviewed and stable**
+- [ ] Clippy: **clean**
+- [ ] Formatting: **clean**
+- [ ] No TODO or placeholder implementations left in this RFC’s scope (explicit **Stub** traits/impls only)
+- [ ] Code review: **approved**
+
+Do not merge until every item above is true.
 
 ---
 
-## Open questions
+## Decisions (formerly open questions)
 
-Implementability only (architecture frozen):
+| Topic | Decision |
+| --- | --- |
+| MSRV / async | Edition 2021, Tokio 1.x, **`async_trait` on all public host traits through M1** |
+| Data dir | `ALLOY_DATA_DIR` → `<workspace>/.alloy` → XDG (see Configuration) |
+| Event seq | **Per-session** gapless `EventSeq` from 0 (in-memory and SQLite); interleaved sessions independent; atomic handoff on sink swap |
+| `Created` + `shutdown` | Allowed → `Stopped` (no-op cleanup) |
+| `RunAccepted` / `RunFinished` | Emitted by Session/RunController (RFC-0003), not `AlloyRuntime::run` |
+| `SchedError::Unavailable` | Mapped by `AlloyRuntime::run` to `RuntimeError::SchedulerUnavailable` |
+| Binary name | Package `alloy-cli`, bin name `alloy`; crates.io publish later |
 
-1. **MSRV / async_trait:** Pin Tokio + edition in workspace `Cargo.toml` on day 1—confirm whether RPITIT replaces `async_trait` or keep `async_trait` for all public traits through M1.
-2. **XDG vs `.alloy/`:** Prefer workspace-local `.alloy/` when `workspace_root` is set; else XDG `data_dir`. Exact precedence string for errors—document in `RuntimeConfig::load`.
-3. **Event mirror:** Should in-memory session events before RFC-0002 share the same `seq` allocator as the future SQLite store (yes recommended) so tests stay stable?
-4. **Binary crate name:** Package `alloy-cli` with `[[bin]] name = "alloy"`—confirm no name collision on crates.io for later publish (local path ok for MVP).
+No architecture open questions remain for this RFC.
 
 ---
 
@@ -1091,9 +1447,12 @@ Implementability only (architecture frozen):
 | Crates | ≤5, single binary | Further splits under compile pressure |
 | Scheduler | Trait + `NullScheduler` | Linear ready-queue → **0010** |
 | Session | Trait signatures | Impl → **0003** (+ store **0002**) |
+| Event durability | `EventSink` + in-memory | SQLite `EventStore` → **0002** |
 | Adapters | Traits + Unavailable | Verify/Test/Gate → **0010** + MCP **0006** |
-| Parallelism | Types default to 1 | Raise after eval |
+| Hint edges | Enum variant only (ignored) | Scheduling behavior after eval |
+| Parallelism | Types default to 1; single-flight `run` | Raise after eval |
 | Daemon / ACP | Absent | Research backlog |
 | Types crate | Inside `alloy-runtime` | Split only if forced |
+| USD representation | `f64` (V2 parity) | Integer cents if metering demands |
 
 **Developer builds first:** workspace + `alloy-runtime` core types + `AlloyRuntime` lifecycle with `NullScheduler`, then `alloy-cli` `--help`/`--version`.
