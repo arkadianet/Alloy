@@ -1,0 +1,10 @@
+# router.toml.example — Author: arkadianet
+[provider.default]
+kind = "openai_compatible"
+base_url = "https://api.example.com/v1"
+api_key_env = "ALLOY_API_KEY"
+
+[tiers]
+repair = "standard"
+edit = "standard"
+review = "economy"
