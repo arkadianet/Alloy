@@ -1390,7 +1390,10 @@ Day 1: in-process `RuntimeMetrics` counters on `RuntimeHandle` (atomics). No OTL
 - [ ] `AlloyRuntime` implements create → configure → start → run → drain → shutdown state machine per the phase-guard matrix
 - [ ] `Scheduler`, `SessionService`, `RunController`, `EventSink`, Verify*/GateHuman adapter **traits** compile; `NullScheduler` + `InMemoryEventSink` registered by default
 - [ ] `run` with stub scheduler returns `SchedulerUnavailable` (defined, not panic); concurrent `run` returns `SchedulerBusy`
+- [ ] Catalog ID / `Digest` serde rejects invalid values via constructors
+- [ ] `EventSeq` is per-session (interleaved sessions independent); `set_event_sink` does not replace mid-emit
 - [ ] `NodeExecContext` is non-serde; `NodeExecRef` is serde-safe
+- [ ] `shutdown` from `Created` reaches `Stopped`; `AlloyRuntime::run` does not emit `RunAccepted`
 - [ ] `alloy --help` and `alloy --version` work via `alloy-cli`; SIGINT/SIGTERM path calls drain→shutdown
 - [ ] `example.env`, `profiles/default.toml`, `router.toml.example` present; **`.env` never written** (automated test)
 - [ ] Module map mirrors V2 component names under `alloy-runtime`; crate root uses explicit re-exports (no `pub use types::*`)
