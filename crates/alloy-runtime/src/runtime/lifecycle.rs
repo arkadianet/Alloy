@@ -89,8 +89,17 @@ impl AlloyRuntime {
 
     async fn start_inner(&mut self) -> Result<RuntimeHandle, RuntimeError> {
         logging::init_tracing();
-        let cfg = self.handle.config()?;
-        tokio::fs::create_dir_all(&cfg.data_dir).await?;
+        let cfg = self.handle.config();
+        tokio::fs::create_dir_all(&cfg.data_dir)
+            .await
+            .map_err(|e| {
+                RuntimeError::Config(format!(
+                    "create data_dir {} (rule: {}); see {}: {e}",
+                    cfg.data_dir.display(),
+                    cfg.data_dir_rule,
+                    cfg.env_file_hint.display()
+                ))
+            })?;
 
         let pending = self
             .handle
@@ -116,35 +125,11 @@ impl AlloyRuntime {
     /// Maps [`SchedError::Unavailable`] → [`RuntimeError::SchedulerUnavailable`].
     /// Does **not** emit `RunAccepted` / `RunFinished`.
     pub async fn run(&self, dag_id: DagId) -> Result<DagOutcome, RuntimeError> {
-        let phase = self.handle.phase();
-        if phase != RuntimePhase::Running {
-            return Err(RuntimeError::InvalidPhase {
-                current: phase,
-                op: "run",
-            });
-        }
-        if self
-            .handle
-            .inner
-            .run_in_flight
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(RuntimeError::SchedulerBusy);
-        }
-
-        self.handle
-            .inner
-            .metrics
-            .runs_started
-            .fetch_add(1, Ordering::Relaxed);
-
-        let sched = self.handle.inner.scheduler.read().await.clone();
+        let permit = self.handle.inner.try_admit_run(dag_id)?;
+        let sched = self.handle.scheduler();
         let result = sched.run(dag_id).await;
-        self.handle
-            .inner
-            .run_in_flight
-            .store(false, Ordering::SeqCst);
+        // Drop permit before mapping so busy state clears even if we return early.
+        drop(permit);
 
         match result {
             Ok(outcome) => {
@@ -176,37 +161,30 @@ impl AlloyRuntime {
 
     /// Phase: `Running` → `Draining`.
     pub async fn drain(&self, grace: Duration) -> Result<(), RuntimeError> {
-        match self.handle.phase() {
-            RuntimePhase::Running => {
-                self.handle.inner.set_phase(RuntimePhase::Draining);
-                let _ = self
-                    .handle
-                    .emit(RuntimeEvent::DrainStarted {
-                        grace_ms: u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
-                    })
-                    .await;
-            }
-            RuntimePhase::Draining => {}
-            other => {
-                return Err(RuntimeError::InvalidPhase {
-                    current: other,
-                    op: "drain",
-                });
-            }
+        let (active_dag, newly) = self.handle.inner.begin_drain()?;
+        if newly {
+            let _ = self
+                .handle
+                .emit(RuntimeEvent::DrainStarted {
+                    grace_ms: u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+                })
+                .await;
         }
 
-        let sched = self.handle.inner.scheduler.read().await.clone();
-        let _ = sched.cancel(DagId::new()).await;
+        let sched = self.handle.scheduler();
+        if let Some(dag_id) = active_dag {
+            let _ = sched.cancel(dag_id).await;
+        }
 
         let start = tokio::time::Instant::now();
-        while self.handle.inner.run_in_flight.load(Ordering::SeqCst) {
+        while self.handle.run_in_flight() {
             if start.elapsed() >= grace {
                 self.handle.cancellation().cancel();
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if self.handle.inner.run_in_flight.load(Ordering::SeqCst) {
+        if self.handle.run_in_flight() {
             self.handle.cancellation().cancel();
         }
         Ok(())
@@ -234,7 +212,6 @@ impl AlloyRuntime {
         }
 
         self.handle.cancellation().cancel();
-        // Emit Stopped only when a sink is usable (Configured+); Created has empty buffer OK.
         if !matches!(self.handle.phase(), RuntimePhase::Created) {
             let _ = self.handle.emit(RuntimeEvent::Stopped).await;
         }

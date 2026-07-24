@@ -32,7 +32,6 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         None => {
-            // `--help` / `--version` handled by clap; bare invocation prints help-ish usage.
             println!("alloy {}", env!("CARGO_PKG_VERSION"));
             println!("Run `alloy --help` for usage.");
             ExitCode::SUCCESS
@@ -63,28 +62,54 @@ async fn run_host(workspace: PathBuf) -> Result<(), Box<dyn std::error::Error>> 
     rt.configure(cfg)?;
     let handle = rt.start().await?;
 
-    tracing::info!(phase = ?handle.phase(), "runtime running; press Ctrl-C to stop");
+    tracing::info!(phase = ?handle.phase(), "runtime running; Ctrl-C / SIGTERM to stop");
+    wait_for_shutdown_signal().await?;
+    graceful_shutdown(rt, Duration::from_secs(10)).await?;
+    Ok(())
+}
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("SIGINT received");
+/// Wait for SIGINT or SIGTERM (Unix). Shared so tests can call [`graceful_shutdown`] directly.
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => {
+                r?;
+                tracing::info!("SIGINT received");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received");
+            }
         }
+        Ok(())
     }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        tracing::info!("SIGINT received");
+        Ok(())
+    }
+}
 
-    rt.drain(Duration::from_secs(10)).await?;
+/// Drain then shutdown — production signal path and test seam.
+async fn graceful_shutdown(
+    rt: AlloyRuntime,
+    grace: Duration,
+) -> Result<(), alloy_runtime::RuntimeError> {
+    rt.drain(grace).await?;
     rt.shutdown().await?;
     Ok(())
 }
 
-/// Shared helper used by integration tests to exercise drain→shutdown without signals.
 #[cfg(test)]
 mod signal_path {
     use super::*;
 
     #[tokio::test]
-    async fn drain_shutdown_helper() {
+    async fn graceful_shutdown_helper() {
         let dir = tempfile::tempdir().unwrap();
-        // Minimal config fixtures
         std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
         std::fs::write(
             dir.path().join("profiles/default.toml"),
@@ -109,7 +134,8 @@ mod signal_path {
         let mut rt = AlloyRuntime::new();
         rt.configure(cfg).unwrap();
         let _ = rt.start().await.unwrap();
-        rt.drain(Duration::from_millis(50)).await.unwrap();
-        rt.shutdown().await.unwrap();
+        graceful_shutdown(rt, Duration::from_millis(50))
+            .await
+            .unwrap();
     }
 }

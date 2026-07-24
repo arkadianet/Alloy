@@ -27,6 +27,8 @@ pub struct ConfigPaths {
 pub struct RuntimeConfig {
     /// Data directory (`.alloy` or XDG).
     pub data_dir: PathBuf,
+    /// Which precedence rule selected [`Self::data_dir`].
+    pub data_dir_rule: &'static str,
     /// Profile path.
     pub profile_path: PathBuf,
     /// Router path.
@@ -65,6 +67,18 @@ struct ObservabilitySection {
     retain_tool_bodies: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct RouterFile {
+    #[serde(default)]
+    provider: std::collections::BTreeMap<String, ProviderSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderSection {
+    #[serde(default)]
+    api_key_env: Option<String>,
+}
+
 fn default_usd() -> f64 {
     5.0
 }
@@ -91,7 +105,6 @@ impl RuntimeConfig {
             RuntimeError::Config(format!("parse profile {}: {e}", paths.profile.display()))
         })?;
 
-        // Router may be incomplete until RFC-0007; require file existence if path set.
         if !paths.router.is_file() {
             return Err(RuntimeError::Config(format!(
                 "missing router TOML at {} (copy router.toml.example; see {})",
@@ -99,21 +112,37 @@ impl RuntimeConfig {
                 paths.example_env.display()
             )));
         }
-        // Parse enough to surface TOML errors; content used later by RFC-0007.
         let router_raw = std::fs::read_to_string(&paths.router).map_err(|e| {
             RuntimeError::Config(format!("read router {}: {e}", paths.router.display()))
         })?;
-        let _: toml::Value = toml::from_str(&router_raw).map_err(|e| {
+        let router: RouterFile = toml::from_str(&router_raw).map_err(|e| {
             RuntimeError::Config(format!("parse router {}: {e}", paths.router.display()))
         })?;
 
-        let data_dir = resolve_data_dir(&paths)?;
+        for (name, provider) in &router.provider {
+            if let Some(key) = &provider.api_key_env {
+                match std::env::var(key) {
+                    Ok(v) if !v.is_empty() => {}
+                    _ => {
+                        tracing::warn!(
+                            provider = %name,
+                            env_key = %key,
+                            hint = %paths.example_env.display(),
+                            "router api_key_env is unset; provider calls will fail later (RFC-0007). Alloy never writes .env"
+                        );
+                    }
+                }
+            }
+        }
+
+        let (data_dir, data_dir_rule) = resolve_data_dir(&paths)?;
 
         let _ = profile.budgets.max_usd_per_run;
         let _ = profile.budgets.max_tokens_per_run;
 
         Ok(Self {
             data_dir,
+            data_dir_rule,
             profile_path: paths.profile,
             router_path: paths.router,
             env_file_hint: paths.example_env,
@@ -124,19 +153,19 @@ impl RuntimeConfig {
     }
 }
 
-fn resolve_data_dir(paths: &ConfigPaths) -> Result<PathBuf, RuntimeError> {
+fn resolve_data_dir(paths: &ConfigPaths) -> Result<(PathBuf, &'static str), RuntimeError> {
     if let Ok(dir) = std::env::var("ALLOY_DATA_DIR") {
         if !dir.is_empty() {
-            return Ok(PathBuf::from(dir));
+            return Ok((PathBuf::from(dir), "ALLOY_DATA_DIR"));
         }
     }
     if let Some(root) = &paths.workspace_root {
-        return Ok(root.join(".alloy"));
+        return Ok((root.join(".alloy"), "<workspace>/.alloy"));
     }
     if let Some(explicit) = &paths.data_dir {
-        return Ok(explicit.clone());
+        return Ok((explicit.clone(), "ConfigPaths.data_dir"));
     }
-    Ok(default_xdg_data_dir())
+    Ok((default_xdg_data_dir(), "XDG_DATA_HOME/alloy"))
 }
 
 fn default_xdg_data_dir() -> PathBuf {
@@ -159,10 +188,8 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn load_never_writes_dotenv() {
-        let dir = tempfile::tempdir().unwrap();
-        let profile = dir.path().join("profiles/default.toml");
+    fn write_fixtures(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let profile = dir.join("profiles/default.toml");
         fs::create_dir_all(profile.parent().unwrap()).unwrap();
         fs::write(
             &profile,
@@ -178,29 +205,37 @@ retain_tool_bodies = false
 "#,
         )
         .unwrap();
-        let router = dir.path().join("router.toml");
+        let router = dir.join("router.toml");
         fs::write(
             &router,
             r#"
 [provider.default]
 kind = "openai_compatible"
+api_key_env = "ALLOY_API_KEY"
 "#,
         )
         .unwrap();
-        let example = dir.path().join("example.env");
+        let example = dir.join("example.env");
         fs::write(&example, "ALLOY_API_KEY=\n").unwrap();
+        (profile, router, example)
+    }
+
+    #[test]
+    fn load_never_writes_dotenv_and_preserves_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
         let dotenv = dir.path().join(".env");
-        assert!(!dotenv.exists());
+        fs::write(&dotenv, "SENTINEL=1\n").unwrap();
 
         let cfg = RuntimeConfig::load(ConfigPaths {
             profile,
             router,
             example_env: example,
-            data_dir: Some(dir.path().join("data")),
+            data_dir: None,
             workspace_root: Some(dir.path().to_path_buf()),
         })
         .unwrap();
-        assert!(cfg.data_dir.ends_with(".alloy") || cfg.data_dir.ends_with("data"));
-        assert!(!dotenv.exists(), ".env must never be created");
+        assert_eq!(cfg.data_dir_rule, "<workspace>/.alloy");
+        assert_eq!(fs::read_to_string(&dotenv).unwrap(), "SENTINEL=1\n");
     }
 }

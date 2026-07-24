@@ -1,12 +1,14 @@
 //! Integration tests for AlloyRuntime lifecycle (RFC-0001).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_runtime::{
-    AlloyRuntime, ConfigPaths, DagId, EventSink, InMemoryEventSink, NewSessionEvent, NullScheduler,
-    RuntimeConfig, RuntimeError, RuntimeEvent, RuntimePhase, SchedError, Scheduler,
-    SessionEventType, SessionId,
+    AlloyRuntime, ConfigPaths, CreateSession, DagId, DagOutcome, DagState, DiagnosticEvent,
+    DiagnosticLevel, Digest, FailureIr, Glob, Grant, InMemoryEventSink, NewSessionEvent,
+    NullScheduler, ProfileId, RuntimeConfig, RuntimeError, RuntimeEvent, RuntimePhase, SchedError,
+    Scheduler, SessionEventType, SessionId, Timestamp,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -32,6 +34,7 @@ retain_tool_bodies = false
         r#"
 [provider.default]
 kind = "openai_compatible"
+api_key_env = "ALLOY_API_KEY"
 "#,
     )
     .unwrap();
@@ -104,7 +107,6 @@ async fn null_scheduler_maps_to_scheduler_unavailable() {
     let _ = rt.start().await.unwrap();
     let err = rt.run(DagId::new()).await.unwrap_err();
     assert!(matches!(err, RuntimeError::SchedulerUnavailable));
-    // Must not be Scheduler(Unavailable)
     assert!(!matches!(
         err,
         RuntimeError::Scheduler(SchedError::Unavailable)
@@ -119,13 +121,13 @@ struct GateScheduler {
 
 #[async_trait]
 impl Scheduler for GateScheduler {
-    async fn run(&self, dag_id: DagId) -> Result<alloy_runtime::DagOutcome, SchedError> {
+    async fn run(&self, dag_id: DagId) -> Result<DagOutcome, SchedError> {
         self.entered.notify_waiters();
         self.release.notified().await;
-        Ok(alloy_runtime::DagOutcome {
+        Ok(DagOutcome {
             dag_id,
             generation: 0,
-            state: alloy_runtime::DagState::Succeeded,
+            state: DagState::Succeeded,
             failed_node: None,
             failure: None,
         })
@@ -146,7 +148,7 @@ async fn single_flight_busy() {
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
-    handle.set_scheduler(sched.clone()).await.unwrap();
+    handle.set_scheduler(sched.clone()).unwrap();
 
     {
         let entered = sched.entered.notified();
@@ -157,10 +159,79 @@ async fn single_flight_busy() {
         }
         let busy = rt.run(DagId::new()).await.unwrap_err();
         assert!(matches!(busy, RuntimeError::SchedulerBusy));
+        let replace = handle.set_scheduler(Arc::new(NullScheduler));
+        assert!(matches!(replace, Err(RuntimeError::SchedulerBusy)));
         sched.release.notify_waiters();
         let outcome = run_fut.await.unwrap();
-        assert_eq!(outcome.state, alloy_runtime::DagState::Succeeded);
+        assert_eq!(outcome.state, DagState::Succeeded);
     }
+    rt.shutdown().await.unwrap();
+}
+
+struct RecordingScheduler {
+    cancelled: Arc<AtomicUsize>,
+    last_cancel: Arc<std::sync::Mutex<Option<DagId>>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Scheduler for RecordingScheduler {
+    async fn run(&self, dag_id: DagId) -> Result<DagOutcome, SchedError> {
+        self.entered.notify_waiters();
+        self.release.notified().await;
+        Ok(DagOutcome {
+            dag_id,
+            generation: 0,
+            state: DagState::Cancelled,
+            failed_node: None,
+            failure: None,
+        })
+    }
+    async fn cancel(&self, dag_id: DagId) -> Result<(), SchedError> {
+        self.cancelled.fetch_add(1, Ordering::SeqCst);
+        *self
+            .last_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dag_id);
+        self.release.notify_waiters();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn drain_cancels_active_dag_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = AlloyRuntime::new();
+    rt.configure(test_config(dir.path())).unwrap();
+    let handle = rt.start().await.unwrap();
+    let dag = DagId::new();
+    let sched = Arc::new(RecordingScheduler {
+        cancelled: Arc::new(AtomicUsize::new(0)),
+        last_cancel: Arc::new(std::sync::Mutex::new(None)),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    handle.set_scheduler(sched.clone()).unwrap();
+
+    {
+        let entered = sched.entered.notified();
+        let mut run_fut = std::pin::pin!(rt.run(dag));
+        tokio::select! {
+            _ = &mut run_fut => panic!("finished early"),
+            _ = entered => {}
+        }
+        rt.drain(Duration::from_millis(200)).await.unwrap();
+        let _ = run_fut.await;
+    }
+    assert_eq!(sched.cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *sched
+            .last_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        Some(dag)
+    );
     rt.shutdown().await.unwrap();
 }
 
@@ -188,8 +259,10 @@ async fn drop_without_shutdown_does_not_panic() {
 #[tokio::test]
 async fn config_never_writes_dotenv() {
     let dir = tempfile::tempdir().unwrap();
+    let dotenv = dir.path().join(".env");
+    std::fs::write(&dotenv, "SENTINEL=keep\n").unwrap();
     let _ = test_config(dir.path());
-    assert!(!dir.path().join(".env").exists());
+    assert_eq!(std::fs::read_to_string(&dotenv).unwrap(), "SENTINEL=keep\n");
 }
 
 #[tokio::test]
@@ -217,33 +290,106 @@ async fn event_seq_interleaved_sessions_via_handle() {
 }
 
 #[tokio::test]
-async fn set_event_sink_refuses_non_empty() {
+async fn set_event_sink_refuses_non_empty_with_busy() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = AlloyRuntime::new();
     rt.configure(test_config(dir.path())).unwrap();
     let handle = rt.start().await.unwrap();
-    handle.emit(RuntimeEvent::Started).await.unwrap();
+    // start already emitted Configured/Started into memory sink
     let err = handle
         .set_event_sink(Arc::new(InMemoryEventSink::new()))
         .await
         .unwrap_err();
-    assert!(matches!(err, RuntimeError::Internal(_)));
+    assert!(matches!(err, RuntimeError::EventSinkBusy));
     rt.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn run_does_not_emit_run_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = AlloyRuntime::new();
+    rt.configure(test_config(dir.path())).unwrap();
+    let handle = rt.start().await.unwrap();
+    let _ = rt.run(DagId::new()).await;
+    let events = handle.memory_sink().runtime_events();
+    assert!(events
+        .iter()
+        .all(|e| !matches!(e, RuntimeEvent::RunAccepted { .. })));
+    rt.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn core_ir_serde_round_trips() {
+    let profile = ProfileId::new("default").unwrap();
+    let cs = CreateSession {
+        workspace_root: std::path::PathBuf::from("/tmp/ws"),
+        profile: profile.clone(),
+        budget: alloy_runtime::BudgetPolicy::default(),
+        language_backends: vec![alloy_runtime::LanguageId::new("rust").unwrap()],
+    };
+    let json = serde_json::to_string(&cs).unwrap();
+    let back: CreateSession = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.profile.as_str(), "default");
+
+    let dig = Digest::sha256(b"x");
+    let diag = DiagnosticEvent {
+        id: alloy_runtime::DiagnosticId::new(),
+        code: Some("E0502".into()),
+        level: DiagnosticLevel::Error,
+        message: "borrow".into(),
+        spans: vec![],
+        children: vec![],
+        package: None,
+        fingerprint: dig.clone(),
+        raw_json: None,
+    };
+    let fail = FailureIr {
+        node: alloy_runtime::NodeId::new(),
+        error_class: alloy_runtime::ErrorClass::Compile,
+        diagnostics: vec![diag],
+        notes: "n".into(),
+    };
+    let round: FailureIr = serde_json::from_str(&serde_json::to_string(&fail).unwrap()).unwrap();
+    assert_eq!(round.notes, "n");
+
+    let grant = Grant::FsRead(Glob("**/*.rs".into()));
+    let _: Grant = serde_json::from_str(&serde_json::to_string(&grant).unwrap()).unwrap();
+
+    let ts = Timestamp::now();
+    let wire = serde_json::to_string(&ts).unwrap();
+    assert!(wire.contains('T') || wire.contains('Z') || wire.contains('+'));
+    let _: Timestamp = serde_json::from_str(&wire).unwrap();
+
+    let ty = SessionEventType::SessionCreated;
+    let s = serde_json::to_string(&ty).unwrap();
+    assert_eq!(s, "\"session_created\"");
 }
 
 #[tokio::test]
 async fn workspace_has_five_members() {
     let manifest = include_str!("../../../Cargo.toml");
-    let members: Vec<_> = manifest
-        .lines()
-        .filter(|l| l.trim().starts_with("\"crates/"))
-        .collect();
-    assert_eq!(members.len(), 5, "{members:?}");
+    let mut in_members = false;
+    let mut count = 0usize;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with("members") {
+            in_members = true;
+            continue;
+        }
+        if in_members {
+            if t.starts_with(']') {
+                break;
+            }
+            if t.starts_with('"') {
+                count += 1;
+            }
+        }
+    }
+    assert_eq!(count, 5);
 }
 
 #[tokio::test]
 async fn null_scheduler_type_is_default() {
     let _ = NullScheduler;
-    let sink: Arc<dyn EventSink> = Arc::new(InMemoryEventSink::new());
-    assert_eq!(sink.buffered_len(), 0);
+    assert_eq!(InMemoryEventSink::new().buffered_len(), 0);
 }

@@ -1,15 +1,17 @@
 //! Shared runtime state.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use tokio::sync::RwLock;
+use tokio::sync::RwLock as AsyncRwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::RuntimeConfig;
+use crate::error::RuntimeError;
 use crate::events::{EventSink, InMemoryEventSink};
 use crate::runtime::RuntimePhase;
 use crate::scheduler::{NullScheduler, Scheduler};
+use crate::types::ids::DagId;
 use crate::types::metrics::RuntimeMetrics;
 
 pub(crate) struct AtomicMetrics {
@@ -68,14 +70,25 @@ impl RuntimePhase {
     }
 }
 
+/// Single-flight run bookkeeping (guarded by [`RuntimeInner::run_gate`]).
+#[derive(Default)]
+pub(crate) struct RunSlot {
+    pub in_flight: bool,
+    pub active_dag: Option<DagId>,
+}
+
 pub(crate) struct RuntimeInner {
     pub phase: AtomicU8,
-    /// Std mutex so sync `configure` works inside tokio tests without `blocking_write`.
+    /// Std mutex so sync `configure` works inside tokio tests.
     pub config: Mutex<Option<Arc<RuntimeConfig>>>,
     pub cancel: CancellationToken,
+    /// Sync RwLock so [`crate::RuntimeHandle::set_scheduler`] stays sync per RFC.
     pub scheduler: RwLock<Arc<dyn Scheduler>>,
-    pub event_sink: RwLock<Arc<dyn EventSink>>,
+    pub event_sink: AsyncRwLock<Arc<dyn EventSink>>,
     pub memory_sink: Arc<InMemoryEventSink>,
+    /// Serializes run admission with drain phase transitions.
+    pub run_gate: Mutex<RunSlot>,
+    /// Fast path for drain wait loops (mirrors `run_gate.in_flight`).
     pub run_in_flight: AtomicBool,
     pub metrics: AtomicMetrics,
     pub stopped: AtomicBool,
@@ -91,8 +104,9 @@ impl RuntimeInner {
             config: Mutex::new(None),
             cancel: CancellationToken::new(),
             scheduler: RwLock::new(Arc::new(NullScheduler)),
-            event_sink: RwLock::new(sink),
+            event_sink: AsyncRwLock::new(sink),
             memory_sink: memory,
+            run_gate: Mutex::new(RunSlot::default()),
             run_in_flight: AtomicBool::new(false),
             metrics: AtomicMetrics::new(),
             stopped: AtomicBool::new(false),
@@ -109,5 +123,68 @@ impl RuntimeInner {
         self.metrics
             .phase_transitions
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Admit a single-flight run while holding [`Self::run_gate`] (checks phase atomically).
+    pub fn try_admit_run(self: &Arc<Self>, dag_id: DagId) -> Result<RunPermit, RuntimeError> {
+        let mut slot = self
+            .run_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let phase = self.phase();
+        if phase != RuntimePhase::Running {
+            return Err(RuntimeError::InvalidPhase {
+                current: phase,
+                op: "run",
+            });
+        }
+        if slot.in_flight {
+            return Err(RuntimeError::SchedulerBusy);
+        }
+        slot.in_flight = true;
+        slot.active_dag = Some(dag_id);
+        self.run_in_flight.store(true, Ordering::SeqCst);
+        self.metrics.runs_started.fetch_add(1, Ordering::Relaxed);
+        Ok(RunPermit {
+            inner: Arc::clone(self),
+        })
+    }
+
+    /// Enter draining while holding the run gate so no new run can admit mid-transition.
+    /// Returns `(active_dag, newly_entered_draining)`.
+    pub fn begin_drain(&self) -> Result<(Option<DagId>, bool), RuntimeError> {
+        let slot = self
+            .run_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.phase() {
+            RuntimePhase::Running => {
+                self.set_phase(RuntimePhase::Draining);
+                Ok((slot.active_dag, true))
+            }
+            RuntimePhase::Draining => Ok((slot.active_dag, false)),
+            other => Err(RuntimeError::InvalidPhase {
+                current: other,
+                op: "drain",
+            }),
+        }
+    }
+}
+
+/// Clears single-flight state on drop (success, error, cancel, or panic).
+pub(crate) struct RunPermit {
+    inner: Arc<RuntimeInner>,
+}
+
+impl Drop for RunPermit {
+    fn drop(&mut self) {
+        let mut slot = self
+            .inner
+            .run_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.in_flight = false;
+        slot.active_dag = None;
+        self.inner.run_in_flight.store(false, Ordering::SeqCst);
     }
 }

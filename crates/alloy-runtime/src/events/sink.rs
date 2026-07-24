@@ -31,11 +31,6 @@ pub trait EventSink: Send + Sync {
 
     /// Append a session event; returns the assigned per-session sequence.
     async fn append_session(&self, ev: NewSessionEvent) -> Result<EventSeq, EventSinkError>;
-
-    /// Approximate buffered event count (for day-1 sink swap refusal).
-    fn buffered_len(&self) -> usize {
-        0
-    }
 }
 
 #[derive(Default)]
@@ -77,6 +72,17 @@ impl InMemoryEventSink {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Buffered runtime + session event count (handoff / tests).
+    #[must_use]
+    pub fn buffered_len(&self) -> usize {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session_n: usize = g.sessions.values().map(Vec::len).sum();
+        g.runtime.len() + session_n
+    }
 }
 
 #[async_trait]
@@ -108,15 +114,6 @@ impl EventSink for InMemoryEventSink {
         };
         g.sessions.entry(ev.session_id).or_default().push(full);
         Ok(seq)
-    }
-
-    fn buffered_len(&self) -> usize {
-        let g = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let session_n: usize = g.sessions.values().map(Vec::len).sum();
-        g.runtime.len() + session_n
     }
 }
 

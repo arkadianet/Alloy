@@ -167,11 +167,10 @@ impl Digest {
     /// Parse a lowercase hex SHA-256 string.
     pub fn try_from_hex(s: impl AsRef<str>) -> Result<Self, DigestError> {
         let s = s.as_ref();
-        if s.len() != 64 || !s.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        if s.len() != 64 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
             return Err(DigestError::InvalidHex);
         }
-        // Normalize to lowercase for stability.
-        Ok(Self(s.to_ascii_lowercase()))
+        Ok(Self(s.to_owned()))
     }
 
     /// Borrow the hex string.
@@ -238,7 +237,9 @@ mod tests {
         let parsed = Digest::try_from_hex(d.as_hex()).unwrap();
         assert_eq!(parsed, d);
         assert!(Digest::try_from_hex("abcd").is_err());
+        assert!(Digest::try_from_hex("A".repeat(64)).is_err());
         assert!(serde_json::from_str::<Digest>("\"not-a-digest\"").is_err());
+        assert!(serde_json::from_str::<Digest>(&format!("\"{}\"", "A".repeat(64))).is_err());
         let ok: Digest = serde_json::from_str(&format!("\"{}\"", d.as_hex())).unwrap();
         assert_eq!(ok, d);
     }
