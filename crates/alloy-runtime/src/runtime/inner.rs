@@ -93,6 +93,8 @@ pub(crate) struct RuntimeInner {
     pub metrics: AtomicMetrics,
     pub stopped: AtomicBool,
     pub pending_configured_dir: Mutex<Option<String>>,
+    /// Runtime events queued by sync APIs (e.g. `set_scheduler`) until the next async flush.
+    pub pending_runtime_events: Mutex<Vec<crate::events::RuntimeEvent>>,
 }
 
 impl RuntimeInner {
@@ -111,6 +113,7 @@ impl RuntimeInner {
             metrics: AtomicMetrics::new(),
             stopped: AtomicBool::new(false),
             pending_configured_dir: Mutex::new(None),
+            pending_runtime_events: Mutex::new(Vec::new()),
         }
     }
 

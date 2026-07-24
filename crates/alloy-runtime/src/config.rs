@@ -16,7 +16,7 @@ pub struct ConfigPaths {
     pub router: PathBuf,
     /// `example.env` path for error messages only.
     pub example_env: PathBuf,
-    /// Optional explicit data dir override.
+    /// Optional explicit data dir override (checked after `ALLOY_DATA_DIR`, before workspace/XDG).
     pub data_dir: Option<PathBuf>,
     /// Optional workspace root for `.alloy` resolution.
     pub workspace_root: Option<PathBuf>,
@@ -159,11 +159,12 @@ fn resolve_data_dir(paths: &ConfigPaths) -> Result<(PathBuf, &'static str), Runt
             return Ok((PathBuf::from(dir), "ALLOY_DATA_DIR"));
         }
     }
-    if let Some(root) = &paths.workspace_root {
-        return Ok((root.join(".alloy"), "<workspace>/.alloy"));
-    }
+    // Programmatic override — same precedence tier as env, wins over workspace/XDG.
     if let Some(explicit) = &paths.data_dir {
         return Ok((explicit.clone(), "ConfigPaths.data_dir"));
+    }
+    if let Some(root) = &paths.workspace_root {
+        return Ok((root.join(".alloy"), "<workspace>/.alloy"));
     }
     Ok((default_xdg_data_dir(), "XDG_DATA_HOME/alloy"))
 }
@@ -237,5 +238,22 @@ api_key_env = "ALLOY_API_KEY"
         .unwrap();
         assert_eq!(cfg.data_dir_rule, "<workspace>/.alloy");
         assert_eq!(fs::read_to_string(&dotenv).unwrap(), "SENTINEL=1\n");
+    }
+
+    #[test]
+    fn explicit_data_dir_overrides_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
+        let explicit = dir.path().join("explicit-data");
+        let cfg = RuntimeConfig::load(ConfigPaths {
+            profile,
+            router,
+            example_env: example,
+            data_dir: Some(explicit.clone()),
+            workspace_root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap();
+        assert_eq!(cfg.data_dir, explicit);
+        assert_eq!(cfg.data_dir_rule, "ConfigPaths.data_dir");
     }
 }

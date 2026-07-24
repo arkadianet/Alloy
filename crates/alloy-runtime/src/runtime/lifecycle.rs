@@ -125,6 +125,7 @@ impl AlloyRuntime {
     /// Maps [`SchedError::Unavailable`] → [`RuntimeError::SchedulerUnavailable`].
     /// Does **not** emit `RunAccepted` / `RunFinished`.
     pub async fn run(&self, dag_id: DagId) -> Result<DagOutcome, RuntimeError> {
+        self.handle.flush_pending_runtime_events().await?;
         let permit = self.handle.inner.try_admit_run(dag_id)?;
         let sched = self.handle.scheduler();
         let result = sched.run(dag_id).await;

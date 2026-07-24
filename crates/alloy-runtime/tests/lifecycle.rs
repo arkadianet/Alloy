@@ -305,6 +305,39 @@ async fn set_event_sink_refuses_non_empty_with_busy() {
 }
 
 #[tokio::test]
+async fn set_scheduler_queues_registered_event_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = AlloyRuntime::new();
+    rt.configure(test_config(dir.path())).unwrap();
+    let handle = rt.start().await.unwrap();
+    handle.set_scheduler(Arc::new(NullScheduler)).unwrap();
+    // Immediately after sync set_scheduler the event is queued, not yet in the sink.
+    assert!(!handle
+        .memory_sink()
+        .runtime_events()
+        .iter()
+        .any(|e| matches!(e, RuntimeEvent::SchedulerRegistered)));
+    // Next async lifecycle path flushes pending events before appending.
+    rt.drain(Duration::from_millis(10)).await.unwrap();
+    let events = handle.memory_sink().runtime_events();
+    let started = events
+        .iter()
+        .position(|e| matches!(e, RuntimeEvent::Started))
+        .expect("Started");
+    let registered = events
+        .iter()
+        .position(|e| matches!(e, RuntimeEvent::SchedulerRegistered))
+        .expect("SchedulerRegistered");
+    let drained = events
+        .iter()
+        .position(|e| matches!(e, RuntimeEvent::DrainStarted { .. }))
+        .expect("DrainStarted");
+    assert!(started < registered);
+    assert!(registered < drained);
+    rt.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn run_does_not_emit_run_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = AlloyRuntime::new();

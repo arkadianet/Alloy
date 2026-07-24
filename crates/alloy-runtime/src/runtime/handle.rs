@@ -65,6 +65,9 @@ impl RuntimeHandle {
     }
 
     /// Install or replace the scheduler (sync per RFC-0001).
+    ///
+    /// Queues [`RuntimeEvent::SchedulerRegistered`] for the next async flush so the
+    /// sync API never spawns unsupervised tasks or reorders the event log.
     pub fn set_scheduler(&self, sched: Arc<dyn Scheduler>) -> Result<(), RuntimeError> {
         let slot = self
             .inner
@@ -89,13 +92,11 @@ impl RuntimeHandle {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = sched;
         drop(slot);
-        // Best-effort registration event; ignore if no runtime / sink busy.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let this = self.clone();
-            handle.spawn(async move {
-                let _ = this.emit(RuntimeEvent::SchedulerRegistered).await;
-            });
-        }
+        self.inner
+            .pending_runtime_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(RuntimeEvent::SchedulerRegistered);
         Ok(())
     }
 
@@ -104,6 +105,8 @@ impl RuntimeHandle {
     /// Acquires the sink write lock (waits for in-flight `emit`/`append_session` readers).
     /// Day-1 refuses swap while the default in-memory buffer is non-empty.
     pub async fn set_event_sink(&self, sink: Arc<dyn EventSink>) -> Result<(), RuntimeError> {
+        self.flush_pending_runtime_events().await?;
+
         let mut guard = tokio::time::timeout(Duration::from_secs(5), self.inner.event_sink.write())
             .await
             .map_err(|_| RuntimeError::EventSinkBusy)?;
@@ -129,6 +132,7 @@ impl RuntimeHandle {
 
     /// Emit a host-level [`RuntimeEvent`] (holds sink read lock across append).
     pub async fn emit(&self, ev: RuntimeEvent) -> Result<(), RuntimeError> {
+        self.flush_pending_runtime_events().await?;
         let sink = self.inner.event_sink.read().await;
         sink.append_runtime(ev).await?;
         Ok(())
@@ -136,8 +140,29 @@ impl RuntimeHandle {
 
     /// Append a session event through the active sink (per-session seq).
     pub async fn append_session(&self, ev: NewSessionEvent) -> Result<EventSeq, RuntimeError> {
+        self.flush_pending_runtime_events().await?;
         let sink = self.inner.event_sink.read().await;
         Ok(sink.append_session(ev).await?)
+    }
+
+    /// Drain sync-queued host events into the sink in FIFO order.
+    pub(crate) async fn flush_pending_runtime_events(&self) -> Result<(), RuntimeError> {
+        let pending = {
+            let mut q = self
+                .inner
+                .pending_runtime_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *q)
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let sink = self.inner.event_sink.read().await;
+        for ev in pending {
+            sink.append_runtime(ev).await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn scheduler(&self) -> Arc<dyn Scheduler> {
