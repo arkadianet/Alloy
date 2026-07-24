@@ -110,7 +110,7 @@ macro_rules! uuid_id {
 
 macro_rules! name_id {
     ($name:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -123,6 +123,13 @@ macro_rules! name_id {
                 Ok(Self(s))
             }
             pub fn as_str(&self) -> &str { &self.0 }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                $name::new(s).map_err(serde::de::Error::custom)
+            }
         }
 
         impl std::fmt::Display for $name {
@@ -159,14 +166,28 @@ pub enum IdError {
 pub struct GraphVersion(pub u64);
 
 /// Lowercase hex SHA-256 (64 chars). Construct only via `Digest::sha256` / `try_from_hex`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `Deserialize` must call `try_from_hex` (never populate the inner `String` unchecked).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Digest(String);
 
 impl Digest {
     pub fn sha256(bytes: &[u8]) -> Self { /* hex encode sha2::Sha256 */ todo!() }
-    pub fn try_from_hex(s: impl AsRef<str>) -> Result<Self, DigestError> { /* validate len/charset */ todo!() }
+    pub fn try_from_hex(s: impl AsRef<str>) -> Result<Self, DigestError> { /* validate len==64 + hex charset */ todo!() }
     pub fn as_hex(&self) -> &str { &self.0 }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Digest::try_from_hex(s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DigestError {
+    #[error("digest must be 64 lowercase hex chars")]
+    InvalidHex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -381,9 +402,10 @@ pub trait EventSink: Send + Sync {
     async fn append_session(&self, ev: NewSessionEvent) -> Result<EventSeq, EventSinkError>;
 }
 
-/// Process-local buffer. Allocates monotonic `EventSeq` starting at 0.
-/// RFC-0002 SQLite sink MUST continue the same allocator contract (gapless per session).
-pub struct InMemoryEventSink { /* … */ }
+/// Process-local buffer. Allocates an **independent** monotonic, gapless `EventSeq`
+/// **per `SessionId`**, each starting at 0. Interleaved sessions must not share a counter.
+/// RFC-0002 SQLite sink MUST continue the same per-session contract.
+pub struct InMemoryEventSink { /* Map<SessionId, next_seq> + buffers */ }
 
 #[async_trait]
 impl EventSink for InMemoryEventSink { /* … */ }
@@ -392,6 +414,8 @@ impl EventSink for InMemoryEventSink { /* … */ }
 pub enum EventSinkError {
     #[error("io: {0}")]
     Io(String),
+    #[error("busy")]
+    Busy,
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -449,11 +473,21 @@ impl RuntimeHandle {
     /// - Returns `SchedulerBusy` if a `run` is in flight.
     pub fn set_scheduler(&self, sched: Arc<dyn Scheduler>) -> Result<(), RuntimeError> { /* … */ }
 
-    /// Swap event sink (RFC-0002 wires SQLite here). Allowed only when no emit is in flight
-    /// and phase is `Configured` or `Running`. Default after `start`: `InMemoryEventSink`.
-    pub fn set_event_sink(&self, sink: Arc<dyn EventSink>) -> Result<(), RuntimeError> { /* … */ }
+    /// Swap event sink (RFC-0002 wires SQLite here).
+    /// - Phase: `Configured` or `Running` only.
+    /// - Takes the sink write lock and waits until no `emit` holds the async read/guard
+    ///   across `append_*` (emit acquires that guard for the full awaitable append).
+    /// - Returns `EventSinkBusy` if a replace is already in progress or wait policy times out.
+    /// - **Handoff:** if the current sink is `InMemoryEventSink`, RFC-0002’s installer must
+    ///   drain buffered runtime + session events and per-session seq maps into SQLite
+    ///   **atomically and losslessly** before the Arc swap becomes visible to new emits.
+    ///   Day-1 MVP may refuse swap until the buffer is empty if handoff is not yet wired.
+    /// Default after `start`: `InMemoryEventSink`.
+    pub async fn set_event_sink(&self, sink: Arc<dyn EventSink>) -> Result<(), RuntimeError> { /* … */ }
 
     /// Emit a host-level RuntimeEvent; session-typed payloads go through `EventSink::append_session`.
+    /// Holds an async sink read-guard across the awaitable `append_*` so `set_event_sink` cannot
+    /// replace mid-append.
     pub async fn emit(&self, ev: RuntimeEvent) -> Result<(), RuntimeError> { /* … */ }
 }
 
@@ -475,6 +509,10 @@ impl AlloyRuntime {
 
     /// Thin forwarder to `Scheduler::run`. Not the user goal API (see RFC-0003).
     /// Rejects unless phase is `Running`. MVP: at most one concurrent `run` (`SchedulerBusy`).
+    /// Maps `SchedError::Unavailable` → `RuntimeError::SchedulerUnavailable`; other scheduler
+    /// errors → `RuntimeError::Scheduler(...)`.
+    /// Does **not** emit `RuntimeEvent::RunAccepted` / `RunFinished` (no `RunId` on this API);
+    /// SessionService / RunController (RFC-0003) emit those when they have a `RunId`.
     pub async fn run(&self, dag_id: DagId) -> Result<DagOutcome, RuntimeError> { /* … */ }
 
     /// Phase: Running → Draining — stop accepting work; wait in-flight ≤ grace.
@@ -482,7 +520,9 @@ impl AlloyRuntime {
     pub async fn drain(&self, grace: std::time::Duration) -> Result<(), RuntimeError> { /* … */ }
 
     /// Phase: → Stopped — cancel token; join tasks; flush logs; consume `self`.
-    /// Allowed from `Running` | `Draining` | `Failed` | `Configured` (never started).
+    /// Allowed from `Created` | `Configured` | `Running` | `Draining` | `Failed`.
+    /// From `Created` / `Configured`: no-op cleanup (no tasks), still reaches `Stopped`.
+    /// From `Starting`: wait for start to finish or return `InvalidPhase` (see matrix).
     /// Second call is impossible (self consumed). Drop without shutdown → `tracing::warn`.
     pub async fn shutdown(self) -> Result<(), RuntimeError> { /* … */ }
 }
@@ -773,7 +813,7 @@ pub mod error;
 pub use types::ids::{
     SessionId, RunId, DagId, NodeId, GateId, ArtifactId, ProfileId, LanguageId,
     CapabilityId, ProviderId, TransactionId, CheckpointId, GraphNodeId, DiagnosticId,
-    GraphVersion, Digest, EventSeq, Timestamp, IdError,
+    GraphVersion, Digest, DigestError, EventSeq, Timestamp, IdError,
 };
 pub use types::budget::{BudgetPolicy, TokenBudget, BudgetSnapshot, ModelTier, CreateSession, Goal, Constraint};
 pub use types::diagnostic::{DiagnosticLevel, SpanRef, DiagnosticEvent, ErrorClass, FailureIr};
@@ -856,7 +896,8 @@ RuntimeInner {
   config: Arc<RuntimeConfig>,
   cancel: CancellationToken,
   scheduler: RwLock<Arc<dyn Scheduler>>,
-  event_sink: RwLock<Arc<dyn EventSink>>,
+  event_sink: RwLock / async lock around Arc<dyn EventSink>,
+  emit_in_flight: guard count held across append await,
   run_in_flight: AtomicBool,          // MVP single-flight
   metrics: RuntimeMetrics,            // atomics
   tasks: JoinSet or Vec<JoinHandle>,  // owned by AlloyRuntime, not cloned handles
@@ -930,7 +971,11 @@ Runtime emits two channels:
 1. **`RuntimeEvent`** — host lifecycle (always available day 1; via `EventSink`).
 2. **`SessionEvent`** — V2 Appendix A (enum + helpers day 1; durable append via RFC-0002 `EventStore` implementing `EventSink`).
 
-Until 0002, default sink is `InMemoryEventSink` with a **monotonic per-process `EventSeq` allocator starting at 0**. RFC-0002 must preserve gapless per-session sequencing so tests remain stable across the swap.
+Until 0002, default sink is `InMemoryEventSink` with a **per-session** monotonic, gapless
+`EventSeq` allocator (each `SessionId` starts at 0; sessions never share a counter).
+Interleaved appends across sessions must keep each session’s sequence independent and gapless.
+RFC-0002 must preserve that contract and, on sink swap, perform an atomic lossless handoff of
+buffered events + per-session next-seq state (see `set_event_sink`).
 
 ```mermaid
 sequenceDiagram
@@ -939,17 +984,20 @@ sequenceDiagram
   participant H as RuntimeHandle
   participant SINK as EventSink
   participant ES as SQLite EventStore (RFC-0002)
+  participant RC as RunController (RFC-0003)
 
   CLI->>RT: new / configure / start
   RT->>H: Running + CancellationToken
   RT->>SINK: RuntimeEvent::Started
   Note over CLI,ES: Session path (RFC-0003+)
   CLI->>H: emit / append_session
-  H->>SINK: InMemoryEventSink
-  Note over SINK,ES: set_event_sink swaps to SQLite
+  H->>SINK: InMemoryEventSink (per-session seq)
+  Note over SINK,ES: set_event_sink atomic handoff → SQLite
   H-->>ES: append when wired
+  Note over CLI,RC: RunAccepted/RunFinished emitted by Session/RunController
+  RC->>H: emit(RunAccepted)
   Note over CLI,ES: Scheduler path (RFC-0010)
-  H->>H: run(dag) → Scheduler::run
+  H->>H: run(dag) → Scheduler::run (no RunAccepted)
   CLI->>RT: drain / shutdown
   RT->>SINK: RuntimeEvent::Stopped
 ```
@@ -962,7 +1010,9 @@ pub enum RuntimeEvent {
     Configured { data_dir: String },
     Started,
     SchedulerRegistered,
+    /// Emitted by Session/RunController (RFC-0003), not by `AlloyRuntime::run`.
     RunAccepted { run_id: RunId, dag_id: DagId },
+    /// Emitted by Session/RunController when a run completes; not by the DagId forwarder.
     RunFinished { run_id: RunId, outcome: DagOutcome },
     DrainStarted { grace_ms: u64 },
     Stopped,
@@ -981,6 +1031,7 @@ stateDiagram-v2
   [*] --> Created: AlloyRuntime::new
   Created --> Configured: configure(ok)
   Created --> Failed: configure(err)
+  Created --> Stopped: shutdown
   Configured --> Starting: start
   Starting --> Running: subsystems up
   Starting --> Failed: start(err)
@@ -990,6 +1041,7 @@ stateDiagram-v2
   Draining --> Stopped: grace elapsed + cancel
   Failed --> Stopped: shutdown best-effort
   Configured --> Stopped: shutdown without start
+  Running --> Stopped: shutdown
   Stopped --> [*]
 ```
 
@@ -998,9 +1050,9 @@ stateDiagram-v2
 | `new` | Allocate handle; phase `Created`; no I/O |
 | `configure` | Parse profile/router TOML; resolve `data_dir`; validate paths; **read** env for keys named in config; never write `.env` |
 | `start` | Init `tracing`; create `data_dir` if missing; install `NullScheduler` + `InMemoryEventSink` unless already injected; emit `Started`; phase `Running` |
-| `run` | Single-flight forward to `Scheduler::run`; reject if not `Running` or draining |
+| `run` | Single-flight forward to `Scheduler::run`; map `Unavailable` → `SchedulerUnavailable`; reject if not `Running` or draining; do not emit `RunAccepted` |
 | `drain` | Phase `Draining`; stop accepting `run`; wait in-flight ≤ grace |
-| `shutdown` | Cancel token; join tasks; flush tracing; phase `Stopped`; consume `self` |
+| `shutdown` | From any live phase including `Created`: cancel token if any; join tasks if any; flush tracing; phase `Stopped`; consume `self` |
 
 SIGINT/SIGTERM (`alloy-cli`): call `drain` then `shutdown`. Dropping `AlloyRuntime` without `shutdown` logs a warning and does not block (best-effort cancel only if feasible without async Drop).
 
@@ -1012,9 +1064,9 @@ SIGINT/SIGTERM (`alloy-cli`): call `drain` then `shutdown`. Dropping `AlloyRunti
 | `start` | `InvalidPhase` | ok | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | n/a |
 | `run` | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | ok / `SchedulerBusy` | `InvalidPhase` | `InvalidPhase` | n/a |
 | `set_scheduler` | `InvalidPhase` | ok | `InvalidPhase` | ok if idle else `SchedulerBusy` | `InvalidPhase` | `InvalidPhase` | n/a |
-| `set_event_sink` | `InvalidPhase` | ok | `InvalidPhase` | ok if idle | `InvalidPhase` | `InvalidPhase` | n/a |
+| `set_event_sink` | `InvalidPhase` | ok / `EventSinkBusy` | `InvalidPhase` | ok if no emit in flight else wait/`EventSinkBusy` | `InvalidPhase` | `InvalidPhase` | n/a |
 | `drain` | `InvalidPhase` | `InvalidPhase` | `InvalidPhase` | ok | ok (idempotent) | `InvalidPhase` | n/a |
-| `shutdown` | ok | ok | wait/`InvalidPhase` | ok | ok | ok | n/a |
+| `shutdown` | ok → `Stopped` | ok → `Stopped` | wait/`InvalidPhase` | ok | ok | ok | n/a |
 
 ---
 
@@ -1031,8 +1083,12 @@ pub enum RuntimeError {
     SchedulerUnavailable,
     #[error("scheduler busy")]
     SchedulerBusy,
+    /// Non-unavailable scheduler failures. Do **not** `#[from]` `SchedError`:
+    /// `AlloyRuntime::run` maps `SchedError::Unavailable` → `SchedulerUnavailable` explicitly.
     #[error("scheduler: {0}")]
-    Scheduler(#[from] SchedError),
+    Scheduler(SchedError),
+    #[error("event sink busy")]
+    EventSinkBusy,
     #[error("event sink: {0}")]
     EventSink(#[from] EventSinkError),
     #[error("io: {0}")]
@@ -1093,9 +1149,11 @@ pub enum AdapterError {
 | --- | --- |
 | Bad TOML / missing profile | `RuntimeError::Config`; refuse `start` |
 | Missing API key in env | Config warning at load; hard fail deferred to provider call (0007) |
-| `run` with `NullScheduler` | `SchedulerUnavailable` (expected until 0010) |
+| `run` with `NullScheduler` | `SchedError::Unavailable` mapped to `RuntimeError::SchedulerUnavailable` (not `Scheduler(...)`) |
 | Second concurrent `run` | `SchedulerBusy` (MVP single-flight) |
 | `set_scheduler` during `run` | `SchedulerBusy` |
+| `set_event_sink` during emit / swap race | Wait for emit guard or `EventSinkBusy`; never tear mid-append |
+| Sink handoff data loss | Forbidden — RFC-0002 atomic drain of buffers + per-session seq before swap |
 | Panic in subsystem task | Catch via `JoinHandle`; emit `RuntimeEvent::Failed`; enter `Failed` |
 | Drain timeout | Cancel token; best-effort join; still reach `Stopped` |
 | `data_dir` create fails | `RuntimeError::Io`; `start` → `Failed` |
@@ -1112,8 +1170,9 @@ pub enum AdapterError {
 | Silent `.env` write | Secrets clobbered | Config loader never opens `.env` for write; tests assert |
 | Phase skip | `run` before `start` | `InvalidPhase` + matrix tests |
 | Hung shutdown | Task ignores cancel | Grace then abort join; log orphan |
-| Dual event stores | Memory + SQLite diverge | Single `EventSink` slot; 0002 replaces, does not duplicate |
+| Dual event stores | Memory + SQLite diverge | Single `EventSink` slot; 0002 atomic handoff, does not duplicate |
 | UUID profile ids | TOML `"default"` cannot parse | `name_id!` for Profile/Language/Capability/Provider |
+| Invalid serde IDs/digests | Empty/overlong names or bad hex enter via JSON | Deserialize via constructors; reject with errors |
 
 ---
 
@@ -1304,17 +1363,19 @@ Day 1: in-process `RuntimeMetrics` counters on `RuntimeHandle` (atomics). No OTL
 | Workspace compiles | workspace | `cargo check --workspace` |
 | Exactly five members | workspace | parse `Cargo.toml` members == 5 |
 | Serde round-trip | `alloy-runtime` | `CreateSession`, `DiagnosticEvent`, `FailureIr`, `Grant`, `TaskDag` sketch, `SessionEventType`, `Timestamp` RFC3339 |
-| Name ids | `alloy-runtime` | `ProfileId::new("default")` ok; empty id errs; UUID ids Display |
-| Digest | `alloy-runtime` | `try_from_hex` rejects bad length/charset |
+| Name ids | `alloy-runtime` | `ProfileId::new("default")` ok; empty/overlong `new` errs; **serde rejects** `""` and overlong strings |
+| Digest | `alloy-runtime` | `try_from_hex` + **serde** reject bad length/charset |
 | Lifecycle happy path | `alloy-runtime` | `new → configure → start → drain → shutdown` |
+| Shutdown from Created | `alloy-runtime` | `new → shutdown` → `Stopped` (no panic) |
 | Phase matrix | `alloy-runtime` | table above: double `configure`, `run` before `start`, `start` twice → `InvalidPhase` |
-| NullScheduler | `alloy-runtime` | `run` → `SchedulerUnavailable` |
+| NullScheduler | `alloy-runtime` | `run` → **`RuntimeError::SchedulerUnavailable`** (not `Scheduler(Unavailable)`) |
 | Single-flight | `alloy-runtime` | overlapping `run` → `SchedulerBusy` |
 | set_scheduler busy | `alloy-runtime` | replace during in-flight `run` → `SchedulerBusy` |
+| set_event_sink vs emit | `alloy-runtime` | emit holds guard across append; concurrent swap waits or `EventSinkBusy` |
 | Cancel on shutdown | `alloy-runtime` | token cancelled after `shutdown` |
 | Drop without shutdown | `alloy-runtime` | drop after `start` does not panic (warn path) |
 | Config never writes `.env` | `alloy-runtime` | temp dir: load leaves no `.env` created; even if `example.env` present |
-| EventSeq monotonic | `alloy-runtime` | N appends → seq 0..N-1 gapless |
+| EventSeq per session | `alloy-runtime` | interleaved sessions A/B: each starts at 0 and stays gapless independently |
 | Binary smoke | `alloy-cli` | `--help`, `--version` exit 0 |
 | CLI signal path | `alloy-cli` | drain+shutdown helper invoked (hook/test seam) |
 | Clippy | workspace | no warnings on public types |
@@ -1366,7 +1427,10 @@ Do not merge until every item above is true.
 | --- | --- |
 | MSRV / async | Edition 2021, Tokio 1.x, **`async_trait` on all public host traits through M1** |
 | Data dir | `ALLOY_DATA_DIR` → `<workspace>/.alloy` → XDG (see Configuration) |
-| Event seq | In-memory and SQLite sinks share gapless per-session `EventSeq` contract |
+| Event seq | **Per-session** gapless `EventSeq` from 0 (in-memory and SQLite); interleaved sessions independent; atomic handoff on sink swap |
+| `Created` + `shutdown` | Allowed → `Stopped` (no-op cleanup) |
+| `RunAccepted` / `RunFinished` | Emitted by Session/RunController (RFC-0003), not `AlloyRuntime::run` |
+| `SchedError::Unavailable` | Mapped by `AlloyRuntime::run` to `RuntimeError::SchedulerUnavailable` |
 | Binary name | Package `alloy-cli`, bin name `alloy`; crates.io publish later |
 
 No architecture open questions remain for this RFC.
