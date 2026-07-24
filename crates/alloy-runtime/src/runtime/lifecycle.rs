@@ -90,15 +90,19 @@ impl AlloyRuntime {
     async fn start_inner(&mut self) -> Result<RuntimeHandle, RuntimeError> {
         logging::init_tracing();
         let cfg = self.handle.config();
+        // RFC failure table: data_dir create → RuntimeError::Io; start → Failed.
         tokio::fs::create_dir_all(&cfg.data_dir)
             .await
             .map_err(|e| {
-                RuntimeError::Config(format!(
-                    "create data_dir {} (rule: {}); see {}: {e}",
-                    cfg.data_dir.display(),
-                    cfg.data_dir_rule,
-                    cfg.env_file_hint.display()
-                ))
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "create data_dir {} (rule: {}); see {}: {e}",
+                        cfg.data_dir.display(),
+                        cfg.data_dir_rule,
+                        cfg.env_file_hint.display()
+                    ),
+                )
             })?;
 
         let pending = self
@@ -180,6 +184,10 @@ impl AlloyRuntime {
         let start = tokio::time::Instant::now();
         while self.handle.run_in_flight() {
             if start.elapsed() >= grace {
+                tracing::warn!(
+                    grace_ms = grace.as_millis(),
+                    "drain grace elapsed; cancelling in-flight work"
+                );
                 self.handle.cancellation().cancel();
                 break;
             }

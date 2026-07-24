@@ -100,6 +100,66 @@ async fn double_configure_rejected() {
 }
 
 #[tokio::test]
+async fn start_before_configure_rejected() {
+    let mut rt = AlloyRuntime::new();
+    let err = match rt.start().await {
+        Ok(_) => panic!("start before configure must fail"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        err,
+        RuntimeError::InvalidPhase {
+            op: "start",
+            current: RuntimePhase::Created,
+            ..
+        }
+    ));
+    rt.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn double_start_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = AlloyRuntime::new();
+    rt.configure(test_config(dir.path())).unwrap();
+    let _ = rt.start().await.unwrap();
+    let err = match rt.start().await {
+        Ok(_) => panic!("second start must fail"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        err,
+        RuntimeError::InvalidPhase {
+            op: "start",
+            current: RuntimePhase::Running,
+            ..
+        }
+    ));
+    rt.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn data_dir_create_failure_is_io_and_failed_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path());
+    // Place a regular file where the data dir should be created.
+    let blocked = dir.path().join("blocked-data-dir");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    cfg.data_dir = blocked;
+    cfg.data_dir_rule = "test";
+
+    let mut rt = AlloyRuntime::new();
+    rt.configure(cfg).unwrap();
+    let err = match rt.start().await {
+        Ok(_) => panic!("start with blocked data_dir must fail"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, RuntimeError::Io(_)), "expected Io, got {err}");
+    assert_eq!(rt.handle().phase(), RuntimePhase::Failed);
+    rt.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn null_scheduler_maps_to_scheduler_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = AlloyRuntime::new();
