@@ -5,7 +5,7 @@ Alloy is a modular AI engineering runtime for software development.
 **Author:** arkadianet  
 **Architecture:** [`docs/architecture/alloy-architecture-v2.md`](docs/architecture/alloy-architecture-v2.md) (frozen)  
 **Implementation RFCs:** [`docs/rfcs/`](docs/rfcs/)  
-**MSRV:** Rust 1.85 (workspace `rust-version`)
+**MSRV:** Rust 1.97 (workspace `rust-version`; pinned in `rust-toolchain.toml`)
 
 ## Workspace
 
