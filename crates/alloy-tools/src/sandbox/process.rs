@@ -392,12 +392,19 @@ mod signal_status_tests {
 
     #[test]
     fn signal_status_encoding() {
-        let signaled = ExitStatus::from_raw(9); // SIGKILL wait-status on Linux
+        // Construct a signaled status without spawning a host binary (macOS
+        // has /usr/bin/true, not /bin/true).
+        let signaled = ExitStatus::from_raw(9); // SIGKILL wait-status
         let (code, sig) = encode_status(signaled);
         assert_eq!(code, None);
         assert_eq!(sig, Some(9));
 
-        let out = std::process::Command::new("/bin/true").status().unwrap();
+        // Exited-0 half: prefer a path that exists on this host.
+        let true_bin = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file())
+            .expect("true binary");
+        let out = std::process::Command::new(true_bin).status().unwrap();
         let (code, sig) = encode_status(out);
         assert_eq!(code, Some(0));
         assert_eq!(sig, None);

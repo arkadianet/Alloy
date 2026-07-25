@@ -172,16 +172,16 @@ fn relative_components(rel: &Path) -> String {
 }
 
 /// Allowlisted RO cargo/rustup subtrees that exist.
+///
+/// Closed set matching RFC-0005 §5.5 item 4. Do **not** add `config.toml` —
+/// operators may store registry tokens there, and the credential bind-over
+/// only covers `credentials.toml` / `credentials`.
 pub fn allowlisted_ro_subtrees(cargo_home: &Path, rustup_home: &Path) -> Vec<PathBuf> {
     let mut v = Vec::new();
     for p in [
         cargo_home.join("registry"),
         cargo_home.join("git"),
         cargo_home.join("bin"),
-        // Offline `cargo check` needs these when CARGO_HOME itself is not RW.
-        cargo_home.join("config.toml"),
-        cargo_home.join("config"),
-        cargo_home.join(".package-cache"),
         rustup_home.join("toolchains"),
     ] {
         if p.exists() {

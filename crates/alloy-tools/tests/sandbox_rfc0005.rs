@@ -743,8 +743,8 @@ async fn container_cargo_check_fixture() {
     let mut profile = SandboxProfile::default_for_jail(jail).unwrap();
     profile.check_backend = SandboxBackend::Container;
     profile.test_backend = SandboxBackend::Container;
-    profile.container_image = std::env::var("ALLOY_CONTAINER_IMAGE")
-        .unwrap_or_else(|_| "rust:1.97.1-bookworm".into());
+    profile.container_image =
+        std::env::var("ALLOY_CONTAINER_IMAGE").unwrap_or_else(|_| "rust:1.97.1-bookworm".into());
 
     let broker = match NativeSandboxBroker::new(profile).await {
         Ok(b) => b,

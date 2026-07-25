@@ -94,12 +94,13 @@ arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
 ## Native `cargo check` layout
 
 Per-exec `CARGO_TARGET_DIR` points at the scratch carve-out. Operator
-`CARGO_HOME` is mounted RO for allowlisted subtrees (`registry`, `git`, `bin`,
-`config.toml`/`config`, `.package-cache`) plus rustup toolchains. Full online
+`CARGO_HOME` RO grants follow the closed RFC-0005 §5.5 list (`registry`,
+`git`, `bin`, `toolchains`, `settings.toml`) — **not** `config.toml`, which
+may hold registry tokens the credential bind-over does not cover. Full online
 registry fetches remain blocked by quarantine + netns. The Landlock
 `landlock_cargo_check_fixture` proves offline `cargo check` against a path
-dependency; registry-dependent checks may still need the Container backend when
-operator cache layout differs.
+dependency; registry-dependent checks with custom `config.toml` may need the
+Container backend or an operator-owned config that does not embed tokens.
 
 ---
 

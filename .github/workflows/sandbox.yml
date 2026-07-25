@@ -68,6 +68,9 @@ jobs:
         run: cargo check -p alloy-tools --features test-hooks
       - name: Test alloy-tools (Seatbelt enforcement)
         run: cargo test -p alloy-tools --features test-hooks -- --nocapture
+      - name: Require Seatbelt enforcement test ran
+        run: |
+          cargo test -p alloy-tools --features test-hooks --test sandbox_rfc0005 seatbelt_cargo_check_fixture -- --nocapture --exact
       - name: Clippy
         run: cargo clippy -p alloy-tools --all-targets --features test-hooks -- -D warnings
 

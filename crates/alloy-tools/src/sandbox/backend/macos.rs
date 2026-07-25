@@ -165,6 +165,8 @@ fn broker_owned_dir() -> Result<PathBuf, SandboxError> {
         .join("alloy-sbx-seatbelt")
         .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&dir).map_err(SandboxError::Io)?;
+    // SBPL matching is on resolved paths; /var → /private/var on macOS.
+    let dir = std::fs::canonicalize(&dir).map_err(SandboxError::Io)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -236,44 +238,59 @@ fn render_sbpl(
     ctx: &IsolateContext,
     broker_dir: &Path,
 ) -> Result<String, SandboxError> {
+    // Match Linux: grant every allowlisted RO root from IsolateContext.
+    // Canonicalize so SBPL path matching works when CARGO_HOME/RUSTUP_HOME
+    // contain symlinked components (e.g. /var → /private/var).
+    let mut ro_clauses = String::new();
+    for p in &ctx.read_only_roots {
+        let Ok(canon) = std::fs::canonicalize(p) else {
+            continue;
+        };
+        if canon.is_file() {
+            ro_clauses.push_str(&format!(
+                "(allow file-read* (literal {}))\n",
+                sbpl_literal(&canon)
+            ));
+        } else {
+            ro_clauses.push_str(&format!(
+                "(allow file-read* (subpath {}))\n",
+                sbpl_literal(&canon)
+            ));
+        }
+    }
+
     let mut deny_clauses = String::new();
     for path in crate::sandbox::backend::credential_bind_targets(&ctx.cargo_home)
         .into_iter()
         .chain(ctx.deny_paths.iter().cloned())
     {
-        let matcher = if path.is_file() {
-            format!("(literal {})", sbpl_literal(&path))
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // Prefer resolved path for SBPL matching; fall back to the raw path
+        // when canonicalize fails (dangling symlink deny targets).
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let matcher = if meta.is_file() || meta.file_type().is_symlink() {
+            format!("(literal {})", sbpl_literal(&canon))
         } else {
-            format!("(subpath {})", sbpl_literal(&path))
+            format!("(subpath {})", sbpl_literal(&canon))
         };
         deny_clauses.push_str(&format!("(deny file-read* file-write* {matcher})\n"));
     }
 
-    // Match Linux: grant every allowlisted RO root from IsolateContext
-    // (config.toml, .package-cache, toolchains, …).
-    let mut ro_clauses = String::new();
-    for p in &ctx.read_only_roots {
-        if !p.exists() {
-            continue;
-        }
-        if p.is_file() {
-            ro_clauses.push_str(&format!(
-                "(allow file-read* (literal {}))\n",
-                sbpl_literal(p)
-            ));
-        } else {
-            ro_clauses.push_str(&format!(
-                "(allow file-read* (subpath {}))\n",
-                sbpl_literal(p)
-            ));
-        }
-    }
+    let jail = std::fs::canonicalize(&profile.fs_jail).unwrap_or_else(|_| profile.fs_jail.clone());
+    let tmp = std::fs::canonicalize(ctx.exec_dir.join("tmp"))
+        .unwrap_or_else(|_| ctx.exec_dir.join("tmp"));
+    let home = std::fs::canonicalize(ctx.exec_dir.join("home"))
+        .unwrap_or_else(|_| ctx.exec_dir.join("home"));
+    let broker = std::fs::canonicalize(broker_dir).unwrap_or_else(|_| broker_dir.to_path_buf());
 
     let mut body = TEMPLATE
-        .replace("{{JAIL}}", &sbpl_literal(&profile.fs_jail))
-        .replace("{{TMP}}", &sbpl_literal(&ctx.exec_dir.join("tmp")))
-        .replace("{{HOME}}", &sbpl_literal(&ctx.exec_dir.join("home")))
-        .replace("{{BROKER_DIR}}", &sbpl_literal(broker_dir));
+        .replace("{{JAIL}}", &sbpl_literal(&jail))
+        .replace("{{TMP}}", &sbpl_literal(&tmp))
+        .replace("{{HOME}}", &sbpl_literal(&home))
+        .replace("{{BROKER_DIR}}", &sbpl_literal(&broker));
     body.push('\n');
     body.push_str(&ro_clauses);
     body.push_str(&deny_clauses);
