@@ -14,8 +14,10 @@
 
 mod artifacts;
 mod checkpoint;
+mod codec;
 mod error;
 mod events;
+mod gate;
 mod install;
 mod metrics;
 mod migrate;
@@ -36,11 +38,11 @@ pub use sessions::{RunRow, SessionRows, SqliteSessionRows};
 // Re-export handoff snapshot from events for the RFC-0002 public surface.
 pub use crate::events::HandoffSnapshot;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use artifacts::FsArtifactStore as FsArtifactStoreImpl;
 use events::SqliteEventStore as SqliteEventStoreImpl;
+use gate::StorageGate;
 use metrics::StorageMetrics;
 use open::DbHandle;
 use sessions::SqliteSessionRows as SqliteSessionRowsImpl;
@@ -54,7 +56,7 @@ pub struct AlloyStorage {
     artifacts: Arc<FsArtifactStoreImpl>,
     sessions: Arc<SqliteSessionRowsImpl>,
     metrics: Arc<StorageMetrics>,
-    closed: Arc<AtomicBool>,
+    gate: Arc<StorageGate>,
 }
 
 impl AlloyStorage {
@@ -65,21 +67,21 @@ impl AlloyStorage {
             tokio::task::spawn_blocking(move || open::open_db(&opts_clone)).await??;
 
         let metrics = Arc::new(StorageMetrics::new());
-        let closed = Arc::new(AtomicBool::new(false));
+        let gate = StorageGate::new();
         let events = Arc::new(SqliteEventStoreImpl::new(
             Arc::clone(&db),
             Arc::clone(&metrics),
-            Arc::clone(&closed),
+            Arc::clone(&gate),
         ));
         let artifacts = Arc::new(FsArtifactStoreImpl::new(
             Arc::clone(&db),
             opts.layout.clone(),
             Arc::clone(&metrics),
-            Arc::clone(&closed),
+            Arc::clone(&gate),
         ));
         let sessions = Arc::new(SqliteSessionRowsImpl::new(
             Arc::clone(&db),
-            Arc::clone(&closed),
+            Arc::clone(&gate),
         ));
 
         Ok(Self {
@@ -90,7 +92,7 @@ impl AlloyStorage {
             artifacts,
             sessions,
             metrics,
-            closed,
+            gate,
         })
     }
 
@@ -126,10 +128,18 @@ impl AlloyStorage {
 
     /// Force WAL checkpoint (uses connection `synchronous` from open).
     pub async fn checkpoint(&self) -> Result<(), StoreError> {
-        self.ensure_open()?;
-        checkpoint::checkpoint_truncate_async(Arc::clone(&self.db)).await?;
-        self.metrics.inc_checkpoints();
-        Ok(())
+        let _permit = self.gate.enter()?;
+        match checkpoint::checkpoint_truncate_async(Arc::clone(&self.db)).await {
+            Ok(()) => {
+                self.metrics.inc_checkpoints();
+                Ok(())
+            }
+            Err(StoreError::Busy) => {
+                self.metrics.inc_busy_errors();
+                Err(StoreError::Busy)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// In-process counter snapshot. Cheap atomics read; safe while store is open.
@@ -142,35 +152,58 @@ impl AlloyStorage {
         Arc::clone(&self.metrics)
     }
 
-    /// Flush + close connections. Idempotent under shared ownership.
+    /// Flush + close connections. Idempotent barrier under shared ownership.
     ///
-    /// After the first successful close, further ops return [`StoreError::Closed`];
-    /// extra `close` calls are no-ops (`Ok(())`).
+    /// 1. Refuse new ops (`Closed`).
+    /// 2. Wait for in-flight ops to finish.
+    /// 3. Checkpoint (errors propagate).
+    /// 4. Close the SQLite connection.
+    ///
+    /// Extra `close` calls are no-ops (`Ok(())`).
     pub async fn close(&self) -> Result<(), StoreError> {
-        if self
-            .closed
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Ok(());
+        if self.gate.is_closed() {
+            // Still wait for any in-flight from a concurrent first close, then ensure conn gone.
+            let gate = Arc::clone(&self.gate);
+            let db = Arc::clone(&self.db);
+            return tokio::task::spawn_blocking(move || {
+                gate.begin_close_and_drain();
+                let _ = db.take_connection();
+                Ok(())
+            })
+            .await?;
         }
-        // Best-effort checkpoint before close.
-        let _ = checkpoint::checkpoint_truncate_async(Arc::clone(&self.db)).await;
-        Ok(())
-    }
 
-    fn ensure_open(&self) -> Result<(), StoreError> {
-        if self.closed.load(Ordering::SeqCst) {
-            Err(StoreError::Closed)
-        } else {
+        let gate = Arc::clone(&self.gate);
+        let db = Arc::clone(&self.db);
+        let metrics = Arc::clone(&self.metrics);
+        tokio::task::spawn_blocking(move || {
+            gate.begin_close_and_drain();
+            // Checkpoint while we still hold the connection, after in-flight finished.
+            match checkpoint::checkpoint_truncate(&db) {
+                Ok(()) => metrics.inc_checkpoints(),
+                Err(StoreError::Busy) => {
+                    metrics.inc_busy_errors();
+                    // Still close — but surface busy so callers know flush was incomplete.
+                    let _ = db.take_connection().ok().flatten().map(|c| c.close());
+                    return Err(StoreError::Busy);
+                }
+                Err(e) => {
+                    let _ = db.take_connection().ok().flatten().map(|c| c.close());
+                    return Err(e);
+                }
+            }
+            if let Some(conn) = db.take_connection()? {
+                conn.close().map_err(|(_c, e)| StoreError::from(e))?;
+            }
             Ok(())
-        }
+        })
+        .await?
     }
 }
 
 impl Drop for AlloyStorage {
     fn drop(&mut self) {
-        if !self.closed.load(Ordering::SeqCst) {
+        if !self.gate.is_closed() {
             tracing::warn!("AlloyStorage dropped without close()");
         }
     }

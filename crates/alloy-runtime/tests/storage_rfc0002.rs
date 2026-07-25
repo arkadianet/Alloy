@@ -574,3 +574,227 @@ async fn replay_callback_error_aborts() {
     assert_eq!(n, 2);
     storage.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn close_is_barrier_rejects_new_ops() {
+    let (_dir, storage) = open_temp().await;
+    let events = storage.events();
+    let s = SessionId::new();
+    events
+        .append_session(new_ev(s, SessionEventType::SessionCreated))
+        .await
+        .unwrap();
+    storage.close().await.unwrap();
+    let err = events
+        .append_session(new_ev(s, SessionEventType::Decision))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, alloy_runtime::EventSinkError::Internal(_)));
+    // Second close is a no-op.
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn handoff_verify_failure_leaves_no_durable_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
+        .await
+        .unwrap();
+    let events = storage.events();
+    let session = SessionId::new();
+
+    // Build a snapshot with inconsistent next_seq (claims next=7 but only seq 0 present).
+    let mut snap = alloy_runtime::HandoffSnapshot::default();
+    snap.sessions.insert(
+        session,
+        vec![alloy_runtime::SessionEvent {
+            seq: EventSeq(0),
+            ts: Timestamp::now(),
+            session_id: session,
+            run_id: None,
+            type_: SessionEventType::SessionCreated,
+            payload: json!({}),
+        }],
+    );
+    snap.next_seq.insert(session, 7);
+
+    let err = events.import_handoff_snapshot(snap).await.unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt(_)));
+
+    assert!(events
+        .list_session_events(session, None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(events
+        .list_runtime_events(None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn seq_mismatch_refuses_ready_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
+            .await
+            .unwrap();
+        let s = SessionId::new();
+        storage
+            .events()
+            .append_session(new_ev(s, SessionEventType::Decision))
+            .await
+            .unwrap();
+        storage.close().await.unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("alloy.sqlite")).unwrap();
+        conn.execute("UPDATE session_seq SET next_seq = 99", [])
+            .unwrap();
+    }
+    let err = match AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path())).await {
+        Ok(_) => panic!("expected corrupt seq mismatch to refuse ready"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, StoreError::Corrupt(_)));
+}
+
+#[tokio::test]
+async fn foreign_key_maps_to_conflict_not_io() {
+    let (_dir, storage) = open_temp().await;
+    let rows = storage.sessions();
+    let orphan = alloy_runtime::RunRow {
+        id: RunId::new(),
+        session_id: SessionId::new(),
+        goal_json: json!({}),
+        state: "pending".into(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+    };
+    let err = rows.upsert_run(&orphan).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::Conflict(_)),
+        "expected Conflict, got {err:?}"
+    );
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordered_shutdown_drain_checkpoint_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, handle) = test_runtime(dir.path()).await;
+    let session = SessionId::new();
+    handle
+        .append_session(new_ev(session, SessionEventType::SessionCreated))
+        .await
+        .unwrap();
+    let storage = install_sqlite_event_sink(&handle, None).await.unwrap();
+
+    // Ordered shutdown when storage is installed: drain → checkpoint → close → runtime shutdown.
+    rt.drain(std::time::Duration::from_millis(50))
+        .await
+        .unwrap();
+    storage.checkpoint().await.unwrap();
+    storage.close().await.unwrap();
+    rt.shutdown().await.unwrap();
+
+    // Reopen sees durable events.
+    let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path().join("data")))
+        .await
+        .unwrap();
+    let listed = storage
+        .events()
+        .list_session_events(session, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_same_session_gapless() {
+    let (_dir, storage) = open_temp().await;
+    let events = storage.events();
+    let s = SessionId::new();
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        let events = Arc::clone(&events);
+        handles.push(tokio::spawn(async move {
+            events
+                .append_session(new_ev(s, SessionEventType::NodeState))
+                .await
+                .unwrap()
+        }));
+    }
+    let mut seqs = Vec::new();
+    for h in handles {
+        seqs.push(h.await.unwrap());
+    }
+    seqs.sort();
+    assert_eq!(seqs.len(), 32);
+    for (i, seq) in seqs.iter().enumerate() {
+        assert_eq!(*seq, EventSeq(i as u64));
+    }
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn crash_after_commit_reopen_sees_event() {
+    use std::process::{Command, Stdio};
+
+    if let Ok(data) = std::env::var("ALLOY_STORAGE_CRASH_DIR") {
+        let data = std::path::PathBuf::from(data);
+        let sid_path = data.parent().unwrap().join("sid");
+        let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(&data))
+            .await
+            .unwrap();
+        let s = SessionId::new();
+        std::fs::write(&sid_path, s.to_string()).unwrap();
+        storage
+            .events()
+            .append_session(new_ev(s, SessionEventType::Decision))
+            .await
+            .unwrap();
+        storage.checkpoint().await.unwrap();
+        // Simulate hard crash after durable commit+checkpoint (no close).
+        std::process::abort();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let sid_path = dir.path().join("sid");
+
+    let exe = std::env::current_exe().unwrap();
+    let status = Command::new(&exe)
+        .env("ALLOY_STORAGE_CRASH_DIR", &data)
+        .env("RUST_BACKTRACE", "0")
+        .args([
+            "--exact",
+            "crash_after_commit_reopen_sees_event",
+            "--nocapture",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success(), "child should abort");
+
+    let sid_str = std::fs::read_to_string(&sid_path).expect("child should write session id");
+    let uuid = uuid::Uuid::parse_str(sid_str.trim()).unwrap();
+    let s: SessionId = serde_json::from_value(serde_json::json!(uuid)).unwrap();
+
+    let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(&data))
+        .await
+        .unwrap();
+    let listed = storage
+        .events()
+        .list_session_events(s, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].seq, EventSeq(0));
+    storage.close().await.unwrap();
+}

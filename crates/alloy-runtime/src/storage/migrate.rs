@@ -113,6 +113,7 @@ pub fn migrate(conn: &Connection, refuse_newer: bool) -> Result<u32, StoreError>
             rusqlite::params![1i64, now_rfc3339()],
         )
         .map_err(|e| StoreError::Migration(e.to_string()))?;
+        // `schema_migrations` was bootstrapped empty by `ensure_migrations_table`.
         tx.commit()
             .map_err(|e| StoreError::Migration(e.to_string()))?;
     }

@@ -1,12 +1,13 @@
 //! SQLite-backed [`EventSink`] + [`EventStore`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 
+use super::codec::{parse_run_id, ts_from_text, ts_to_text};
 use super::error::StoreError;
+use super::gate::StorageGate;
 use super::metrics::StorageMetrics;
 use super::open::{spawn_db, DbHandle};
 use crate::events::{
@@ -14,7 +15,7 @@ use crate::events::{
     SessionEventType,
 };
 use crate::session::clamp_events_page_limit;
-use crate::types::ids::{EventSeq, RunId, SessionId, Timestamp};
+use crate::types::ids::{EventSeq, SessionId, Timestamp};
 
 /// Read/replay APIs on top of [`EventSink`].
 #[async_trait]
@@ -62,28 +63,16 @@ pub trait EventStore: EventSink {
 pub struct SqliteEventStore {
     db: Arc<DbHandle>,
     metrics: Arc<StorageMetrics>,
-    closed: Arc<AtomicBool>,
+    gate: Arc<StorageGate>,
 }
 
 impl SqliteEventStore {
     pub(crate) fn new(
         db: Arc<DbHandle>,
         metrics: Arc<StorageMetrics>,
-        closed: Arc<AtomicBool>,
+        gate: Arc<StorageGate>,
     ) -> Self {
-        Self {
-            db,
-            metrics,
-            closed,
-        }
-    }
-
-    fn ensure_open(&self) -> Result<(), StoreError> {
-        if self.closed.load(Ordering::SeqCst) {
-            Err(StoreError::Closed)
-        } else {
-            Ok(())
-        }
+        Self { db, metrics, gate }
     }
 
     fn map_busy(&self, err: StoreError) -> StoreError {
@@ -97,18 +86,17 @@ impl SqliteEventStore {
 #[async_trait]
 impl EventSink for SqliteEventStore {
     async fn append_runtime(&self, ev: RuntimeEvent) -> Result<(), EventSinkError> {
-        self.ensure_open().map_err(EventSinkError::from)?;
+        let _permit = self.gate.enter().map_err(EventSinkError::from)?;
         let db = Arc::clone(&self.db);
         let metrics = Arc::clone(&self.metrics);
         let result = spawn_db(db, move |handle| {
             handle.with(|conn| {
+                // Row `ts` is wall-clock for host channel indexing only; RuntimeEvent
+                // itself has no timestamp field (unlike session events).
                 let ts = Timestamp::now();
                 let json = serde_json::to_string(&ev)
                     .map_err(|e| StoreError::Internal(format!("serialize runtime event: {e}")))?;
-                let ts_s =
-                    serde_json::to_string(&ts).map_err(|e| StoreError::Internal(e.to_string()))?;
-                // Timestamp serializes as a JSON string; strip quotes for TEXT column.
-                let ts_text = ts_s.trim_matches('"').to_owned();
+                let ts_text = ts_to_text(&ts)?;
                 conn.execute(
                     "INSERT INTO runtime_events (ts, event_json) VALUES (?1, ?2)",
                     params![ts_text, json],
@@ -126,9 +114,14 @@ impl EventSink for SqliteEventStore {
         }
     }
 
-    #[tracing::instrument(skip(self, ev), fields(session_id = %ev.session_id, type = ?ev.type_), name = "storage.append_session", level = "debug")]
+    #[tracing::instrument(
+        skip(self, ev),
+        fields(session_id = %ev.session_id, type = ?ev.type_, seq = tracing::field::Empty),
+        name = "storage.append_session",
+        level = "debug"
+    )]
     async fn append_session(&self, ev: NewSessionEvent) -> Result<EventSeq, EventSinkError> {
-        self.ensure_open().map_err(EventSinkError::from)?;
+        let _permit = self.gate.enter().map_err(EventSinkError::from)?;
         let db = Arc::clone(&self.db);
         let metrics = Arc::clone(&self.metrics);
         let result = spawn_db(db, move |handle| {
@@ -151,13 +144,10 @@ impl EventSink for SqliteEventStore {
                 let ts = Timestamp::now();
                 let type_json = serde_json::to_string(&ev.type_)
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
-                // SessionEventType serializes as a JSON string.
                 let type_text = type_json.trim_matches('"').to_owned();
                 let payload = serde_json::to_string(&ev.payload)
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
-                let ts_s =
-                    serde_json::to_string(&ts).map_err(|e| StoreError::Internal(e.to_string()))?;
-                let ts_text = ts_s.trim_matches('"').to_owned();
+                let ts_text = ts_to_text(&ts)?;
                 let run_id = ev.run_id.map(|r| r.to_string());
 
                 tx.execute(
@@ -173,7 +163,6 @@ impl EventSink for SqliteEventStore {
                 )?;
 
                 tx.commit()?;
-                tracing::Span::current().record("seq", seq.0);
                 Ok(seq)
             })
         })
@@ -181,6 +170,7 @@ impl EventSink for SqliteEventStore {
 
         match result {
             Ok(seq) => {
+                tracing::Span::current().record("seq", seq.0);
                 metrics.inc_events_appended();
                 Ok(seq)
             }
@@ -197,7 +187,7 @@ impl EventStore for SqliteEventStore {
         after: Option<EventSeq>,
         limit: usize,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
         let limit = clamp_events_page_limit(limit);
         let db = Arc::clone(&self.db);
         let metrics = Arc::clone(&self.metrics);
@@ -219,7 +209,6 @@ impl EventStore for SqliteEventStore {
     where
         F: FnMut(&SessionEvent) -> Result<(), StoreError> + Send,
     {
-        self.ensure_open()?;
         let mut cursor: Option<EventSeq> = None;
         let mut last: Option<EventSeq> = None;
         loop {
@@ -242,7 +231,7 @@ impl EventStore for SqliteEventStore {
     }
 
     async fn last_seq(&self, session: SessionId) -> Result<Option<EventSeq>, StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
         let db = Arc::clone(&self.db);
         spawn_db(db, move |handle| {
             handle.with(|conn| {
@@ -263,7 +252,7 @@ impl EventStore for SqliteEventStore {
         after_rowid: Option<i64>,
         limit: usize,
     ) -> Result<Vec<(i64, RuntimeEvent)>, StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
         let limit = clamp_events_page_limit(limit);
         let db = Arc::clone(&self.db);
         let after = after_rowid.unwrap_or(-1);
@@ -293,7 +282,7 @@ impl EventStore for SqliteEventStore {
     }
 
     async fn import_handoff_snapshot(&self, snap: HandoffSnapshot) -> Result<(), StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
         let db = Arc::clone(&self.db);
         spawn_db(db, move |handle| {
             handle.with_mut(|conn| import_handoff_snapshot_sync(conn, snap))
@@ -310,21 +299,25 @@ fn list_session_events_sync(
     limit: usize,
 ) -> Result<Vec<SessionEvent>, StoreError> {
     let sid = session.to_string();
-    let (sql, after_val): (&str, i64) = match after_seq {
-        None => (
+    let sql = match after_seq {
+        None => {
             "SELECT seq, ts, run_id, type, payload_json FROM session_events
-             WHERE session_id = ?1 AND seq >= 0 ORDER BY seq ASC LIMIT ?2",
-            -1,
-        ),
-        Some(s) => (
+             WHERE session_id = ?1 AND seq >= 0 ORDER BY seq ASC LIMIT ?2"
+        }
+        Some(_) => {
             "SELECT seq, ts, run_id, type, payload_json FROM session_events
-             WHERE session_id = ?1 AND seq > ?3 ORDER BY seq ASC LIMIT ?2",
-            s,
-        ),
+             WHERE session_id = ?1 AND seq > ?3 ORDER BY seq ASC LIMIT ?2"
+        }
     };
 
     let mut stmt = conn.prepare(sql)?;
-    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, String, Option<String>, String, String)> {
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+    )> {
         Ok((
             row.get(0)?,
             row.get(1)?,
@@ -334,10 +327,10 @@ fn list_session_events_sync(
         ))
     };
 
-    let rows = if after_seq.is_none() {
-        stmt.query_map(params![sid, limit as i64], map_row)?
+    let rows = if let Some(s) = after_seq {
+        stmt.query_map(params![sid, limit as i64, s], map_row)?
     } else {
-        stmt.query_map(params![sid, limit as i64, after_val], map_row)?
+        stmt.query_map(params![sid, limit as i64], map_row)?
     };
 
     let mut out = Vec::new();
@@ -345,15 +338,12 @@ fn list_session_events_sync(
         let (seq, ts_text, run_id, type_text, payload) = row?;
         let type_: SessionEventType = serde_json::from_str(&format!("\"{type_text}\""))
             .map_err(|e| StoreError::Corrupt(format!("event type: {e}")))?;
-        let ts: Timestamp = serde_json::from_str(&format!("\"{ts_text}\""))
-            .map_err(|e| StoreError::Corrupt(format!("event ts: {e}")))?;
+        let ts = ts_from_text(&ts_text)?;
         let payload: serde_json::Value = serde_json::from_str(&payload)
             .map_err(|e| StoreError::Corrupt(format!("event payload: {e}")))?;
         let run_id = match run_id {
             None => None,
-            Some(s) => {
-                Some(parse_run_id(&s).map_err(|e| StoreError::Corrupt(format!("run_id: {e}")))?)
-            }
+            Some(s) => Some(parse_run_id(&s)?),
         };
         out.push(SessionEvent {
             seq: EventSeq(seq as u64),
@@ -378,9 +368,8 @@ fn import_handoff_snapshot_sync(
     for ev in &snap.runtime {
         let json = serde_json::to_string(ev)
             .map_err(|e| StoreError::Internal(format!("serialize runtime event: {e}")))?;
-        let ts = Timestamp::now();
-        let ts_s = serde_json::to_string(&ts).map_err(|e| StoreError::Internal(e.to_string()))?;
-        let ts_text = ts_s.trim_matches('"').to_owned();
+        // Host channel row timestamp only — RuntimeEvent has no ts to preserve.
+        let ts_text = ts_to_text(&Timestamp::now())?;
         tx.execute(
             "INSERT INTO runtime_events (ts, event_json) VALUES (?1, ?2)",
             params![ts_text, json],
@@ -400,9 +389,7 @@ fn import_handoff_snapshot_sync(
             let type_text = type_json.trim_matches('"').to_owned();
             let payload = serde_json::to_string(&ev.payload)
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
-            let ts_s =
-                serde_json::to_string(&ev.ts).map_err(|e| StoreError::Internal(e.to_string()))?;
-            let ts_text = ts_s.trim_matches('"').to_owned();
+            let ts_text = ts_to_text(&ev.ts)?;
             let run_id = ev.run_id.map(|r| r.to_string());
             tx.execute(
                 "INSERT INTO session_events (session_id, seq, ts, run_id, type, payload_json)
@@ -420,7 +407,6 @@ fn import_handoff_snapshot_sync(
         )?;
     }
 
-    // Verify each session last_seq matches next_seq-1 when next_seq > 0.
     for (session_id, next) in &snap.next_seq {
         if *next == 0 {
             let count: i64 = tx.query_row(
@@ -451,7 +437,6 @@ fn import_handoff_snapshot_sync(
         }
     }
 
-    // Also verify sessions that have events but were only in sessions map.
     for session_id in snap.sessions.keys() {
         if !snap.next_seq.contains_key(session_id) {
             return Err(StoreError::Corrupt(format!(
@@ -462,10 +447,4 @@ fn import_handoff_snapshot_sync(
 
     tx.commit()?;
     Ok(())
-}
-
-fn parse_run_id(s: &str) -> Result<RunId, String> {
-    // RunId is a transparent UUID newtype; reconstruct via serde without exposing constructors.
-    let uuid = uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?;
-    serde_json::from_value(serde_json::json!(uuid)).map_err(|e| e.to_string())
 }

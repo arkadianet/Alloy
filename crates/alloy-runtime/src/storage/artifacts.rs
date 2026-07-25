@@ -1,14 +1,15 @@
 //! Filesystem content-addressed artifact store + SQLite index.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use super::codec::{parse_artifact_id, parse_run_id, parse_session_id, ts_from_text, ts_to_text};
 use super::error::StoreError;
+use super::gate::StorageGate;
 use super::metrics::StorageMetrics;
 use super::open::{spawn_db, DbHandle};
 use super::paths::StorageLayout;
@@ -101,7 +102,7 @@ pub struct FsArtifactStore {
     db: Arc<DbHandle>,
     layout: StorageLayout,
     metrics: Arc<StorageMetrics>,
-    closed: Arc<AtomicBool>,
+    gate: Arc<StorageGate>,
 }
 
 impl FsArtifactStore {
@@ -109,49 +110,41 @@ impl FsArtifactStore {
         db: Arc<DbHandle>,
         layout: StorageLayout,
         metrics: Arc<StorageMetrics>,
-        closed: Arc<AtomicBool>,
+        gate: Arc<StorageGate>,
     ) -> Self {
         Self {
             db,
             layout,
             metrics,
-            closed,
+            gate,
         }
     }
 
-    fn ensure_open(&self) -> Result<(), StoreError> {
-        if self.closed.load(Ordering::SeqCst) {
-            Err(StoreError::Closed)
-        } else {
-            Ok(())
+    fn map_busy(&self, err: StoreError) -> StoreError {
+        if matches!(err, StoreError::Busy) {
+            self.metrics.inc_busy_errors();
         }
+        err
     }
 }
 
 #[async_trait]
 impl ArtifactStore for FsArtifactStore {
-    #[tracing::instrument(skip(self, req), fields(byte_len = req.bytes.len()), name = "storage.artifact_put", level = "debug")]
+    #[tracing::instrument(
+        skip(self, req),
+        fields(
+            byte_len = req.bytes.len(),
+            digest = tracing::field::Empty,
+            id = tracing::field::Empty
+        ),
+        name = "storage.artifact_put",
+        level = "debug"
+    )]
     async fn put(&self, req: ArtifactPut) -> Result<ArtifactId, StoreError> {
-        self.ensure_open()?;
-        let digest = Digest::sha256(&req.bytes);
-        let digest_hex = digest.as_hex().to_owned();
-        let rel = StorageLayout::cas_rel_path(&digest_hex)?;
-        let cas_path = self.layout.cas_path(&digest_hex)?;
-        let tmp_dir = self.layout.artifacts_dir.join("tmp");
-        let tmp_path = tmp_dir.join(uuid::Uuid::new_v4().to_string());
-        let byte_len = req.bytes.len() as u64;
+        let _permit = self.gate.enter()?;
         let layout = self.layout.clone();
+        let byte_len = req.bytes.len() as u64;
         let bytes = req.bytes;
-
-        // Write CAS on blocking thread (create-or-reuse file).
-        let digest_for_fs = digest_hex.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
-            write_cas_blob(&layout, &cas_path, &tmp_path, &bytes, &digest_for_fs)
-        })
-        .await??;
-
-        let id = ArtifactId::new();
-        let created_at = Timestamp::now();
         let kind = req.kind;
         let content_type = req.content_type;
         let session_id = req.session_id;
@@ -159,17 +152,35 @@ impl ArtifactStore for FsArtifactStore {
         let labels = req.labels;
         let db = Arc::clone(&self.db);
         let metrics = Arc::clone(&self.metrics);
+
+        // Hash + CAS write on a blocking thread (unbounded CPU/IO off the reactor).
+        let (digest, rel, id, created_at) = tokio::task::spawn_blocking(move || {
+            let digest = Digest::sha256(&bytes);
+            let digest_hex = digest.as_hex().to_owned();
+            let rel = StorageLayout::cas_rel_path(&digest_hex)?;
+            let cas_path = layout.cas_path(&digest_hex)?;
+            let tmp_path = layout
+                .artifacts_dir
+                .join("tmp")
+                .join(uuid::Uuid::new_v4().to_string());
+            write_cas_blob(&layout, &cas_path, &tmp_path, &bytes, &digest_hex)?;
+            Ok::<_, StoreError>((digest, rel, ArtifactId::new(), Timestamp::now()))
+        })
+        .await??;
+
+        tracing::Span::current().record("digest", digest.as_hex());
+        tracing::Span::current().record("id", id.to_string());
+
+        let digest_hex = digest.as_hex().to_owned();
         let id_str = id.to_string();
 
-        let result = spawn_db(db, move |handle| {
+        spawn_db(db, move |handle| {
             handle.with(|conn| {
                 let kind_json = serde_json::to_string(&kind)
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
                 let labels_json = serde_json::to_string(&labels)
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
-                let ts_s = serde_json::to_string(&created_at)
-                    .map_err(|e| StoreError::Internal(e.to_string()))?;
-                let ts_text = ts_s.trim_matches('"').to_owned();
+                let ts_text = ts_to_text(&created_at)?;
                 conn.execute(
                     "INSERT INTO artifacts (
                         id, digest, kind, content_type, byte_len, rel_path,
@@ -191,22 +202,16 @@ impl ArtifactStore for FsArtifactStore {
                 Ok(())
             })
         })
-        .await;
+        .await
+        .map_err(|e| self.map_busy(e))?;
 
-        match result {
-            Ok(()) => {
-                metrics.inc_artifacts_put();
-                tracing::Span::current().record("digest", digest.as_hex());
-                tracing::Span::current().record("id", id.to_string());
-                Ok(id)
-            }
-            Err(e) => Err(e),
-        }
+        metrics.inc_artifacts_put();
+        Ok(id)
     }
 
     async fn get(&self, id: ArtifactId) -> Result<ArtifactBlob, StoreError> {
-        self.ensure_open()?;
-        let meta = self.meta(id).await?;
+        let _permit = self.gate.enter()?;
+        let meta = self.meta_unlocked(id).await?;
         let path = self.layout.cas_path(meta.digest.as_hex())?;
         let digest = meta.digest.clone();
         let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, StoreError> {
@@ -229,7 +234,62 @@ impl ArtifactStore for FsArtifactStore {
     }
 
     async fn meta(&self, id: ArtifactId) -> Result<ArtifactMeta, StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
+        self.meta_unlocked(id).await
+    }
+
+    async fn get_by_digest(&self, digest: &Digest) -> Result<Option<ArtifactId>, StoreError> {
+        let _permit = self.gate.enter()?;
+        let db = Arc::clone(&self.db);
+        let digest_hex = digest.as_hex().to_owned();
+        spawn_db(db, move |handle| {
+            handle.with(|conn| {
+                let id: Option<String> = conn
+                    .query_row(
+                        "SELECT id FROM artifacts
+                         WHERE digest = ?1 AND deleted_at IS NULL
+                         ORDER BY created_at ASC, id ASC LIMIT 1",
+                        [&digest_hex],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match id {
+                    None => Ok(None),
+                    Some(s) => Ok(Some(parse_artifact_id(&s)?)),
+                }
+            })
+        })
+        .await
+        .map_err(|e| self.map_busy(e))
+    }
+
+    async fn delete(&self, id: ArtifactId) -> Result<(), StoreError> {
+        let _permit = self.gate.enter()?;
+        let db = Arc::clone(&self.db);
+        let id_str = id.to_string();
+        let ts = Timestamp::now();
+        spawn_db(db, move |handle| {
+            handle.with(|conn| {
+                let ts_text = ts_to_text(&ts)?;
+                let n = conn.execute(
+                    "UPDATE artifacts SET deleted_at = ?1
+                     WHERE id = ?2 AND deleted_at IS NULL",
+                    params![ts_text, id_str],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::NotFound(format!("artifact {id}")));
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| self.map_busy(e))
+    }
+}
+
+impl FsArtifactStore {
+    /// Meta lookup without taking another gate permit (caller already holds one).
+    async fn meta_unlocked(&self, id: ArtifactId) -> Result<ArtifactMeta, StoreError> {
         let db = Arc::clone(&self.db);
         let id_str = id.to_string();
         spawn_db(db, move |handle| {
@@ -280,70 +340,16 @@ impl ArtifactStore for FsArtifactStore {
                     byte_len: byte_len as u64,
                     digest: Digest::try_from_hex(&digest_hex)
                         .map_err(|e| StoreError::Corrupt(format!("artifact digest: {e}")))?,
-                    created_at: serde_json::from_str(&format!("\"{created_at}\""))
-                        .map_err(|e| StoreError::Corrupt(format!("artifact ts: {e}")))?,
-                    session_id: session_id
-                        .map(|s| parse_session_id(&s))
-                        .transpose()
-                        .map_err(StoreError::Corrupt)?,
-                    run_id: run_id
-                        .map(|s| parse_run_id(&s))
-                        .transpose()
-                        .map_err(StoreError::Corrupt)?,
+                    created_at: ts_from_text(&created_at)?,
+                    session_id: session_id.map(|s| parse_session_id(&s)).transpose()?,
+                    run_id: run_id.map(|s| parse_run_id(&s)).transpose()?,
                     labels: serde_json::from_str(&labels_json)
                         .map_err(|e| StoreError::Corrupt(format!("artifact labels: {e}")))?,
                 })
             })
         })
         .await
-    }
-
-    async fn get_by_digest(&self, digest: &Digest) -> Result<Option<ArtifactId>, StoreError> {
-        self.ensure_open()?;
-        let db = Arc::clone(&self.db);
-        let digest_hex = digest.as_hex().to_owned();
-        spawn_db(db, move |handle| {
-            handle.with(|conn| {
-                let id: Option<String> = conn
-                    .query_row(
-                        "SELECT id FROM artifacts
-                         WHERE digest = ?1 AND deleted_at IS NULL
-                         ORDER BY created_at ASC, id ASC LIMIT 1",
-                        [&digest_hex],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                match id {
-                    None => Ok(None),
-                    Some(s) => Ok(Some(parse_artifact_id(&s).map_err(StoreError::Corrupt)?)),
-                }
-            })
-        })
-        .await
-    }
-
-    async fn delete(&self, id: ArtifactId) -> Result<(), StoreError> {
-        self.ensure_open()?;
-        let db = Arc::clone(&self.db);
-        let id_str = id.to_string();
-        let ts = Timestamp::now();
-        spawn_db(db, move |handle| {
-            handle.with(|conn| {
-                let ts_s =
-                    serde_json::to_string(&ts).map_err(|e| StoreError::Internal(e.to_string()))?;
-                let ts_text = ts_s.trim_matches('"').to_owned();
-                let n = conn.execute(
-                    "UPDATE artifacts SET deleted_at = ?1
-                     WHERE id = ?2 AND deleted_at IS NULL",
-                    params![ts_text, id_str],
-                )?;
-                if n == 0 {
-                    return Err(StoreError::NotFound(format!("artifact {id}")));
-                }
-                Ok(())
-            })
-        })
-        .await
+        .map_err(|e| self.map_busy(e))
     }
 }
 
@@ -355,12 +361,16 @@ fn write_cas_blob(
     digest_hex: &str,
 ) -> Result<(), StoreError> {
     if cas_path.is_file() {
-        // Reuse existing blob; verify digest quickly.
-        let existing = std::fs::read(cas_path)?;
-        if Digest::sha256(&existing).as_hex() != digest_hex {
-            return Err(StoreError::DigestMismatch);
+        // Reuse existing blob; if corrupt, rewrite with known-good bytes (self-heal).
+        match std::fs::read(cas_path) {
+            Ok(existing) if Digest::sha256(&existing).as_hex() == digest_hex => return Ok(()),
+            Ok(_) | Err(_) => {
+                tracing::warn!(
+                    path = %cas_path.display(),
+                    "replacing corrupt or unreadable CAS blob"
+                );
+            }
         }
-        return Ok(());
     }
 
     if let Some(parent) = cas_path.parent() {
@@ -374,13 +384,12 @@ fn write_cas_blob(
         f.sync_all()?;
     }
 
-    // Atomic rename into CAS path.
+    // Atomic rename into CAS path. On Unix this replaces an existing file.
     std::fs::rename(tmp_path, cas_path).map_err(|e| {
         let _ = std::fs::remove_file(tmp_path);
         StoreError::Io(e.to_string())
     })?;
 
-    // Fsync CAS parent directory so the rename is durable.
     if let Some(parent) = cas_path.parent() {
         fsync_dir(parent)?;
     }
@@ -391,19 +400,4 @@ fn fsync_dir(dir: &std::path::Path) -> Result<(), StoreError> {
     let f = std::fs::File::open(dir)?;
     f.sync_all()?;
     Ok(())
-}
-
-fn parse_session_id(s: &str) -> Result<SessionId, String> {
-    let uuid = uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?;
-    serde_json::from_value(serde_json::json!(uuid)).map_err(|e| e.to_string())
-}
-
-fn parse_run_id(s: &str) -> Result<RunId, String> {
-    let uuid = uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?;
-    serde_json::from_value(serde_json::json!(uuid)).map_err(|e| e.to_string())
-}
-
-fn parse_artifact_id(s: &str) -> Result<ArtifactId, String> {
-    let uuid = uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?;
-    serde_json::from_value(serde_json::json!(uuid)).map_err(|e| e.to_string())
 }

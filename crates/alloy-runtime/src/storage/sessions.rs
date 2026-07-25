@@ -1,13 +1,14 @@
 //! Thin session/run row persistence (orchestration in RFC-0003).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use super::codec::{parse_run_id, parse_session_id, path_to_utf8, ts_from_text, ts_to_text};
 use super::error::StoreError;
+use super::gate::StorageGate;
 use super::open::{spawn_db, DbHandle};
 use crate::session::Session;
 use crate::types::ids::{RunId, SessionId, Timestamp};
@@ -48,27 +49,19 @@ pub trait SessionRows: Send + Sync {
 /// SQLite implementation of [`SessionRows`].
 pub struct SqliteSessionRows {
     db: Arc<DbHandle>,
-    closed: Arc<AtomicBool>,
+    gate: Arc<StorageGate>,
 }
 
 impl SqliteSessionRows {
-    pub(crate) fn new(db: Arc<DbHandle>, closed: Arc<AtomicBool>) -> Self {
-        Self { db, closed }
-    }
-
-    fn ensure_open(&self) -> Result<(), StoreError> {
-        if self.closed.load(Ordering::SeqCst) {
-            Err(StoreError::Closed)
-        } else {
-            Ok(())
-        }
+    pub(crate) fn new(db: Arc<DbHandle>, gate: Arc<StorageGate>) -> Self {
+        Self { db, gate }
     }
 }
 
 #[async_trait]
 impl SessionRows for SqliteSessionRows {
     async fn upsert_session(&self, session: &Session) -> Result<(), StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
         let db = Arc::clone(&self.db);
         let session = session.clone();
         spawn_db(db, move |handle| {
@@ -77,9 +70,8 @@ impl SessionRows for SqliteSessionRows {
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
                 let langs = serde_json::to_string(&session.language_backends)
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
-                let ts_s = serde_json::to_string(&session.created_at)
-                    .map_err(|e| StoreError::Internal(e.to_string()))?;
-                let ts_text = ts_s.trim_matches('"').to_owned();
+                let ts_text = ts_to_text(&session.created_at)?;
+                let root = path_to_utf8(&session.workspace_root)?;
                 conn.execute(
                     "INSERT INTO sessions (
                         id, workspace_root, profile, budget_json,
@@ -89,11 +81,10 @@ impl SessionRows for SqliteSessionRows {
                         workspace_root = excluded.workspace_root,
                         profile = excluded.profile,
                         budget_json = excluded.budget_json,
-                        language_backends_json = excluded.language_backends_json,
-                        created_at = excluded.created_at",
+                        language_backends_json = excluded.language_backends_json",
                     params![
                         session.id.to_string(),
-                        session.workspace_root.to_string_lossy(),
+                        root,
                         session.profile.as_str(),
                         budget,
                         langs,
@@ -107,7 +98,7 @@ impl SessionRows for SqliteSessionRows {
     }
 
     async fn get_session(&self, id: SessionId) -> Result<Option<Session>, StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
         let db = Arc::clone(&self.db);
         let id_str = id.to_string();
         spawn_db(db, move |handle| {
@@ -141,8 +132,7 @@ impl SessionRows for SqliteSessionRows {
                         .map_err(|e| StoreError::Corrupt(format!("budget: {e}")))?,
                     language_backends: serde_json::from_str(&langs)
                         .map_err(|e| StoreError::Corrupt(format!("language_backends: {e}")))?,
-                    created_at: serde_json::from_str(&format!("\"{created_at}\""))
-                        .map_err(|e| StoreError::Corrupt(format!("created_at: {e}")))?,
+                    created_at: ts_from_text(&created_at)?,
                 }))
             })
         })
@@ -150,17 +140,15 @@ impl SessionRows for SqliteSessionRows {
     }
 
     async fn upsert_run(&self, row: &RunRow) -> Result<(), StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
         let db = Arc::clone(&self.db);
         let row = row.clone();
         spawn_db(db, move |handle| {
             handle.with(|conn| {
                 let goal = serde_json::to_string(&row.goal_json)
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
-                let created = serde_json::to_string(&row.created_at)
-                    .map_err(|e| StoreError::Internal(e.to_string()))?;
-                let updated = serde_json::to_string(&row.updated_at)
-                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                let created = ts_to_text(&row.created_at)?;
+                let updated = ts_to_text(&row.updated_at)?;
                 conn.execute(
                     "INSERT INTO runs (
                         id, session_id, goal_json, state, created_at, updated_at
@@ -169,15 +157,14 @@ impl SessionRows for SqliteSessionRows {
                         session_id = excluded.session_id,
                         goal_json = excluded.goal_json,
                         state = excluded.state,
-                        created_at = excluded.created_at,
                         updated_at = excluded.updated_at",
                     params![
                         row.id.to_string(),
                         row.session_id.to_string(),
                         goal,
                         row.state,
-                        created.trim_matches('"'),
-                        updated.trim_matches('"'),
+                        created,
+                        updated,
                     ],
                 )?;
                 Ok(())
@@ -187,7 +174,7 @@ impl SessionRows for SqliteSessionRows {
     }
 
     async fn get_run(&self, id: RunId) -> Result<Option<RunRow>, StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
         let db = Arc::clone(&self.db);
         let id_str = id.to_string();
         spawn_db(db, move |handle| {
@@ -213,14 +200,12 @@ impl SessionRows for SqliteSessionRows {
                 };
                 Ok(Some(RunRow {
                     id,
-                    session_id: parse_session_id(&session_id).map_err(StoreError::Corrupt)?,
+                    session_id: parse_session_id(&session_id)?,
                     goal_json: serde_json::from_str(&goal)
                         .map_err(|e| StoreError::Corrupt(format!("goal: {e}")))?,
                     state,
-                    created_at: serde_json::from_str(&format!("\"{created_at}\""))
-                        .map_err(|e| StoreError::Corrupt(format!("created_at: {e}")))?,
-                    updated_at: serde_json::from_str(&format!("\"{updated_at}\""))
-                        .map_err(|e| StoreError::Corrupt(format!("updated_at: {e}")))?,
+                    created_at: ts_from_text(&created_at)?,
+                    updated_at: ts_from_text(&updated_at)?,
                 }))
             })
         })
@@ -228,7 +213,7 @@ impl SessionRows for SqliteSessionRows {
     }
 
     async fn list_runs(&self, session: SessionId) -> Result<Vec<RunRow>, StoreError> {
-        self.ensure_open()?;
+        let _permit = self.gate.enter()?;
         let db = Arc::clone(&self.db);
         let sid = session.to_string();
         spawn_db(db, move |handle| {
@@ -250,15 +235,13 @@ impl SessionRows for SqliteSessionRows {
                 for row in rows {
                     let (id, goal, state, created_at, updated_at) = row?;
                     out.push(RunRow {
-                        id: parse_run_id(&id).map_err(StoreError::Corrupt)?,
+                        id: parse_run_id(&id)?,
                         session_id: session,
                         goal_json: serde_json::from_str(&goal)
                             .map_err(|e| StoreError::Corrupt(format!("goal: {e}")))?,
                         state,
-                        created_at: serde_json::from_str(&format!("\"{created_at}\""))
-                            .map_err(|e| StoreError::Corrupt(format!("created_at: {e}")))?,
-                        updated_at: serde_json::from_str(&format!("\"{updated_at}\""))
-                            .map_err(|e| StoreError::Corrupt(format!("updated_at: {e}")))?,
+                        created_at: ts_from_text(&created_at)?,
+                        updated_at: ts_from_text(&updated_at)?,
                     });
                 }
                 Ok(out)
@@ -266,14 +249,4 @@ impl SessionRows for SqliteSessionRows {
         })
         .await
     }
-}
-
-fn parse_session_id(s: &str) -> Result<SessionId, String> {
-    let uuid = uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?;
-    serde_json::from_value(serde_json::json!(uuid)).map_err(|e| e.to_string())
-}
-
-fn parse_run_id(s: &str) -> Result<RunId, String> {
-    let uuid = uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?;
-    serde_json::from_value(serde_json::json!(uuid)).map_err(|e| e.to_string())
 }

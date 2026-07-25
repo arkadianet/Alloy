@@ -173,7 +173,7 @@ impl RuntimeHandle {
 
         // Re-flush under write lock if sync APIs queued more events.
         {
-            let pending = {
+            let mut pending = {
                 let mut q = self
                     .inner
                     .pending_runtime_events
@@ -181,8 +181,24 @@ impl RuntimeHandle {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 std::mem::take(&mut *q)
             };
-            for ev in pending {
-                guard.append_runtime(ev).await?;
+            let mut i = 0;
+            while i < pending.len() {
+                match guard.append_runtime(pending[i].clone()).await {
+                    Ok(()) => i += 1,
+                    Err(e) => {
+                        // Restore the failed event and everything behind it.
+                        let remaining = pending.split_off(i);
+                        let mut q = self
+                            .inner
+                            .pending_runtime_events
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut restored = remaining;
+                        restored.append(&mut *q);
+                        *q = restored;
+                        return Err(e.into());
+                    }
+                }
             }
         }
 
@@ -229,7 +245,7 @@ impl RuntimeHandle {
 
     /// Drain sync-queued host events into the sink in FIFO order.
     pub(crate) async fn flush_pending_runtime_events(&self) -> Result<(), RuntimeError> {
-        let pending = {
+        let mut pending = {
             let mut q = self
                 .inner
                 .pending_runtime_events
@@ -241,8 +257,23 @@ impl RuntimeHandle {
             return Ok(());
         }
         let sink = self.inner.event_sink.read().await;
-        for ev in pending {
-            sink.append_runtime(ev).await?;
+        let mut i = 0;
+        while i < pending.len() {
+            match sink.append_runtime(pending[i].clone()).await {
+                Ok(()) => i += 1,
+                Err(e) => {
+                    let remaining = pending.split_off(i);
+                    let mut q = self
+                        .inner
+                        .pending_runtime_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut restored = remaining;
+                    restored.append(&mut *q);
+                    *q = restored;
+                    return Err(e.into());
+                }
+            }
         }
         Ok(())
     }

@@ -54,20 +54,38 @@ impl From<StoreError> for EventSinkError {
     }
 }
 
-impl From<rusqlite::Error> for StoreError {
-    fn from(e: rusqlite::Error) -> Self {
-        match e {
-            rusqlite::Error::SqliteFailure(err, _msg)
-                if err.code == rusqlite::ErrorCode::DatabaseBusy
-                    || err.code == rusqlite::ErrorCode::DatabaseLocked =>
-            {
+/// Convert a rusqlite error using SQLite error codes (not message substrings).
+pub(crate) fn from_rusqlite(e: rusqlite::Error) -> StoreError {
+    match e {
+        rusqlite::Error::SqliteFailure(err, msg) => match err.code {
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
                 StoreError::Busy
             }
-            rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("UNIQUE") => {
-                StoreError::Conflict(msg)
+            rusqlite::ErrorCode::ConstraintViolation => {
+                StoreError::Conflict(msg.unwrap_or_else(|| "constraint violation".into()))
             }
-            other => StoreError::Io(other.to_string()),
-        }
+            rusqlite::ErrorCode::DatabaseCorrupt
+            | rusqlite::ErrorCode::NotADatabase
+            | rusqlite::ErrorCode::SchemaChanged => {
+                StoreError::Corrupt(msg.unwrap_or_else(|| err.to_string()))
+            }
+            rusqlite::ErrorCode::SystemIoFailure
+            | rusqlite::ErrorCode::DiskFull
+            | rusqlite::ErrorCode::CannotOpen
+            | rusqlite::ErrorCode::ReadOnly
+            | rusqlite::ErrorCode::NoLargeFileSupport
+            | rusqlite::ErrorCode::PermissionDenied => {
+                StoreError::Io(msg.unwrap_or_else(|| err.to_string()))
+            }
+            _ => StoreError::Internal(msg.unwrap_or_else(|| format!("{err:?}"))),
+        },
+        other => StoreError::Internal(other.to_string()),
+    }
+}
+
+impl From<rusqlite::Error> for StoreError {
+    fn from(e: rusqlite::Error) -> Self {
+        from_rusqlite(e)
     }
 }
 

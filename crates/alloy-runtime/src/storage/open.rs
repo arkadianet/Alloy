@@ -11,10 +11,17 @@ use super::paths::StorageOpenOptions;
 /// Shared SQLite connection guarded for single-process MVP use.
 #[derive(Debug)]
 pub struct DbHandle {
-    conn: Mutex<Connection>,
+    conn: Mutex<Option<Connection>>,
 }
 
 impl DbHandle {
+    /// Wrap an open connection.
+    pub(crate) fn new(conn: Connection) -> Arc<Self> {
+        Arc::new(Self {
+            conn: Mutex::new(Some(conn)),
+        })
+    }
+
     /// Lock the connection for a synchronous operation.
     pub fn with<F, T>(&self, f: F) -> Result<T, StoreError>
     where
@@ -24,7 +31,8 @@ impl DbHandle {
             .conn
             .lock()
             .map_err(|_| StoreError::Internal("db mutex poisoned".into()))?;
-        f(&guard)
+        let conn = guard.as_ref().ok_or(StoreError::Closed)?;
+        f(conn)
     }
 
     /// Lock the connection mutably (needed for some rusqlite transaction helpers).
@@ -36,7 +44,17 @@ impl DbHandle {
             .conn
             .lock()
             .map_err(|_| StoreError::Internal("db mutex poisoned".into()))?;
-        f(&mut guard)
+        let conn = guard.as_mut().ok_or(StoreError::Closed)?;
+        f(conn)
+    }
+
+    /// Take the connection out for final close (idempotent).
+    pub(crate) fn take_connection(&self) -> Result<Option<Connection>, StoreError> {
+        let mut guard = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Internal("db mutex poisoned".into()))?;
+        Ok(guard.take())
     }
 }
 
@@ -66,9 +84,7 @@ pub fn open_db(opts: &StorageOpenOptions) -> Result<(Arc<DbHandle>, u32), StoreE
     // Warn on orphan CAS files (file without index) — do not delete in MVP.
     warn_orphan_blobs(&conn, &opts.layout.artifacts_dir);
 
-    let handle = Arc::new(DbHandle {
-        conn: Mutex::new(conn),
-    });
+    let handle = DbHandle::new(conn);
     debug_assert!(version >= CODE_SCHEMA_VERSION || !opts.refuse_newer_schema);
     Ok((handle, version))
 }

@@ -30,21 +30,32 @@ pub async fn install_sqlite_event_sink(
     let storage = Arc::new(storage);
     let events = storage.events();
 
-    handle
+    let result = handle
         .handoff_event_sink(events.clone(), {
             let events = Arc::clone(&events);
-            move |snap| async move { events.import_handoff_snapshot(snap).await }
+            move |snap| async move {
+                let runtime_n = snap.runtime.len();
+                let session_n: usize = snap.sessions.values().map(Vec::len).sum();
+                tracing::info!(
+                    runtime_events = runtime_n,
+                    session_events = session_n,
+                    "draining in-memory sink into sqlite"
+                );
+                events.import_handoff_snapshot(snap).await
+            }
         })
-        .await?;
+        .await;
 
-    storage.metrics_handle().inc_handoffs();
-    let snap = storage.metrics();
-    tracing::info!(
-        events = snap.events_appended,
-        runtime = snap.runtime_events_appended,
-        "sqlite event sink installed"
-    );
-    Ok(storage)
+    match result {
+        Ok(()) => {
+            storage.metrics_handle().inc_handoffs();
+            Ok(storage)
+        }
+        Err(e) => {
+            let _ = storage.close().await;
+            Err(e)
+        }
+    }
 }
 
 /// Map [`StoreError`] into [`RuntimeError`] for install / handoff boundaries.
