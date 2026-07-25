@@ -320,10 +320,7 @@ pub fn probe_seatbelt_sync() -> Result<String, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let dir = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
     let sb = dir.join("probe.sb");
-    // Mirror the production shape: deny default, allow pipes + process + /usr,
-    // then exec /usr/bin/true. If this aborts, Seatbelt is Unavailable.
-    let body = format!(
-        r#"(version 1)
+    let body = r#"(version 1)
 (deny default)
 (allow process*)
 (allow process-exec*)
@@ -331,9 +328,8 @@ pub fn probe_seatbelt_sync() -> Result<String, String> {
 (allow sysctl-read)
 (allow mach-lookup)
 (allow file-read-metadata)
-(allow file-write* (vnode-type PIPE))
-(allow file-write* (vnode-type SOCKET))
-(allow file-ioctl (vnode-type PIPE))
+(allow file-write* (regex #"^(/private)?/dev/fd/"))
+(allow file-ioctl (regex #"^(/private)?/dev/fd/"))
 (allow file-read* (subpath "/usr"))
 (allow file-read* (subpath "/bin"))
 (allow file-read* (subpath "/System"))
@@ -341,8 +337,7 @@ pub fn probe_seatbelt_sync() -> Result<String, String> {
 (allow file-read* file-write* (literal "/dev/null"))
 (allow process-exec (literal "/usr/bin/true"))
 (deny network*)
-"#
-    );
+"#;
     let result = (|| {
         std::fs::write(&sb, body).map_err(|e| e.to_string())?;
         let out = std::process::Command::new("/usr/bin/sandbox-exec")

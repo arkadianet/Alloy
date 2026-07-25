@@ -3,7 +3,6 @@
 ;; RO cargo/rustup roots and deny clauses are appended by the broker from
 ;; IsolateContext (must match Linux allowlisted_ro_subtrees).
 ;; {{BROKER_DIR}} is outside the jail (SBPL + trampoline); never jail-writable.
-;; Do NOT grant whole /tmp — only the broker-owned leaf directory.
 (version 1)
 (deny default)
 (allow process*)
@@ -12,10 +11,9 @@
 (allow sysctl-read)
 (allow mach-lookup)
 (allow file-read-metadata)
-;; Inherited stdio / ready-byte pipes — without this, the first write SIGABRTs.
-(allow file-write* (vnode-type PIPE))
-(allow file-write* (vnode-type SOCKET))
-(allow file-ioctl (vnode-type PIPE))
+;; Inherited stdio / ready-byte pipes (vnode-type PIPE is unbound on modern macOS).
+(allow file-write* (regex #"^(/private)?/dev/fd/"))
+(allow file-ioctl (regex #"^(/private)?/dev/fd/"))
 (allow file-read* file-write* (subpath {{JAIL}}))
 (allow file-read* file-write* (subpath {{TMP}}))
 (allow file-read* file-write* (subpath {{HOME}}))
