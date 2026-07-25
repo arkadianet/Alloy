@@ -90,7 +90,7 @@ pub async fn run_isolated(
 /// deny-globs must still bind over. Do **not** prune `.git` — credentials and
 /// hooks can live there and PathPolicy would deny them. Truncation is
 /// fail-closed (see below).
-const SKIP_DIR_NAMES: &[&str] = &["target", ".alloy-sbx", "alloy-sbx-binds"];
+const SKIP_DIR_NAMES: &[&str] = &["target", ".alloy-sbx"];
 
 /// Collect deny-glob matches under `jail`.
 ///

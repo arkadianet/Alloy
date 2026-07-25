@@ -172,6 +172,7 @@ if [[ "${1:-}" != "--" ]]; then
 fi
 shift
 printf 'x' >&"$ready_fd" || exit 75
+shopt -s execfail
 exec -a "$argv0" "$program" "$@" || exit 76
 "#;
     write_mode_0600(path, BODY.as_bytes())?;

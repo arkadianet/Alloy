@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::ffi::CString;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 
 use landlock::{
@@ -33,10 +34,6 @@ struct LandlockPlan {
     require_id_maps: bool,
 }
 
-/// Marker in `pre_exec` I/O errors so missing binaries are not misreported as
-/// isolation failures.
-const ISOLATE_ERR: &str = "alloy.sandbox.landlock_isolate";
-
 impl LinuxLandlockBackend {
     /// Execute under Landlock + userns + netns.
     pub async fn exec(
@@ -60,6 +57,21 @@ impl LinuxLandlockBackend {
         let cwd = ctx.cwd.clone();
         let env = ctx.env.clone();
 
+        // Ready-byte pipe: written only after `apply_plan` succeeds. std transmits
+        // only errno across fork, so a string marker cannot distinguish isolation
+        // failure from a missing binary — this pipe is the structural signal.
+        let (mut ready_r, ready_w) = isolation_pipe()?;
+        let ready_fd = ready_w.as_raw_fd();
+        clear_cloexec(ready_fd)?;
+        let ready_w_fd = ready_w.into_raw_fd();
+        let after_spawn = Box::new(move || unsafe {
+            libc::close(ready_w_fd);
+        });
+
+        let ready_wait = profile.exec_timeout;
+        let ready_task =
+            tokio::task::spawn_blocking(move || read_isolation_ready(&mut ready_r, ready_wait));
+
         let outcome = spawn_supervised(SpawnSpec {
             program,
             argv,
@@ -72,33 +84,98 @@ impl LinuxLandlockBackend {
                 let plan = plan
                     .take()
                     .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-                apply_plan(plan)
-                    .map_err(|e| std::io::Error::new(e.kind(), format!("{ISOLATE_ERR}: {e}")))
+                // No allocation/formatting in the multi-threaded child (§5.5).
+                apply_plan(plan)?;
+                // Signal isolation applied before execve.
+                loop {
+                    let n = unsafe { libc::write(ready_fd, b"x".as_ptr().cast(), 1) };
+                    if n == 1 {
+                        break;
+                    }
+                    if n < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
+                Ok(())
             })),
-            after_spawn: None,
+            after_spawn: Some(after_spawn),
         })
         .await;
 
+        let got_ready = ready_task.await.unwrap_or(false);
         // Keep empty-dir bind sources alive until the child returns.
         drop(bind_dir);
 
-        // Probe said Available, but exec-time userns/netns/landlock failed.
-        // Under network=Deny that is "cannot enforce", not "backend missing"
-        // (RFC §5.5): operators must not be steered to reinstall a present ABI.
-        match outcome {
-            Err(SandboxError::Io(ref e)) if is_isolation_io(e) => {
-                Err(SandboxError::BackendCannotEnforce(format!(
-                    "landlock isolation failed at exec under network=deny \
-                     (userns/netns/landlock): {e}"
-                )))
-            }
-            other => other,
-        }
+        map_isolation_outcome(outcome, got_ready)
     }
 }
 
-fn is_isolation_io(e: &std::io::Error) -> bool {
-    e.to_string().contains(ISOLATE_ERR)
+/// Map spawn outcome + isolation ready-byte into RFC §5.5 errors.
+///
+/// Ready means Landlock/userns applied before `execve`. Without it, an `Io`
+/// error is an isolation failure (`BackendCannotEnforce`), not a missing ABI.
+fn map_isolation_outcome(
+    outcome: Result<SupervisedOutcome, SandboxError>,
+    got_ready: bool,
+) -> Result<SupervisedOutcome, SandboxError> {
+    match (outcome, got_ready) {
+        (Ok(out), true) => Ok(out),
+        (Err(SandboxError::Io(e)), true) => Err(SandboxError::Io(e)),
+        (Ok(out), false) => Err(SandboxError::BackendCannotEnforce(format!(
+            "landlock isolation failed at exec under network=deny \
+             (child exited before isolation ready-byte; exit={:?} signal={:?})",
+            out.exit_code, out.signal
+        ))),
+        (Err(SandboxError::Io(e)), false) => Err(SandboxError::BackendCannotEnforce(format!(
+            "landlock isolation failed at exec under network=deny \
+             (userns/netns/landlock): {e}"
+        ))),
+        (Err(e), _) => Err(e),
+    }
+}
+
+fn isolation_pipe() -> Result<(std::fs::File, std::fs::File), SandboxError> {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(SandboxError::Io(std::io::Error::last_os_error()));
+    }
+    let r = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let w = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    Ok((r, w))
+}
+
+fn clear_cloexec(fd: i32) -> Result<(), SandboxError> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(SandboxError::Io(std::io::Error::last_os_error()));
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    if rc != 0 {
+        return Err(SandboxError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn read_isolation_ready(ready_r: &mut std::fs::File, wait: std::time::Duration) -> bool {
+    use std::io::Read;
+    let fd = ready_r.as_raw_fd();
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if rc <= 0 {
+        return false;
+    }
+    let mut buf = [0u8; 1];
+    matches!(ready_r.read(&mut buf), Ok(1) if buf[0] == b'x')
 }
 
 fn prepare_plan(
@@ -518,5 +595,22 @@ mod tests {
         };
         assert!(matches!(a, SandboxError::BackendCannotEnforce(_)));
         assert!(matches!(b, SandboxError::BackendUnavailable { .. }));
+    }
+
+    #[test]
+    fn isolation_ready_byte_maps_cannot_enforce() {
+        let io = SandboxError::Io(std::io::Error::from_raw_os_error(libc::EPERM));
+        let err = map_isolation_outcome(Err(io), false).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::BackendCannotEnforce(_)),
+            "no ready-byte + Io must be BackendCannotEnforce, got {err:?}"
+        );
+
+        let io = SandboxError::Io(std::io::Error::from_raw_os_error(libc::ENOENT));
+        let err = map_isolation_outcome(Err(io), true).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::Io(_)),
+            "ready-byte + Io (e.g. missing binary) must stay Io, got {err:?}"
+        );
     }
 }

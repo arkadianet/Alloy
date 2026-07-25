@@ -79,6 +79,13 @@ arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
   itself (Landlock's mount hooks deny `umount`/`mount` for sandboxed tasks even
   if a nested userns restores capabilities); the cap drop is defense-in-depth.
   Verified by `child_cannot_umount_dotenv_bind`.
+  **Orphan note:** supervision kills the process group and bounds stdio drains
+  by `exec_timeout`. A payload that calls `setsid` (or otherwise leaves the
+  session) while holding an inherited pipe can still escape the group signal;
+  MVP does not yet add `CLONE_NEWPID` (deferred: needs a private `/proc` mount).
+  Container backends already get PID-namespace teardown via the runtime
+  `--init`. Operators should treat long-running daemonization inside
+  `build.rs` as a residual availability risk until NEWPID lands.
 - **Seatbelt** uses `/usr/bin/sandbox-exec` (Apple-deprecated). MVP uses a bash
   trampoline for the ready-byte handshake and `exec -a` argv0 preservation;
   arguments are never re-joined into an unquoted `bash -c` string. The SBPL and

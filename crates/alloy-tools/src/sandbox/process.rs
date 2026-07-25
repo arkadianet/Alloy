@@ -160,15 +160,12 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
         Some(Ok(status)) => status,
         Some(Err(e)) => {
             guard.kill_group().await;
-            let _ = out_task.await;
-            let _ = err_task.await;
+            abort_drains(out_abort, err_abort, out_task, err_task).await;
             return Err(SandboxError::Io(e));
         }
         None => {
             guard.kill_group().await;
-            // Pipes are closed once the group is gone, so these joins finish.
-            let _ = out_task.await;
-            let _ = err_task.await;
+            abort_drains(out_abort, err_abort, out_task, err_task).await;
             return Err(SandboxError::Timeout(spec.exec_timeout));
         }
     };
@@ -217,6 +214,23 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
             Err(SandboxError::Timeout(spec.exec_timeout))
         }
     }
+}
+
+/// Abort stdio drains and wait briefly so a session-escaping orphan holding a
+/// pipe cannot hang `exec` forever after kill_group (RFC §6.4 wall clock).
+async fn abort_drains(
+    out_abort: tokio::task::AbortHandle,
+    err_abort: tokio::task::AbortHandle,
+    out_task: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+    err_task: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, bool)>>,
+) {
+    out_abort.abort();
+    err_abort.abort();
+    let _ = timeout(Duration::from_millis(200), async {
+        let _ = out_task.await;
+        let _ = err_task.await;
+    })
+    .await;
 }
 
 /// Carries a `Send`-only value through an API that asks for `Sync`.
