@@ -1,0 +1,5 @@
+# router.toml.example — Author: arkadianet
+# Copy to router.toml (active config). Only api_key_env is read in RFC-0001;
+# kind/base_url/tiers arrive with RFC-0007.
+[provider.default]
+api_key_env = "ALLOY_API_KEY"

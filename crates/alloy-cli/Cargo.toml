@@ -1,0 +1,25 @@
+[package]
+name = "alloy-cli"
+description = "Alloy command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "alloy"
+path = "src/main.rs"
+
+[dependencies]
+alloy-runtime = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+alloy-runtime = { workspace = true }
+tokio = { workspace = true }

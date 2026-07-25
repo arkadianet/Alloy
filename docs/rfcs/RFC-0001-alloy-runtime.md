@@ -98,6 +98,7 @@ macro_rules! uuid_id {
         impl $name {
             pub fn new() -> Self { Self(Uuid::new_v4()) }
             pub fn as_uuid(&self) -> &Uuid { &self.0 }
+            // No Default — callers must use `new()` so random UUIDs are never implicit.
         }
 
         impl std::fmt::Display for $name {
@@ -465,7 +466,9 @@ pub struct RuntimeHandle {
 impl RuntimeHandle {
     pub fn phase(&self) -> RuntimePhase { /* … */ }
     pub fn cancellation(&self) -> CancellationToken { /* … */ }
-    pub fn config(&self) -> Arc<RuntimeConfig> { /* clone Arc, never return & from lock */ }
+    /// Clone Arc of loaded config. Errors with `InvalidPhase` if not yet `configure`d
+    /// (never panics; never returns a lock guard).
+    pub fn config(&self) -> Result<Arc<RuntimeConfig>, RuntimeError> { /* … */ }
 
     /// Install or replace Scheduler.
     /// - Allowed in `Configured` (pre-start inject) and `Running` when no DAG is active.
@@ -648,7 +651,14 @@ pub trait SessionService: Send + Sync {
     async fn create(&self, req: CreateSession) -> Result<SessionId, SessionError>;
     async fn resume(&self, id: SessionId) -> Result<Session, SessionError>;
     async fn submit_goal(&self, id: SessionId, goal: Goal) -> Result<RunId, SessionError>;
-    async fn events(&self, id: SessionId, after: EventSeq) -> Result<Vec<SessionEvent>, SessionError>;
+    /// Exclusive cursor + page limit. `after: None` starts at `EventSeq(0)`.
+    /// `after: Some(seq)` returns events with `seq > after`. Impls clamp via `MAX_EVENTS_PAGE`.
+    async fn events(
+        &self,
+        id: SessionId,
+        after: Option<EventSeq>,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>, SessionError>;
 }
 
 #[async_trait]
@@ -779,7 +789,7 @@ pub struct WorkerMetrics {
     pub tool_calls: u32,
     pub cache_hits: u32,
     pub duration_ms: u64,
-    pub confidence: f32,
+    pub confidence: Option<f32>, // None when provider confidence unavailable
     pub error_class: Option<ErrorClass>,
 }
 
@@ -1183,8 +1193,11 @@ pub enum AdapterError {
 ### Data dir precedence (pinned)
 
 1. `ALLOY_DATA_DIR` if set and non-empty  
-2. else `<workspace_root>/.alloy` when a workspace root is known to the loader  
-3. else XDG data dir (`$XDG_DATA_HOME/alloy` or platform default)  
+2. else `ConfigPaths.data_dir` programmatic override when set  
+3. else `<workspace_root>/.alloy` when a workspace root is known to the loader  
+4. else XDG data dir (`$XDG_DATA_HOME/alloy` or platform default)  
+
+`ALLOY_PROFILE` / `ALLOY_ROUTER` select TOML paths when constructing [`ConfigPaths::for_workspace`] (defaults: `profiles/default.toml`, active `router.toml`). Never parse or write a `.env` file.
 
 Error messages must cite which rule won and the `example.env` hint path (never invent a `.env` path to write).
 
@@ -1197,27 +1210,25 @@ Error messages must cite which rule won and the `example.env` hint path (never i
 # Provider key name referenced by router.toml api_key_env
 ALLOY_API_KEY=
 
-# Optional overrides
-# ALLOY_DATA_DIR=
+# Optional overrides (process env; Alloy never writes .env)
+# ALLOY_DATA_DIR=                 # data dir (else <workspace>/.alloy else XDG)
 # ALLOY_PROFILE=profiles/default.toml
-# ALLOY_ROUTER=router.toml
+# ALLOY_ROUTER=router.toml        # active router (copy from router.toml.example)
 # RUST_LOG=alloy_runtime=info,alloy_cli=info
 ```
 
 ### `profiles/default.toml` (skeleton; full wiring RFC-0015)
 
+Only fields consumed by RFC-0001 `RuntimeConfig::load` are listed. Parallelism defaults live on `BudgetPolicy` type defaults until RFC-0015.
+
 ```toml
 # profiles/default.toml — Author: arkadianet
 [profile]
 id = "default"
-description = "Correctness-first Rust profile"
 
 [budgets]
 max_usd_per_run = 5.0
 max_tokens_per_run = 2_000_000
-max_parallel_nodes = 1
-max_parallel_cargo = 1
-max_parallel_edits = 1
 
 [observability]
 retain_full_prompts = false
@@ -1226,17 +1237,12 @@ retain_tool_bodies = false
 
 ### `router.toml.example` (placeholder; RFC-0007)
 
+Template only — copy to user-owned `router.toml`. RFC-0001 reads `api_key_env` for presence warnings.
+
 ```toml
 # router.toml.example — Author: arkadianet
 [provider.default]
-kind = "openai_compatible"
-base_url = "https://api.example.com/v1"
 api_key_env = "ALLOY_API_KEY"
-
-[tiers]
-repair = "standard"
-edit = "standard"
-review = "economy"
 ```
 
 ### Load sketch
@@ -1244,10 +1250,15 @@ review = "economy"
 ```rust
 pub struct ConfigPaths {
     pub profile: PathBuf,
-    pub router: PathBuf,
-    pub example_env: PathBuf, // for error messages only
-    pub data_dir: Option<PathBuf>,
+    pub router: PathBuf,           // active router.toml (not .example)
+    pub example_env: PathBuf,      // for error messages only
+    pub data_dir: Option<PathBuf>, // after ALLOY_DATA_DIR, before workspace/XDG
     pub workspace_root: Option<PathBuf>,
+}
+
+impl ConfigPaths {
+    /// Honors ALLOY_PROFILE / ALLOY_ROUTER; defaults to profiles/default.toml + router.toml.
+    pub fn for_workspace(workspace_root: PathBuf) -> Self { /* … */ }
 }
 
 // RuntimeConfig::load:

@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+.DS_Store
+/.alloy/
+# Never commit secrets; Alloy documents example.env only.
+.env
+.env.*
+!.env.example
