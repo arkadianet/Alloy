@@ -1,10 +1,36 @@
 [package]
 name = "alloy-tools"
-description = "Alloy MCP host and sandbox tooling (stub until RFC-0005/0006)"
+description = "Alloy MCP host and sandbox tooling (RFC-0005 sandbox broker)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Test-only hooks (never enable in release profiles).
+test-hooks = []
+
 [dependencies]
+alloy-runtime = { workspace = true }
+async-trait = { workspace = true }
+globset = { workspace = true }
+libc = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+which = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

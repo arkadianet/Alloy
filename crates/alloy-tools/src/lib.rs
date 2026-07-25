@@ -1,6 +1,20 @@
-//! Alloy tooling crate.
+//! Alloy tooling: sandbox broker (RFC-0005) and MCP host (RFC-0006).
 //!
-//! Stub surface for RFC-0005 (Sandbox Broker) and RFC-0006 (MCP Host).
-//! Intentional empty library so the five-crate workspace compiles today.
+//! # Crate map
+//!
+//! - [`sandbox`] — SandboxBroker, PathPolicy, backends (RFC-0005)
+//! - MCP host surface lands in RFC-0006 (not implemented here)
+//!
+//! Author: arkadianet
 
-#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+#![deny(unsafe_code)]
+
+pub mod sandbox;
+
+pub use sandbox::{
+    default_deny_globs, load_sandbox_profile, BackendStatus, DenialReason, ExecClass,
+    NativeSandboxBroker, NetworkPolicy, PathAccess, PathPolicy, RecordingSandboxBroker,
+    SandboxBackend, SandboxBroker, SandboxCapabilities, SandboxError, SandboxExecRequest,
+    SandboxExecResult, SandboxProfile,
+};

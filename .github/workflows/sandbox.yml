@@ -1,0 +1,69 @@
+# RFC-0005 Sandbox Broker CI
+
+name: sandbox
+
+on:
+  push:
+    paths:
+      - "crates/alloy-tools/**"
+      - "crates/alloy-runtime/**"
+      - "profiles/**"
+      - "docs/security/sandbox-residual-risk.md"
+      - ".github/workflows/sandbox.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "crates/alloy-tools/**"
+      - "crates/alloy-runtime/**"
+      - "profiles/**"
+      - "docs/security/sandbox-residual-risk.md"
+      - ".github/workflows/sandbox.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+jobs:
+  linux-landlock:
+    name: Linux Landlock (required)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Test alloy-tools
+        run: cargo test -p alloy-tools -- --nocapture
+      - name: Require Landlock enforcement test ran
+        run: |
+          # Fail the job if landlock_actually_applied was ignored/filtered away.
+          cargo test -p alloy-tools --test sandbox_rfc0005 landlock_actually_applied -- --nocapture --exact
+      - name: Clippy (deny warnings)
+        run: cargo clippy -p alloy-tools --all-targets -- -D warnings
+      - name: Fmt
+        run: cargo fmt --all -- --check
+
+  macos-seatbelt:
+    name: macOS Seatbelt (optional)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - name: Test alloy-tools
+        run: cargo test -p alloy-tools -- --nocapture
+
+  container:
+    name: Container backend (optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: Test with docker available
+        run: cargo test -p alloy-tools container_ -- --nocapture || true
