@@ -11,7 +11,9 @@ max_tokens_per_run = 2_000_000
 retain_full_prompts = false
 retain_tool_bodies = false
 
-# Sandbox (RFC-0005). On macOS set check = "seatbelt". Container is an acceptable fallback.
+# Sandbox (RFC-0005). On macOS prefer check = "container" when sandbox-exec
+# deny-default profiles are Unavailable (see docs/security/sandbox-residual-risk.md).
+# Container is an acceptable fallback for both check and test classes.
 [sandbox]
 check = "landlock"
 test = "container"

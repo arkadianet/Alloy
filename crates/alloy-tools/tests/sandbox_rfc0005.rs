@@ -57,8 +57,34 @@ fn sleep_bin() -> &'static str {
     }
 }
 
-fn require_landlock() -> bool {
-    std::env::var_os("ALLOY_REQUIRE_LANDLOCK").is_some()
+fn require_seatbelt() -> bool {
+    std::env::var_os("ALLOY_REQUIRE_SEATBELT").is_some()
+}
+
+/// Returns `true` when Seatbelt is Available. When required by CI, panics if not.
+async fn seatbelt_or_skip() -> bool {
+    let dir = tempdir().unwrap();
+    let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
+    profile.check_backend = SandboxBackend::Seatbelt;
+    profile.test_backend = SandboxBackend::Seatbelt;
+    let (available, detail) = match NativeSandboxBroker::new(profile).await {
+        Ok(b) => match &b.capabilities().seatbelt {
+            BackendStatus::Available { detail } => (true, detail.clone()),
+            BackendStatus::Unavailable { reason } => (false, reason.clone()),
+            other => (false, format!("{other:?}")),
+        },
+        Err(SandboxError::BackendUnavailable { message, .. }) => (false, message),
+        Err(SandboxError::UnsupportedOs) => (false, "unsupported OS".into()),
+        Err(e) => panic!("unexpected broker error: {e:?}"),
+    };
+    if available {
+        return true;
+    }
+    if require_seatbelt() {
+        panic!("ALLOY_REQUIRE_SEATBELT=1 but Seatbelt is Unavailable: {detail}");
+    }
+    eprintln!("skip: seatbelt unavailable ({detail}); set ALLOY_REQUIRE_SEATBELT=1 to fail");
+    false
 }
 
 /// Returns `true` when Landlock is Available. When required by CI, panics if not.
@@ -679,6 +705,9 @@ async fn landlock_cargo_version_fixture() {
 #[tokio::test]
 #[cfg(target_os = "macos")]
 async fn seatbelt_cargo_check_fixture() {
+    if !seatbelt_or_skip().await {
+        return;
+    }
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let fixture_root = fixtures.join("sbx_check");
     assert!(fixture_root.join("Cargo.toml").is_file());
@@ -688,10 +717,9 @@ async fn seatbelt_cargo_check_fixture() {
     let mut profile = SandboxProfile::default_for_jail(jail).unwrap();
     profile.check_backend = SandboxBackend::Seatbelt;
     profile.test_backend = SandboxBackend::Seatbelt;
-    let broker = match NativeSandboxBroker::new(profile).await {
-        Ok(b) => b,
-        Err(e) => panic!("Seatbelt broker required on macOS CI: {e}"),
-    };
+    let broker = NativeSandboxBroker::new(profile)
+        .await
+        .expect("seatbelt available");
     assert!(matches!(
         broker.capabilities().seatbelt,
         BackendStatus::Available { .. }
@@ -722,6 +750,9 @@ async fn seatbelt_cargo_check_fixture() {
 #[tokio::test]
 #[cfg(target_os = "macos")]
 async fn seatbelt_denies_outside_jail_read() {
+    if !seatbelt_or_skip().await {
+        return;
+    }
     let outer = tempdir().unwrap();
     let sentinel = outer.path().join("secret.txt");
     std::fs::write(&sentinel, b"outside-secret").unwrap();
@@ -730,7 +761,9 @@ async fn seatbelt_denies_outside_jail_read() {
     let jail = dir.path().canonicalize().unwrap();
     let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
     profile.check_backend = SandboxBackend::Seatbelt;
-    let broker = NativeSandboxBroker::new(profile).await.expect("seatbelt");
+    let broker = NativeSandboxBroker::new(profile)
+        .await
+        .expect("seatbelt available");
 
     let script = jail.join("try_read.sh");
     std::fs::write(

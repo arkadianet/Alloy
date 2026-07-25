@@ -349,7 +349,9 @@ pub fn probe_seatbelt_sync() -> Result<String, String> {
             Ok("sandbox-exec deny-default probe ok".into())
         } else {
             Err(format!(
-                "sandbox-exec probe failed: status={} stderr={}",
+                "sandbox-exec deny-default probe failed (Seatbelt Unavailable; \
+                 on macOS 26+ runners sandbox-exec often SIGABRTs deny-default \
+                 profiles — use check=container): status={} stderr={}",
                 out.status,
                 String::from_utf8_lossy(&out.stderr)
             ))

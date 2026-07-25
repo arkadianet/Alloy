@@ -83,6 +83,12 @@ arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
   arguments are never re-joined into an unquoted `bash -c` string. The SBPL and
   trampoline are written under a broker-owned 0700 directory **outside** the jail
   (never under `.alloy-sbx`), so jail-writable `build.rs` cannot rewrite policy.
+  **Host caveat:** on current macOS 26 GitHub runners, `sandbox-exec` SIGABRTs
+  when applying deny-default profiles (even a minimal probe of `/usr/bin/true`).
+  The probe therefore reports Seatbelt `Unavailable` and
+  `NativeSandboxBroker::new` fails closed when `check=seatbelt`. Operators on
+  affected hosts should set `check = "container"` (or run Linux Landlock) until
+  a non-deprecated Seatbelt/AppSandbox path replaces `sandbox-exec`.
 - **Container** depends on docker/podman availability and a pinned image
   (`rust:1.97.1-bookworm` by default). Runtime cleanup uses a cidfile drop-guard
   on every exit path. The cidfile and env-file live under the jail (RFC-mandated
