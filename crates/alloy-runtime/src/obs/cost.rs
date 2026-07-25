@@ -15,6 +15,10 @@ pub struct CostSnapshot {
     /// Accumulated known output tokens.
     pub tokens_out: u64,
     /// Sum of reported USD amounts. `None` until the first finite non-negative USD update.
+    ///
+    /// `None` MUST NOT be presented as a measured zero cost in user-facing output;
+    /// [`CostMeter::to_budget_snapshot`] maps it to `0.0` only for the
+    /// [`BudgetSnapshot`](crate::BudgetSnapshot) field type.
     pub usd_spent: Option<f64>,
     /// Number of model-usage updates recorded.
     pub model_calls: u64,
@@ -101,23 +105,18 @@ impl CostMeter {
         usd: Option<f64>,
     ) {
         self.model_calls = self.model_calls.saturating_add(1);
-        let tier_cost = self.tier_mut(tier);
-        tier_cost.calls = tier_cost.calls.saturating_add(1);
 
         if let Some(n) = input {
             self.tokens_in = self.tokens_in.saturating_add(n);
-            let tier_cost = self.tier_mut(tier);
-            tier_cost.tokens_in = tier_cost.tokens_in.saturating_add(n);
         }
         if let Some(n) = output {
             self.tokens_out = self.tokens_out.saturating_add(n);
-            let tier_cost = self.tier_mut(tier);
-            tier_cost.tokens_out = tier_cost.tokens_out.saturating_add(n);
         }
         if input.is_none() || output.is_none() {
             self.unknown_token_events = self.unknown_token_events.saturating_add(1);
         }
 
+        let mut usd_add: Option<f64> = None;
         if let Some(x) = usd {
             if !x.is_finite() {
                 tracing::warn!("non-finite usd ignored");
@@ -125,9 +124,20 @@ impl CostMeter {
                 tracing::warn!("negative usd ignored");
             } else {
                 self.usd_spent = Some(saturating_add_usd(self.usd_spent, x));
-                let tier_cost = self.tier_mut(tier);
-                tier_cost.usd = Some(saturating_add_usd(tier_cost.usd, x));
+                usd_add = Some(x);
             }
+        }
+
+        let tier_cost = self.tier_mut(tier);
+        tier_cost.calls = tier_cost.calls.saturating_add(1);
+        if let Some(n) = input {
+            tier_cost.tokens_in = tier_cost.tokens_in.saturating_add(n);
+        }
+        if let Some(n) = output {
+            tier_cost.tokens_out = tier_cost.tokens_out.saturating_add(n);
+        }
+        if let Some(x) = usd_add {
+            tier_cost.usd = Some(saturating_add_usd(tier_cost.usd, x));
         }
     }
 
@@ -336,6 +346,13 @@ mod tests {
         let mut m = CostMeter::new();
         m.add_model_usage(ModelTier::Standard, Some(1), Some(1), None);
         assert!(m.snapshot().usd_spent.is_none());
+    }
+
+    #[test]
+    fn cost_zero_usd_is_some_zero() {
+        let mut m = CostMeter::new();
+        m.add_model_usage(ModelTier::Standard, Some(0), Some(0), Some(0.0));
+        assert_eq!(m.snapshot().usd_spent, Some(0.0));
     }
 
     #[test]

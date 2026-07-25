@@ -12,14 +12,19 @@ use crate::storage::EventStore;
 use crate::types::ids::{EventSeq, RunId, SessionId};
 
 /// Max store pages scanned per [`list_decision_events`] call before yielding a resume cursor.
-const MAX_SCAN_PAGES: usize = 16;
+pub(crate) const MAX_SCAN_PAGES: usize = 16;
 
 /// Page of decision-related session events.
 #[derive(Debug, Clone)]
 pub struct DecisionPage {
     /// Matching events in ascending seq order.
     pub events: Vec<SessionEvent>,
-    /// Exclusive resume cursor (`after` on the next call). `None` when the scan reached the end.
+    /// Exclusive resume cursor: pass as `after` on the next call.
+    ///
+    /// - `None` — the scan reached the end of the session log (no more events to scan).
+    /// - `Some(seq)` — more store events may exist after `seq` (including when the
+    ///   [`MAX_SCAN_PAGES`] budget was exhausted **with zero matches**). Callers MUST
+    ///   resume with `after = next_after` rather than stopping on empty `events`.
     pub next_after: Option<EventSeq>,
 }
 
@@ -31,11 +36,36 @@ fn is_decision_related(t: SessionEventType) -> bool {
 }
 
 /// Page matching `Decision` | `ModelCall` | `ToolCall` via dyn-safe `list_session_events`.
+///
+/// # Cursor contract (RFC-0004 §3.14)
+///
+/// - Ascending `seq` order.
+/// - `limit == 0` is treated as `1` matching event max.
+/// - `limit` is the max **matching** events returned (clamped to [`MAX_EVENTS_PAGE`]).
+/// - Internally scans store pages of size `clamp_events_page_limit(MAX_EVENTS_PAGE)` until
+///   `events.len() == limit`, a store page returns short/empty, **or** [`MAX_SCAN_PAGES`]
+///   (16) store pages have been read — then returns with `next_after` set so the caller
+///   can resume. Empty `events` with `Some(next_after)` means “no matches in this scan
+///   window; keep paging.”
+/// - `next_after` is the `seq` of the last **scanned** store event (matching or not)
+///   when more store events may exist; `None` when the store page was short/empty at
+///   end of scan.
 pub async fn list_decision_events(
     store: &dyn EventStore,
     session: SessionId,
     after: Option<EventSeq>,
     limit: usize,
+) -> Result<DecisionPage, ObsError> {
+    list_decision_events_bounded(store, session, after, limit, MAX_SCAN_PAGES).await
+}
+
+/// Same as [`list_decision_events`] with an explicit scan-page budget (tests / internals).
+pub(crate) async fn list_decision_events_bounded(
+    store: &dyn EventStore,
+    session: SessionId,
+    after: Option<EventSeq>,
+    limit: usize,
+    max_scan_pages: usize,
 ) -> Result<DecisionPage, ObsError> {
     let limit = if limit == 0 {
         1
@@ -50,7 +80,7 @@ pub async fn list_decision_events(
     let mut pages = 0usize;
     let mut more_after_scan = false;
 
-    while events.len() < limit && pages < MAX_SCAN_PAGES {
+    while events.len() < limit && pages < max_scan_pages {
         let page = store
             .list_session_events(session, cursor, store_page)
             .await?;
@@ -69,7 +99,6 @@ pub async fn list_decision_events(
                 events.push(ev);
                 if events.len() == limit {
                     hit_limit = true;
-                    // Unscanned remainder of this page, or a full page implying later pages.
                     more_after_scan = (i + 1) < page_len || !short_page;
                     break;
                 }
@@ -82,11 +111,7 @@ pub async fn list_decision_events(
             more_after_scan = false;
             break;
         }
-        // Full page consumed without filling limit — continue; may hit MAX_SCAN_PAGES.
-        more_after_scan = true;
-    }
-
-    if pages >= MAX_SCAN_PAGES && events.len() < limit {
+        // Full page consumed without filling limit — more pages may exist.
         more_after_scan = true;
     }
 
@@ -162,6 +187,9 @@ pub fn parse_tool_call_event(ev: &SessionEvent) -> Result<ToolCallRecord, ObsErr
 ///
 /// `run: None` aggregates all runs; `Some(id)` filters by envelope run id.
 /// Meter-only updates without a durable model call are not recovered.
+///
+/// Parse order follows RFC-0004 §7.5: every `ModelCall` is parsed first (corrupt
+/// payloads fail the rebuild), then the run filter is applied.
 pub async fn reaccumulate_cost_from_events(
     store: &dyn EventStore,
     session: SessionId,
@@ -182,12 +210,12 @@ pub async fn reaccumulate_cost_from_events(
             if ev.type_ != SessionEventType::ModelCall {
                 continue;
             }
+            let rec = parse_model_call_event(ev)?;
             if let Some(want) = run {
-                if ev.run_id != Some(want) {
+                if rec.run != Some(want) {
                     continue;
                 }
             }
-            let rec = parse_model_call_event(ev)?;
             meter.add_model_usage(rec.model_tier, rec.input_tokens, rec.output_tokens, rec.usd);
         }
         if page_len < MAX_EVENTS_PAGE {
@@ -200,16 +228,170 @@ pub async fn reaccumulate_cost_from_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::obs::decision::{DecisionKind, ModelCallRecord};
+    use crate::events::{EventSink, EventSinkError, NewSessionEvent, RuntimeEvent};
+    use crate::storage::StoreError;
     use crate::types::budget::ModelTier;
-    use crate::types::ids::{EventSeq, ProviderId, SessionId};
+    use crate::types::ids::{EventSeq, ProviderId, SessionId, Timestamp};
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    struct FakeStore {
+        events: Mutex<Vec<SessionEvent>>,
+    }
+
+    impl FakeStore {
+        fn with(events: Vec<SessionEvent>) -> Self {
+            Self {
+                events: Mutex::new(events),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EventSink for FakeStore {
+        async fn append_runtime(&self, _ev: RuntimeEvent) -> Result<(), EventSinkError> {
+            Ok(())
+        }
+        async fn append_session(&self, _ev: NewSessionEvent) -> Result<EventSeq, EventSinkError> {
+            Err(EventSinkError::Internal("unused".into()))
+        }
+    }
+
+    #[async_trait]
+    impl EventStore for FakeStore {
+        async fn list_session_events(
+            &self,
+            _session: SessionId,
+            after: Option<EventSeq>,
+            limit: usize,
+        ) -> Result<Vec<SessionEvent>, StoreError> {
+            let limit = clamp_events_page_limit(limit);
+            let all = self.events.lock().unwrap();
+            let start = after.map(|s| s.0 + 1).unwrap_or(0);
+            Ok(all
+                .iter()
+                .filter(|e| e.seq.0 >= start)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        async fn replay_session<F>(
+            &self,
+            _session: SessionId,
+            _on_event: F,
+        ) -> Result<Option<EventSeq>, StoreError>
+        where
+            Self: Sized,
+            F: FnMut(&SessionEvent) -> Result<(), StoreError> + Send,
+        {
+            Ok(None)
+        }
+
+        async fn last_seq(&self, _session: SessionId) -> Result<Option<EventSeq>, StoreError> {
+            Ok(None)
+        }
+
+        async fn list_runtime_events(
+            &self,
+            _after_rowid: Option<i64>,
+            _limit: usize,
+        ) -> Result<Vec<(i64, RuntimeEvent)>, StoreError> {
+            Ok(vec![])
+        }
+
+        async fn has_session_event_for_run(
+            &self,
+            _session: SessionId,
+            _run: crate::types::ids::RunId,
+            _type_: SessionEventType,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn has_run_accepted_event(
+            &self,
+            _run: crate::types::ids::RunId,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn has_run_finished_event(
+            &self,
+            _run: crate::types::ids::RunId,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn import_handoff_snapshot(
+            &self,
+            _snap: crate::events::HandoffSnapshot,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    fn pad(seq: u64, session: SessionId) -> SessionEvent {
+        SessionEvent {
+            seq: EventSeq(seq),
+            ts: Timestamp::now(),
+            session_id: session,
+            run_id: None,
+            type_: SessionEventType::Error,
+            payload: serde_json::json!({}),
+        }
+    }
+
+    fn decision(seq: u64, session: SessionId) -> SessionEvent {
+        SessionEvent {
+            seq: EventSeq(seq),
+            ts: Timestamp::now(),
+            session_id: session,
+            run_id: None,
+            type_: SessionEventType::Decision,
+            payload: serde_json::json!({
+                "kind": "retry",
+                "metadata": {},
+                "content_hash": null,
+                "prompt_body": null
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_budget_exhausted_empty_events_with_resume() {
+        let session = SessionId::new();
+        // Two full store pages of non-matching events (page size clamped from MAX_EVENTS_PAGE),
+        // then a decision — with max_scan_pages=1 the first call returns empty + next_after.
+        let mut events = Vec::new();
+        for i in 0..MAX_EVENTS_PAGE {
+            events.push(pad(i as u64, session));
+        }
+        events.push(decision(MAX_EVENTS_PAGE as u64, session));
+        let store = FakeStore::with(events);
+
+        let page = list_decision_events_bounded(&store, session, None, 10, 1)
+            .await
+            .unwrap();
+        assert!(page.events.is_empty());
+        assert_eq!(
+            page.next_after,
+            Some(EventSeq((MAX_EVENTS_PAGE as u64) - 1))
+        );
+
+        let page2 = list_decision_events_bounded(&store, session, page.next_after, 10, 1)
+            .await
+            .unwrap();
+        assert_eq!(page2.events.len(), 1);
+        assert_eq!(page2.events[0].type_, SessionEventType::Decision);
+    }
 
     #[test]
     fn usage_unknown_consistency_parse() {
         let session = SessionId::new();
         let ev = SessionEvent {
             seq: EventSeq(0),
-            ts: crate::types::ids::Timestamp::now(),
+            ts: Timestamp::now(),
             session_id: session,
             run_id: None,
             type_: SessionEventType::ModelCall,
@@ -234,25 +416,9 @@ mod tests {
     #[test]
     fn parse_model_ok() {
         let session = SessionId::new();
-        let rec = ModelCallRecord {
-            session,
-            run: None,
-            node: None,
-            provider_id: ProviderId::new("p").unwrap(),
-            model_tier: ModelTier::Standard,
-            input_tokens: None,
-            output_tokens: Some(1),
-            usd: None,
-            duration_ms: None,
-            confidence: None,
-            error_class: None,
-            content_hash: None,
-            prompt_body: None,
-        };
-        // Build via serde of private shape through list path — synthesize consistent wire.
         let ev = SessionEvent {
             seq: EventSeq(1),
-            ts: crate::types::ids::Timestamp::now(),
+            ts: Timestamp::now(),
             session_id: session,
             run_id: None,
             type_: SessionEventType::ModelCall,
@@ -271,21 +437,22 @@ mod tests {
             }),
         };
         let parsed = parse_model_call_event(&ev).unwrap();
-        assert_eq!(parsed.input_tokens, rec.input_tokens);
-        assert_eq!(parsed.output_tokens, rec.output_tokens);
+        assert_eq!(parsed.input_tokens, None);
+        assert_eq!(parsed.output_tokens, Some(1));
+        assert_eq!(parsed.model_tier, ModelTier::Standard);
+        assert_eq!(parsed.provider_id, ProviderId::new("p").unwrap());
     }
 
     #[test]
     fn wrong_type_rejected() {
         let ev = SessionEvent {
             seq: EventSeq(0),
-            ts: crate::types::ids::Timestamp::now(),
+            ts: Timestamp::now(),
             session_id: SessionId::new(),
             run_id: None,
             type_: SessionEventType::ToolCall,
             payload: serde_json::json!({}),
         };
         assert!(parse_decision_event(&ev).is_err());
-        let _ = DecisionKind::Retry; // keep import used if optimized
     }
 }

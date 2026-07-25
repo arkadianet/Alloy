@@ -34,6 +34,11 @@ mod tests {
     }
 
     #[test]
+    fn hash_content_matches_digest() {
+        assert_eq!(hash_content(b"abc"), Digest::sha256(b"abc"));
+    }
+
+    #[test]
     fn hash_tool_body_stable() {
         let a = hash_tool_body("{}");
         let b = hash_tool_body("{}");

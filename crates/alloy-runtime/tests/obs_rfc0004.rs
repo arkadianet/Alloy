@@ -31,7 +31,6 @@ impl Host {
     async fn open(retain_prompts: bool, retain_tools: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
-        write_fixtures(&dir, retain_prompts, retain_tools);
         let mut host = Self::open_kept(dir, retain_prompts, retain_tools).await;
         host._tmp = Some(tmp);
         host
@@ -547,11 +546,88 @@ fn walkdir_rs(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
-async fn retention_policy_defaults_match_config() {
-    let _ = RetentionPolicy::defaults();
-    let h = Host::open(false, false).await;
+async fn retention_policy_from_config_and_from_handle() {
+    let h = Host::open(true, false).await;
+    let cfg = h.handle.config().unwrap();
+    let from_cfg = RetentionPolicy::from(cfg.as_ref());
+    assert!(from_cfg.retain_full_prompts);
+    assert!(!from_cfg.retain_tool_bodies);
+    assert!(!RetentionPolicy::defaults().retain_full_prompts);
+    assert!(!RetentionPolicy::defaults().retain_tool_bodies);
+    // from_handle uses the same mapping — exercise via opt-in record body.
+    let session = h.create_session().await;
     let log = h.log();
-    // from_handle loaded defaults
-    let _ = log;
+    log.record(DecisionRecord {
+        session,
+        run: None,
+        node: None,
+        kind: DecisionKind::Retry,
+        metadata: serde_json::json!({}),
+        content_hash: None,
+        prompt_body: Some("kept".into()),
+    })
+    .await
+    .unwrap();
+    let page = list_decision_events(h.storage.events().as_ref(), session, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        parse_decision_event(&page.events[0])
+            .unwrap()
+            .prompt_body
+            .as_deref(),
+        Some("kept")
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn list_decision_events_limit_zero_is_one() {
+    let h = Host::open(false, false).await;
+    let session = h.create_session().await;
+    let log = h.log();
+    for _ in 0..3 {
+        log.record(DecisionRecord {
+            session,
+            run: None,
+            node: None,
+            kind: DecisionKind::Retry,
+            metadata: serde_json::json!({}),
+            content_hash: None,
+            prompt_body: None,
+        })
+        .await
+        .unwrap();
+    }
+    let page = list_decision_events(h.storage.events().as_ref(), session, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.events.len(), 1);
+    assert!(page.next_after.is_some());
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn metadata_secrets_masked_on_wire() {
+    let h = Host::open(false, false).await;
+    let session = h.create_session().await;
+    let log = h.log();
+    log.record(DecisionRecord {
+        session,
+        run: None,
+        node: None,
+        kind: DecisionKind::ModelRoute,
+        metadata: serde_json::json!({"api_key": "sk-abcdefghij", "ok": 1}),
+        content_hash: None,
+        prompt_body: None,
+    })
+    .await
+    .unwrap();
+    let page = list_decision_events(h.storage.events().as_ref(), session, None, 1)
+        .await
+        .unwrap();
+    let rec = parse_decision_event(&page.events[0]).unwrap();
+    assert_eq!(rec.metadata["api_key"], "[REDACTED]");
+    assert_eq!(rec.metadata["ok"], 1);
     h.shutdown().await;
 }

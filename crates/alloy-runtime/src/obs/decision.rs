@@ -10,8 +10,7 @@ use crate::error::SessionError;
 use crate::events::{NewSessionEvent, SessionEventType};
 use crate::obs::error::ObsError;
 use crate::obs::redact::{
-    apply_prompt_retention, apply_tool_retention, redact_json_strings, RetentionPolicy,
-    BODY_MAX_BYTES, METADATA_MAX_BYTES,
+    apply_body_retention, redact_json_strings, RetentionPolicy, BODY_MAX_BYTES, METADATA_MAX_BYTES,
 };
 use crate::runtime::RuntimeHandle;
 use crate::storage::{AlloyStorage, SessionRows};
@@ -126,6 +125,10 @@ pub trait DecisionLog: Send + Sync {
 }
 
 /// [`DecisionLog`] backed by [`RuntimeHandle::append_session`] + retention from config.
+///
+/// Normative: a session row MUST exist before append (§3.7); missing →
+/// [`ObsError::Session`]`(`[`SessionError::NotFound`]`)`. Append failures are fail-closed
+/// (§5.9) — no substitute success event is invented.
 pub struct EventDecisionLog {
     handle: RuntimeHandle,
     storage: Arc<AlloyStorage>,
@@ -262,6 +265,10 @@ fn resolve_hash(
     }
 }
 
+fn log_deny_strip(session: SessionId) {
+    tracing::warn!(%session, reason = "path_deny_list", "retention deny-list stripped body");
+}
+
 /// Prepare decision fields for append or in-memory recording (shared with [`super::recording`]).
 pub(crate) fn prepare_decision(
     mut rec: DecisionRecord,
@@ -269,12 +276,16 @@ pub(crate) fn prepare_decision(
 ) -> Result<DecisionRecord, ObsError> {
     rec.metadata = normalize_metadata(rec.metadata)?;
     check_body_size(rec.prompt_body.as_deref())?;
-    let raw = rec.prompt_body.as_deref();
-    let (hash, body) = apply_prompt_retention(raw, retention)?;
-    let content_hash = resolve_hash(rec.session, rec.content_hash.clone(), raw, hash);
+    let session = rec.session;
+    let caller_hash = rec.content_hash.take();
+    let raw_owned = rec.prompt_body.take();
+    let outcome = apply_body_retention(raw_owned.as_deref(), retention.retain_full_prompts, true)?;
+    if outcome.deny_list_stripped {
+        log_deny_strip(session);
+    }
+    rec.content_hash = resolve_hash(session, caller_hash, raw_owned.as_deref(), outcome.hash);
     rec.metadata = redact_json_strings(&rec.metadata);
-    rec.content_hash = content_hash;
-    rec.prompt_body = body;
+    rec.prompt_body = outcome.body;
     Ok(rec)
 }
 
@@ -288,10 +299,15 @@ pub(crate) fn prepare_model_call(
             return Err(ObsError::Invalid("usd must be finite".into()));
         }
     }
-    let raw = rec.prompt_body.as_deref();
-    let (hash, body) = apply_prompt_retention(raw, retention)?;
-    rec.content_hash = resolve_hash(rec.session, rec.content_hash.clone(), raw, hash);
-    rec.prompt_body = body;
+    let session = rec.session;
+    let caller_hash = rec.content_hash.take();
+    let raw_owned = rec.prompt_body.take();
+    let outcome = apply_body_retention(raw_owned.as_deref(), retention.retain_full_prompts, true)?;
+    if outcome.deny_list_stripped {
+        log_deny_strip(session);
+    }
+    rec.content_hash = resolve_hash(session, caller_hash, raw_owned.as_deref(), outcome.hash);
+    rec.prompt_body = outcome.body;
     Ok(rec)
 }
 
@@ -300,51 +316,57 @@ pub(crate) fn prepare_tool_call(
     retention: RetentionPolicy,
 ) -> Result<ToolCallRecord, ObsError> {
     check_body_size(rec.body.as_deref())?;
-    let raw = rec.body.as_deref();
-    let (hash, body) = apply_tool_retention(raw, retention)?;
-    rec.content_hash = resolve_hash(rec.session, rec.content_hash.clone(), raw, hash);
-    rec.body = body;
+    let session = rec.session;
+    let caller_hash = rec.content_hash.take();
+    let raw_owned = rec.body.take();
+    let outcome = apply_body_retention(raw_owned.as_deref(), retention.retain_tool_bodies, false)?;
+    if outcome.deny_list_stripped {
+        log_deny_strip(session);
+    }
+    rec.content_hash = resolve_hash(session, caller_hash, raw_owned.as_deref(), outcome.hash);
+    rec.body = outcome.body;
     Ok(rec)
 }
 
-fn decision_to_payload(rec: &DecisionRecord) -> Result<serde_json::Value, ObsError> {
+fn decision_to_payload(rec: DecisionRecord) -> Result<serde_json::Value, ObsError> {
     let payload = DecisionPayload {
-        kind: rec.kind.clone(),
+        kind: rec.kind,
         node_id: rec.node,
-        metadata: rec.metadata.clone(),
-        content_hash: rec.content_hash.clone(),
-        prompt_body: rec.prompt_body.clone(),
+        metadata: rec.metadata,
+        content_hash: rec.content_hash,
+        prompt_body: rec.prompt_body,
     };
     serde_json::to_value(payload).map_err(|e| ObsError::Internal(e.to_string()))
 }
 
-fn model_to_payload(rec: &ModelCallRecord) -> Result<serde_json::Value, ObsError> {
+fn model_to_payload(rec: ModelCallRecord) -> Result<serde_json::Value, ObsError> {
+    let usage_unknown = rec.input_tokens.is_none() || rec.output_tokens.is_none();
     let payload = ModelCallPayload {
         node_id: rec.node,
-        provider_id: rec.provider_id.clone(),
+        provider_id: rec.provider_id,
         model_tier: rec.model_tier,
         input_tokens: rec.input_tokens,
         output_tokens: rec.output_tokens,
-        usage_unknown: rec.input_tokens.is_none() || rec.output_tokens.is_none(),
+        usage_unknown,
         usd: rec.usd,
         duration_ms: rec.duration_ms,
         confidence: rec.confidence,
         error_class: rec.error_class,
-        content_hash: rec.content_hash.clone(),
-        prompt_body: rec.prompt_body.clone(),
+        content_hash: rec.content_hash,
+        prompt_body: rec.prompt_body,
     };
     serde_json::to_value(payload).map_err(|e| ObsError::Internal(e.to_string()))
 }
 
-fn tool_to_payload(rec: &ToolCallRecord) -> Result<serde_json::Value, ObsError> {
+fn tool_to_payload(rec: ToolCallRecord) -> Result<serde_json::Value, ObsError> {
     let payload = ToolCallPayload {
         node_id: rec.node,
-        tool_name: rec.tool_name.clone(),
-        tool_server: rec.tool_server.clone(),
+        tool_name: rec.tool_name,
+        tool_server: rec.tool_server,
         latency_ms: rec.latency_ms,
         denied: rec.denied,
-        content_hash: rec.content_hash.clone(),
-        body: rec.body.clone(),
+        content_hash: rec.content_hash,
+        body: rec.body,
     };
     serde_json::to_value(payload).map_err(|e| ObsError::Internal(e.to_string()))
 }
@@ -356,7 +378,8 @@ impl DecisionLog for EventDecisionLog {
         let session = rec.session;
         let run = rec.run;
         let prepared = prepare_decision(rec, self.retention)?;
-        let payload = decision_to_payload(&prepared)?;
+        let kind = prepared.kind.clone();
+        let payload = decision_to_payload(prepared)?;
         match self
             .handle
             .append_session(NewSessionEvent {
@@ -369,7 +392,7 @@ impl DecisionLog for EventDecisionLog {
         {
             Ok(seq) => Ok(seq),
             Err(e) => {
-                tracing::error!(%session, ?run, kind = ?prepared.kind, error = %e, "decision append failed");
+                tracing::error!(%session, ?run, ?kind, error = %e, "decision append failed");
                 Err(ObsError::Append(e))
             }
         }
@@ -380,7 +403,7 @@ impl DecisionLog for EventDecisionLog {
         let session = rec.session;
         let run = rec.run;
         let prepared = prepare_model_call(rec, self.retention)?;
-        let payload = model_to_payload(&prepared)?;
+        let payload = model_to_payload(prepared)?;
         match self
             .handle
             .append_session(NewSessionEvent {
@@ -404,7 +427,7 @@ impl DecisionLog for EventDecisionLog {
         let session = rec.session;
         let run = rec.run;
         let prepared = prepare_tool_call(rec, self.retention)?;
-        let payload = tool_to_payload(&prepared)?;
+        let payload = tool_to_payload(prepared)?;
         match self
             .handle
             .append_session(NewSessionEvent {
@@ -428,19 +451,19 @@ impl DecisionLog for EventDecisionLog {
 pub(crate) fn parse_decision_payload(
     payload: &serde_json::Value,
 ) -> Result<DecisionPayload, ObsError> {
-    serde_json::from_value(payload.clone())
+    DecisionPayload::deserialize(payload)
         .map_err(|e| ObsError::Invalid(format!("decision payload: {e}")))
 }
 
 pub(crate) fn parse_model_payload(
     payload: &serde_json::Value,
 ) -> Result<ModelCallPayload, ObsError> {
-    serde_json::from_value(payload.clone())
+    ModelCallPayload::deserialize(payload)
         .map_err(|e| ObsError::Invalid(format!("model_call payload: {e}")))
 }
 
 pub(crate) fn parse_tool_payload(payload: &serde_json::Value) -> Result<ToolCallPayload, ObsError> {
-    serde_json::from_value(payload.clone())
+    ToolCallPayload::deserialize(payload)
         .map_err(|e| ObsError::Invalid(format!("tool_call payload: {e}")))
 }
 
@@ -479,6 +502,10 @@ mod tests {
             serde_json::to_value(DecisionKind::Custom("x".into())).unwrap(),
             serde_json::json!({"custom":"x"})
         );
+        assert_eq!(
+            serde_json::from_value::<DecisionKind>(serde_json::json!({"custom":"x"})).unwrap(),
+            DecisionKind::Custom("x".into())
+        );
         assert!(serde_json::from_value::<DecisionKind>(serde_json::json!("nope")).is_err());
     }
 
@@ -493,7 +520,7 @@ mod tests {
             content_hash: Some(hash_prompt("a")),
             prompt_body: None,
         };
-        let v = decision_to_payload(&rec).unwrap();
+        let v = decision_to_payload(rec).unwrap();
         assert!(v.get("session").is_none());
         assert!(v.get("run").is_none());
         assert!(v.get("session_id").is_none());
@@ -518,6 +545,68 @@ mod tests {
     }
 
     #[test]
+    fn size_cap_rejects_huge_metadata() {
+        let big = "y".repeat(METADATA_MAX_BYTES);
+        let meta = serde_json::json!({ "k": big });
+        let err = normalize_metadata(meta).unwrap_err();
+        assert!(matches!(err, ObsError::Invalid(msg) if msg.contains("metadata")));
+    }
+
+    #[test]
+    fn content_hash_mismatch_replaced() {
+        let wrong = hash_prompt("other");
+        let rec = DecisionRecord {
+            session: SessionId::new(),
+            run: None,
+            node: None,
+            kind: DecisionKind::Retry,
+            metadata: serde_json::json!({}),
+            content_hash: Some(wrong),
+            prompt_body: Some("actual".into()),
+        };
+        let prepared = prepare_decision(rec, RetentionPolicy::defaults()).unwrap();
+        assert_eq!(prepared.content_hash, Some(hash_prompt("actual")));
+        assert!(prepared.prompt_body.is_none());
+    }
+
+    #[test]
+    fn metadata_secrets_redacted_on_prepare() {
+        let rec = DecisionRecord {
+            session: SessionId::new(),
+            run: None,
+            node: None,
+            kind: DecisionKind::ModelRoute,
+            metadata: serde_json::json!({"api_key": "sk-abcdefghij", "route": "ok"}),
+            content_hash: None,
+            prompt_body: None,
+        };
+        let prepared = prepare_decision(rec, RetentionPolicy::defaults()).unwrap();
+        assert_eq!(prepared.metadata["api_key"], "[REDACTED]");
+        assert_eq!(prepared.metadata["route"], "ok");
+    }
+
+    #[test]
+    fn record_model_call_rejects_non_finite_usd() {
+        let rec = ModelCallRecord {
+            session: SessionId::new(),
+            run: None,
+            node: None,
+            provider_id: ProviderId::new("p").unwrap(),
+            model_tier: ModelTier::Standard,
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            usd: Some(f64::NAN),
+            duration_ms: None,
+            confidence: None,
+            error_class: None,
+            content_hash: None,
+            prompt_body: None,
+        };
+        let err = prepare_model_call(rec, RetentionPolicy::defaults()).unwrap_err();
+        assert!(matches!(err, ObsError::Invalid(msg) if msg.contains("usd")));
+    }
+
+    #[test]
     fn worker_metrics_confidence_option() {
         let rec = ModelCallRecord {
             session: SessionId::new(),
@@ -534,7 +623,7 @@ mod tests {
             content_hash: None,
             prompt_body: None,
         };
-        let v = model_to_payload(&rec).unwrap();
+        let v = model_to_payload(rec).unwrap();
         assert!(v.get("confidence").is_none() || v["confidence"].is_null());
         let parsed: ModelCallPayload = serde_json::from_value(v).unwrap();
         assert!(parsed.confidence.is_none());

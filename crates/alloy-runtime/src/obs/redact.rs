@@ -1,4 +1,7 @@
 //! Secret redaction and retention helpers (RFC-0004 §5.6–5.7).
+//!
+//! `ObsError::Redaction` is reserved for helper misuse; current helpers are
+//! infallible for well-formed `&str` / JSON inputs and return `Ok`.
 
 use crate::obs::error::ObsError;
 use crate::obs::hash::{hash_prompt, hash_tool_body};
@@ -41,21 +44,56 @@ impl From<&crate::config::RuntimeConfig> for RetentionPolicy {
     }
 }
 
+/// Outcome of applying retention to a prompt or tool body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetentionOutcome {
+    /// Pre-redaction content hash when input was present.
+    pub hash: Option<Digest>,
+    /// Retained body (redacted), or `None` when stripped / not retained.
+    pub body: Option<String>,
+    /// True when a path deny-list hit forced stripping under opt-in retention.
+    pub deny_list_stripped: bool,
+}
+
 /// Redact secret-like substrings in `text` (API keys, Bearer tokens, env assignments, PEM).
 ///
 /// Each match span is replaced with `[REDACTED]`. Leftmost-longest; non-overlapping.
+/// Returns `text` unchanged (no allocation) when nothing matches.
 #[must_use]
 pub fn redact_secrets(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
     let mut i = 0;
+    let mut first_match: Option<(usize, usize)> = None;
     while i < text.len() {
         if let Some(len) = match_at(text, i) {
+            first_match = Some((i, len));
+            break;
+        }
+        let ch = text[i..].chars().next().expect("valid utf-8 index");
+        i += ch.len_utf8();
+    }
+    let Some((start, len)) = first_match else {
+        return text.to_owned();
+    };
+
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(REDACTED);
+    i = start + len;
+    while i < text.len() {
+        if let Some(mlen) = match_at(text, i) {
             out.push_str(REDACTED);
-            i += len;
+            i += mlen;
         } else {
-            let ch = text[i..].chars().next().expect("valid utf-8 index");
-            out.push(ch);
-            i += ch.len_utf8();
+            // Copy an unmatched span until the next match (or end).
+            let span_start = i;
+            while i < text.len() {
+                if match_at(text, i).is_some() {
+                    break;
+                }
+                let ch = text[i..].chars().next().expect("valid utf-8 index");
+                i += ch.len_utf8();
+            }
+            out.push_str(&text[span_start..i]);
         }
     }
     out
@@ -89,7 +127,8 @@ pub fn apply_prompt_retention(
     prompt: Option<&str>,
     policy: RetentionPolicy,
 ) -> Result<(Option<Digest>, Option<String>), ObsError> {
-    apply_body_retention(prompt, policy.retain_full_prompts, true)
+    let o = apply_body_retention(prompt, policy.retain_full_prompts, true)?;
+    Ok((o.hash, o.body))
 }
 
 /// Apply tool-body retention analogously using `retain_tool_bodies`.
@@ -97,16 +136,21 @@ pub fn apply_tool_retention(
     body: Option<&str>,
     policy: RetentionPolicy,
 ) -> Result<(Option<Digest>, Option<String>), ObsError> {
-    apply_body_retention(body, policy.retain_tool_bodies, false)
+    let o = apply_body_retention(body, policy.retain_tool_bodies, false)?;
+    Ok((o.hash, o.body))
 }
 
-fn apply_body_retention(
+pub(crate) fn apply_body_retention(
     raw: Option<&str>,
     retain: bool,
     is_prompt: bool,
-) -> Result<(Option<Digest>, Option<String>), ObsError> {
+) -> Result<RetentionOutcome, ObsError> {
     let Some(text) = raw else {
-        return Ok((None, None));
+        return Ok(RetentionOutcome {
+            hash: None,
+            body: None,
+            deny_list_stripped: false,
+        });
     };
     let hash = if is_prompt {
         hash_prompt(text)
@@ -114,17 +158,25 @@ fn apply_body_retention(
         hash_tool_body(text)
     };
     if !retain {
-        return Ok((Some(hash), None));
+        return Ok(RetentionOutcome {
+            hash: Some(hash),
+            body: None,
+            deny_list_stripped: false,
+        });
     }
     let redacted = redact_secrets(text);
     if path_deny_list_hit(&redacted) || path_deny_list_hit(text) {
-        tracing::warn!(
-            reason = "path_deny_list",
-            "retention deny-list stripped body"
-        );
-        return Ok((Some(hash), None));
+        return Ok(RetentionOutcome {
+            hash: Some(hash),
+            body: None,
+            deny_list_stripped: true,
+        });
     }
-    Ok((Some(hash), Some(redacted)))
+    Ok(RetentionOutcome {
+        hash: Some(hash),
+        body: Some(redacted),
+        deny_list_stripped: false,
+    })
 }
 
 /// True if text contains a `.env` path segment or ends with `/.env`.
@@ -137,27 +189,36 @@ pub(crate) fn path_deny_list_hit(text: &str) -> bool {
         while let Some(rel) = text[start..].find(needle) {
             let abs = start + rel;
             let after = abs + needle.len();
-            let ok_after = after >= text.len()
-                || text.as_bytes()[after].is_ascii_whitespace()
-                || matches!(
-                    text.as_bytes()[after],
-                    b'/' | b'\\' | b'"' | b'\'' | b')' | b']' | b',' | b';' | b':'
-                );
-            if ok_after {
+            if env_path_boundary_after(text, after) {
                 return true;
             }
             start = abs + 1;
         }
     }
-    for part in text.split(|c: char| c == '/' || c == '\\' || c.is_whitespace()) {
-        let trimmed = part.trim_matches(|c: char| {
-            matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';' | ':')
-        });
-        if trimmed == ".env" {
+    // Split on path and JSON/structural delimiters so `{"path":".env"}` hits.
+    for part in text.split(|c: char| {
+        c == '/'
+            || c == '\\'
+            || c.is_whitespace()
+            || matches!(
+                c,
+                '{' | '}' | '[' | ']' | ':' | ',' | '"' | '\'' | '(' | ')' | ';' | '='
+            )
+    }) {
+        if part == ".env" {
             return true;
         }
     }
     false
+}
+
+fn env_path_boundary_after(text: &str, after: usize) -> bool {
+    after >= text.len()
+        || text.as_bytes()[after].is_ascii_whitespace()
+        || matches!(
+            text.as_bytes()[after],
+            b'/' | b'\\' | b'"' | b'\'' | b')' | b']' | b'}' | b',' | b';' | b':' | b'{'
+        )
 }
 
 fn json_key_is_sensitive(key: &str) -> bool {
@@ -191,39 +252,45 @@ fn match_at(text: &str, i: usize) -> Option<usize> {
     (best > 0).then_some(best)
 }
 
+/// Match a PEM private-key block.
+///
+/// Searches for a matching `-----END … PRIVATE KEY-----` over the full remainder
+/// (including single-line PEMs). Unterminated private-key blocks fail closed:
+/// the span extends to the end of the input.
 fn match_pem(text: &str, i: usize) -> Option<usize> {
     let rest = &text[i..];
     if !rest_ci_starts_with(rest, "-----BEGIN") {
         return None;
     }
-    // Require PRIVATE KEY in the begin line before we treat it as sensitive.
-    let begin_end = rest.find('\n').unwrap_or(rest.len());
-    let header = &rest[..begin_end];
+    let after_begin = "-----BEGIN".len();
+    let rel_close = find_ci(&rest[after_begin..], "-----")?;
+    let header_end = after_begin + rel_close + "-----".len();
+    let header = &rest[..header_end];
     if !contains_ci(header, "PRIVATE KEY") {
         return None;
     }
-    let after_header = begin_end;
-    let body = &rest[after_header..];
-    // Find matching END line.
-    let mut search = 0;
-    while let Some(rel) = body[search..].find("-----END") {
-        let abs = after_header + search + rel;
-        let end_line_end = text[i + abs..]
-            .find('\n')
-            .map(|n| abs + n)
-            .unwrap_or(rest.len());
-        let end_line = &rest[abs..end_line_end];
-        if contains_ci(end_line, "PRIVATE KEY") || contains_ci(end_line, "-----END") {
-            // include through end of END line (without requiring trailing newline)
-            let mut len = end_line_end;
+
+    let mut search = header_end;
+    while let Some(rel) = find_ci(&rest[search..], "-----END") {
+        let abs = search + rel;
+        let after_end_kw = abs + "-----END".len();
+        let Some(rel_end_close) = find_ci(&rest[after_end_kw..], "-----") else {
+            search = abs + "-----END".len();
+            continue;
+        };
+        let end_marker_end = after_end_kw + rel_end_close + "-----".len();
+        let end_line = &rest[abs..end_marker_end];
+        if contains_ci(end_line, "PRIVATE KEY") {
+            let mut len = end_marker_end;
             if len < rest.len() && rest.as_bytes()[len] == b'\n' {
                 len += 1;
             }
             return Some(len);
         }
-        search = rel + 8;
+        search = abs + "-----END".len();
     }
-    None
+    // Unterminated PRIVATE KEY block — fail closed.
+    Some(rest.len())
 }
 
 fn match_bearer(text: &str, i: usize) -> Option<usize> {
@@ -232,7 +299,6 @@ fn match_bearer(text: &str, i: usize) -> Option<usize> {
         return None;
     }
     let mut pos = "authorization".len();
-    // optional spaces, then ':'
     pos = skip_spaces(rest, pos);
     if pos >= rest.len() || rest.as_bytes()[pos] != b':' {
         return None;
@@ -256,7 +322,6 @@ fn match_bearer(text: &str, i: usize) -> Option<usize> {
 
 fn match_env_assignment(text: &str, i: usize) -> Option<usize> {
     let rest = &text[i..];
-    // Left boundary: start or non-ident char before i
     if i > 0 {
         let prev = text[..i].chars().next_back().unwrap();
         if is_ident_char(prev) {
@@ -269,7 +334,12 @@ fn match_env_assignment(text: &str, i: usize) -> Option<usize> {
     }
     let mut pos = name_len;
     pos = skip_spaces(rest, pos);
-    if pos >= rest.len() || rest.as_bytes()[pos] != b'=' {
+    if pos >= rest.len() {
+        return None;
+    }
+    // `=` is normative (§5.6); `:` covers common log/YAML forms.
+    let sep = rest.as_bytes()[pos];
+    if sep != b'=' && sep != b':' {
         return None;
     }
     pos += 1;
@@ -284,12 +354,12 @@ fn match_env_assignment(text: &str, i: usize) -> Option<usize> {
     Some(pos)
 }
 
+/// `sk-` + 8+ of `[A-Za-z0-9_-]` (covers `sk-proj-…` / `sk-svcacct-…` forms).
 fn match_sk_token(text: &str, i: usize) -> Option<usize> {
     let rest = &text[i..];
     if !rest.starts_with("sk-") {
         return None;
     }
-    // Left boundary: not alphanumeric continuation into sk-
     if i > 0 {
         let prev = text[..i].chars().next_back().unwrap();
         if prev.is_ascii_alphanumeric() || prev == '_' || prev == '-' {
@@ -297,11 +367,16 @@ fn match_sk_token(text: &str, i: usize) -> Option<usize> {
         }
     }
     let mut pos = 3;
-    while pos < rest.len() && rest.as_bytes()[pos].is_ascii_alphanumeric() {
-        pos += 1;
+    while pos < rest.len() {
+        let b = rest.as_bytes()[pos];
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+            pos += 1;
+        } else {
+            break;
+        }
     }
-    let alnum = pos - 3;
-    if alnum < 8 {
+    let body_len = pos - 3;
+    if body_len < 8 {
         return None;
     }
     Some(pos)
@@ -368,12 +443,16 @@ fn rest_ci_starts_with(s: &str, prefix: &str) -> bool {
 }
 
 fn contains_ci(hay: &str, needle: &str) -> bool {
+    find_ci(hay, needle).is_some()
+}
+
+fn find_ci(hay: &str, needle: &str) -> Option<usize> {
     let h = hay.as_bytes();
     let n = needle.as_bytes();
     if n.is_empty() || h.len() < n.len() {
-        return false;
+        return None;
     }
-    h.windows(n.len()).any(|w| {
+    h.windows(n.len()).position(|w| {
         w.iter()
             .zip(n.iter())
             .all(|(a, b)| a.eq_ignore_ascii_case(b))
@@ -399,6 +478,11 @@ mod tests {
     }
 
     #[test]
+    fn password_colon_assignment_redacted() {
+        assert_eq!(redact_secrets("password: hunter2xyz"), "[REDACTED]");
+    }
+
+    #[test]
     fn bearer_redacted() {
         let out = redact_secrets("Authorization: Bearer tokensecret99");
         assert_eq!(out, "[REDACTED]");
@@ -407,6 +491,13 @@ mod tests {
     #[test]
     fn bare_sk_token_redacted() {
         assert_eq!(redact_secrets("key sk-abcdefgh ij"), "key [REDACTED] ij");
+    }
+
+    #[test]
+    fn sk_proj_token_redacted() {
+        let out = redact_secrets("k=sk-proj-AbCdEfGhIjKlMnOpQrSt");
+        assert!(out.contains("[REDACTED]"), "{out}");
+        assert!(!out.contains("sk-proj-"));
     }
 
     #[test]
@@ -436,7 +527,6 @@ mod tests {
         let body = b.unwrap();
         assert!(body.contains("[REDACTED]"));
         assert!(!body.contains("sk-12345678"));
-        // hash is of pre-redaction bytes
         assert_eq!(h.unwrap(), hash_prompt("hello api_key=sk-12345678"));
     }
 
@@ -459,6 +549,17 @@ mod tests {
     }
 
     #[test]
+    fn tool_redaction_strips_env_path_in_json() {
+        let policy = RetentionPolicy {
+            retain_full_prompts: false,
+            retain_tool_bodies: true,
+        };
+        let (h, b) = apply_tool_retention(Some(r#"{"path":".env"}"#), policy).unwrap();
+        assert!(h.is_some());
+        assert!(b.is_none());
+    }
+
+    #[test]
     fn prompt_deny_list_strips_env_path() {
         let policy = RetentionPolicy {
             retain_full_prompts: true,
@@ -474,5 +575,34 @@ mod tests {
         let pem = "-----BEGIN RSA PRIVATE KEY-----\nABC\n-----END RSA PRIVATE KEY-----\n";
         let out = redact_secrets(pem);
         assert_eq!(out.trim(), "[REDACTED]");
+    }
+
+    #[test]
+    fn pem_single_line_private_key_redacted() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----MIIBOgIBAAJBAKj-----END RSA PRIVATE KEY-----";
+        let out = redact_secrets(pem);
+        assert_eq!(out, "[REDACTED]");
+    }
+
+    #[test]
+    fn pem_unterminated_private_key_fail_closed() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBsecretstuff\n";
+        let out = redact_secrets(pem);
+        assert_eq!(out, "[REDACTED]");
+        assert!(!out.contains("MIIB"));
+    }
+
+    #[test]
+    fn pem_end_certificate_does_not_close_private_key() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nABC\n-----END CERTIFICATE-----\nmore\n-----END RSA PRIVATE KEY-----\n";
+        let out = redact_secrets(pem);
+        assert_eq!(out.trim(), "[REDACTED]");
+        assert!(!out.contains("ABC"));
+        assert!(!out.contains("more"));
+    }
+
+    #[test]
+    fn redact_secrets_noop_no_alloc_change() {
+        assert_eq!(redact_secrets("plain text"), "plain text");
     }
 }
