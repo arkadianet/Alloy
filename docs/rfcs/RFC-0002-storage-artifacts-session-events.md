@@ -98,6 +98,7 @@ This RFC **implements** durable backends behind those contracts. It does **not**
 | `RuntimeConfig.data_dir` creation on `start` | **0001** |
 | SQLite `SqliteEventStore` implementing `EventSink` + `EventStore` | **0002** |
 | `EventStore` read/replay/pagination trait | **0002** |
+| `EventStore` `has_session_event_for_run` / `has_run_accepted_event` / `has_run_finished_event` | **0002** (trait + SQLite impl; added for **0003** idempotency, see §3.4) |
 | `ArtifactStore` trait + filesystem CAS + SQLite index | **0002** |
 | Schema migrations, WAL, checkpoint, reopen/recover | **0002** |
 | Atomic handoff installer from `InMemoryEventSink` → SQLite | **0002** |
@@ -314,6 +315,24 @@ pub trait EventStore: EventSink {
     async fn list_runtime_events(&self, after_rowid: Option<i64>, limit: usize)
         -> Result<Vec<(i64, RuntimeEvent)>, StoreError>;
 
+    // --- Existence probes (added for RFC-0003 resume/cancel idempotency) ---
+
+    /// True if a session event of `type_` exists for `run` in `session`.
+    /// Indexed `LIMIT 1` lookup — MUST NOT page or scan the log.
+    /// Session-scoped rows (`run_id IS NULL`) never match.
+    async fn has_session_event_for_run(
+        &self,
+        session: SessionId,
+        run: RunId,
+        type_: SessionEventType,
+    ) -> Result<bool, StoreError>;
+
+    /// True if a host `RunAccepted` exists for `run` (`LIMIT 1`).
+    async fn has_run_accepted_event(&self, run: RunId) -> Result<bool, StoreError>;
+
+    /// True if a host `RunFinished` exists for `run` (`LIMIT 1`).
+    async fn has_run_finished_event(&self, run: RunId) -> Result<bool, StoreError>;
+
     /// Import a handoff snapshot with **exact** `seq` / `ts` (no re-allocation, no `Timestamp::now`).
     /// Single DB transaction that MUST include post-import seq verification (or equivalent
     /// cleanup on verify failure before commit visibility). Used only by atomic handoff (§3.7).
@@ -332,6 +351,18 @@ impl EventSink for SqliteEventStore {
 #[async_trait]
 impl EventStore for SqliteEventStore { /* … */ }
 ```
+
+**Existence probes (normative):** the three `has_*` methods are **required** trait methods, not
+provided defaults — `SqliteEventStore` is the only impl, and a page-scanning default would let a
+future impl silently turn an O(1) idempotency check into a full replay. They are read-only, take a
+single storage permit, and answer from one indexed `LIMIT 1` row: `has_session_event_for_run` matches
+`(session_id, run_id, type)` via `idx_session_events_session_run_type` (schema v3); the two host
+probes match `json_extract(event_json, '$.run_accepted.run_id')` / `'$.run_finished.run_id'` via the
+partial expression indexes on `runtime_events` (also v3), because those rows carry no session id.
+**Caveat:** `session_events`’ primary key is `(session_id, seq)` and does **not** index `run_id` —
+matching `(session_id, run_id, type)` without `idx_session_events_session_run_type` would be an
+unindexed filter on the seq-ordered PK. RFC-0003 uses the probes to keep terminal-event writes
+idempotent across retries and restarts (RFC-0003 §3.8 / §5.3 / §6.4).
 
 **Seq contract (normative, unchanged from 0001):**
 
@@ -781,6 +812,12 @@ stateDiagram-v2
 - Migrations are ordered SQL files / `&'static str` embedded in `migrate.rs`.
 - Additive only in MVP (roadmap risk: schema thrash — keep additive).
 - v1 schema includes reserved `dag_blobs` empty table and `sessions.graph_version` nullable column for 0009/0011 without implementing those RFCs.
+- v2: `idx_runs_session_created_id` on `runs(session_id, created_at, id)`.
+- v3: existence-probe indexes for RFC-0003 — composite `idx_session_events_session_run_type` on
+  `session_events(session_id, run_id, type)`, plus partial expression indexes on
+  `runtime_events` for `json_extract(event_json, '$.run_accepted.run_id')` and
+  `'$.run_finished.run_id'`. The `session_events` PK `(session_id, seq)` does **not** cover the
+  run-id probe key.
 
 ### Checkpoint meaning
 
@@ -1154,6 +1191,27 @@ CREATE TABLE dag_blobs (
   blob_json TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+```
+
+### Schema sketch (normative v2 / v3 additive indexes)
+
+```sql
+-- schema_version = 2
+CREATE INDEX IF NOT EXISTS idx_runs_session_created_id
+  ON runs(session_id, created_at, id);
+
+-- schema_version = 3 (RFC-0003 existence probes)
+-- Note: session_events PK (session_id, seq) does NOT index run_id.
+CREATE INDEX IF NOT EXISTS idx_session_events_session_run_type
+  ON session_events(session_id, run_id, type);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_events_run_accepted_run_id
+  ON runtime_events(json_extract(event_json, '$.run_accepted.run_id'))
+  WHERE json_extract(event_json, '$.run_accepted.run_id') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_runtime_events_run_finished_run_id
+  ON runtime_events(json_extract(event_json, '$.run_finished.run_id'))
+  WHERE json_extract(event_json, '$.run_finished.run_id') IS NOT NULL;
 ```
 
 ---

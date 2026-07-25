@@ -10,11 +10,11 @@ use alloy_runtime::storage::{
 };
 use alloy_runtime::types::budget::BudgetPolicy;
 use alloy_runtime::types::ids::{
-    Digest, EventSeq, LanguageId, ProfileId, RunId, SessionId, Timestamp,
+    DagId, Digest, EventSeq, LanguageId, ProfileId, RunId, SessionId, Timestamp,
 };
 use alloy_runtime::{
-    install_sqlite_event_sink, AlloyRuntime, ConfigPaths, RuntimeConfig, RuntimeHandle,
-    RuntimePhase,
+    install_sqlite_event_sink, AlloyRuntime, ConfigPaths, DagOutcome, DagState, RuntimeConfig,
+    RuntimeHandle, RuntimePhase,
 };
 use serde_json::json;
 
@@ -24,6 +24,13 @@ fn new_ev(session: SessionId, ty: SessionEventType) -> NewSessionEvent {
         run_id: None,
         type_: ty,
         payload: json!({"ok": true}),
+    }
+}
+
+fn run_ev(session: SessionId, run: RunId, ty: SessionEventType) -> NewSessionEvent {
+    NewSessionEvent {
+        run_id: Some(run),
+        ..new_ev(session, ty)
     }
 }
 
@@ -83,7 +90,7 @@ async fn open_creates_layout() {
     assert!(dir.path().join("alloy.sqlite").is_file());
     assert!(dir.path().join("artifacts").is_dir());
     assert!(dir.path().join("graph").is_dir());
-    assert_eq!(storage.schema_version(), 2);
+    assert_eq!(storage.schema_version(), 3);
     storage.close().await.unwrap();
 }
 
@@ -99,7 +106,7 @@ async fn migrate_idempotent_and_refuse_newer() {
     let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
         .await
         .unwrap();
-    assert_eq!(storage.schema_version(), 2);
+    assert_eq!(storage.schema_version(), 3);
     storage.close().await.unwrap();
     drop(storage);
 
@@ -220,6 +227,102 @@ async fn appendix_a_types_round_trip() {
     for (ev, ty) in listed.iter().zip(types.iter()) {
         assert_eq!(ev.type_, *ty);
     }
+    storage.close().await.unwrap();
+}
+
+/// Existence probes used by the RFC-0003 control plane for resume/cancel idempotency.
+/// Each is a `LIMIT 1` lookup, so duplicates stay `true` and every id/type component of
+/// the predicate has to matter.
+#[tokio::test]
+async fn event_existence_probes_are_scoped_and_limit_one() {
+    let (_dir, storage) = open_temp().await;
+    let events = storage.events();
+    let session = SessionId::new();
+    let other_session = SessionId::new();
+    let run = RunId::new();
+    let other_run = RunId::new();
+    let dag = DagId::new();
+
+    assert!(!events
+        .has_session_event_for_run(session, run, SessionEventType::RunCompleted)
+        .await
+        .unwrap());
+    assert!(!events.has_run_accepted_event(run).await.unwrap());
+    assert!(!events.has_run_finished_event(run).await.unwrap());
+
+    for _ in 0..2 {
+        events
+            .append_session(run_ev(session, run, SessionEventType::RunCompleted))
+            .await
+            .unwrap();
+    }
+    events
+        .append_session(new_ev(session, SessionEventType::SessionCreated))
+        .await
+        .unwrap();
+    events
+        .append_session(run_ev(
+            other_session,
+            other_run,
+            SessionEventType::RunCompleted,
+        ))
+        .await
+        .unwrap();
+
+    assert!(events
+        .has_session_event_for_run(session, run, SessionEventType::RunCompleted)
+        .await
+        .unwrap());
+    assert!(!events
+        .has_session_event_for_run(session, run, SessionEventType::ApprovalResolved)
+        .await
+        .unwrap());
+    assert!(!events
+        .has_session_event_for_run(session, other_run, SessionEventType::RunCompleted)
+        .await
+        .unwrap());
+    assert!(!events
+        .has_session_event_for_run(other_session, run, SessionEventType::RunCompleted)
+        .await
+        .unwrap());
+    // Session-scoped rows carry `run_id = NULL` and must never satisfy a run probe.
+    assert!(!events
+        .has_session_event_for_run(session, run, SessionEventType::SessionCreated)
+        .await
+        .unwrap());
+
+    events
+        .append_runtime(RuntimeEvent::RunAccepted {
+            run_id: run,
+            dag_id: dag,
+        })
+        .await
+        .unwrap();
+    assert!(events.has_run_accepted_event(run).await.unwrap());
+    assert!(!events.has_run_accepted_event(other_run).await.unwrap());
+    // `RunAccepted` must not be mistaken for a finish.
+    assert!(!events.has_run_finished_event(run).await.unwrap());
+
+    for _ in 0..2 {
+        events
+            .append_runtime(RuntimeEvent::RunFinished {
+                run_id: run,
+                outcome: DagOutcome {
+                    dag_id: dag,
+                    generation: 0,
+                    state: DagState::Failed,
+                    failed_node: None,
+                    failure: None,
+                },
+            })
+            .await
+            .unwrap();
+    }
+    assert!(events.has_run_finished_event(run).await.unwrap());
+    assert!(!events.has_run_finished_event(other_run).await.unwrap());
+    // Host events carry no session id, so the probe keys on `run_id` alone.
+    assert!(events.has_run_accepted_event(run).await.unwrap());
+
     storage.close().await.unwrap();
 }
 

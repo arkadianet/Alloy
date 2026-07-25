@@ -42,7 +42,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | --- | --- | --- | --- | --- | --- |
 | [RFC-0001](./RFC-0001-alloy-runtime.md) | Alloy Runtime | Ready for Implementation | 5–8 pd | — | **Yes** (Runtime foundation + core types) |
 | [RFC-0002](./RFC-0002-storage-artifacts-session-events.md) | Storage, Artifacts & Session Event Log | Ready for Implementation | 4–7 pd | 0001 | **Yes** |
-| [RFC-0003](./RFC-0003-session-manager-run-controller.md) | Session Manager & RunController | Ready for Implementation | 3–5 pd | 0001, 0002 | **Yes** |
+| [RFC-0003](./RFC-0003-session-manager-run-controller.md) | Session Manager & RunController | Implemented | 3–5 pd | 0001, 0002 | **Yes** |
 | [RFC-0004](./RFC-0004-observability-cost-metering.md) | Observability & Cost Metering | Draft | 2–4 pd | 0001, 0002 | **Yes** |
 | [RFC-0005](./RFC-0005-sandbox-broker.md) | Sandbox Broker | Draft | 5–8 pd | 0001 | **Yes** |
 | [RFC-0006](./RFC-0006-mcp-host-builtins.md) | MCP Host & In-Process Builtins | Draft | 5–8 pd | 0001, 0005 | **Yes** |

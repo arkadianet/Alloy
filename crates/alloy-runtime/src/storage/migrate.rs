@@ -4,11 +4,12 @@ use rusqlite::Connection;
 
 use super::error::StoreError;
 
-/// Schema version shipped by this crate (RFC-0002).
-pub const CODE_SCHEMA_VERSION: u32 = 2;
+/// Schema version shipped by this crate (RFC-0002 / RFC-0003 existence probes).
+pub const CODE_SCHEMA_VERSION: u32 = 3;
 
 // `schema_migrations` is bootstrapped in `ensure_migrations_table` before v1 runs.
-// PK (session_id, seq) already covers session_events lookups; no redundant index.
+// PK (session_id, seq) covers ordered replay, not (session_id, run_id, type) probes —
+// those indexes land in v3.
 const V1_SQL: &str = r#"
 CREATE TABLE sessions (
   id TEXT PRIMARY KEY,
@@ -81,6 +82,21 @@ CREATE INDEX IF NOT EXISTS idx_runs_session_created_id
   ON runs(session_id, created_at, id);
 "#;
 
+// Existence-probe indexes for RFC-0003 resume/cancel idempotency.
+// session_events PK is (session_id, seq) and does not index run_id.
+const V3_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_session_events_session_run_type
+  ON session_events(session_id, run_id, type);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_events_run_accepted_run_id
+  ON runtime_events(json_extract(event_json, '$.run_accepted.run_id'))
+  WHERE json_extract(event_json, '$.run_accepted.run_id') IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_runtime_events_run_finished_run_id
+  ON runtime_events(json_extract(event_json, '$.run_finished.run_id'))
+  WHERE json_extract(event_json, '$.run_finished.run_id') IS NOT NULL;
+"#;
+
 /// Apply pending migrations. Returns the schema version after migrate.
 ///
 /// When `refuse_newer` is true and the DB reports a version above
@@ -132,6 +148,23 @@ pub fn migrate(conn: &Connection, refuse_newer: bool) -> Result<u32, StoreError>
         tx.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![2i64, now_rfc3339()],
+        )
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+    }
+
+    let current = current_version(conn)?;
+    if current < 3 {
+        tracing::info!(version = 3, "applying migration");
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        tx.execute_batch(V3_SQL)
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![3i64, now_rfc3339()],
         )
         .map_err(|e| StoreError::Migration(e.to_string()))?;
         tx.commit()
@@ -241,9 +274,40 @@ mod tests {
     fn migrate_fresh_and_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         let v = migrate(&conn, true).unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
         let v2 = migrate(&conn, true).unwrap();
-        assert_eq!(v2, 2);
+        assert_eq!(v2, 3);
+    }
+
+    #[test]
+    fn migrate_v3_creates_existence_probe_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn, true).unwrap();
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND name IN (
+                       'idx_session_events_session_run_type',
+                       'idx_runtime_events_run_accepted_run_id',
+                       'idx_runtime_events_run_finished_run_id'
+                     )
+                     ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            names,
+            [
+                "idx_runtime_events_run_accepted_run_id",
+                "idx_runtime_events_run_finished_run_id",
+                "idx_session_events_session_run_type",
+            ]
+        );
     }
 
     #[test]

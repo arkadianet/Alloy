@@ -15,7 +15,7 @@ use crate::events::{
     SessionEventType,
 };
 use crate::session::clamp_events_page_limit;
-use crate::types::ids::{EventSeq, SessionId, Timestamp};
+use crate::types::ids::{EventSeq, RunId, SessionId, Timestamp};
 
 /// Read/replay APIs on top of [`EventSink`].
 #[async_trait]
@@ -53,6 +53,20 @@ pub trait EventStore: EventSink {
         limit: usize,
     ) -> Result<Vec<(i64, RuntimeEvent)>, StoreError>;
 
+    /// True if a session event of `type_` exists for `run` (at most one row examined).
+    async fn has_session_event_for_run(
+        &self,
+        session: SessionId,
+        run: RunId,
+        type_: SessionEventType,
+    ) -> Result<bool, StoreError>;
+
+    /// True if a host `RunAccepted` exists for `run` (at most one row examined).
+    async fn has_run_accepted_event(&self, run: RunId) -> Result<bool, StoreError>;
+
+    /// True if a host `RunFinished` exists for `run` (at most one row examined).
+    async fn has_run_finished_event(&self, run: RunId) -> Result<bool, StoreError>;
+
     /// Import a handoff snapshot with **exact** `seq` / `ts` (no re-allocation).
     ///
     /// Single DB transaction including post-import seq verification.
@@ -80,6 +94,30 @@ impl SqliteEventStore {
             self.metrics.inc_busy_errors();
         }
         err
+    }
+
+    async fn has_runtime_variant_for_run(
+        &self,
+        run: RunId,
+        json_path: &'static str,
+    ) -> Result<bool, StoreError> {
+        let _permit = self.gate.enter()?;
+        let db = Arc::clone(&self.db);
+        spawn_db(db, move |handle| {
+            handle.with(|conn| {
+                let sql = format!(
+                    "SELECT 1 FROM runtime_events
+                     WHERE json_extract(event_json, '{json_path}') = ?1
+                     LIMIT 1"
+                );
+                let found: Option<i64> = conn
+                    .query_row(&sql, params![run.to_string()], |r| r.get(0))
+                    .optional()?;
+                Ok(found.is_some())
+            })
+        })
+        .await
+        .map_err(|e| self.map_busy(e))
     }
 }
 
@@ -277,6 +315,43 @@ impl EventStore for SqliteEventStore {
         })
         .await
         .map_err(|e| self.map_busy(e))
+    }
+
+    async fn has_session_event_for_run(
+        &self,
+        session: SessionId,
+        run: RunId,
+        type_: SessionEventType,
+    ) -> Result<bool, StoreError> {
+        let _permit = self.gate.enter()?;
+        let db = Arc::clone(&self.db);
+        let type_text = event_type_to_text(type_)?;
+        spawn_db(db, move |handle| {
+            handle.with(|conn| {
+                let found: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1 FROM session_events
+                         WHERE session_id = ?1 AND run_id = ?2 AND type = ?3
+                         LIMIT 1",
+                        params![session.to_string(), run.to_string(), type_text],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                Ok(found.is_some())
+            })
+        })
+        .await
+        .map_err(|e| self.map_busy(e))
+    }
+
+    async fn has_run_accepted_event(&self, run: RunId) -> Result<bool, StoreError> {
+        self.has_runtime_variant_for_run(run, "$.run_accepted.run_id")
+            .await
+    }
+
+    async fn has_run_finished_event(&self, run: RunId) -> Result<bool, StoreError> {
+        self.has_runtime_variant_for_run(run, "$.run_finished.run_id")
+            .await
     }
 
     async fn import_handoff_snapshot(&self, snap: HandoffSnapshot) -> Result<(), StoreError> {

@@ -10,9 +10,9 @@ structured execution, tools, and project state are the product.
 
 ## Status
 
-Early. The runtime host (RFC-0001) and durable SQLite event log / artifact store
-(RFC-0002) are in tree. Session orchestration, scheduler, model router, MCP, and
-eval remain ahead on the RFC series.
+Early. The runtime host (RFC-0001), durable SQLite event log / artifact store
+(RFC-0002), and session / run control plane (RFC-0003) are in tree. Scheduler,
+model router, MCP, and eval remain ahead on the RFC series.
 
 ## Workspace
 

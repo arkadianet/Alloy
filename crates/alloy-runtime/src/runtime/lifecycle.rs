@@ -8,7 +8,7 @@ use super::handle::RuntimeHandle;
 use super::inner::RuntimeInner;
 use super::RuntimePhase;
 use crate::config::RuntimeConfig;
-use crate::error::{RuntimeError, SchedError};
+use crate::error::RuntimeError;
 use crate::events::RuntimeEvent;
 use crate::logging;
 use crate::scheduler::DagOutcome;
@@ -146,44 +146,12 @@ impl AlloyRuntime {
         Ok(self.handle.clone())
     }
 
-    /// Thin forwarder to [`crate::Scheduler::run`].
+    /// Thin forwarder to [`crate::Scheduler::run`] via [`RuntimeHandle::run_dag`].
     ///
-    /// Maps [`SchedError::Unavailable`] → [`RuntimeError::SchedulerUnavailable`].
+    /// Maps [`crate::SchedError::Unavailable`] → [`RuntimeError::SchedulerUnavailable`].
     /// Does **not** emit `RunAccepted` / `RunFinished`.
     pub async fn run(&self, dag_id: DagId) -> Result<DagOutcome, RuntimeError> {
-        self.handle.flush_pending_runtime_events().await?;
-        let permit = self.handle.inner.try_admit_run(dag_id)?;
-        let sched = self.handle.scheduler();
-        let result = sched.run(dag_id).await;
-        // Drop permit before mapping so busy state clears even if we return early.
-        drop(permit);
-
-        match result {
-            Ok(outcome) => {
-                self.handle
-                    .inner
-                    .metrics
-                    .runs_completed
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(outcome)
-            }
-            Err(SchedError::Unavailable) => {
-                self.handle
-                    .inner
-                    .metrics
-                    .runs_failed
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(RuntimeError::SchedulerUnavailable)
-            }
-            Err(e) => {
-                self.handle
-                    .inner
-                    .metrics
-                    .runs_failed
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(RuntimeError::Scheduler(e))
-            }
-        }
+        self.handle.run_dag(dag_id).await
     }
 
     /// Phase: `Running` → `Draining`.

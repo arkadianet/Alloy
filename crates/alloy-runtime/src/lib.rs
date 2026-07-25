@@ -1,7 +1,8 @@
 //! Alloy runtime host and shared intermediate representation.
 //!
 //! This crate is the foundation defined by **RFC-0001**, extended by **RFC-0002**
-//! (durable storage, artifacts, session event log).
+//! (durable storage, artifacts, session event log) and **RFC-0003** (session manager
+//! and run controller control plane).
 //!
 //! # Crate map
 //!
@@ -11,7 +12,7 @@
 //! - [`runtime`] — [`AlloyRuntime`] host lifecycle
 //! - [`scheduler`] — [`Scheduler`] trait + [`NullScheduler`]
 //! - [`adapters`] — Verify*/GateHuman stub traits
-//! - [`session`] — Session/RunController trait signatures (impl in RFC-0003)
+//! - [`session`] — [`SessionPlane`] control plane: Session/RunController (RFC-0003)
 //! - [`dag`] — TaskDag type sketches (store in RFC-0009)
 //! - [`config`] — TOML + env load (never writes `.env`)
 //!
@@ -50,7 +51,8 @@ pub use events::{
 pub use runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
 pub use scheduler::{DagOutcome, DagState, NullScheduler, Scheduler};
 pub use session::{
-    clamp_events_page_limit, ReplanReason, RunController, Session, SessionService, MAX_EVENTS_PAGE,
+    clamp_events_page_limit, ReplanReason, RunControlState, RunController, RunGoalRecord, Session,
+    SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE,
 };
 pub use storage::{
     install_sqlite_event_sink, store_to_runtime, store_to_session, AlloyStorage, ArtifactBlob,

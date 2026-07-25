@@ -75,6 +75,7 @@ pub struct Session {
 /// Reason for requesting a replan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ReplanReason {
     /// Failure IR from a node.
     FailureIr(FailureIr),
