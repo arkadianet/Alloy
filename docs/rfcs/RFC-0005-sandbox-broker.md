@@ -408,7 +408,7 @@ impl PathPolicy {
 }
 ```
 
-**`PathAccess` semantics:** `Read` allows RO roots; `Write` on a path under any `read_only_roots` entry → `Denied(PathDenied)` (except `.package-cache` carve-out).
+**`PathAccess` semantics:** `Read` allows RO roots; `Write` on a path under any `read_only_roots` entry → `Denied(PathDenied)` (except `.package-cache` and `registry/src` carve-outs).
 
 **Deny-glob matching (normative):**
 
@@ -633,7 +633,7 @@ Implementers MUST encode these examples as unit tests.
 | `CARGO_HOME` | Host `cargo_home` absolute path (identical bind for registry/git/cache) |
 | `HOME` | `fs_jail/.alloy-sbx-home` |
 | `CARGO_NET_OFFLINE` | Forced `true` when quarantine |
-| `USER`, `LANG`, `LC_ALL`, `TERM` | Forwarded if present (names only from §6.2 that are not in the deny list above) |
+| `USER`, `LANG`, `LC_ALL`, `TERM` | Forwarded if present (only these names from §6.2; not overridden by the rows above) |
 
 Native scrub (§6) still applies to Landlock/Seatbelt. Container builds env via this table, then writes `--env-file`.
 
@@ -654,7 +654,7 @@ AC7 / `child_cannot_read_dotenv_in_jail` applies to **all** backends via this ta
 Composition: prepare ruleset FD + uid/gid map buffers + deny bind `CString` pairs **in the parent** before spawn; `pre_exec` only applies them (no allocation/formatting in the multi-threaded child).
 
 1. `unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET)`.
-2. Write pre-formatted identity `uid_map` / `setgroups=deny` / `gid_map`. If identity+netns fails (sysctl), probe marks Unavailable.
+2. Write pre-formatted identity `uid_map` / `setgroups=deny` / `gid_map`. If identity+netns fails at **probe** time → Landlock `Unavailable` → `BackendUnavailable` on `new` when check uses Landlock. `BackendCannotEnforce` is reserved for an exec-time attempt to run Landlock **without** netns under `network=Deny` (must not happen if probe is honest).
 3. **`mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)`** so subsequent bind-overs **cannot** propagate to the host mount peer group (required — without this, `/dev/null` over `.env` / `credentials.toml` can persist on the host after the sandbox exits).
 4. Bind deny matches using parent-prepared `CString` pairs (files → `/dev/null`; dirs → empty RO tmpfs/dir).
 5. Loopback up via `SIOCSIFFLAGS` on `lo` (ioctl); no `/bin/ip` dependency.
@@ -688,7 +688,7 @@ Composition: prepare ruleset FD + uid/gid map buffers + deny bind `CString` pair
 | Network | `--network none` when Deny |
 | Identity | `--cidfile <broker_tmp>/cid` (required); timeout: `kill --signal TERM` then after 2s `kill` (SIGKILL); missing container on second kill = success |
 | Lifecycle | `--rm`; `--init` |
-| Env | Scrubbed env in `broker_tmp/envfile` mode 0600 via `--env-file`; reject values containing `\n` or names starting with `#` as `Invalid`; delete after run |
+| Env | Env composed per the container env composition table, written to `broker_tmp/envfile` mode 0600 via `--env-file`; reject values containing `\n` or names starting with `#` as `Invalid`; delete after run |
 | Workdir | `--workdir <canonical cwd>` |
 
 **Container status mapping (normative):**
@@ -869,7 +869,7 @@ landlock = "0.4"
 | `container_cargo_check_fixture` | runtime present |
 | `child_cannot_read_dotenv_in_jail` | place `.env` in jail; sandboxed read fails |
 | `child_cannot_read_cargo_credentials` | sentinel `credentials.toml` unreadable inside sandbox |
-| `netns_failure_is_cannot_enforce` | fault-inject / document probe |
+| `netns_probe_marks_unavailable` | probe-time netns failure → Landlock Unavailable / `BackendUnavailable` |
 | `network_deny_blocks_egress` | connect fails |
 | `timeout_kills_process_group` | grandchild dead |
 | `cancel_drop_no_orphan` | drop future → no child |
@@ -912,7 +912,7 @@ Skip policy: individual tests may `ignore` with reason when probe says Unavailab
 | 4 | Non-zero exit `Ok`; denial `Err`; signal `Ok{signal}` | `signal_status_encoding` + integration cargo fail |
 | 5 | `network=deny` via netns/Seatbelt/`--network none`; FS-only Landlock impossible | `netns_failure_is_cannot_enforce` + `network_deny_blocks_egress` |
 | 6 | Quarantine forces offline + blocks fetch/update/install | `quarantine_rewrites_and_blocks_fetch` |
-| 7 | Deny globs + in-sandbox `.env` unreadable; cargo credentials unreadable; host `.env` untouched | `child_cannot_read_dotenv_in_jail` + `child_cannot_read_cargo_credentials` + `dotenv_sentinel_unchanged` |
+| 7 | Deny globs + in-sandbox `.env` unreadable; cargo credentials unreadable; host `.env` / credentials untouched | `child_cannot_read_dotenv_in_jail` + `child_cannot_read_cargo_credentials` + `dotenv_sentinel_unchanged` + `credentials_sentinel_unchanged` |
 | 8 | `PathPolicy` exported for 0006 | public API + path policy tests |
 | 9 | Unavailable backend fail closed | `backend_unavailable_fail_closed` |
 | 10 | Timeout/drop kill process group | `timeout_kills_process_group` + `cancel_drop_no_orphan` |
