@@ -78,7 +78,14 @@ arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
   `SECBIT_NOROOT`. The load-bearing umount defense is the **Landlock domain**
   itself (Landlock's mount hooks deny `umount`/`mount` for sandboxed tasks even
   if a nested userns restores capabilities); the cap drop is defense-in-depth.
-  Verified by `child_cannot_umount_dotenv_bind`.
+  Verified by `child_cannot_umount_dotenv_bind`. Handled FS access rights use
+  ABI v2 as a hard floor and best-effort ABI v5 so `truncate(2)` is mediated on
+  kernels ≥ 6.2 (verified by `landlock_denies_outside_jail_truncate`).
+  **Metadata residual:** Landlock does not mediate `chmod` / `utimes` at any
+  ABI — a sandboxed payload that somehow obtains a path to an operator-writable
+  file outside the jail cannot open/write/truncate it under the v5 ruleset, but
+  could still change mode/mtime if it knew the path. Keep secrets out of
+  guessable absolute paths; document as inherent to the Landlock backend.
   **Orphan note:** supervision kills the process group and bounds stdio drains
   by `exec_timeout`. A payload that calls `setsid` (or otherwise leaves the
   session) while holding an inherited pipe can still escape the group signal;

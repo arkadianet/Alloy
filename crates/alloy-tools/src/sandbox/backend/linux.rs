@@ -235,15 +235,24 @@ fn build_ruleset_created(
     ctx: &IsolateContext,
     bind_root: &Path,
 ) -> Result<RulesetCreated, SandboxError> {
-    let abi = ABI::V2;
-    let access_all = AccessFs::from_all(abi);
-    let access_read = AccessFs::from_read(abi);
-    let access_file = AccessFs::from_file(abi);
+    // RFC §5.5 floor is ABI v2 (HardRequirement). Best-effort newer ABIs so
+    // truncate(2) (v3+) and ioctl_dev (v5+) are mediated on modern kernels —
+    // otherwise those rights are completely unenforced outside the jail.
+    const FLOOR: ABI = ABI::V2;
+    const LATEST: ABI = ABI::V5;
+    let access_all = AccessFs::from_all(LATEST);
+    let access_read = AccessFs::from_read(LATEST);
+    let access_file = AccessFs::from_file(LATEST);
 
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(access_all)
-        .map_err(|e| SandboxError::BackendCannotEnforce(format!("landlock handle_access: {e}")))?
+        .handle_access(AccessFs::from_all(FLOOR))
+        .map_err(|e| SandboxError::BackendCannotEnforce(format!("landlock handle_access v2: {e}")))?
+        .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::from_all(LATEST))
+        .map_err(|e| {
+            SandboxError::BackendCannotEnforce(format!("landlock handle_access latest: {e}"))
+        })?
         .create()
         .map_err(|e| SandboxError::BackendCannotEnforce(format!("landlock create: {e}")))?;
 
@@ -476,16 +485,19 @@ pub fn probe_landlock_sync() -> Result<String, String> {
             mount_bind("/dev/null", "/etc/hostname")
                 .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
             let _ = bring_up_loopback();
-            let abi = ABI::V2;
+            // Same floor + best-effort pattern as build_ruleset_created.
             let status = Ruleset::default()
                 .set_compatibility(CompatLevel::HardRequirement)
-                .handle_access(AccessFs::from_all(abi))
+                .handle_access(AccessFs::from_all(ABI::V2))
+                .map_err(std::io::Error::other)?
+                .set_compatibility(CompatLevel::BestEffort)
+                .handle_access(AccessFs::from_all(ABI::V5))
                 .map_err(std::io::Error::other)?
                 .create()
                 .map_err(std::io::Error::other)?
                 .add_rule(PathBeneath::new(
                     PathFd::new("/").map_err(std::io::Error::other)?,
-                    AccessFs::from_all(abi),
+                    AccessFs::from_all(ABI::V5),
                 ))
                 .map_err(std::io::Error::other)?
                 .restrict_self()
@@ -498,7 +510,7 @@ pub fn probe_landlock_sync() -> Result<String, String> {
     }
     let out = cmd.output().map_err(|e| e.to_string())?;
     if out.status.success() {
-        Ok("landlock+userns+netns+idmap ABI>=2".into())
+        Ok("landlock+userns+netns+idmap ABI>=2 (truncate best-effort)".into())
     } else {
         Err(format!(
             "landlock probe failed (need unprivileged userns identity maps + landlock ABI>=2): status={} stderr={}",

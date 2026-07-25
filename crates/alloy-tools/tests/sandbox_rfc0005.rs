@@ -264,6 +264,61 @@ async fn landlock_actually_applied() {
     );
 }
 
+/// ABI v3+ `truncate(2)` must be handled; otherwise a sandboxed payload can
+/// zero operator-writable files outside the jail without open(O_WRONLY).
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn landlock_denies_outside_jail_truncate() {
+    if !landlock_or_skip().await {
+        return;
+    }
+    if !python3_ok() {
+        if require_landlock() {
+            panic!("ALLOY_REQUIRE_LANDLOCK=1 but python3 missing for truncate PoC");
+        }
+        eprintln!("skip: python3 unavailable for truncate PoC");
+        return;
+    }
+
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let outer = tempdir().unwrap();
+    let sentinel = outer.path().join("victim.txt");
+    let original = b"do-not-truncate-me";
+    std::fs::write(&sentinel, original).unwrap();
+
+    let broker = broker_for_jail(jail.clone()).await.unwrap();
+    let script = jail.join("try_trunc.py");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/usr/bin/env python3\nimport os\ntry:\n    os.truncate({path:?}, 0)\n    print('TRUNCATE_OK')\nexcept OSError as e:\n    print(f'TRUNCATE_DENIED:{{e.errno}}')\n",
+            path = sentinel.display()
+        ),
+    )
+    .unwrap();
+    chmod_755(&script);
+
+    let req = SandboxExecRequest::new(
+        vec!["python3".into(), script.display().to_string()],
+        jail,
+        token("python3", None),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        !stdout.contains("TRUNCATE_OK"),
+        "outside-jail truncate(2) must be denied: stdout={stdout:?} stderr={}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        original,
+        "outside-jail sentinel must not be truncated"
+    );
+}
+
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn deny_walk_budget_blocks_exec() {
