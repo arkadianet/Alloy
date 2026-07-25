@@ -444,6 +444,59 @@ async fn credentials_sentinel_unchanged() {
     assert_eq!(after, original);
 }
 
+/// File RO roots (rustup `settings.toml`) must not receive WriteFile/Truncate.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn landlock_ro_settings_toml_not_writable() {
+    if !landlock_or_skip().await {
+        return;
+    }
+
+    let jail_dir = tempdir().unwrap();
+    let jail = jail_dir.path().canonicalize().unwrap();
+    // Homes must sit *outside* the jail — otherwise jail RW covers settings.toml.
+    let homes_dir = tempdir().unwrap();
+    let cargo_home = homes_dir.path().join("fake-cargo");
+    let rustup_home = homes_dir.path().join("fake-rustup");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::create_dir_all(&rustup_home).unwrap();
+    let settings = rustup_home.join("settings.toml");
+    let original = b"default_toolchain = \"stable\"\n";
+    std::fs::write(&settings, original).unwrap();
+
+    let _homes = override_operator_homes(cargo_home, rustup_home);
+    let broker = broker_for_jail(jail.clone()).await.unwrap();
+
+    let script = jail.join("try_write_settings.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf 'pwned' > '{s}' 2>/dev/null && echo WRITE_OK || echo WRITE_DENIED\n",
+            s = settings.display()
+        ),
+    )
+    .unwrap();
+    chmod_755(&script);
+
+    let req = SandboxExecRequest::new(
+        vec![sh_bin().into(), script.display().to_string()],
+        jail,
+        token(sh_bin(), None),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        !stdout.contains("WRITE_OK"),
+        "settings.toml must stay RO: stdout={stdout:?}"
+    );
+    assert_eq!(
+        std::fs::read(&settings).unwrap(),
+        original,
+        "settings.toml must not be overwritten"
+    );
+}
+
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn network_deny_blocks_egress() {

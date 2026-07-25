@@ -305,11 +305,9 @@ fn build_ruleset_created(
         if !p.exists() {
             continue;
         }
-        let access = if p.is_file() {
-            access_file
-        } else {
-            access_read
-        };
+        // File RO roots (e.g. rustup settings.toml) must not receive WriteFile /
+        // Truncate — from_file() is the exec/read set and includes writes.
+        let access = access_read;
         let path_fd = PathFd::new(p).map_err(|e| {
             SandboxError::BackendCannotEnforce(format!("PathFd {}: {e}", p.display()))
         })?;
