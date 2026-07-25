@@ -10,3 +10,10 @@ max_tokens_per_run = 2_000_000
 [observability]
 retain_full_prompts = false
 retain_tool_bodies = false
+
+# Sandbox (RFC-0005). On macOS set check = "seatbelt". Container is an acceptable fallback.
+[sandbox]
+check = "landlock"
+test = "container"
+network = "deny"
+quarantine_deps = true
