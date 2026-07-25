@@ -121,6 +121,7 @@ This RFC **owns when** to call `SessionRows` / append events; it does **not** fo
 | `RunGoalRecord` envelope in `goal_json` | **0003** |
 | Budget exhaustion hooks + `BudgetWarning` emission | **0003** |
 | Additive `RunError` variants + `RuntimeHandle::{run_dag,cancel_dag}` | **0003** |
+| Additive `EventStore` existence probes (`has_session_event_for_run` / `has_run_accepted_event` / `has_run_finished_event`) | **0002** trait + SQLite impl, required by **0003** (§3.8) |
 | Gate waiter registry (in-process; for 0010) | **0003** |
 | Cost metering / decision writers / OTLP | **0004** |
 | Planner / DAG load / topology mutation | **0009** |
@@ -424,7 +425,60 @@ impl RuntimeHandle {
 
 `AlloyRuntime::run` MUST call the same shared implementation as `RuntimeHandle::run_dag` (no divergent admit logic).
 
-### 3.8 Crate-root re-exports (additive)
+### 3.8 Additive `EventStore` existence seam
+
+Every terminal write in this RFC orders events **before** the terminal row (§6.3 step 10, §6.4 step
+10, §5.3 step 9) so a crash cannot leave a terminal row whose events no writer owes. That ordering
+only stays safe if a retry — a second `cancel`, a second `resume`, or a `start` outcome that joins a
+run another writer already finalized — can ask whether a given event is already durable instead of
+re-appending it. Reading a page of the event log to answer that would turn an O(1) guard into a
+replay, so RFC-0002 `EventStore` grows three probes:
+
+```rust
+// alloy-runtime/src/storage/events.rs — ADDITIVE (RFC-0002 §3.4)
+
+#[async_trait]
+pub trait EventStore: EventSink {
+    // … list_session_events / replay_session / last_seq / list_runtime_events …
+
+    /// True if a session event of `type_` exists for `run` (at most one row examined).
+    async fn has_session_event_for_run(
+        &self,
+        session: SessionId,
+        run: RunId,
+        type_: SessionEventType,
+    ) -> Result<bool, StoreError>;
+
+    /// True if a host `RunAccepted` exists for `run` (at most one row examined).
+    async fn has_run_accepted_event(&self, run: RunId) -> Result<bool, StoreError>;
+
+    /// True if a host `RunFinished` exists for `run` (at most one row examined).
+    async fn has_run_finished_event(&self, run: RunId) -> Result<bool, StoreError>;
+}
+```
+
+**Rules:**
+
+- All three are **required** trait methods with no provided default. `SqliteEventStore` is the only
+  impl; a page-scanning default would let a future impl silently degrade an idempotency guard into a
+  full replay.
+- Each MUST answer from a single `LIMIT 1` lookup and MUST NOT page. Duplicates therefore read as one
+  `true`.
+- `has_session_event_for_run` keys on `(session_id, run_id, type)`. Session-scoped rows
+  (`run_id IS NULL`, e.g. `SessionCreated`) never match a run probe.
+- The host probes key on `run_id` alone, extracted from the stored `RuntimeEvent` JSON —
+  `runtime_events` rows carry no session id.
+- Read-only: no probe writes, and none of them is a substitute for the per-run mutex. They answer
+  "is this event already durable", not "may I transition".
+
+| Probe | Control-plane use |
+| --- | --- |
+| `has_session_event_for_run(_, _, RunCompleted)` | Skip a duplicate `RunCompleted` on cancel retry (§6.4 step 10), resume finalization (§5.3 step 9), and terminal `start` outcomes (§6.3 step 10). Also the **gate** for Failed-row repair (§5.3) |
+| `has_session_event_for_run(_, _, ApprovalResolved)` | Skip inventing a resolved event when `approve(Deny)` already appended one before crashing (§5.3 Failed-row repair) |
+| `has_run_accepted_event` | Decide whether a terminal `RunFinished` would be unpaired when the durable state cannot prove acceptance (`created → cancelling`; §6.4 step 5, §5.3 step 9). Consulted only after the process-local marker misses |
+| `has_run_finished_event` | Skip a duplicate `RunFinished` on any retry of a terminal finalization |
+
+### 3.9 Crate-root re-exports (additive)
 
 ```rust
 pub use session::{
@@ -503,7 +557,16 @@ All RunController methods that append session events or call the host forwarder 
 | `dag_id` | `RunGoalRecord.dag_id` deserialized from `RunRow.goal_json` |
 | `run_id` | method argument / `RunRow.id` |
 
-Corrupt `goal_json` on `start` / `request_replan` ⇒ `RunError::Internal`. On `cancel`, if `goal_json` is corrupt, still transition to `cancelled` and clear waiters; skip `cancel_dag` and skip `RunFinished` (log warn).
+A method MUST parse the envelope only when it actually needs `dag_id`, and the corrupt-envelope contract follows from that:
+
+| Method | Needs `dag_id` | Corrupt `goal_json` |
+| --- | --- | --- |
+| `start` | Yes — `RunAccepted { run_id, dag_id }` and `run_dag(dag_id)` | `RunError::Internal` (nothing to dispatch), after the §6.3 state guards |
+| `cancel` | Best-effort — `cancel_dag` + `RunFinished` outcome | Still transition to `cancelled` and clear waiters; skip `cancel_dag`, skip `RunFinished` (log warn) |
+| `approve` | Only on `Deny`, for the `RunFinished` outcome | Persist the decision and `ApprovalResolved` / `RunCompleted`; skip `RunFinished` (log warn) |
+| `request_replan` | No | **Not parsed.** Record the replan intent and return `Ok(())` |
+
+`request_replan` records intent and never dispatches: it emits no DAG-bound event and calls no host forwarder, so a corrupt envelope is not an obstacle to recording the request and MUST NOT be reported as `Internal`. Refusing here would strand exactly the run an operator is most likely trying to replan away from — the run whose envelope is unreadable — behind an error no caller can clear, since RFC-0009 owns envelope rewrites. The corrupt row is still reported by `resume` (§5.3 step 6) and still refuses `start`.
 
 ---
 
@@ -548,13 +611,21 @@ Corrupt `goal_json` on `start` / `request_replan` ⇒ `RunError::Internal`. On `
 1. `get_session(id)` → `None` ⇒ `SessionError::NotFound(id)` (**do not** use `store_to_session` for this miss).
 2. Store errors ⇒ `store_to_session`.
 3. Return `Session` snapshot as stored.
-4. MUST NOT invent missing events, except the terminal pair owed by step 9 finalization.
+4. MUST NOT invent DAG progress, and MUST NOT append events for its own bookkeeping. Resume writes events in exactly the two cases where the writer that owed them died mid-transition: cancel finalization (step 9) and Failed-row approval repair (step 10). Both are gated on existence probes (§3.8), so a repeated resume is a no-op.
 5. MUST NOT auto-start runs.
 6. Rebuild **process-local** run→dag bindings by scanning `list_runs` and deserializing `RunGoalRecord` from `goal_json`. On per-run deser failure: `tracing::warn`, skip that run’s binding, continue. The corrupt row remains persisted and listable, is not dispatched, is not entered into `live_execution`, and MUST NOT block resume of the session or restoration of other valid runs.
 7. Gate waiters start empty (0010 re-registers).
 8. `live_execution` starts empty.
-9. **Re-arm after restart (explicit recovery only):** for rows in `running` or `waiting_approval`, upsert durable state to `accepted` (crash recovery), then they follow the `Accepted` re-dispatch path in §6.3. Rows already `accepted` stay re-dispatchable. Rows in `cancelling` MUST be finalized to `cancelled` on resume (best-effort `cancel_dag` skipped if no live scheduler work), together with a `RunCompleted` event. Emit `RunFinished` **only when** a durable `RunAccepted` exists for the run (or this process marked acceptance): `cancelling` is reachable from `created` without acceptance, so durable state alone must not invent an unpaired finish. Do not invent DAG progress. In-process non-terminal outcomes MUST NOT be treated as crash recovery (see §6.3). Terminal cancel finalization writes events **before** the `cancelled` upsert, with existence checks so a retry stays idempotent.
-10. Each row is re-read under its per-run mutex before step 9 decides anything: the `list_runs` result is a snapshot, and a concurrent `cancel` in the same process must not be rewritten from a stale state.
+9. **Re-arm after restart (explicit recovery only):** for rows in `running` or `waiting_approval`, upsert durable state to `accepted` (crash recovery), then they follow the `Accepted` re-dispatch path in §6.3. Rows already `accepted` stay re-dispatchable. Rows in `cancelling` MUST be finalized to `cancelled` on resume (best-effort `cancel_dag` skipped if no live scheduler work), together with a `RunCompleted` event. Emit `RunFinished` **only when** a durable `RunAccepted` exists for the run (or this process marked acceptance): `cancelling` is reachable from `created` without acceptance, so durable state alone must not invent an unpaired finish. Do not invent DAG progress. In-process non-terminal outcomes MUST NOT be treated as crash recovery (see §6.3). Terminal cancel finalization writes events **before** the `cancelled` upsert, with existence checks (§3.8) so a retry stays idempotent. Its `RunCompleted` carries `{ "dag_state": "cancelled", "reason": "resume_finalized_cancel" }` so the log distinguishes a resume-owed finalization from a cancel that completed inside its own process.
+10. **Failed-row approval repair (Deny crash window only):** `approve(Deny)` is the one path in this RFC that writes a terminal row **before** its events (§6.5 step 4 — the row write is what makes the decision durable before the waiter is notified). A crash in that window leaves a `failed` row with no `RunCompleted`. Resume repairs such a row **in place** — the row stays `failed`, it is never re-armed or re-dispatched:
+
+    - **Gate:** repair only when `has_session_event_for_run(session, run, RunCompleted)` is `false`. A `failed` row that already has `RunCompleted` is complete and MUST be left alone. This is what keeps a run failed **with** its events first — the shape RFC-0010's scheduler writes (events before row, §6.3 step 10) — from being mis-repaired.
+    - Append `ApprovalResolved` with `{"decision": "deny", "reason": "resume_finalized_approval_denied"}` **only when** `has_session_event_for_run(…, ApprovalResolved)` is `false`. The `gate_id` of the original request is not durable in this row, so the repaired event records the decision and its provenance rather than pretending to reproduce §6.5's payload.
+    - Append `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`.
+    - Emit `RunFinished` with a synthetic failed outcome **only when** a durable `RunAccepted` exists for the run (or this process marked acceptance) **and** `has_run_finished_event` is `false`. `waiting_approval` implies acceptance, but the marker is process-local and the row no longer says `waiting_approval`, so acceptance is re-established from the log.
+    - A `failed` row whose `goal_json` is corrupt is skipped entirely by step 6, so it is not repaired: without `dag_id` there is no `RunFinished` to pair, and the row is already terminal and undispatchable.
+
+11. Each row is re-read under its per-run mutex before steps 9–10 decide anything: the `list_runs` result is a snapshot, and a concurrent `cancel` in the same process must not be rewritten from a stale state.
 
 ### 5.4 `submit_goal`
 
@@ -649,6 +720,7 @@ sequenceDiagram
   SP->>SR: get_session
   SR-->>SP: Session
   Note over SP: live_execution empty; running/waiting_approval rewritten to accepted
+  Note over SP: cancelling finalized; failed without RunCompleted repaired in place
   SP-->>Proc: Session
   Proc->>SP: events(None, n)
   SP->>ES: list_session_events
@@ -771,6 +843,8 @@ sequenceDiagram
 
 A second `approve` for the same gate finds no waiter ⇒ `UnknownGate`.
 
+**Crash window (Deny):** this is the only terminal transition in this RFC that writes the row **before** its events, because the decision has to be durable before the waiter is released. A crash between the two leaves a `failed` row with no `RunCompleted`; resume repairs the missing events in place (§5.3 step 10) and leaves the row `failed`. On `Deny` with a corrupt `goal_json`, `RunFinished` is skipped with a warn (§4) — the decision, `ApprovalResolved`, and `RunCompleted` still commit.
+
 `ApprovalRequested` emission remains owned by GateHuman execution (0010). This RFC writes `waiting_approval` only in `register_gate_waiter` and resolves via `approve`.
 
 ### 6.6 `request_replan`
@@ -788,7 +862,7 @@ A second `approve` for the same gate finds no waiter ⇒ `UnknownGate`.
 **Algorithm:**
 
 1. Acquire per-run mutex.
-2. Load run; apply table.
+2. Load run; apply table. Do **not** deserialize `RunGoalRecord` — this method needs no `dag_id`, so a corrupt envelope MUST NOT block recording the request (§4). A `tracing::warn` about the envelope is permitted but not required.
 3. Drop **all** gate waiters for this `run` (invalidate outstanding approvals).
 4. Upsert `replan_requested` (**row first**).
 5. Append `ReplanRequested` with `{ "reason": /* serde ReplanReason */ }` using `RunRow.session_id`.
@@ -841,7 +915,9 @@ stateDiagram-v2
 | Operation | SessionRows | EventSink via handle | RuntimeEvent |
 | --- | --- | --- | --- |
 | create | `upsert_session` | `SessionCreated` | — |
-| resume | `get_session` (+ list_runs for re-arm) | `RunCompleted` cancelled when finalizing a `cancelling` row (§5.3 step 9) | `RunFinished` with the same finalization, when applicable |
+| resume (re-arm) | `get_session` + `list_runs`; `upsert_run` → `accepted` for `running` / `waiting_approval` | — | — |
+| resume (cancel finalization, §5.3 step 9) | `upsert_run` → `cancelled`, **after** the events | `RunCompleted` `{ "dag_state": "cancelled", "reason": "resume_finalized_cancel" }` when missing | `RunFinished` only when a durable `RunAccepted` exists and no `RunFinished` does |
+| resume (Failed-row repair, §5.3 step 10) | none — the row stays `failed` | `ApprovalResolved` `{ "decision": "deny", "reason": "resume_finalized_approval_denied" }` then `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`, each only when missing; whole step skipped when `RunCompleted` already exists | `RunFinished` (synthetic failed outcome) when a durable `RunAccepted` exists and no `RunFinished` does |
 | submit_goal | `upsert_run` | `GoalSubmitted` | — |
 | events | `get_session` + EventStore list | — | — |
 | start (first) | `upsert_run` → `accepted` **before** emit | `Error` on unavailable | `RunAccepted` after row |
@@ -950,7 +1026,8 @@ AlloyRuntime::new()
 - After reopen + install, `resume` + `events` MUST observe durable pre-crash commits.
 - In-flight oneshot gate waiters are **not** durable; 0010 MUST call `register_gate_waiter` again after resume when re-entering gates.
 - Durable `accepted` / `running` / `waiting_approval` without `live_execution` remain **re-dispatchable** via `start` (§6.3) — the MVP Unavailable path MUST NOT permanently poison a run.
-- `cancelling` rows are finalized to `cancelled` on resume (§5.3).
+- `cancelling` rows are finalized to `cancelled` on resume (§5.3 step 9).
+- `failed` rows missing `RunCompleted` — the `approve(Deny)` row-before-events crash window — are repaired in place on resume (§5.3 step 10). A `failed` row that already has `RunCompleted` is left untouched.
 
 ---
 
@@ -985,6 +1062,7 @@ AlloyRuntime::new()
 | Graceful `drain` / `shutdown` | In-flight `run_dag` cancelled via host drain path; reject new `start` / `submit_goal` when not `Running`; `cancel` still allowed in `Draining` |
 | Crash after successful append commit | Events durable (0002 WAL/fsync policy) |
 | Crash between upsert and append/emit | Row may exist without matching event; resume uses row; `start` re-dispatch rules apply |
+| Crash after the `approve(Deny)` row write, before its events | Row is `failed` without `RunCompleted`; resume repairs `ApprovalResolved` / `RunCompleted` / conditional `RunFinished` in place (§5.3 step 10) |
 | Crash after `RunAccepted` before outcome | Row stays `accepted`; restart → re-dispatchable |
 | Restart | `resume` + `events` restore control truth; waiters empty; `live_execution` empty |
 
@@ -1008,7 +1086,7 @@ Durability of session events equals RFC-0002 EventStore durability. This RFC add
 | --- | --- |
 | `NotFound` | Missing run row |
 | `InvalidPhase` | Illegal transition; scheduler busy; runtime phase; dag not found; cancelling/terminal |
-| `Internal` | Corrupt `goal_json` on start/replan; sink failures; dropped waiter channel |
+| `Internal` | Corrupt `goal_json` on `start` (**not** on `request_replan` — see §4); sink failures; dropped waiter channel |
 | `SchedulerUnavailable` | NullScheduler / Unavailable |
 | `AlreadyStarted` | `start` while `live_execution` contains the run |
 | `UnknownGate` | `approve` without waiter |
@@ -1064,66 +1142,97 @@ Profile **catalog files** (`profiles/default.toml`, etc.) remain 0015/0001 confi
 
 ## 14. Testing Strategy
 
-### Unit tests (`alloy-runtime`)
+Test names below are the ones in the tree, so the matrix can be diffed against the suite.
+
+### Unit tests — session lifecycle (`src/session/tests.rs`)
 
 | Test | Expect |
 | --- | --- |
-| `session_create_persists_row_and_event` | Row + `SessionCreated` seq 0 |
-| `session_submit_goal_creates_run` | `RunRow.state == created`, `GoalSubmitted` |
-| `session_events_pagination_exclusive` | `after`/`limit` semantics + clamp |
-| `session_resume_not_found` | `SessionError::NotFound` |
-| `session_reject_unknown_profile` | `Invalid` |
-| `session_events_allowed_while_draining` | resume/events ok in `Draining` |
-| `run_start_null_scheduler_unavailable` | `RunAccepted` once + `SchedulerUnavailable` + state `accepted` |
-| `run_start_redispatch_after_unavailable` | second `start` no second `RunAccepted`; still Unavailable |
-| `run_start_scheduler_cancelled_emits_finished` | `SchedError::Cancelled` → `Ok(())` + `RunFinished` + `RunCompleted`; not `InvalidPhase` |
-| `runtime_to_run_cancelled_is_bug_internal` | bare `runtime_to_run(Scheduler(Cancelled))` → `Internal` (start must special-case) |
-| `run_double_start_while_live_already_started` | `AlreadyStarted` when `live_execution` set |
-| `run_running_outcome_not_redispatchable` | after `Ok(Running)`, second `start` → `AlreadyStarted` |
-| `run_approve_unknown_gate` | `UnknownGate` only when `WaitingApproval` and no waiter |
-| `run_approve_requires_waiting_approval` | `InvalidPhase` if not waiting (even if waiter present) |
-| `run_approve_persists_before_notify` | fail append → waiter not notified |
-| `run_approve_with_waiter` | oneshot resolves + `ApprovalResolved`; second approve `UnknownGate` |
-| `run_cancel_clears_waiters` | approve after cancel → `UnknownGate` |
-| `run_cancel_corrupt_goal_skips_run_finished` | `goal_ok == false` → cancelled row, no `RunFinished` |
-| `run_cancel_idempotent` | second cancel `Ok(())`; uses `RunCompleted` not `Error` |
-| `run_request_replan_rejects_terminal` | `InvalidPhase` |
-| `run_request_replan_records_event` | state + `ReplanRequested`; waiters cleared |
-| `run_request_replan_not_overwritten_by_late_start` | concurrent `run_dag` Ok does not clobber `replan_requested` |
-| `budget_warning_hook_appends_event` | `BudgetWarning` |
-| `store_miss_session_maps_to_not_found` | not `Invalid` via `store_to_session` |
-| `store_to_run_corrupt_is_internal` | `Corrupt`/`Migration` → `Internal`; `Conflict` → `InvalidPhase` |
-| `runtime_error_invalid_phase_maps` | `runtime_to_run` preserves `InvalidPhase` |
-| `start_lock_not_held_across_run_dag` | with a mock scheduler that blocks until approve, approve succeeds |
-| `session_resume_skips_corrupt_goal_json` | warn + skip binding; other runs restored |
-| `run_start_abort_clears_lease` | aborting a `start` task releases the lease; next `start` is a fresh dispatch, not `AlreadyStarted` |
+| `session_create_persists_row_and_event` | Row + `SessionCreated` at seq 0 with profile / budget / backends payload |
+| `session_reject_unknown_profile` | `Invalid("unsupported profile: …")` |
+| `session_create_rejects_relative_root_and_empty_backends` | `Invalid` for relative `workspace_root` and for empty `language_backends` |
+| `session_submit_goal_creates_run` | `RunRow.state == created` + `GoalSubmitted` carrying `dag_id` and the budget snapshot |
+| `session_submit_goal_rejects_empty_text` | `Invalid`; no run row written |
+| `session_events_pagination_exclusive` | `after` / `limit` semantics + clamp at both ends |
+| `session_resume_not_found` | `SessionError::NotFound`, not `Invalid` |
+| `session_events_allowed_while_draining` | `resume` / `events` succeed in `Draining`; mutating APIs do not |
+| `session_resume_rearms_crash_recovery_states` | `running` / `waiting_approval` → `accepted`; `cancelling` → `cancelled`; `created` untouched; exactly one invented `RunCompleted` |
+| `session_resume_skips_corrupt_goal_json` | Warn + skip binding; sibling run re-armed; corrupt row stays listable and fails `start` with `Internal` |
+| `session_resume_finalizes_cancelling_with_run_completed` | Never-accepted `cancelling` → `cancelled` + one `RunCompleted`, **no** `RunFinished` |
+| `session_resume_finalizes_accepted_cancelling_emits_finished` | Accepted then `cancelling` → `cancelled` + `RunCompleted` + `RunFinished` |
+| `session_resume_cancel_events_precede_cancelled_upsert` | Injected upsert failure after the events leaves the row `cancelling`; retry is idempotent and then commits `cancelled` |
+| `session_resume_keeps_cancelling_when_append_fails` | Injected append failure writes no events and leaves `cancelling`; resume still returns `Ok` |
+| `session_resume_does_not_clobber_concurrent_cancel` | Resume racing `cancel` yields one terminal write and one `RunCompleted` in either order |
+| `session_resume_repairs_failed_approval_without_terminal_events` | `failed` row with no `RunCompleted` → repaired `ApprovalResolved` `{deny, resume_finalized_approval_denied}` + `RunCompleted` `{failed, approval_denied}` + one `RunFinished`; row stays `failed`; second resume is a no-op (§5.3 step 10) |
+| `budget_warning_hook_appends_event` | `BudgetWarning` with snapshot + message; unknown session → `NotFound` |
+
+### Unit tests — run control (`src/session/tests.rs`)
+
+| Test | Expect |
+| --- | --- |
+| `run_start_null_scheduler_unavailable` | One `RunAccepted` + `SchedulerUnavailable` + durable `accepted` + `Error {class: scheduler_unavailable}` |
+| `run_start_redispatch_after_unavailable` | Second `start` emits no second `RunAccepted`; still Unavailable; still re-dispatchable |
+| `run_start_terminal_success_emits_finished` | `Ok(Succeeded)` → `RunCompleted` + `RunFinished` then `succeeded` row |
+| `run_start_scheduler_cancelled_emits_finished` | `SchedError::Cancelled` → `Ok(())` + `RunCompleted` + `RunFinished`; not `InvalidPhase` |
+| `run_start_dag_not_found_keeps_accepted` | `InvalidPhase("dag not found: …")` + `Error {class: dag_not_found}`; row stays `accepted` |
+| `run_start_pending_outcome_is_internal` | `Ok(Pending)` → `Internal("unexpected pending outcome")`; row stays `accepted` |
+| `run_running_outcome_not_redispatchable` | After `Ok(Running)`, a second `start` → `AlreadyStarted` |
+| `run_start_missing_run_is_not_found` | `RunError::NotFound` |
+| `run_unknown_state_string_is_invalid_phase` | Unknown persisted `state` → `InvalidPhase("unknown run state: …")` from `start`; the session still resumes and keeps listing the row |
+| `start_lock_not_held_across_run_dag` | Scheduler blocking inside `run_dag` still lets `register_gate_waiter` / `approve` proceed |
+| `run_double_start_while_live_already_started` | `AlreadyStarted` while the execution lease is held |
+| `run_start_abort_clears_lease` | Aborting a `start` task releases the lease; the next `start` is a fresh dispatch |
+| `lock_maps_evict_after_drop` | Per-run and per-session lock maps return to empty once guards / tickets drop |
+| `run_request_replan_not_overwritten_by_late_start` | Late `run_dag` `Ok` does not clobber `replan_requested`; lease still cleared |
+| `run_cancel_during_start_is_not_clobbered` | Late `run_dag` `Ok` does not clobber `cancelled` |
+| `run_cancel_idempotent_and_records_run_completed` | Second `cancel` → `Ok(())`; terminal recorded as `RunCompleted`, never `Error` |
+| `run_cancel_from_created_skips_run_finished` | `created` → `cancelled` in one shot; no `cancelling`, no `cancel_dag`, no `RunFinished` |
+| `run_cancel_retry_after_cancel_dag_failure_skips_unpaired_finished` | `cancel_dag` failure leaves `cancelling`; retry of a never-accepted run emits **zero** `RunFinished` |
+| `run_cancel_retry_after_cancel_dag_failure_emits_finished_when_accepted` | Same retry for an accepted run emits exactly one `RunFinished` (acceptance read from the log) |
+| `run_cancel_corrupt_goal_skips_run_finished` | `goal_ok == false` → `cancelled` row, `cancel_dag` skipped, no `RunFinished` |
+| `run_cancel_clears_waiters` | `approve` after `cancel` → terminal `InvalidPhase`; waiters dropped |
+| `run_approve_with_waiter` | Oneshot resolves + one `ApprovalResolved`; second `approve` → `UnknownGate` |
+| `run_approve_requires_waiting_approval` | `InvalidPhase` for every non-`WaitingApproval` state even with a waiter present; `UnknownGate` only when `WaitingApproval` and no waiter |
+| `run_approve_deny_fails_run` | `Deny` → `failed` + `RunCompleted {failed, approval_denied}` + one `RunFinished` |
 | `run_approve_deny_emits_run_finished_after_redispatch` | `Deny` emits `RunFinished` even when this process never emitted `RunAccepted` |
-| `register_gate_waiter_rejects_replan_requested` | `InvalidPhase("replan pending")`; pending replan not rewritten |
-| `session_resume_finalizes_cancelling_with_run_completed` | never-accepted `cancelling` → `cancelled` + one `RunCompleted`, **no** `RunFinished` |
-| `session_resume_finalizes_accepted_cancelling_emits_finished` | accepted then `cancelling` → `cancelled` + `RunCompleted` + `RunFinished` |
-| `session_resume_does_not_clobber_concurrent_cancel` | resume racing `cancel` yields one terminal write and one `RunCompleted` in any order |
-| `run_approve_deny_during_run_dag_joins_cleanly` | Deny mid-`run_dag` → durable `failed`; `start` returns `Ok(())` with one terminal pair |
-| `run_approve_deny_drops_waiter_when_append_fails` | Deny append fail after row commit drops sender (`Closed`); no stranded waiter |
-| `lock_maps_evict_after_drop` | lock maps return to empty once guards/tickets drop |
+| `run_approve_deny_during_run_dag_joins_cleanly` | `Deny` mid-`run_dag` → durable `failed`; the agreeing `Ok(Failed)` returns `Ok(())` with one terminal pair |
+| `run_approve_persists_before_notify` | Row-write failure leaves `waiting_approval` and an untouched waiter; append failure after the row commit drops the sender (`Closed`) and writes no `ApprovalResolved` |
+| `run_approve_deny_drops_waiter_when_append_fails` | Deny append failure after the row commit closes the receiver; the terminal row then refuses further `approve` |
+| `run_request_replan_records_event_and_clears_waiters` | `replan_requested` + `ReplanRequested {reason}`; waiters dropped; repeat call idempotent |
+| `run_request_replan_rejects_created_and_terminal` | `InvalidPhase("not started")` / `InvalidPhase("terminal")` |
+| `register_gate_waiter_rejects_created_and_terminal` | `InvalidPhase("not started")` / `InvalidPhase("terminal")`; a missing run → `NotFound` |
+| `register_gate_waiter_rejects_replan_requested` | `InvalidPhase("replan pending")`; the pending replan is not rewritten |
+| `register_gate_waiter_replaces_prior_waiter` | Re-registration closes the prior receiver and resolves the new one |
+
+### Unit tests — error mapping (`src/session/map_err.rs`)
+
+| Test | Expect |
+| --- | --- |
+| `store_corrupt_is_internal` | `Corrupt` / `Migration` → `Internal`; `Conflict` → `InvalidPhase` |
+| `cancelled_is_bug_internal` | Bare `runtime_to_run(Scheduler(Cancelled))` → `Internal` (`start` must special-case it) |
+| `invalid_phase_preserved` | `runtime_to_run` preserves `InvalidPhase` |
 
 ### Integration tests
 
-| Test | Expect |
-| --- | --- |
-| `session_resume` (roadmap M5 name) | create/submit → reopen storage/runtime → resume + events bit-identical seq/payload |
-| `session_sqlite_cursor_after_restart` | exclusive cursor continues |
-| `run_accepted_survives_restart_and_redispatch` | accepted row re-dispatchable after reopen |
-| `cancelling_run_is_finalized_after_restart` | accepted then `cancelling` finalized once on resume with `RunFinished`; second resume is a no-op |
-| `created_cancelling_resume_skips_run_finished` | `created → cancelling` without `RunAccepted` finalizes with **zero** `RunFinished` |
-| Concurrent: N readers `events` + M `submit_goal` on distinct sessions | no deadlocks; seq gapless per session |
+| Test | File | Expect |
+| --- | --- | --- |
+| `session_resume_after_restart_is_bit_identical` | `tests/session_rfc0003.rs` | create/submit → reopen storage + runtime → `resume` + `events` return bit-identical seq / ts / payload (roadmap M5 `session_resume`) |
+| `session_sqlite_cursor_after_restart` | `tests/session_rfc0003.rs` | Exclusive cursor continues across the restart |
+| `run_accepted_survives_restart_and_redispatch` | `tests/session_rfc0003.rs` | `accepted` row is re-dispatchable after reopen with no second `RunAccepted` |
+| `cancelling_run_is_finalized_after_restart` | `tests/session_rfc0003.rs` | Accepted then `cancelling` finalized once with `RunFinished`; second resume is a no-op |
+| `created_cancelling_resume_skips_run_finished` | `tests/session_rfc0003.rs` | `created → cancelling` without `RunAccepted` finalizes with **zero** `RunFinished` |
+| `concurrent_readers_and_submitters_are_gapless` | `tests/session_rfc0003.rs` | N `events` readers + M `submit_goal` on distinct sessions: no deadlock, per-session seq gapless |
+| `resume_of_unknown_session_after_restart_is_not_found` | `tests/session_rfc0003.rs` | `NotFound` from a reopened store |
+| `event_existence_probes_are_scoped_and_limit_one` | `tests/storage_rfc0002.rs` | The §3.8 seam: duplicates read as one `true`; session / run / type scoping holds; `run_id IS NULL` rows never match a run probe; `RunAccepted` is not a `RunFinished` |
 
 ### Commands
 
 ```bash
+cargo test -p alloy-runtime
 cargo test -p alloy-runtime -- session_
 cargo test -p alloy-runtime -- run_
 cargo test --workspace
-cargo clippy --workspace -- -D warnings
+cargo clippy -p alloy-runtime --all-targets -- -D warnings
 cargo fmt --check
 ```
 
@@ -1159,46 +1268,48 @@ Do not invent additional deferred subsystems in this RFC.
 
 Merge only when all items hold:
 
-- [ ] `SessionService` / `RunController` method signatures match RFC-0001 / `session/traits.rs` (including `events(after: Option<EventSeq>, limit)`)
-- [ ] Architecture V2 §5.2 / §5.5 / ADR F-22 intent preserved: Session ≠ tools/DAG mutation; RunController owns start/cancel/approve/replan
-- [ ] Session does **not** execute tools or mutate DAG topology
-- [ ] Persistence uses RFC-0002 `SessionRows` / `EventStore` / `RuntimeHandle` append — no dual-write, no sixth crate
-- [ ] Row-then-event ordering for start acceptance; locks not held across `run_dag` / `cancel_dag`
-- [ ] `accepted` remains re-dispatchable when `live_execution` is false (Unavailable path does not poison runs)
-- [ ] `Running`/`WaitingApproval` not in-process re-dispatchable; resume rewrites to `accepted`
-- [ ] Execution lease cleared only after durable transition; late outcomes cannot clobber `replan_requested`/`cancelled`
-- [ ] `approve` / `request_replan` / `cancel` state guards and waiter lifecycle defined and tested
-- [ ] Approve persists before waiter notify
-- [ ] `RuntimeError` → `RunError` / `SessionError` mapping table implemented; `SchedError::Cancelled` handled as start success
-- [ ] `store_to_run`: Corrupt/Migration → Internal; Conflict → InvalidPhase
-- [ ] `BudgetPolicy` attached on create; `signal_budget_warning` hook defined and tested
-- [ ] Restart recovery: `resume` + `events` + re-dispatch rules defined and integration-tested
-- [ ] Corrupt `goal_json` on resume skipped with warn; cancel skips `RunFinished` when `!goal_ok`
-- [ ] `RunError::SchedulerUnavailable` / `AlreadyStarted` / `UnknownGate`; `RunError` is `#[non_exhaustive]` with downstream catch-all guidance
-- [ ] `RunRow.state` vocabulary pinned (`RunControlState::parse` → `Option`); not a second DAG state machine
-- [ ] `RunGoalRecord` stored in `goal_json` with minted `DagId`; unknown fields tolerated
-- [ ] `RuntimeHandle::run_dag` / `cancel_dag` additive seams share `AlloyRuntime::run` admit semantics
-- [ ] `SessionMetrics` defined and re-exported
-- [ ] Unit + integration tests in §14 passing
-- [ ] `cargo fmt --check` clean; `clippy -D warnings` clean on touched crates
-- [ ] Crate root re-exports updated explicitly (no glob)
-- [ ] `.env` never written; `example.env` policy preserved
-- [ ] Series [Definition of Done](./README.md#definition-of-done-merge-gate) satisfied
+- [x] `SessionService` / `RunController` method signatures match RFC-0001 / `session/traits.rs` (including `events(after: Option<EventSeq>, limit)`)
+- [x] Architecture V2 §5.2 / §5.5 / ADR F-22 intent preserved: Session ≠ tools/DAG mutation; RunController owns start/cancel/approve/replan
+- [x] Session does **not** execute tools or mutate DAG topology
+- [x] Persistence uses RFC-0002 `SessionRows` / `EventStore` / `RuntimeHandle` append — no dual-write, no sixth crate
+- [x] Row-then-event ordering for start acceptance; locks not held across `run_dag` / `cancel_dag`
+- [x] `accepted` remains re-dispatchable when `live_execution` is false (Unavailable path does not poison runs)
+- [x] `Running`/`WaitingApproval` not in-process re-dispatchable; resume rewrites to `accepted`
+- [x] Execution lease cleared only after durable transition; late outcomes cannot clobber `replan_requested`/`cancelled`
+- [x] `approve` / `request_replan` / `cancel` state guards and waiter lifecycle defined and tested
+- [x] Approve persists before waiter notify
+- [x] `RuntimeError` → `RunError` / `SessionError` mapping table implemented; `SchedError::Cancelled` handled as start success
+- [x] `store_to_run`: Corrupt/Migration → Internal; Conflict → InvalidPhase
+- [x] `BudgetPolicy` attached on create; `signal_budget_warning` hook defined and tested
+- [x] Restart recovery: `resume` + `events` + re-dispatch rules defined and integration-tested
+- [x] Corrupt `goal_json` on resume skipped with warn; cancel skips `RunFinished` when `!goal_ok`; `request_replan` does not parse the envelope at all (§4)
+- [x] `failed` rows left by the `approve(Deny)` row-before-events crash window are repaired in place on resume, gated on a missing `RunCompleted` so a scheduler-written `failed` (events first) is never mis-repaired (§5.3 step 10)
+- [x] `EventStore` existence probes (§3.8) are required trait methods answering from one `LIMIT 1` row, and every terminal write is guarded by them
+- [x] `RunError::SchedulerUnavailable` / `AlreadyStarted` / `UnknownGate`; `RunError` is `#[non_exhaustive]` with downstream catch-all guidance
+- [x] `RunRow.state` vocabulary pinned (`RunControlState::parse` → `Option`); not a second DAG state machine
+- [x] `RunGoalRecord` stored in `goal_json` with minted `DagId`; unknown fields tolerated
+- [x] `RuntimeHandle::run_dag` / `cancel_dag` additive seams share `AlloyRuntime::run` admit semantics
+- [x] `SessionMetrics` defined and re-exported
+- [x] Unit + integration tests in §14 passing
+- [x] `cargo fmt --check` clean; `clippy -D warnings` clean on touched crates
+- [x] Crate root re-exports updated explicitly (no glob)
+- [x] `.env` never written; `example.env` policy preserved
+- [x] Series [Definition of Done](./README.md#definition-of-done-merge-gate) satisfied
 
 ## Definition of Done
 
 Merge only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
 
-- [ ] Architecture compliance: **PASS**
-- [ ] RFC acceptance criteria: **100% satisfied**
-- [ ] Unit tests: **passing**
-- [ ] Integration tests: **passing**
-- [ ] Documentation: **complete**
-- [ ] Public APIs: **reviewed and stable**
-- [ ] Clippy: **clean**
-- [ ] Formatting: **clean**
-- [ ] No TODO or placeholder implementations left in this RFC’s scope (explicit **Stub** / deferred only)
-- [ ] Code review: **approved**
+- [x] Architecture compliance: **PASS** — V2 §5.2 / §5.5 / ADR F-22 boundaries hold; no new crate, no new service, no parallel traits
+- [x] RFC acceptance criteria: **100% satisfied** (§16)
+- [x] Unit tests: **passing** — `cargo test -p alloy-runtime` (lib unit tests, incl. `session/tests.rs` and `session/map_err.rs`)
+- [x] Integration tests: **passing** — `tests/session_rfc0003.rs`, `tests/storage_rfc0002.rs`, `tests/lifecycle.rs`
+- [x] Documentation: **complete** — §3.8 storage seam, §4 corrupt-envelope matrix, §5.3 step 10 repair, §7 write table, §14 matrix all match the tree
+- [x] Public APIs: **reviewed and stable** — additive only: `RunError` variants (`#[non_exhaustive]`), `RuntimeHandle::{run_dag,cancel_dag}`, `EventStore` existence probes, `session::` types + explicit crate-root re-exports
+- [x] Clippy: **clean** — `cargo clippy -p alloy-runtime --all-targets -- -D warnings`
+- [x] Formatting: **clean** — `cargo fmt -p alloy-runtime -- --check`
+- [x] No TODO or placeholder implementations left in this RFC’s scope (explicit **Stub** / deferred only)
+- [x] Code review: **approved** — production review of the control plane returned APPROVED with Architecture V2 compliance PASS on this PR; every finding raised there is either fixed in code or pinned in this document
 
 ---
 
@@ -1227,6 +1338,9 @@ Only genuine implementation spikes — settled V2/0001/0002 decisions are not re
 - `SchedError::Cancelled` from `run_dag` is handled as success in §6.3, not via `runtime_to_run` → `InvalidPhase`
 - Approve persists before notifying the gate waiter
 - `#[non_exhaustive]` on `RunError` requires downstream catch-all match arms
+- `request_replan` records intent and never parses `goal_json`; a corrupt envelope is a `start`-only `Internal` (§4)
+- `approve(Deny)` is the only terminal transition that writes the row before its events; resume repairs that window in place, gated on a missing `RunCompleted` (§5.3 step 10)
+- The `EventStore` existence probes are required trait methods answering from one `LIMIT 1` row — no page-scanning default (§3.8)
 
 ---
 

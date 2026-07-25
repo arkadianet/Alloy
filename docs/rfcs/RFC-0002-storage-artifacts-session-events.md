@@ -98,6 +98,7 @@ This RFC **implements** durable backends behind those contracts. It does **not**
 | `RuntimeConfig.data_dir` creation on `start` | **0001** |
 | SQLite `SqliteEventStore` implementing `EventSink` + `EventStore` | **0002** |
 | `EventStore` read/replay/pagination trait | **0002** |
+| `EventStore` `has_session_event_for_run` / `has_run_accepted_event` / `has_run_finished_event` | **0002** (trait + SQLite impl; added for **0003** idempotency, see §3.4) |
 | `ArtifactStore` trait + filesystem CAS + SQLite index | **0002** |
 | Schema migrations, WAL, checkpoint, reopen/recover | **0002** |
 | Atomic handoff installer from `InMemoryEventSink` → SQLite | **0002** |
@@ -314,6 +315,24 @@ pub trait EventStore: EventSink {
     async fn list_runtime_events(&self, after_rowid: Option<i64>, limit: usize)
         -> Result<Vec<(i64, RuntimeEvent)>, StoreError>;
 
+    // --- Existence probes (added for RFC-0003 resume/cancel idempotency) ---
+
+    /// True if a session event of `type_` exists for `run` in `session`.
+    /// Indexed `LIMIT 1` lookup — MUST NOT page or scan the log.
+    /// Session-scoped rows (`run_id IS NULL`) never match.
+    async fn has_session_event_for_run(
+        &self,
+        session: SessionId,
+        run: RunId,
+        type_: SessionEventType,
+    ) -> Result<bool, StoreError>;
+
+    /// True if a host `RunAccepted` exists for `run` (`LIMIT 1`).
+    async fn has_run_accepted_event(&self, run: RunId) -> Result<bool, StoreError>;
+
+    /// True if a host `RunFinished` exists for `run` (`LIMIT 1`).
+    async fn has_run_finished_event(&self, run: RunId) -> Result<bool, StoreError>;
+
     /// Import a handoff snapshot with **exact** `seq` / `ts` (no re-allocation, no `Timestamp::now`).
     /// Single DB transaction that MUST include post-import seq verification (or equivalent
     /// cleanup on verify failure before commit visibility). Used only by atomic handoff (§3.7).
@@ -332,6 +351,14 @@ impl EventSink for SqliteEventStore {
 #[async_trait]
 impl EventStore for SqliteEventStore { /* … */ }
 ```
+
+**Existence probes (normative):** the three `has_*` methods are **required** trait methods, not
+provided defaults — `SqliteEventStore` is the only impl, and a page-scanning default would let a
+future impl silently turn an O(1) idempotency check into a full replay. They are read-only, take a
+single storage permit, and answer from one indexed row: `has_session_event_for_run` matches
+`(session_id, run_id, type)`; the two host probes match `json_extract(event_json, '$.run_accepted.run_id')`
+/ `'$.run_finished.run_id'` because `runtime_events` rows carry no session id. RFC-0003 uses them to
+keep terminal-event writes idempotent across retries and restarts (RFC-0003 §3.8 / §5.3 / §6.4).
 
 **Seq contract (normative, unchanged from 0001):**
 
