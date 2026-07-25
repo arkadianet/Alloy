@@ -15,9 +15,9 @@
 
 ---
 
-### 1. Overview
+## 1. Overview
 
-#### Purpose
+### Purpose
 
 Ship the MVP **data plane** inside `alloy-runtime`:
 
@@ -29,11 +29,11 @@ Ship the MVP **data plane** inside `alloy-runtime`:
 
 Day-1 developer deliverable: open a temp `data_dir`, append Appendix A events through the host sink, restart (or reopen), page/replay the same per-session `EventSeq` stream, put/get an artifact by `ArtifactId` / digest — without writing the user’s `.env`.
 
-#### Problem
+### Problem
 
 RFC-0001 publishes `SessionEvent` / `NewSessionEvent` / `EventSink` / `InMemoryEventSink` and installs the in-memory sink by default. Persistence, artifact blobs, migrations, and crash recovery are explicitly deferred here. Without this RFC, Session resume (0003), decision-log defaults (0004), DAG persistence (0009), and ProjectGraph storage roots (0011) have no durable substrate.
 
-#### Scope
+### Scope
 
 | In scope | Detail |
 | --- | --- |
@@ -46,7 +46,7 @@ RFC-0001 publishes `SessionEvent` / `NewSessionEvent` / `EventSink` / `InMemoryE
 | Config | Keys in `example.env` + profile observability flags already on `RuntimeConfig`; never write `.env` |
 | Observability | `tracing` spans + in-process storage counters |
 
-#### Non-goals
+### Non-goals
 
 - `SessionService` / `RunController` orchestration, budgets enforcement, goal submit → **RFC-0003**.
 - Rich decision writers / cost metering / OTLP → **RFC-0004** (this RFC stores whatever envelopes callers append; default payload *shape* guidance only).
@@ -59,9 +59,9 @@ RFC-0001 publishes `SessionEvent` / `NewSessionEvent` / `EventSink` / `InMemoryE
 
 ---
 
-### 2. Architecture Integration
+## 2. Architecture Integration
 
-#### Relationship to Architecture V2
+### Relationship to Architecture V2
 
 | V2 reference | Application |
 | --- | --- |
@@ -74,7 +74,7 @@ RFC-0001 publishes `SessionEvent` / `NewSessionEvent` / `EventSink` / `InMemoryE
 | §21.2 | SQLite remains MVP; Postgres deferred |
 | §19 W2 | Session event log (SQLite); decision metadata defaults |
 
-#### Relationship to RFC-0001
+### Relationship to RFC-0001
 
 RFC-0001 is **authoritative** for:
 
@@ -87,7 +87,7 @@ RFC-0001 is **authoritative** for:
 
 This RFC **implements** durable backends behind those contracts. It does **not** fork a second event channel.
 
-#### Already implemented by RFC-0001 | Added by RFC-0002 | Deferred beyond MVP
+### Already implemented by RFC-0001 | Added by RFC-0002 | Deferred beyond MVP
 
 | Item | Owner |
 | --- | --- |
@@ -96,7 +96,7 @@ This RFC **implements** durable backends behind those contracts. It does **not**
 | `EventSink` trait + `InMemoryEventSink` + host emit/append/set_event_sink | **0001** |
 | `Session` struct + `SessionService::events` signature + `MAX_EVENTS_PAGE` | **0001** |
 | `RuntimeConfig.data_dir` creation on `start` | **0001** |
-| SQLite `SqliteEventSink` implementing `EventSink` | **0002** |
+| SQLite `SqliteEventStore` implementing `EventSink` + `EventStore` | **0002** |
 | `EventStore` read/replay/pagination trait | **0002** |
 | `ArtifactStore` trait + filesystem CAS + SQLite index | **0002** |
 | Schema migrations, WAL, checkpoint, reopen/recover | **0002** |
@@ -109,23 +109,23 @@ This RFC **implements** durable backends behind those contracts. It does **not**
 | ProjectGraph SQLite | **0011** (deferred) |
 | Postgres / OverlayFS / OTel crate | V2 deferred |
 
-#### Components reused
+### Components reused
 
 - Types and events from `alloy_runtime::{…}` (crate root re-exports).
-- `RuntimeHandle::set_event_sink` + `memory_sink()` for install/handoff.
+- `RuntimeHandle::set_event_sink` / `handoff_event_sink` + `memory_sink()` for install/handoff.
 - `RuntimeConfig::retain_full_prompts` / `retain_tool_bodies` as retention policy inputs for artifact/event body helpers (writers in 0004; store must not invent full-body retention by default).
 
-#### Stubs extended / replaced
+### Stubs extended / replaced
 
 | Stub / default | Replacement |
 | --- | --- |
-| Default `InMemoryEventSink` after `start` | Remains default; **installer** opens SQLite and swaps via `set_event_sink` once handoff succeeds |
-| Day-1 `set_event_sink` refusal when memory buffer non-empty | Remains for bare `set_event_sink`; **lossless** path is `handoff_event_sink` (drain+import+swap under write lock) |
+| Default `InMemoryEventSink` after `start` | Remains default; **installer** opens SQLite and installs via `handoff_event_sink` (not bare `set_event_sink`) |
+| Day-1 `set_event_sink` refusal when memory buffer non-empty | Remains: bare `set_event_sink` is **empty-buffer / already-durable swaps only**; non-empty lossless path is **only** `handoff_event_sink` |
 | No artifact APIs | New `ArtifactStore` trait + `FsArtifactStore` |
 
 `InMemoryEventSink` stays available for unit tests and as the pre-handoff buffer; it is not deleted.
 
-#### Dependency boundaries
+### Dependency boundaries
 
 ```text
 alloy-cli ──► alloy-runtime
@@ -139,13 +139,13 @@ No new workspace crate. No new OS service. SQLite is in-process only.
 
 ---
 
-### 3. Public Rust API
+## 3. Public Rust API
 
 All new public items live in `alloy-runtime` (edition 2021, Tokio 1.x, `async_trait` on public traits through M1 — same pins as RFC-0001). Prefer traits for backends.
 
 **Do not break** existing public signatures. Extend via new modules/traits and crate-root re-exports.
 
-#### 3.1 Errors
+### 3.1 Errors
 
 ```rust
 // alloy-runtime/src/storage/error.rs
@@ -193,7 +193,7 @@ impl From<StoreError> for EventSinkError {
 
 Map `StoreError` → `SessionError` only at SessionService boundaries (RFC-0003); this RFC may provide `fn store_to_session(e: StoreError) -> SessionError` helper but must not change `SessionError` variants without 0003 coordination — use `SessionError::Internal` / `Invalid` / `NotFound` via helpers if needed.
 
-#### 3.2 Storage layout & open options
+### 3.2 Storage layout & open options
 
 ```rust
 // alloy-runtime/src/storage/paths.rs
@@ -211,6 +211,21 @@ impl StorageLayout {
     pub fn ensure_dirs(&self) -> Result<(), StoreError> { /* create root, artifacts, graph */ }
 }
 
+/// Maps `ALLOY_SQLITE_SYNCHRONOUS` / `PRAGMA synchronous`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SqliteSynchronous {
+    Off,
+    #[default]
+    Normal,
+    Full,
+    Extra,
+}
+
+impl SqliteSynchronous {
+    pub fn parse(s: &str) -> Result<Self, StoreError> { /* OFF|NORMAL|FULL|EXTRA; else config error */ }
+    pub fn as_pragma(self) -> &'static str { /* "OFF"|"NORMAL"|"FULL"|"EXTRA" */ }
+}
+
 #[derive(Debug, Clone)]
 pub struct StorageOpenOptions {
     pub layout: StorageLayout,
@@ -218,12 +233,15 @@ pub struct StorageOpenOptions {
     pub wal: bool,
     /// Busy timeout milliseconds (default 5000).
     pub busy_timeout_ms: u32,
+    /// Default: `SqliteSynchronous::Normal` (same as `ALLOY_SQLITE_SYNCHRONOUS=NORMAL`).
+    /// Applied at open via `PRAGMA synchronous`; checkpoint uses the same connection setting.
+    pub synchronous: SqliteSynchronous,
     /// When true, refuse open if DB exists with unknown future schema_version.
     pub refuse_newer_schema: bool, // default true
 }
 ```
 
-#### 3.3 Persistence handle (lifecycle façade)
+### 3.3 Persistence handle (lifecycle façade)
 
 ```rust
 // alloy-runtime/src/storage/mod.rs
@@ -250,15 +268,19 @@ impl AlloyStorage {
     /// Thin session/run row API (for RFC-0003; no orchestration).
     pub fn sessions(&self) -> Arc<SqliteSessionRows>;
 
-    /// Force WAL checkpoint + fsync policy (see §6).
+    /// Force WAL checkpoint + fsync policy (see §6). Uses connection `synchronous` from open.
     pub async fn checkpoint(&self) -> Result<(), StoreError>;
 
-    /// Flush + close connections. Idempotent.
-    pub async fn close(self) -> Result<(), StoreError>;
+    /// In-process counter snapshot (§13). Cheap atomics read; safe while store is open.
+    pub fn metrics(&self) -> StorageMetricsSnapshot;
+
+    /// Flush + close connections. Idempotent barrier under shared ownership (`Arc<AlloyStorage>`).
+    /// After the first successful close, further ops return `StoreError::Closed`; extra `close` calls are no-ops (`Ok(())`).
+    pub async fn close(&self) -> Result<(), StoreError>;
 }
 ```
 
-#### 3.4 Event log / EventSink
+### 3.4 Event log / EventSink
 
 ```rust
 // alloy-runtime/src/storage/events.rs
@@ -293,7 +315,8 @@ pub trait EventStore: EventSink {
         -> Result<Vec<(i64, RuntimeEvent)>, StoreError>;
 
     /// Import a handoff snapshot with **exact** `seq` / `ts` (no re-allocation, no `Timestamp::now`).
-    /// Single DB transaction. Used only by atomic handoff (§3.7); not a second public emit path.
+    /// Single DB transaction that MUST include post-import seq verification (or equivalent
+    /// cleanup on verify failure before commit visibility). Used only by atomic handoff (§3.7).
     async fn import_handoff_snapshot(&self, snap: HandoffSnapshot) -> Result<(), StoreError>;
 }
 
@@ -317,7 +340,7 @@ impl EventStore for SqliteEventStore { /* … */ }
 - `append_session` assigns `seq` and stamps `ts = Timestamp::now()` (same as `InMemoryEventSink`).
 - Wire `type` via existing `SessionEventType` serde (`snake_case` Appendix A names).
 
-#### 3.5 Artifact store
+### 3.5 Artifact store
 
 ```rust
 // alloy-runtime/src/storage/artifacts.rs
@@ -377,7 +400,7 @@ pub struct FsArtifactStore { /* sqlite index + artifacts_dir CAS */ }
 
 **Integrity:** `put` computes `Digest::sha256(bytes)`, writes blob to CAS path by digest, then inserts index row with new `ArtifactId`. **MVP (pinned):** dedupe blob file on disk; always allocate a **new** `ArtifactId` metadata row referencing the same digest path (session attribution). `get_by_digest` returns the **oldest non-deleted** row for that digest (`ORDER BY created_at ASC, id ASC LIMIT 1`), or `None` if none.
 
-#### 3.6 Thin session/run rows (persistence helpers)
+### 3.6 Thin session/run rows (persistence helpers)
 
 ```rust
 // alloy-runtime/src/storage/sessions.rs
@@ -406,7 +429,7 @@ pub struct SqliteSessionRows { /* … */ }
 
 RFC-0003 owns when to call these; RFC-0002 only persists rows.
 
-#### 3.7 Installer / handoff (wires into RuntimeHandle)
+### 3.7 Installer / handoff (wires into RuntimeHandle)
 
 ```rust
 // alloy-runtime/src/storage/install.rs
@@ -422,9 +445,9 @@ pub async fn install_sqlite_event_sink(
 | Piece | Ownership | Notes |
 | --- | --- | --- |
 | `InMemoryEventSink::drain_for_handoff` | `events` (0001 additive helper) | Takes buffered runtime + session events + `next_seq`; leaves memory sink empty |
-| `SqliteEventStore::import_handoff_snapshot` | `storage::events` | Inserts exact `seq`/`ts`; sets `session_seq` from snapshot; one transaction |
-| `RuntimeHandle::handoff_event_sink` | `runtime` (0002 **additive** method; does **not** change `EventSink` or `set_event_sink` signature) | Holds sink **write** lock for drain → import → Arc swap |
-| `set_event_sink` | unchanged 0001 | Still refuses non-empty memory buffer; used for empty-buffer / already-durable swaps only |
+| `SqliteEventStore::import_handoff_snapshot` | `storage::events` | Inserts exact `seq`/`ts`; sets `session_seq` from snapshot; **one transaction including seq verify** (rollback on mismatch) |
+| `RuntimeHandle::handoff_event_sink` | `runtime` (0002 **additive** method; does **not** change `EventSink` or `set_event_sink` signature) | Holds sink **write** lock for drain → import+verify → Arc swap |
+| `set_event_sink` | unchanged 0001 | Still refuses non-empty memory buffer; **empty-buffer / already-durable swaps only** |
 | `install_sqlite_event_sink` | `storage::install` | `open` → `handoff_event_sink(sqlite)` |
 
 Public `EventSink` trait signatures remain unchanged. Dual-write is forbidden.
@@ -455,12 +478,16 @@ impl RuntimeHandle {
     /// 2. If current sink is not the process `memory_sink`, behave like `set_event_sink`
     ///    (swap only; no drain).
     /// 3. If memory buffer empty: `*guard = sink` and return.
-    /// 4. Else: `snap = memory_sink.drain_for_handoff()`; `import(snap).await?;`
-    ///    verify each session `last_seq` matches `next_seq[session]-1` when `next_seq>0`;
-    ///    `*guard = sink`.
-    /// On import/`verify` failure: restore snapshot into memory sink (re-buffer), keep
-    /// memory as active sink, return error — never leave a half-swapped durable store
-    /// as the live sink.
+    /// 4. Else: `snap = memory_sink.drain_for_handoff()`; then **one DB transaction** that
+    ///    imports the snapshot **and** verifies each session `last_seq` matches
+    ///    `next_seq[session]-1` when `next_seq>0` **before commit**. On verify failure,
+    ///    roll back the transaction (no durable residue). Equivalent: if verify must run
+    ///    after a committed import, delete/cleanup the imported rows in the same failure
+    ///    path **before** restoring the memory snapshot.
+    /// 5. Only after durable import+verify success: `*guard = sink`.
+    /// On import/`verify` failure: durable state rolled back (or cleaned); restore snapshot
+    /// into memory sink (re-buffer); keep memory as active sink; return error — never leave
+    /// a half-imported durable store as the live sink or as orphaned handoff residue.
     pub async fn handoff_event_sink<F, Fut>(
         &self,
         sink: Arc<dyn EventSink>,
@@ -477,7 +504,7 @@ impl RuntimeHandle {
 1. Require phase `Configured` or `Running`.
 2. Resolve `StorageOpenOptions` from `handle.config()?.data_dir` (or `opts`).
 3. `AlloyStorage::open` (migrate). On open failure, return error; memory sink unchanged.
-4. `handle.handoff_event_sink(storage.events(), |snap| storage.events().import_handoff_snapshot(snap))`.
+4. `handle.handoff_event_sink(storage.events(), |snap| storage.events().import_handoff_snapshot(snap))` — import+verify in one transaction (or cleanup durable residue on verify fail before memory restore).
 5. After success, further `emit` / `append_session` go only to SQLite.
 6. Do **not** call bare `set_event_sink` for non-empty memory handoff (race / refusal). Empty-buffer installs may use either `handoff_event_sink` or `set_event_sink`.
 
@@ -485,7 +512,7 @@ Losslessness is mandatory (RFC-0001). No silent seq renumbering. `import_handoff
 
 **Module note:** `storage::install` calls `RuntimeHandle` (same crate). Lifecycle still defaults to `InMemoryEventSink` on `start`; install is opt-in. This is an intentional install seam, not a Scheduler/MCP expansion.
 
-#### 3.8 Crate root re-exports (additive)
+### 3.8 Crate root re-exports (additive)
 
 ```rust
 // lib.rs — add (keep existing re-exports)
@@ -494,16 +521,17 @@ pub mod storage;
 pub use storage::{
     AlloyStorage, ArtifactBlob, ArtifactKind, ArtifactMeta, ArtifactPut, ArtifactStore,
     EventStore, FsArtifactStore, HandoffSnapshot, RunRow, SessionRows, SqliteEventStore,
-    SqliteSessionRows, StorageLayout, StorageOpenOptions, StoreError, install_sqlite_event_sink,
+    SqliteSessionRows, SqliteSynchronous, StorageLayout, StorageMetricsSnapshot,
+    StorageOpenOptions, StoreError, install_sqlite_event_sink,
 };
 // RuntimeHandle::handoff_event_sink is additive on the existing handle type (not a re-export).
 ```
 
 ---
 
-### 4. Internal Module Design
+## 4. Internal Module Design
 
-#### Crate / module ownership (≤5 crates; single binary)
+### Crate / module ownership (≤5 crates; single binary)
 
 ```text
 crates/alloy-runtime/src/storage/
@@ -530,7 +558,7 @@ crates/alloy-runtime/src/storage/
 | `storage::install` | RuntimeHandle wiring |
 | `storage::checkpoint` | Durability flush |
 
-#### Dependency direction
+### Dependency direction
 
 ```mermaid
 flowchart TB
@@ -558,7 +586,7 @@ flowchart TB
 - `runtime` / CLI may call `install_sqlite_event_sink`; **default `start` still installs `InMemoryEventSink`** (0001). Opt-in after `start` or in `Configured`.
 - No dependency from `storage` → `scheduler` / `adapters` / `dag` beyond types already in IR.
 
-#### Workspace dependencies (additive)
+### Workspace dependencies (additive)
 
 Add to workspace / `alloy-runtime`:
 
@@ -569,9 +597,9 @@ Do not add Postgres drivers.
 
 ---
 
-### 5. Session Event Log
+## 5. Session Event Log
 
-#### Event model
+### Event model
 
 Reuse RFC-0001 envelopes exactly:
 
@@ -586,19 +614,19 @@ Reuse RFC-0001 envelopes exactly:
 
 Host channel: `RuntimeEvent` stored in `runtime_events` (not Appendix A).
 
-#### Envelope & IDs
+### Envelope & IDs
 
 - Session/run IDs: UUID newtypes from 0001.
 - Event identity for paging: `(session_id, seq)` primary.
 - Runtime events: monotonic `rowid` for list cursor (process-local durability, not Appendix A).
 
-#### Ordering
+### Ordering
 
 - Session events: total order by `seq` ascending per session.
 - Append is atomic: seq allocation + insert in one transaction.
 - Never leave gaps after a successful append. Failed append must not consume seq (rollback).
 
-#### Append
+### Append
 
 1. `session_id` required on `NewSessionEvent`. **Payload:** store persists any `serde_json::Value` (Appendix A writers SHOULD emit a JSON object; store does not reject non-objects — writer responsibility in 0003/0004).
 2. Begin immediate transaction.
@@ -608,7 +636,7 @@ Host channel: `RuntimeEvent` stored in `runtime_events` (not Appendix A).
 
 On UNIQUE conflict → `StoreError::Conflict` → `EventSinkError::Internal` (should be unreachable if allocator is correct). Failed append must not consume seq (rollback).
 
-#### Exclusive cursor & pagination
+### Exclusive cursor & pagination
 
 Match `SessionService::events`:
 
@@ -619,7 +647,7 @@ Match `SessionService::events`:
 
 `limit` clamped with `clamp_events_page_limit` (`1..=MAX_EVENTS_PAGE`).
 
-#### Replay
+### Replay
 
 **Pinned signature:** `replay_session` → `Result<Option<EventSeq>, StoreError>` (`None` if no events).
 
@@ -628,7 +656,7 @@ Match `SessionService::events`:
 - Callback `Err`: abort immediately; propagate; do not skip remaining events.
 - Undecodable row: `StoreError::Corrupt` (do not skip).
 
-#### Recovery
+### Recovery
 
 On reopen:
 
@@ -640,7 +668,7 @@ On reopen:
 6. Crash mid-append: SQLite rollback ⇒ no gap, seq not advanced.
 7. Crash after commit, before process exit: events durable; reopen lists them bit-identical (same seq, ts, type, payload JSON).
 
-#### Append flow
+### Append flow
 
 ```mermaid
 sequenceDiagram
@@ -660,7 +688,7 @@ sequenceDiagram
   H-->>C: EventSeq
 ```
 
-#### Replay flow
+### Replay flow
 
 ```mermaid
 sequenceDiagram
@@ -679,9 +707,9 @@ sequenceDiagram
 
 ---
 
-### 6. Persistence Lifecycle
+## 6. Persistence Lifecycle
 
-#### State machine
+### State machine
 
 ```mermaid
 stateDiagram-v2
@@ -701,24 +729,24 @@ stateDiagram-v2
   Closed --> Opening: reopen
 ```
 
-#### Phases
+### Phases
 
 | Phase | Actions |
 | --- | --- |
-| **open** | `ensure_dirs`; open `alloy.sqlite`; set PRAGMA `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout`; create `schema_migrations` if missing |
+| **open** | `ensure_dirs`; open `alloy.sqlite`; set PRAGMA `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout`, `synchronous` from `StorageOpenOptions::synchronous`; create `schema_migrations` if missing |
 | **migrate** | Apply pending migrations in order in a transaction; record version; refuse DB with `schema_version > CODE_VERSION` when `refuse_newer_schema` |
 | **append/read** | Normal EventStore / ArtifactStore / SessionRows operations |
-| **checkpoint** | `PRAGMA wal_checkpoint(TRUNCATE)` or `PASSIVE` + `fsync` of db file as configured; artifact puts already durable via write+rename+fsync |
+| **checkpoint** | `PRAGMA wal_checkpoint(TRUNCATE)` or `PASSIVE` + `fsync` of db file as configured (respects open-time `synchronous`); artifact puts durable via write+fsync+rename+parent-dir fsync |
 | **shutdown** | Finish in-flight blocking ops; checkpoint; close connections; mark Closed |
 | **reopen/recover** | open → migrate → rebuild seq maps; no automatic truncation of events |
 
-#### Durability
+### Durability
 
-- Session append: commit of SQLite transaction = durable for MVP (WAL). Optional `synchronous=NORMAL` default; `FULL` via config if set.
-- Artifact put: write to `artifacts/tmp/<uuid>`, fsync, atomic rename to `artifacts/sha256/<prefix>/<digest>`, then insert SQLite index in a transaction. On index failure after rename, next `put` of same digest reuses file; orphan GC deferred.
+- Session append: commit of SQLite transaction = durable for MVP (WAL). Default `SqliteSynchronous::Normal` (`ALLOY_SQLITE_SYNCHRONOUS=NORMAL`); `OFF` voids durability AC (tests must use default `NORMAL`).
+- Artifact put: write to `artifacts/tmp/<uuid>`, fsync file, atomic rename to `artifacts/sha256/<prefix>/<digest>`, **fsync the CAS parent directory** (so the rename itself is durable), then insert SQLite index in a transaction. On index failure after rename, next `put` of same digest reuses file; orphan GC deferred.
 - `AlloyStorage::checkpoint` before process exit (CLI drain/shutdown path should call it when storage installed).
 
-#### Failure
+### Failure
 
 | Failure | Handling |
 | --- | --- |
@@ -728,7 +756,7 @@ stateDiagram-v2
 | Panic mid-append | SQLite rollback; seq not advanced |
 | Large artifact / FS write fail | `StoreError::Io`; no index row; best-effort delete tmp |
 
-#### Failure modes (normative — detection / recovery / outcome)
+### Failure modes (normative — detection / recovery / outcome)
 
 | Class | Detection | Recovery | Outcome |
 | --- | --- | --- | --- |
@@ -736,10 +764,10 @@ stateDiagram-v2
 | **Artifact** (tmp fail, rename fail, digest mismatch) | FS/`DigestMismatch` on get | Orphan tmp cleaned on open; index-without-blob → NotFound/Corrupt on get | Put returns `Io`; get fails closed |
 | **DB** (busy, migrate, newer schema, corrupt JSON) | PRAGMA/migrate/decode errors | Refuse Ready on migrate/newer/seq mismatch; busy waits then Busy | No silent skip of corrupt rows |
 | **Resource** (disk full, permission) | OS/`Io` | Fail closed; no partial Ready | `StoreError::Io` / `RuntimeError::Io` |
-| **Replay** (corrupt row, callback Err, cancel) | Decode/`on_event`/`cancellation` | Abort replay; no skip | `Corrupt` / callback error / cancel between pages |
-| **Handoff** (import/verify fail) | Verify `last_seq` vs `next_seq` | Restore snapshot into memory sink; keep memory live | Swap aborted; no dual-write |
+| **Replay** (corrupt row, callback Err) | Decode / `on_event` Err | Abort replay; no skip | `Corrupt` / callback error |
+| **Handoff** (import/verify fail) | Verify `last_seq` vs `next_seq` | Roll back / cleanup durable import; restore memory snapshot; keep memory live | Swap aborted; no dual-write; no orphaned handoff rows |
 
-#### Corruption
+### Corruption
 
 | Case | Handling |
 | --- | --- |
@@ -747,22 +775,22 @@ stateDiagram-v2
 | Digest mismatch on `get` | `DigestMismatch` |
 | Partial migration | Detect via migrations table; refuse start until fixed |
 
-#### Migration
+### Migration
 
 - Integer `schema_version` starting at `1` for this RFC.
 - Migrations are ordered SQL files / `&'static str` embedded in `migrate.rs`.
 - Additive only in MVP (roadmap risk: schema thrash — keep additive).
 - v1 schema includes reserved `dag_blobs` empty table and `sessions.graph_version` nullable column for 0009/0011 without implementing those RFCs.
 
-#### Checkpoint meaning
+### Checkpoint meaning
 
 **Storage checkpoint** = WAL/db durability flush. **Not** git EditEngine checkpoints (V2 ADR F-24).
 
 ---
 
-### 7. Artifact Store
+## 7. Artifact Store
 
-#### Model
+### Model
 
 | Layer | Content |
 | --- | --- |
@@ -771,11 +799,11 @@ stateDiagram-v2
 
 Secrets must never be stored as artifact bodies by Alloy defaults; callers responsible. Telemetry retention still governed by `retain_*` flags for *what* writers put.
 
-#### API
+### API
 
 See §3.5. Public trait `ArtifactStore`; impl `FsArtifactStore`.
 
-#### Write / read
+### Write / read
 
 **Write path:**
 
@@ -788,18 +816,18 @@ sequenceDiagram
 
   C->>A: put(ArtifactPut)
   A->>A: digest = Digest::sha256(bytes)
-  A->>FS: write tmp + fsync + rename CAS path
+  A->>FS: write tmp + fsync file + rename CAS path + fsync CAS parent dir
   A->>DB: INSERT artifacts (new ArtifactId, digest, meta)
   A-->>C: ArtifactId
 ```
 
 **Read:** load meta by id → read file → verify digest → return `ArtifactBlob`.
 
-#### Metadata
+### Metadata
 
 `ArtifactMeta` as above. Default labels empty. Decision/prompt artifacts store **hashes** in labels/payload by convention when `retain_full_prompts=false` (enforced by writers in 0004; store does not strip bodies already written).
 
-#### Retention
+### Retention
 
 | Policy | MVP |
 | --- | --- |
@@ -808,14 +836,14 @@ sequenceDiagram
 | GC | Deferred (no `alloy artifacts gc` required in this RFC) |
 | Full prompt bodies | Not stored by default by Alloy writers; store itself is content-agnostic |
 
-#### Integrity
+### Integrity
 
 - SHA-256 via existing `Digest::sha256`.
 - Path must match digest hex; reject traversal (`..`) in any path API.
 
 ---
 
-### 8. Concurrency Model
+## 8. Concurrency Model
 
 | Concern | Rule |
 | --- | --- |
@@ -831,19 +859,19 @@ MVP does not claim multi-writer multi-process SQLite. Lock file / single-process
 
 ---
 
-### 9. Async Model
+## 9. Async Model
 
 | Assumption | Detail |
 | --- | --- |
 | Public traits | `async_trait` + `Send + Sync` |
 | Blocking | All `rusqlite` and sync FS in `tokio::task::spawn_blocking` |
-| Cancellation | Honor `RuntimeHandle::cancellation` on long replay loops (check between pages); in-flight single append completes or rolls back |
-| No async Drop | `AlloyStorage::close` is explicit; `Drop` warns if not closed (mirror Runtime pattern) |
+| Cancellation | No cancel token on `replay_session` (pinned signature). Callers cancel by dropping/aborting the await future; in-flight single append completes or rolls back. Runtime `CancellationToken` is not threaded into `EventStore` in this RFC |
+| No async Drop | `AlloyStorage::close(&self)` is the explicit idempotent barrier; `Drop` warns if never closed (mirror Runtime pattern) |
 | Install | `install_sqlite_event_sink` is `async` and may await `set_event_sink` |
 
 ---
 
-### 10. Shutdown and Durability
+## 10. Shutdown and Durability
 
 Ordered steps when storage is installed (CLI / host integration):
 
@@ -859,7 +887,7 @@ Crash mid-WAL: SQLite recovery on next open. Crash mid-artifact rename: orphan t
 
 ---
 
-### 11. Error Handling
+## 11. Error Handling
 
 | Failure | Type | Handling |
 | --- | --- | --- |
@@ -875,11 +903,11 @@ Do not invent alternate session event type strings. Serde must round-trip Append
 
 ---
 
-### 12. Configuration
+## 12. Configuration
 
 **Rules:** Process environment + existing TOML. Document new keys in `example.env`. **Never create or overwrite `.env`.**
 
-#### Keys
+### Keys
 
 | Key | Default | Validation |
 | --- | --- | --- |
@@ -889,7 +917,7 @@ Do not invent alternate session event type strings. Serde must round-trip Append
 | `ALLOY_STORAGE_WAL` | `true` | `true`/`false`/`1`/`0` |
 | Existing `retain_full_prompts` / `retain_tool_bodies` | `false` | From profile TOML (0001) — storage install reads via `RuntimeConfig` |
 
-#### `example.env` additions (document only)
+### `example.env` additions (document only)
 
 ```bash
 # Storage (RFC-0002) — optional; Alloy never writes .env
@@ -898,21 +926,21 @@ Do not invent alternate session event type strings. Serde must round-trip Append
 # ALLOY_STORAGE_WAL=true
 ```
 
-#### Profile
+### Profile
 
 No new mandatory profile keys. Observability flags already loaded by 0001.
 
-#### Validation
+### Validation
 
-- `StorageOpenOptions` built from env + `RuntimeConfig.data_dir`.
+- `StorageOpenOptions` built from env + `RuntimeConfig.data_dir` (`busy_timeout_ms`, `wal`, `synchronous` ← `ALLOY_SQLITE_*` / `ALLOY_STORAGE_WAL`; default `synchronous = Normal`).
 - Missing parent permissions → `StoreError::Io` / `RuntimeError::Io`.
 - Error messages cite `env_file_hint` (`example.env`), never suggest writing `.env`.
 
 ---
 
-### 13. Observability
+## 13. Observability
 
-#### Logging (`tracing`)
+### Logging (`tracing`)
 
 | Span / event | When |
 | --- | --- |
@@ -926,7 +954,27 @@ No new mandatory profile keys. Observability flags already loaded by 0001.
 
 Never log API keys, `.env` contents, or full prompt bodies at default levels.
 
-#### Metrics (`StorageMetrics`)
+### Metrics (`StorageMetrics` / `StorageMetricsSnapshot`)
+
+```rust
+// alloy-runtime/src/storage/metrics.rs
+#[derive(Debug, Clone, Default)]
+pub struct StorageMetricsSnapshot {
+    pub events_appended: u64,
+    pub runtime_events_appended: u64,
+    pub events_read: u64,
+    pub artifacts_put: u64,
+    pub artifacts_get: u64,
+    pub checkpoints: u64,
+    pub handoffs: u64,
+    pub busy_errors: u64,
+}
+
+impl AlloyStorage {
+    /// Copy current counter values (atomics → snapshot).
+    pub fn metrics(&self) -> StorageMetricsSnapshot;
+}
+```
 
 | Counter | When |
 | --- | --- |
@@ -938,11 +986,11 @@ Never log API keys, `.env` contents, or full prompt bodies at default levels.
 | `handoffs` | successful install handoff |
 | `busy_errors` | Busy returned |
 
-Expose via `AlloyStorage::metrics()` snapshot. No OTLP (0004/deferred).
+Expose via `AlloyStorage::metrics() -> StorageMetricsSnapshot` (crate-root re-export). No OTLP (0004/deferred).
 
 ---
 
-### 14. Testing Strategy
+## 14. Testing Strategy
 
 | Class | Asserts |
 | --- | --- |
@@ -959,7 +1007,7 @@ Expose via `AlloyStorage::metrics()` snapshot. No OTLP (0004/deferred).
 
 ---
 
-### 15. MVP vs Deferred
+## 15. MVP vs Deferred
 
 | Item | MVP (this RFC) | Deferred (V2 / later RFC) |
 | --- | --- | --- |
@@ -977,7 +1025,7 @@ Do not invent additional deferred subsystems.
 
 ---
 
-### 16. Acceptance Criteria
+## 16. Acceptance Criteria
 
 Concrete checklist for merge:
 
@@ -991,7 +1039,7 @@ Concrete checklist for merge:
 - [ ] **Durability:** crash/kill after successful append commit → reopen sees event; crash mid-append → no gap / seq not advanced
 - [ ] `RuntimeEvent` append/list durable across reopen
 - [ ] `install_sqlite_event_sink` uses `handoff_event_sink` for **lossless** handoff (including non-empty buffer); post-swap appends continue gapless seq on SQLite only
-- [ ] Failed handoff restores memory buffer and does **not** leave SQLite as the live sink
+- [ ] Failed handoff rolls back / cleans durable import, restores memory buffer, and does **not** leave SQLite as the live sink or orphaned handoff residue
 - [ ] After handoff, further `RuntimeHandle::append_session` persists only to SQLite (no dual store divergence)
 - [ ] `ArtifactStore::put` / `get` / `meta` / `get_by_digest` (oldest non-deleted); digests via `Digest::sha256`; tamper detected
 - [ ] Thin `SessionRows` upsert/get for `Session` + `RunRow`
@@ -1003,7 +1051,7 @@ Concrete checklist for merge:
 - [ ] Crate root re-exports storage public API explicitly (no glob)
 - [ ] Reserved DAG/graph schema/path only — no ProjectGraph/DAG orchestration behavior
 
-### Definition of Done
+## Definition of Done
 
 Merge only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
 
@@ -1020,7 +1068,7 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 
 ---
 
-### 17. Open Questions
+## 17. Open Questions
 
 Only genuine implementation spikes — settled V2/0001 decisions are not reopened.
 

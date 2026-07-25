@@ -7,7 +7,6 @@
 | **Reviewer** | Principal Rust Systems / durable storage review gate |
 | **Author** | arkadianet |
 | **Date** | 2026-07-25 |
-| **Canvas** | [/home/rkadias/.cursor/projects/home-rkadias-coding-development-arkadianet-alloy/canvases/rfc-0002-architecture-review.canvas.tsx](/home/rkadias/.cursor/projects/home-rkadias-coding-development-arkadianet-alloy/canvases/rfc-0002-architecture-review.canvas.tsx) |
 | **Rounds** | 2 |
 | **Final Verdict** | **APPROVE** |
 
@@ -44,7 +43,7 @@
 
 | # | Location | Improvement | Reason |
 | --- | --- | --- | --- |
-| N1 | §12 `ALLOY_SQLITE_SYNCHRONOUS=OFF` | Document that `OFF` voids durability AC; tests should run at default `NORMAL` | Prevents false confidence from opt-in unsafe pragma |
+| N1 | §12 `ALLOY_SQLITE_SYNCHRONOUS=OFF` | Document that `OFF` voids durability AC; tests should run at default `NORMAL` | Addressed in Round-2+ RFC durability note + `SqliteSynchronous` on `StorageOpenOptions` |
 | N2 | §7 Artifact put | Optional soft cap / document “MVP loads full `Vec<u8>` in memory” | Sets expectation; OOM remains fail-closed via OS |
 | N3 | §3.6 `RunRow.state` | Keep opaque; add one-line cross-link that 0003 must not persist free-form forever without enum | Already in OQ; clarity only |
 | N4 | Metrics §13 | Keep counters; avoid expanding to histograms in this RFC | Prefer removing complexity later if unused |
