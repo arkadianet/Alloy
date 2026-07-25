@@ -11,8 +11,10 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use super::inner::SessionInner;
-use super::metrics::{AtomicSessionMetrics, SessionMetrics};
-use super::run_controller::{load_run, parse_state, require_running, upsert_state};
+use super::metrics::SessionMetrics;
+use super::run_controller::{
+    load_run, parse_state, require_running, upsert_state, RunControllerView,
+};
 use super::run_state::RunControlState;
 use super::service::require_mutating_phase;
 use super::service::SessionServiceView;
@@ -35,29 +37,34 @@ use crate::types::ids::{EventSeq, GateId, RunId, SessionId};
 #[derive(Clone)]
 pub struct SessionPlane {
     inner: Arc<SessionInner>,
+    sessions: Arc<dyn SessionService>,
+    runs: Arc<dyn RunController>,
 }
 
 impl SessionPlane {
     /// Wire the control plane onto a started runtime and an opened store.
     #[must_use]
     pub fn new(handle: RuntimeHandle, storage: Arc<AlloyStorage>) -> Self {
+        let inner = Arc::new(SessionInner::new(handle, storage));
+        let sessions = Arc::new(SessionServiceView::new(Arc::clone(&inner))) as Arc<_>;
+        let runs = Arc::new(RunControllerView::new(Arc::clone(&inner))) as Arc<_>;
         Self {
-            inner: Arc::new(SessionInner::new(handle, storage)),
+            inner,
+            sessions,
+            runs,
         }
     }
 
     /// [`SessionService`] view over the same inner state.
     #[must_use]
     pub fn sessions(&self) -> Arc<dyn SessionService> {
-        Arc::new(SessionServiceView::new(Arc::clone(&self.inner)))
+        Arc::clone(&self.sessions)
     }
 
     /// [`RunController`] view over the same inner state.
     #[must_use]
     pub fn runs(&self) -> Arc<dyn RunController> {
-        Arc::new(super::run_controller::RunControllerView::new(Arc::clone(
-            &self.inner,
-        )))
+        Arc::clone(&self.runs)
     }
 
     /// Snapshot of the in-process counters (RFC-0003 §13).
@@ -73,12 +80,12 @@ impl SessionPlane {
         gate: GateId,
         decision: Approval,
     ) -> Result<(), RunError> {
-        self.runs().approve(run, gate, decision).await
+        self.runs.approve(run, gate, decision).await
     }
 
     /// CLI convenience facade for [`RunController::cancel`].
     pub async fn cancel(&self, run: RunId) -> Result<(), RunError> {
-        self.runs().cancel(run).await
+        self.runs.cancel(run).await
     }
 
     /// Budget exhaustion hook (RFC-0003 §5.6).
@@ -122,7 +129,7 @@ impl SessionPlane {
             .await
             .map_err(super::map_err::runtime_to_session)?;
 
-        AtomicSessionMetrics::inc(&self.inner.metrics.budget_warnings);
+        self.inner.metrics.bump_budget_warnings();
         Ok(seq)
     }
 
@@ -134,7 +141,8 @@ impl SessionPlane {
     /// [`SessionService::resume`].
     ///
     /// Returns [`RunError::NotFound`] when the run is missing and
-    /// [`RunError::InvalidPhase`] when it is terminal, cancelling, or not yet started.
+    /// [`RunError::InvalidPhase`] when it is terminal, cancelling, replan-pending, or not
+    /// yet started.
     pub async fn register_gate_waiter(
         &self,
         run: RunId,
@@ -147,13 +155,17 @@ impl SessionPlane {
         match parse_state(&row)? {
             RunControlState::Accepted
             | RunControlState::Running
-            | RunControlState::WaitingApproval
-            | RunControlState::ReplanRequested => {}
+            | RunControlState::WaitingApproval => {}
             RunControlState::Created => {
                 return Err(RunError::InvalidPhase("not started".into()));
             }
             RunControlState::Cancelling => {
                 return Err(RunError::InvalidPhase("cancelling".into()));
+            }
+            // A replan discards the DAG that owns this gate, so re-registering a waiter
+            // would rewrite `replan_requested` back to `waiting_approval` (§6.6).
+            RunControlState::ReplanRequested => {
+                return Err(RunError::InvalidPhase("replan pending".into()));
             }
             RunControlState::Cancelled | RunControlState::Succeeded | RunControlState::Failed => {
                 return Err(RunError::InvalidPhase("terminal".into()));
@@ -164,5 +176,33 @@ impl SessionPlane {
         let rx = self.inner.gates.register(run, gate);
         info!(run_id = %run, gate_id = %gate, "gate waiter registered");
         Ok(rx)
+    }
+
+    /// Test-only: make the next control-plane run-row upsert fail once.
+    #[cfg(test)]
+    pub(crate) fn fail_next_run_upsert(&self) {
+        self.inner
+            .fail_next_run_upsert
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: make the next control-plane session-event append fail once.
+    #[cfg(test)]
+    pub(crate) fn fail_next_append(&self) {
+        self.inner
+            .fail_next_append
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only: number of retained per-run mutexes (must return to zero when idle).
+    #[cfg(test)]
+    pub(crate) fn run_lock_map_len(&self) -> usize {
+        self.inner.run_lock_map_len()
+    }
+
+    /// Test-only: number of retained per-session mutexes.
+    #[cfg(test)]
+    pub(crate) fn session_lock_map_len(&self) -> usize {
+        self.inner.session_lock_map_len()
     }
 }
