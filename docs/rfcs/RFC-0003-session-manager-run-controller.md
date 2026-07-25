@@ -465,18 +465,21 @@ pub trait EventStore: EventSink {
 - Each MUST answer from a single `LIMIT 1` lookup and MUST NOT page. Duplicates therefore read as one
   `true`.
 - `has_session_event_for_run` keys on `(session_id, run_id, type)`. Session-scoped rows
-  (`run_id IS NULL`, e.g. `SessionCreated`) never match a run probe.
+  (`run_id IS NULL`, e.g. `SessionCreated`) never match a run probe. Schema v3 requires composite
+  index `idx_session_events_session_run_type` on those columns — the `session_events` PK
+  `(session_id, seq)` does **not** index `run_id`.
 - The host probes key on `run_id` alone, extracted from the stored `RuntimeEvent` JSON —
-  `runtime_events` rows carry no session id.
+  `runtime_events` rows carry no session id. Schema v3 requires partial expression indexes on
+  `json_extract(event_json, '$.run_accepted.run_id')` and `'$.run_finished.run_id'`.
 - Read-only: no probe writes, and none of them is a substitute for the per-run mutex. They answer
   "is this event already durable", not "may I transition".
 
 | Probe | Control-plane use |
 | --- | --- |
-| `has_session_event_for_run(_, _, RunCompleted)` | Skip a duplicate `RunCompleted` on cancel retry (§6.4 step 10), resume finalization (§5.3 step 9), and terminal `start` outcomes (§6.3 step 10). Also the **gate** for Failed-row repair (§5.3) |
+| `has_session_event_for_run(_, _, RunCompleted)` | Skip a duplicate `RunCompleted` on cancel retry (§6.4 step 10), resume finalization (§5.3 step 9), and terminal `start` outcomes (§6.3 step 10). Also the **session-event gate** for Failed-row repair (§5.3) — not a gate on `RunFinished` |
 | `has_session_event_for_run(_, _, ApprovalResolved)` | Skip inventing a resolved event when `approve(Deny)` already appended one before crashing (§5.3 Failed-row repair) |
 | `has_run_accepted_event` | Decide whether a terminal `RunFinished` would be unpaired when the durable state cannot prove acceptance (`created → cancelling`; §6.4 step 5, §5.3 step 9). Consulted only after the process-local marker misses |
-| `has_run_finished_event` | Skip a duplicate `RunFinished` on any retry of a terminal finalization |
+| `has_run_finished_event` | Skip a duplicate `RunFinished` on any retry of a terminal finalization; Failed-row repair consults it **independently** of the `RunCompleted` gate |
 
 ### 3.9 Crate-root re-exports (additive)
 
@@ -617,12 +620,11 @@ A method MUST parse the envelope only when it actually needs `dag_id`, and the c
 7. Gate waiters start empty (0010 re-registers).
 8. `live_execution` starts empty.
 9. **Re-arm after restart (explicit recovery only):** for rows in `running` or `waiting_approval`, upsert durable state to `accepted` (crash recovery), then they follow the `Accepted` re-dispatch path in §6.3. Rows already `accepted` stay re-dispatchable. Rows in `cancelling` MUST be finalized to `cancelled` on resume (best-effort `cancel_dag` skipped if no live scheduler work), together with a `RunCompleted` event. Emit `RunFinished` **only when** a durable `RunAccepted` exists for the run (or this process marked acceptance): `cancelling` is reachable from `created` without acceptance, so durable state alone must not invent an unpaired finish. Do not invent DAG progress. In-process non-terminal outcomes MUST NOT be treated as crash recovery (see §6.3). Terminal cancel finalization writes events **before** the `cancelled` upsert, with existence checks (§3.8) so a retry stays idempotent. Its `RunCompleted` carries `{ "dag_state": "cancelled", "reason": "resume_finalized_cancel" }` so the log distinguishes a resume-owed finalization from a cancel that completed inside its own process.
-10. **Failed-row approval repair (Deny crash window only):** `approve(Deny)` is the one path in this RFC that writes a terminal row **before** its events (§6.5 step 4 — the row write is what makes the decision durable before the waiter is notified). A crash in that window leaves a `failed` row with no `RunCompleted`. Resume repairs such a row **in place** — the row stays `failed`, it is never re-armed or re-dispatched:
+10. **Failed-row approval repair (Deny crash window only):** `approve(Deny)` is the one path in this RFC that writes a terminal row **before** its events (§6.5 step 4 — the row write is what makes the decision durable before the waiter is notified). A crash in that window leaves a `failed` row with missing terminal events. Resume repairs such a row **in place** — the row stays `failed`, it is never re-armed or re-dispatched:
 
-    - **Gate:** repair only when `has_session_event_for_run(session, run, RunCompleted)` is `false`. A `failed` row that already has `RunCompleted` is complete and MUST be left alone. This is what keeps a run failed **with** its events first — the shape RFC-0010's scheduler writes (events before row, §6.3 step 10) — from being mis-repaired.
-    - Append `ApprovalResolved` with `{"decision": "deny", "reason": "resume_finalized_approval_denied"}` **only when** `has_session_event_for_run(…, ApprovalResolved)` is `false`. The `gate_id` of the original request is not durable in this row, so the repaired event records the decision and its provenance rather than pretending to reproduce §6.5's payload.
-    - Append `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`.
-    - Emit `RunFinished` with a synthetic failed outcome **only when** a durable `RunAccepted` exists for the run (or this process marked acceptance) **and** `has_run_finished_event` is `false`. `waiting_approval` implies acceptance, but the marker is process-local and the row no longer says `waiting_approval`, so acceptance is re-established from the log.
+    - **Session-event gate:** append `ApprovalResolved` / `RunCompleted` only when `has_session_event_for_run(session, run, RunCompleted)` is `false`. A `failed` row that already has `RunCompleted` MUST NOT get a second `ApprovalResolved` or `RunCompleted`. This is what keeps a run failed **with** its session events first — the shape RFC-0010's scheduler writes (events before row, §6.3 step 10) — from being mis-repaired.
+    - When that gate is open: append `ApprovalResolved` with `{"decision": "deny", "reason": "resume_finalized_approval_denied"}` **only when** `has_session_event_for_run(…, ApprovalResolved)` is `false`. The `gate_id` of the original request is not durable in this row, so the repaired event records the decision and its provenance rather than pretending to reproduce §6.5's payload. Then append `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`.
+    - **`RunFinished` repair is independent of the `RunCompleted` gate:** emit a synthetic failed `RunFinished` when a durable `RunAccepted` exists for the run (or this process marked acceptance) **and** `has_run_finished_event` is `false` — even if `RunCompleted` is already durable (crash after session events, before host finish). `waiting_approval` implies acceptance, but the marker is process-local and the row no longer says `waiting_approval`, so acceptance is re-established from the log.
     - A `failed` row whose `goal_json` is corrupt is skipped entirely by step 6, so it is not repaired: without `dag_id` there is no `RunFinished` to pair, and the row is already terminal and undispatchable.
 
 11. Each row is re-read under its per-run mutex before steps 9–10 decide anything: the `list_runs` result is a snapshot, and a concurrent `cancel` in the same process must not be rewritten from a stale state.
@@ -785,7 +787,7 @@ sequenceDiagram
 
 | Host result | RunController result | Required side effects |
 | --- | --- | --- |
-| `Ok(outcome)` with **terminal** `DagState` (`Succeeded` / `Failed` / `Cancelled`) | `Ok(())` | Append `RunCompleted` then emit `RunFinished`, then upsert matching `RunControlState` (events before row; existence checks keep a failed upsert retry-safe). **Not** `SessionEventType::Error` for user/host cancel |
+| `Ok(outcome)` with **terminal** `DagState` (`Succeeded` / `Failed` / `Cancelled`) | `Ok(())` | Append `RunCompleted` then emit `RunFinished`, then upsert matching `RunControlState` (**events before** the final row; existence checks keep a failed upsert retry-safe). Distinct from the general mutating-API row-first rule (§7). **Not** `SessionEventType::Error` for user/host cancel |
 | `Ok(outcome)` with `DagState::WaitingApproval` | `Ok(())` | Upsert `waiting_approval`; **do not** emit `RunFinished`; lease cleared after upsert — further `start` rejected until §5.3 recovery rewrites to `accepted` |
 | `Ok(outcome)` with `DagState::Running` | `Ok(())` | Upsert `running`; **do not** emit `RunFinished`; same re-dispatch rule as `WaitingApproval` |
 | `Ok(outcome)` with `DagState::ReplanRequired` | `Ok(())` | Upsert `replan_requested`; **do not** emit `RunFinished` |
@@ -843,7 +845,7 @@ sequenceDiagram
 
 A second `approve` for the same gate finds no waiter ⇒ `UnknownGate`.
 
-**Crash window (Deny):** this is the only terminal transition in this RFC that writes the row **before** its events, because the decision has to be durable before the waiter is released. A crash between the two leaves a `failed` row with no `RunCompleted`; resume repairs the missing events in place (§5.3 step 10) and leaves the row `failed`. On `Deny` with a corrupt `goal_json`, `RunFinished` is skipped with a warn (§4) — the decision, `ApprovalResolved`, and `RunCompleted` still commit.
+**Crash window (Deny):** this is the only terminal transition in this RFC that writes the row **before** its events (`failed` upsert, then `ApprovalResolved` / `RunCompleted` / conditional `RunFinished`), because the decision has to be durable before the waiter is released. That is the opposite of the terminal `DagState` / cancel finalization order (§6.3 step 10, §6.4 step 10). A crash between the row and its events leaves a `failed` row with missing terminal events; resume repairs them in place (§5.3 step 10) — session events gated on missing `RunCompleted`, `RunFinished` repaired independently when accepted and unfinished — and leaves the row `failed`. On `Deny` with a corrupt `goal_json`, `RunFinished` is skipped with a warn (§4) — the decision, `ApprovalResolved`, and `RunCompleted` still commit.
 
 `ApprovalRequested` emission remains owned by GateHuman execution (0010). This RFC writes `waiting_approval` only in `register_gate_waiter` and resolves via `approve`.
 
@@ -917,7 +919,7 @@ stateDiagram-v2
 | create | `upsert_session` | `SessionCreated` | — |
 | resume (re-arm) | `get_session` + `list_runs`; `upsert_run` → `accepted` for `running` / `waiting_approval` | — | — |
 | resume (cancel finalization, §5.3 step 9) | `upsert_run` → `cancelled`, **after** the events | `RunCompleted` `{ "dag_state": "cancelled", "reason": "resume_finalized_cancel" }` when missing | `RunFinished` only when a durable `RunAccepted` exists and no `RunFinished` does |
-| resume (Failed-row repair, §5.3 step 10) | none — the row stays `failed` | `ApprovalResolved` `{ "decision": "deny", "reason": "resume_finalized_approval_denied" }` then `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`, each only when missing; whole step skipped when `RunCompleted` already exists | `RunFinished` (synthetic failed outcome) when a durable `RunAccepted` exists and no `RunFinished` does |
+| resume (Failed-row repair, §5.3 step 10) | none — the row stays `failed` | `ApprovalResolved` / `RunCompleted` only when `RunCompleted` is missing; never duplicate them | `RunFinished` (synthetic failed) when accepted and `has_run_finished_event` is false — **independent** of whether `RunCompleted` already exists |
 | submit_goal | `upsert_run` | `GoalSubmitted` | — |
 | events | `get_session` + EventStore list | — | — |
 | start (first) | `upsert_run` → `accepted` **before** emit | `Error` on unavailable | `RunAccepted` after row |
@@ -931,7 +933,9 @@ stateDiagram-v2
 ### Ordering guarantees
 
 - Per-session event `seq` is assigned only by the active `EventSink` (0001/0002) — Session MUST NOT assign seq.
-- Mutating APIs that both upsert and append/emit MUST persist the **row first**, then append/emit, under the per-session or per-run lock for that critical section.
+- **Default mutating-API rule:** APIs that both upsert and append/emit MUST persist the **row first**, then append/emit, under the per-session or per-run lock for that critical section (create, `submit_goal`, first-dispatch acceptance, `approve(Allow*)`, `request_replan`, `register_gate_waiter`).
+- **Terminal `DagState` / cancel finalization exception:** when writing a terminal `RunControlState` from `start` outcome handling (§6.3 step 10), `cancel` finalization (§6.4 step 10), or resume cancel finalization (§5.3 step 9), append/emit **before** the final terminal row. Existence probes (§3.8) keep retries idempotent if the upsert fails after events.
+- **`approve(Deny)` exception:** upsert `failed` **before** its events (§6.5), so the decision is durable before the waiter is notified. Resume repairs missing events (§5.3 step 10); `RunFinished` repair does not require a missing `RunCompleted`.
 - Host awaits (`run_dag`, `cancel_dag`) happen **outside** the lock (see §6.3 / §8).
 - Readers of `events` MAY race with appenders; pagination is cursor-based and MUST tolerate concurrent appends (same as 0002).
 
@@ -1027,7 +1031,7 @@ AlloyRuntime::new()
 - In-flight oneshot gate waiters are **not** durable; 0010 MUST call `register_gate_waiter` again after resume when re-entering gates.
 - Durable `accepted` / `running` / `waiting_approval` without `live_execution` remain **re-dispatchable** via `start` (§6.3) — the MVP Unavailable path MUST NOT permanently poison a run.
 - `cancelling` rows are finalized to `cancelled` on resume (§5.3 step 9).
-- `failed` rows missing `RunCompleted` — the `approve(Deny)` row-before-events crash window — are repaired in place on resume (§5.3 step 10). A `failed` row that already has `RunCompleted` is left untouched.
+- `failed` rows missing terminal events — the `approve(Deny)` row-before-events crash window — are repaired in place on resume (§5.3 step 10). Missing `ApprovalResolved` / `RunCompleted` are gated on a missing `RunCompleted`; missing `RunFinished` is repaired independently when acceptance is known.
 
 ---
 
@@ -1062,7 +1066,8 @@ AlloyRuntime::new()
 | Graceful `drain` / `shutdown` | In-flight `run_dag` cancelled via host drain path; reject new `start` / `submit_goal` when not `Running`; `cancel` still allowed in `Draining` |
 | Crash after successful append commit | Events durable (0002 WAL/fsync policy) |
 | Crash between upsert and append/emit | Row may exist without matching event; resume uses row; `start` re-dispatch rules apply |
-| Crash after the `approve(Deny)` row write, before its events | Row is `failed` without `RunCompleted`; resume repairs `ApprovalResolved` / `RunCompleted` / conditional `RunFinished` in place (§5.3 step 10) |
+| Crash after the `approve(Deny)` row write, before its events | Row is `failed` with missing terminal events; resume repairs `ApprovalResolved` / `RunCompleted` (when `RunCompleted` missing) and conditional `RunFinished` independently (§5.3 step 10) |
+| Crash after `approve(Deny)` `RunCompleted`, before `RunFinished` | Row is `failed` with session events; resume emits synthetic failed `RunFinished` when accepted and unfinished — does **not** re-append session events |
 | Crash after `RunAccepted` before outcome | Row stays `accepted`; restart → re-dispatchable |
 | Restart | `resume` + `events` restore control truth; waiters empty; `live_execution` empty |
 
@@ -1164,6 +1169,7 @@ Test names below are the ones in the tree, so the matrix can be diffed against t
 | `session_resume_keeps_cancelling_when_append_fails` | Injected append failure writes no events and leaves `cancelling`; resume still returns `Ok` |
 | `session_resume_does_not_clobber_concurrent_cancel` | Resume racing `cancel` yields one terminal write and one `RunCompleted` in either order |
 | `session_resume_repairs_failed_approval_without_terminal_events` | `failed` row with no `RunCompleted` → repaired `ApprovalResolved` `{deny, resume_finalized_approval_denied}` + `RunCompleted` `{failed, approval_denied}` + one `RunFinished`; row stays `failed`; second resume is a no-op (§5.3 step 10) |
+| `session_resume_repairs_missing_run_finished_when_run_completed_exists` | `failed` with durable `RunCompleted` but no `RunFinished` → one synthetic `RunFinished`; session events not duplicated; second resume is a no-op (§5.3 step 10) |
 | `budget_warning_hook_appends_event` | `BudgetWarning` with snapshot + message; unknown session → `NotFound` |
 
 ### Unit tests — run control (`src/session/tests.rs`)
@@ -1283,8 +1289,8 @@ Merge only when all items hold:
 - [x] `BudgetPolicy` attached on create; `signal_budget_warning` hook defined and tested
 - [x] Restart recovery: `resume` + `events` + re-dispatch rules defined and integration-tested
 - [x] Corrupt `goal_json` on resume skipped with warn; cancel skips `RunFinished` when `!goal_ok`; `request_replan` does not parse the envelope at all (§4)
-- [x] `failed` rows left by the `approve(Deny)` row-before-events crash window are repaired in place on resume, gated on a missing `RunCompleted` so a scheduler-written `failed` (events first) is never mis-repaired (§5.3 step 10)
-- [x] `EventStore` existence probes (§3.8) are required trait methods answering from one `LIMIT 1` row, and every terminal write is guarded by them
+- [x] `failed` rows left by the `approve(Deny)` row-before-events crash window are repaired in place on resume: session events gated on missing `RunCompleted`; missing `RunFinished` repaired independently when accepted (§5.3 step 10)
+- [x] `EventStore` existence probes (§3.8) are required trait methods answering from one indexed `LIMIT 1` row (schema v3 indexes), and every terminal write is guarded by them
 - [x] `RunError::SchedulerUnavailable` / `AlreadyStarted` / `UnknownGate`; `RunError` is `#[non_exhaustive]` with downstream catch-all guidance
 - [x] `RunRow.state` vocabulary pinned (`RunControlState::parse` → `Option`); not a second DAG state machine
 - [x] `RunGoalRecord` stored in `goal_json` with minted `DagId`; unknown fields tolerated
@@ -1339,8 +1345,8 @@ Only genuine implementation spikes — settled V2/0001/0002 decisions are not re
 - Approve persists before notifying the gate waiter
 - `#[non_exhaustive]` on `RunError` requires downstream catch-all match arms
 - `request_replan` records intent and never parses `goal_json`; a corrupt envelope is a `start`-only `Internal` (§4)
-- `approve(Deny)` is the only terminal transition that writes the row before its events; resume repairs that window in place, gated on a missing `RunCompleted` (§5.3 step 10)
-- The `EventStore` existence probes are required trait methods answering from one `LIMIT 1` row — no page-scanning default (§3.8)
+- `approve(Deny)` is the only terminal transition that writes the row before its events; resume repairs that window in place — session events gated on missing `RunCompleted`, `RunFinished` independently (§5.3 step 10)
+- The `EventStore` existence probes are required trait methods answering from one indexed `LIMIT 1` row — no page-scanning default (§3.8); `session_events` PK does not index `run_id`
 
 ---
 

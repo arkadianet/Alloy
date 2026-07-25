@@ -90,7 +90,7 @@ async fn open_creates_layout() {
     assert!(dir.path().join("alloy.sqlite").is_file());
     assert!(dir.path().join("artifacts").is_dir());
     assert!(dir.path().join("graph").is_dir());
-    assert_eq!(storage.schema_version(), 2);
+    assert_eq!(storage.schema_version(), 3);
     storage.close().await.unwrap();
 }
 
@@ -106,7 +106,7 @@ async fn migrate_idempotent_and_refuse_newer() {
     let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
         .await
         .unwrap();
-    assert_eq!(storage.schema_version(), 2);
+    assert_eq!(storage.schema_version(), 3);
     storage.close().await.unwrap();
     drop(storage);
 

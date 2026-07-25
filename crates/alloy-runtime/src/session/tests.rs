@@ -16,7 +16,7 @@ use super::traits::{ReplanReason, RunController, SessionService};
 use crate::adapters::Approval;
 use crate::config::RuntimeConfig;
 use crate::error::{RunError, SchedError, SessionError};
-use crate::events::{RuntimeEvent, SessionEvent, SessionEventType};
+use crate::events::{EventSink, NewSessionEvent, RuntimeEvent, SessionEvent, SessionEventType};
 use crate::runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
 use crate::scheduler::{DagOutcome, DagState, Scheduler};
 use crate::storage::{
@@ -1356,6 +1356,69 @@ async fn session_resume_repairs_failed_approval_without_terminal_events() {
             .len(),
         1
     );
+    assert_eq!(h.count_finished(run).await, 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn session_resume_repairs_missing_run_finished_when_run_completed_exists() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    assert!(matches!(
+        h.runs().start(run).await.unwrap_err(),
+        RunError::SchedulerUnavailable
+    ));
+    assert_eq!(h.count_accepted(run).await, 1);
+
+    // Crash after Failed + ApprovalResolved + RunCompleted, before RunFinished.
+    h.set_run_state(run, RunControlState::Failed).await;
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run),
+            type_: SessionEventType::ApprovalResolved,
+            payload: json!({
+                "decision": "deny",
+                "reason": "approval_denied",
+            }),
+        })
+        .await
+        .unwrap();
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run),
+            type_: SessionEventType::RunCompleted,
+            payload: json!({
+                "dag_state": "failed",
+                "reason": "approval_denied",
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(h.count_finished(run).await, 0);
+
+    h.sessions().resume(session).await.unwrap();
+
+    assert_eq!(h.run_state(run).await, RunControlState::Failed);
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::ApprovalResolved)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::RunCompleted)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(h.count_finished(run).await, 1);
+
+    h.sessions().resume(session).await.unwrap();
     assert_eq!(h.count_finished(run).await, 1);
     h.close().await;
 }
