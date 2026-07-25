@@ -56,6 +56,11 @@ pub struct SpawnSpec {
     /// Optional Unix pre-exec hook (Landlock apply, etc.).
     #[cfg(unix)]
     pub pre_exec: Option<PreExecHook>,
+    /// Runs in the parent immediately after `spawn` returns (before wait).
+    ///
+    /// Used by Seatbelt to close the ready-byte pipe write end once the child
+    /// has inherited it — must not run before fork.
+    pub after_spawn: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// Outcome before attaching policy metadata.
@@ -124,6 +129,9 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
     }
 
     let mut child = cmd.spawn().map_err(SandboxError::Io)?;
+    if let Some(hook) = spec.after_spawn.take() {
+        hook();
+    }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut guard = ChildGuard::new(child);
@@ -376,6 +384,26 @@ fn encode_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
     (status.code(), None)
 }
 
+#[cfg(all(test, unix))]
+mod signal_status_tests {
+    use super::encode_status;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn signal_status_encoding() {
+        let signaled = ExitStatus::from_raw(9); // SIGKILL wait-status on Linux
+        let (code, sig) = encode_status(signaled);
+        assert_eq!(code, None);
+        assert_eq!(sig, Some(9));
+
+        let out = std::process::Command::new("/bin/true").status().unwrap();
+        let (code, sig) = encode_status(out);
+        assert_eq!(code, Some(0));
+        assert_eq!(sig, None);
+    }
+}
+
 /// Attach policy fields to a supervised outcome.
 #[must_use]
 pub fn into_exec_result(
@@ -419,6 +447,7 @@ pub async fn spawn_runtime_command(
         exec_timeout,
         #[cfg(unix)]
         pre_exec: None,
+        after_spawn: None,
     })
     .await
 }
@@ -448,6 +477,7 @@ mod tests {
             stderr_cap: cap,
             exec_timeout,
             pre_exec: None,
+            after_spawn: None,
         }
     }
 

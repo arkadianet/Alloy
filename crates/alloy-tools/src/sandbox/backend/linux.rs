@@ -62,9 +62,10 @@ impl LinuxLandlockBackend {
             pre_exec: Some(Box::new(move || {
                 let plan = plan
                     .take()
-                    .ok_or_else(|| std::io::Error::other("landlock plan already consumed"))?;
+                    .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
                 apply_plan(plan)
             })),
+            after_spawn: None,
         })
         .await;
 
@@ -88,6 +89,7 @@ fn is_isolation_io(e: &std::io::Error) -> bool {
         e.kind(),
         std::io::ErrorKind::PermissionDenied
             | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::NotFound
             | std::io::ErrorKind::Other
     )
 }
@@ -116,24 +118,17 @@ fn prepare_plan(
         binds.push(bind_file_to_devnull(&cred)?);
     }
     for path in &ctx.deny_paths {
-        if path.is_symlink() {
-            // Deny the symlink node itself via /dev/null when it is a file symlink;
-            // directory symlinks get an empty RO dir bind on the link path.
-            let meta = std::fs::symlink_metadata(path).map_err(SandboxError::Io)?;
-            if meta.file_type().is_symlink() {
-                // Prefer treating as file bind-over for the link path.
-                binds.push(bind_file_to_devnull(path)?);
-                continue;
-            }
-        }
-        let ft = std::fs::symlink_metadata(path).map_err(SandboxError::Io)?;
-        if ft.is_file() {
+        let ft = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(SandboxError::Io(e)),
+        };
+        if ft.is_symlink() || ft.is_file() {
             binds.push(bind_file_to_devnull(path)?);
         } else if ft.is_dir() {
             let empty = bind_root.join(format!("empty-{empty_idx}"));
             empty_idx += 1;
             std::fs::create_dir_all(&empty).map_err(SandboxError::Io)?;
-            // Mark empty dir immutable from parent POV; child remounts RO after bind.
             binds.push((cstring_path(&empty)?, cstring_path(path)?));
         } else {
             return Err(SandboxError::Internal(format!(
@@ -254,7 +249,8 @@ fn build_ruleset_created(
 }
 
 fn apply_plan(mut plan: LandlockPlan) -> std::io::Result<()> {
-    // Async-signal-safe-ish path: no format!, no Mutex, no alloc beyond syscalls.
+    // Child side: only syscalls + pre-built CStr buffers from the parent.
+    // No format!, Mutex, std::fs, or String allocation on the success path.
     unshare(UnshareFlags::NEWUSER | UnshareFlags::NEWNS | UnshareFlags::NEWNET)
         .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
 
@@ -271,11 +267,21 @@ fn apply_plan(mut plan: LandlockPlan) -> std::io::Result<()> {
     .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
 
     for (src, dst) in &plan.binds {
-        mount_bind(src.as_c_str(), dst.as_c_str())
-            .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+        match mount_bind(src.as_c_str(), dst.as_c_str()) {
+            Ok(()) => {}
+            // Target vanished between parent snapshot and child mount — skip.
+            Err(e) if e.raw_os_error() == libc::ENOENT => continue,
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e.raw_os_error())),
+        }
         // Remount bind read-only when source is not /dev/null (directory denies).
+        // Landlock still denies writes if this remount fails.
         if src.as_bytes() != b"/dev/null" {
-            let _ = mount_remount(dst.as_c_str(), MountFlags::BIND | MountFlags::RDONLY, "");
+            if let Err(e) = mount_remount(dst.as_c_str(), MountFlags::BIND | MountFlags::RDONLY, "")
+            {
+                if e.raw_os_error() != libc::ENOENT {
+                    let _ = e; // best-effort; Landlock is the write boundary
+                }
+            }
         }
     }
 
@@ -284,18 +290,38 @@ fn apply_plan(mut plan: LandlockPlan) -> std::io::Result<()> {
     let ruleset = plan
         .ruleset
         .take()
-        .ok_or_else(|| std::io::Error::other("ruleset already consumed"))?;
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
     let status = ruleset.restrict_self().map_err(std::io::Error::other)?;
     if !status.no_new_privs {
-        return Err(std::io::Error::other("PR_SET_NO_NEW_PRIVS not set"));
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
     }
     Ok(())
 }
 
 fn write_id_maps_preformatted(uid_map: &[u8], gid_map: &[u8]) -> std::io::Result<()> {
-    std::fs::write("/proc/self/setgroups", b"deny")?;
-    std::fs::write("/proc/self/uid_map", uid_map)?;
-    std::fs::write("/proc/self/gid_map", gid_map)?;
+    // rustix open/write on static paths — no std::fs path allocation in the child.
+    write_proc_file(c"/proc/self/setgroups", b"deny")?;
+    write_proc_file(c"/proc/self/uid_map", uid_map)?;
+    write_proc_file(c"/proc/self/gid_map", gid_map)?;
+    Ok(())
+}
+
+fn write_proc_file(path: &std::ffi::CStr, bytes: &[u8]) -> std::io::Result<()> {
+    use rustix::fd::AsFd;
+    use rustix::fs::{open, Mode, OFlags};
+    use rustix::io::write;
+
+    let fd = open(path, OFlags::WRONLY, Mode::empty())
+        .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let n = write(fd.as_fd(), &bytes[off..])
+            .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+        if n == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        off += n;
+    }
     Ok(())
 }
 

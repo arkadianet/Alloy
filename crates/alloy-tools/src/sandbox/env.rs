@@ -69,8 +69,8 @@ pub(crate) fn is_hard_denied(name: &str) -> bool {
 /// Homes resolved from the parent environment (RFC-0005 §5.5).
 #[derive(Debug, Clone)]
 pub(crate) struct OperatorHomes {
-    /// Parent `HOME`.
-    #[allow(dead_code)] // retained for future credential path derivation
+    /// Parent `HOME` (retained for credential-path derivation / tests).
+    #[allow(dead_code)]
     pub op_home: PathBuf,
     /// Operator cargo home (absolute).
     pub cargo_home: PathBuf,
@@ -78,9 +78,57 @@ pub(crate) struct OperatorHomes {
     pub rustup_home: PathBuf,
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+mod homes_override {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static OVERRIDE: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
+
+    /// RAII guard that restores the previous override (usually `None`).
+    pub struct HomesOverrideGuard {
+        prev: Option<(PathBuf, PathBuf)>,
+    }
+
+    impl Drop for HomesOverrideGuard {
+        fn drop(&mut self) {
+            *OVERRIDE.lock().unwrap() = self.prev.take();
+        }
+    }
+
+    /// Override operator cargo/rustup homes for the current process (tests only).
+    pub fn override_operator_homes(
+        cargo_home: PathBuf,
+        rustup_home: PathBuf,
+    ) -> HomesOverrideGuard {
+        let mut slot = OVERRIDE.lock().unwrap();
+        let prev = slot.replace((cargo_home, rustup_home));
+        HomesOverrideGuard { prev }
+    }
+
+    pub(super) fn take_override() -> Option<(PathBuf, PathBuf)> {
+        OVERRIDE.lock().unwrap().clone()
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub use homes_override::override_operator_homes;
+
 impl OperatorHomes {
     /// Resolve from parent env; requires `HOME` on Unix.
     pub(crate) fn resolve() -> Result<Self, SandboxError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some((cargo_home, rustup_home)) = homes_override::take_override() {
+            let op_home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"));
+            return Ok(Self {
+                op_home,
+                cargo_home,
+                rustup_home,
+            });
+        }
+
         let op_home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| SandboxError::Invalid("HOME unset".into()))?;
@@ -109,6 +157,8 @@ pub(crate) struct ScrubInput<'a> {
     pub cargo_home: &'a Path,
     /// Operator rustup home (native absolute).
     pub rustup_home: &'a Path,
+    /// Per-exec writable cargo cache (RFC §5.5 carve-out) → `CARGO_TARGET_DIR`.
+    pub cargo_target_dir: Option<&'a Path>,
     /// Extra allowlisted names from the request.
     pub env_allow: &'a [String],
     /// Force `CARGO_NET_OFFLINE=true`.
@@ -162,6 +212,13 @@ pub(crate) fn scrub_env(
         OsString::from("RUSTUP_HOME"),
         input.rustup_home.as_os_str().to_os_string(),
     );
+
+    if let Some(target) = input.cargo_target_dir {
+        map.insert(
+            OsString::from("CARGO_TARGET_DIR"),
+            target.as_os_str().to_os_string(),
+        );
+    }
 
     if input.quarantine {
         map.insert(OsString::from("CARGO_NET_OFFLINE"), OsString::from("true"));
@@ -300,6 +357,9 @@ pub(crate) fn compose_container_env(
     map.insert("HOME".into(), input.child_home.display().to_string());
     map.insert("TMPDIR".into(), input.child_tmpdir.display().to_string());
     map.insert("CARGO_HOME".into(), input.cargo_home.display().to_string());
+    if let Some(target) = input.cargo_target_dir {
+        map.insert("CARGO_TARGET_DIR".into(), target.display().to_string());
+    }
     if input.quarantine {
         map.insert("CARGO_NET_OFFLINE".into(), "true".into());
     }
@@ -357,6 +417,7 @@ mod tests {
             child_tmpdir: &tmp,
             cargo_home: &cargo,
             rustup_home: &rustup,
+            cargo_target_dir: None,
             // Hard-denied names must never enter the child map via env_allow.
             env_allow: &denied,
             quarantine: false,
@@ -424,6 +485,7 @@ mod tests {
             child_tmpdir: &tmp,
             cargo_home: &cargo,
             rustup_home: &rustup,
+            cargo_target_dir: Some(&tmp),
             env_allow: &[],
             quarantine: true,
             path_value: Some(OsString::from("/usr/bin")),
@@ -434,5 +496,9 @@ mod tests {
             home.as_os_str()
         );
         assert_eq!(map.get(OsStr::new("CARGO_NET_OFFLINE")).unwrap(), "true");
+        assert_eq!(
+            map.get(OsStr::new("CARGO_TARGET_DIR")).unwrap().as_os_str(),
+            tmp.as_os_str()
+        );
     }
 }

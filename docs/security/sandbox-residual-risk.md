@@ -39,16 +39,16 @@ policies).
 
 Credential and deny-glob bind-overs (`/dev/null` or empty RO dirs) are computed
 **once per `exec`**, from paths that exist under the jail when the broker walks
-it. Paths created *after* spawn (or outside the walk budget) are **not**
-retroactively bound over.
+it. Paths created *after* spawn are **not** retroactively bound over.
 
-Landlock still denies reads/writes outside the jail and RO roots, so a new
-`.env` created mid-exec under the jail is writable/readable by the child unless
-a deny-glob matched it at spawn. Large workspaces may truncate the walk (warn +
-best-effort binds); Landlock remains the primary FS boundary.
+The jail itself is Landlock-writable, so deny-glob coverage for **in-jail**
+secrets depends on the walk finding them. The walk therefore **fails closed**
+when its entry budget is exhausted (refuses the exec) rather than returning a
+partial bind list. `target/` and `.git/` are pruned as build/VCS noise;
+`node_modules/` is **not** pruned (it commonly holds `.env` files).
 
 **Operator guidance:** keep secrets out of the jail when possible; treat
-deny-globs as defense-in-depth, not a live FS monitor.
+deny-globs as defense-in-depth on top of fail-closed walks, not a live FS monitor.
 
 ---
 
@@ -58,11 +58,11 @@ Quarantine forces offline mode for known cargo subcommands and blocks the
 network-facing cargo family (`fetch` / `update` / `install` / …). Other cargo
 subcommands are allowed with `CARGO_NET_OFFLINE` only (no `--offline` insert).
 
-**Known holes:** cargo flags such as `--config` / `CARGO_HOME` redirection and
-non-cargo tools are unchanged aside from the shared env scrub and FS/network
-isolation. Basename grants match rustup shims (`cargo` → `rustup`) via invocation
-authority, but arbitrary `rustup run` wrappers are out of scope for MVP
-quarantine rewriting.
+**Known holes:** cargo flags such as `--config` / value-taking flags can make
+`cargo_subcommand` mis-classify the subcommand, so the **QuarantineBlocked**
+denial may not fire (network deny + `CARGO_NET_OFFLINE` still apply). Basename
+grants match rustup shims (`cargo` → `rustup`) via invocation authority, but
+arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
 
 ---
 
@@ -73,13 +73,14 @@ quarantine rewriting.
   failure at **probe** time marks Landlock `Unavailable` (fail closed on
   `NativeSandboxBroker::new`). Nested user namespaces (some CI / cloud agent
   hosts) may refuse `uid_map` writes → Unavailable even when Landlock ABI exists.
-- **Seatbelt** uses `/usr/bin/sandbox-exec`, which Apple documents as deprecated;
-  treat as best-effort on macOS until a replacement profile path exists. The MVP
-  ready-byte / argv0 path is an approximation of the RFC trampoline (no custom
-  helper binary).
+- **Seatbelt** uses `/usr/bin/sandbox-exec` (Apple-deprecated). MVP uses a bash
+  trampoline for the ready-byte handshake and `exec -a` argv0 preservation;
+  arguments are never re-joined into an unquoted `bash -c` string.
 - **Container** depends on docker/podman availability and a pinned image
   (`rust:1.97.1-bookworm` by default). Runtime cleanup uses a cidfile drop-guard
-  on every exit path.
+  on every exit path. The cidfile lives under the jail (RFC-mandated path) and is
+  therefore visible to the container as RW — a compromised child could rewrite
+  the id the broker later signals.
 
 ---
 

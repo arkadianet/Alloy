@@ -34,3 +34,6 @@ pub use types::{
     BackendStatus, DenialReason, ExecClass, NetworkPolicy, SandboxBackend, SandboxBroker,
     SandboxCapabilities, SandboxError, SandboxExecRequest, SandboxExecResult,
 };
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub use env::override_operator_homes;

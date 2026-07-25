@@ -90,6 +90,7 @@ impl ContainerBackend {
             child_tmpdir: &tmp,
             cargo_home: &ctx.cargo_home,
             rustup_home: &ctx.rustup_home,
+            cargo_target_dir: Some(&cargo_cache),
             env_allow: &[],
             quarantine: profile.quarantine_deps,
             path_value: None,

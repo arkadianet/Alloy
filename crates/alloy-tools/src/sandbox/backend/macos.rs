@@ -1,22 +1,33 @@
 //! macOS Seatbelt backend via `sandbox-exec` (RFC-0005 §5.5).
+//!
+//! Isolation is applied by `sandbox-exec`. A small bash trampoline then:
+//! 1. Writes one ready-byte on an inherited pipe fd (profile apply succeeded).
+//! 2. `exec -a`s the real program so rustup/busybox argv0 dispatch is preserved.
+//!
+//! Arguments are passed as distinct argv slots to the trampoline — never
+//! re-joined into an unquoted `bash -c` string (that would bypass `args_glob`).
 
 #![allow(unsafe_code)]
 #![allow(clippy::disallowed_methods)]
 
-use std::io::{Read, Write};
-use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::io::Read;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use crate::sandbox::backend::IsolateContext;
 use crate::sandbox::process::{spawn_supervised, SpawnSpec, SupervisedOutcome};
 use crate::sandbox::profile::SandboxProfile;
-use crate::sandbox::types::{SandboxBackend, SandboxError};
+use crate::sandbox::types::{NetworkPolicy, SandboxBackend, SandboxError};
 
 /// Seatbelt isolation backend.
 pub struct MacosSeatbeltBackend;
 
 const TEMPLATE: &str = include_str!("macos/alloy-check.sb.template");
+
+/// Ready-byte wait after spawn (profile apply / trampoline handoff).
+const READY_WAIT: Duration = Duration::from_secs(2);
 
 impl MacosSeatbeltBackend {
     /// Execute under `/usr/bin/sandbox-exec` with argv0 preserved.
@@ -24,6 +35,12 @@ impl MacosSeatbeltBackend {
         profile: &SandboxProfile,
         ctx: IsolateContext,
     ) -> Result<SupervisedOutcome, SandboxError> {
+        if matches!(profile.network, NetworkPolicy::Allow) {
+            return Err(SandboxError::Invalid(
+                "network=allow unsupported in MVP".into(),
+            ));
+        }
+
         let sandbox_exec = PathBuf::from("/usr/bin/sandbox-exec");
         if !sandbox_exec.is_file() {
             return Err(SandboxError::BackendUnavailable {
@@ -36,96 +53,135 @@ impl MacosSeatbeltBackend {
         let body = render_sbpl(profile, &ctx)?;
         std::fs::write(&sbpl, body).map_err(SandboxError::Io)?;
 
-        // Ready-byte pipe: trampoline writes one byte after sandbox-exec handoff.
-        // Parent waits briefly; if the child exits before the byte with sandbox
-        // diagnostics → BackendCannotEnforce.
-        let (ready_r, ready_w) = pipe_pair()?;
+        let trampoline = ctx.exec_dir.join("trampoline.sh");
+        write_trampoline(&trampoline)?;
 
-        let mut argv = vec![
+        let (ready_r, ready_w) = pipe_pair()?;
+        let ready_fd = ready_w.as_raw_fd();
+        // Child must inherit the write end; clear FD_CLOEXEC before fork.
+        clear_cloexec(ready_fd)?;
+
+        let argv0 = ctx
+            .argv
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ctx.program.display().to_string());
+
+        // sandbox-exec -- trampoline <ready_fd> <argv0> <program> -- <args…>
+        let mut spawn_argv = vec![
             "sandbox-exec".into(),
             "-f".into(),
             sbpl.display().to_string(),
             "--".into(),
-            // Spawn the resolved binary; argv0 for the *inner* process is set via
-            // SpawnSpec.arg0 below so rustup/busybox dispatch is preserved.
+            trampoline.display().to_string(),
+            ready_fd.to_string(),
+            argv0,
             ctx.program.display().to_string(),
+            "--".into(),
         ];
         if ctx.argv.len() > 1 {
-            argv.extend(ctx.argv[1..].iter().cloned());
+            spawn_argv.extend(ctx.argv[1..].iter().cloned());
         }
 
-        // Encode original argv0 into the supervised argv[0] slot for Command::arg0.
-        let mut env = ctx.env;
-        // Pass write-end FD number to a tiny shell trampoline? RFC wants ready-byte
-        // after sandbox_init. Without a custom trampoline binary we approximate:
-        // parent races a short read on the pipe while the child runs; sandbox-exec
-        // itself does not write the byte. For MVP we keep the pipe open in the
-        // parent and treat early exit + stderr diagnostics as CannotEnforce.
-        // Close write end in parent so read unblocks on child exit.
-        drop(ready_w);
-
-        let mut spawn_argv = argv;
-        // Ensure argv[0] for the sandboxed program is the caller's original argv0.
-        if !ctx.argv.is_empty() {
-            // sandbox-exec -- <program> <args>; Command.arg0 applies to sandbox-exec.
-            // To preserve inner argv0 we invoke via `exec -a` shell form when needed.
-            if ctx.argv[0] != ctx.program.display().to_string() {
-                let inner_args = if ctx.argv.len() > 1 {
-                    ctx.argv[1..].join(" ")
-                } else {
-                    String::new()
-                };
-                spawn_argv = vec![
-                    "sandbox-exec".into(),
-                    "-f".into(),
-                    sbpl.display().to_string(),
-                    "--".into(),
-                    "/bin/bash".into(),
-                    "-c".into(),
-                    format!(
-                        "exec -a {} {} {}",
-                        shell_single_quote(&ctx.argv[0]),
-                        shell_single_quote(&ctx.program.display().to_string()),
-                        inner_args
-                    ),
-                ];
+        let ready_w_fd = ready_w.into_raw_fd();
+        let after_spawn = Box::new(move || {
+            // Parent closes its write end only after fork so the child still
+            // inherits it; otherwise the ready-byte pipe is dead on arrival.
+            unsafe {
+                libc::close(ready_w_fd);
             }
-        }
+        });
+
+        let mut ready_r = ready_r;
+        let ready_task =
+            tokio::task::spawn_blocking(move || read_ready_byte(&mut ready_r, READY_WAIT));
 
         let outcome = spawn_supervised(SpawnSpec {
             program: sandbox_exec,
             argv: spawn_argv,
             cwd: ctx.cwd,
-            env,
+            env: ctx.env,
             stdout_cap: profile.stdout_cap,
             stderr_cap: profile.stderr_cap,
             exec_timeout: profile.exec_timeout,
             pre_exec: None,
+            after_spawn: Some(after_spawn),
         })
-        .await?;
+        .await;
 
-        // Drain ready pipe (may be EOF if child never wrote).
-        let mut ready_r = ready_r;
-        let mut buf = [0u8; 1];
-        let _ = ready_r.read(&mut buf);
+        let got_ready = ready_task.await.unwrap_or(false);
 
-        if outcome.exit_code == Some(1) {
-            let stderr = String::from_utf8_lossy(&outcome.stderr);
-            if stderr.contains("sandbox-exec")
-                || stderr.contains("sandbox_init")
-                || stderr.contains("deny")
-            {
-                return Err(SandboxError::BackendCannotEnforce(format!(
-                    "sandbox-exec profile apply failed: {stderr}"
-                )));
+        match outcome {
+            Ok(out) if got_ready => Ok(out),
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Err(SandboxError::BackendCannotEnforce(format!(
+                    "sandbox-exec/trampoline exited before ready-byte \
+                     (exit={:?} signal={:?}): {stderr}",
+                    out.exit_code, out.signal
+                )))
             }
+            Err(e) => Err(e),
         }
-        Ok(outcome)
     }
 }
 
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+fn write_trampoline(path: &Path) -> Result<(), SandboxError> {
+    // Pure bash: no eval of joined args. argv layout:
+    //   $0=trampoline $1=ready_fd $2=argv0 $3=program $4=-- $5..=args
+    const BODY: &str = r#"#!/bin/bash
+set -euo pipefail
+ready_fd="$1"
+argv0="$2"
+program="$3"
+shift 3
+if [[ "${1:-}" != "--" ]]; then
+  echo "alloy trampoline: missing -- separator" >&2
+  exit 74
+fi
+shift
+printf 'x' >&"$ready_fd" || exit 75
+exec -a "$argv0" "$program" "$@"
+"#;
+    std::fs::write(path, BODY).map_err(SandboxError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)
+            .map_err(SandboxError::Io)?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).map_err(SandboxError::Io)?;
+    }
+    Ok(())
+}
+
+fn clear_cloexec(fd: i32) -> Result<(), SandboxError> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(SandboxError::Io(std::io::Error::last_os_error()));
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    if rc != 0 {
+        return Err(SandboxError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn read_ready_byte(ready_r: &mut std::fs::File, wait: Duration) -> bool {
+    let fd = ready_r.as_raw_fd();
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if rc <= 0 {
+        return false;
+    }
+    let mut buf = [0u8; 1];
+    matches!(ready_r.read(&mut buf), Ok(1) if buf[0] == b'x')
 }
 
 fn pipe_pair() -> Result<(std::fs::File, std::fs::File), SandboxError> {
@@ -166,12 +222,16 @@ fn render_sbpl(profile: &SandboxProfile, ctx: &IsolateContext) -> Result<String,
         .replace("{{RUSTUP_SETTINGS}}", &sbpl_literal(&rustup_settings));
     body.push('\n');
     body.push_str(&deny_clauses);
-    let _ = Path::new; // keep Path in scope for clarity
     Ok(body)
 }
 
 fn sbpl_literal(path: &Path) -> String {
-    format!("\"{}\"", path.display().to_string().replace('\"', "\\\""))
+    let s = path
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('\"', "\\\"");
+    format!("\"{s}\"")
 }
 
 /// Probe Seatbelt by applying a minimal profile (not just statting the binary).

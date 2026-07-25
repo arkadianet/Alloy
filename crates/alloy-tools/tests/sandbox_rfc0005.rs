@@ -3,22 +3,23 @@
 //! Landlock tests are required on Linux CI when `ALLOY_REQUIRE_LANDLOCK=1`.
 //! Without that env var, Unavailable hosts skip (local nested-userns) rather
 //! than reporting a dishonest green pass for enforcement.
+//!
+//! Built with `--features test-hooks` so operator homes can be overridden
+//! without mutating process-global `CARGO_HOME`.
 
 #![allow(clippy::disallowed_methods)] // positive baselines may use host Command
 
+use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::process::Command;
 use std::time::Duration;
 
 use alloy_runtime::{ExecAllow, Grant, PermissionToken, ProfileId, RunId, Timestamp};
 use alloy_tools::{
-    load_sandbox_profile, BackendStatus, ExecClass, NativeSandboxBroker, NetworkPolicy,
-    SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
+    load_sandbox_profile, override_operator_homes, BackendStatus, ExecClass, NativeSandboxBroker,
+    NetworkPolicy, SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
 };
 use tempfile::tempdir;
-
-/// Serializes tests that mutate process environment (`CARGO_HOME`, …).
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn token(binary: &str, args_glob: Option<&str>) -> PermissionToken {
     PermissionToken {
@@ -117,11 +118,19 @@ fn process_alive(pid: i32) -> bool {
     }
 }
 
+fn python3_ok() -> bool {
+    Command::new("python3")
+        .arg("-c")
+        .arg("1")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 #[tokio::test]
 async fn backend_unavailable_fail_closed() {
     let dir = tempdir().unwrap();
     let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
-    // Force Seatbelt on Linux → UnsupportedOs / Unavailable at construction for check.
     profile.check_backend = SandboxBackend::Seatbelt;
     let err = NativeSandboxBroker::new(profile).await.unwrap_err();
     assert!(
@@ -146,7 +155,6 @@ async fn landlock_actually_applied() {
     let dir = tempdir().unwrap();
     let jail = dir.path().canonicalize().unwrap();
 
-    // Sentinel outside the jail and outside Landlock RO roots (sibling tempdir).
     let outer = tempdir().unwrap();
     let sentinel = outer.path().join("secret.txt");
     std::fs::write(&sentinel, b"outside-secret").unwrap();
@@ -191,6 +199,36 @@ async fn landlock_actually_applied() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn deny_walk_budget_blocks_exec() {
+    if !landlock_or_skip().await {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    // Blow the 10k entry budget with many sibling files; place `.env` last in
+    // name order so a truncated walk would miss it.
+    for i in 0..10_050 {
+        std::fs::write(jail.join(format!("pad-{i:05}")), b"x").unwrap();
+    }
+    std::fs::write(jail.join("zzzz.env"), b"nope").unwrap(); // not a deny pattern
+    std::fs::write(jail.join(".env"), b"SECRET=1\n").unwrap();
+
+    let broker = broker_for_jail(jail.clone()).await.unwrap();
+    let req = SandboxExecRequest::new(
+        vec![true_bin().into()],
+        jail,
+        token(true_bin(), None),
+        ExecClass::Check,
+    );
+    let err = broker.exec(req).await.unwrap_err();
+    assert!(
+        matches!(err, SandboxError::Internal(ref m) if m.contains("exceeded")),
+        "budget overrun must fail closed, got {err:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn child_cannot_read_dotenv_in_jail() {
     if !landlock_or_skip().await {
         return;
@@ -218,7 +256,6 @@ async fn child_cannot_read_dotenv_in_jail() {
         "child read .env contents: {stdout:?} exit={:?}",
         result.exit_code
     );
-    // Bind-over makes `.env` a /dev/null node — cat may exit 0 with empty stdout.
 }
 
 #[tokio::test]
@@ -248,25 +285,24 @@ async fn dotenv_sentinel_unchanged() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
-#[allow(clippy::await_holding_lock)] // serializes CARGO_HOME mutation across awaits
 async fn credentials_sentinel_unchanged() {
     if !landlock_or_skip().await {
         return;
     }
-    let _env = ENV_LOCK.lock().unwrap();
 
     let dir = tempdir().unwrap();
     let jail = dir.path().canonicalize().unwrap();
 
     let cargo_home = dir.path().join("fake-cargo");
+    let rustup_home = dir.path().join("fake-rustup");
     std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::create_dir_all(&rustup_home).unwrap();
     let creds = cargo_home.join("credentials.toml");
     let original = b"token = \"sentinel\"\n";
     std::fs::write(&creds, original).unwrap();
 
-    // Safety: test-only env mutation, serialized by ENV_LOCK.
-    let old = std::env::var_os("CARGO_HOME");
-    std::env::set_var("CARGO_HOME", &cargo_home);
+    // Test-hooks override — no process-global CARGO_HOME mutation.
+    let _homes = override_operator_homes(cargo_home.clone(), rustup_home);
 
     let broker = broker_for_jail(jail.clone()).await.unwrap();
     let script = jail.join("try_creds.sh");
@@ -284,11 +320,6 @@ async fn credentials_sentinel_unchanged() {
 
     let after = std::fs::read(&creds).unwrap();
     assert_eq!(after, original);
-
-    match old {
-        Some(v) => std::env::set_var("CARGO_HOME", v),
-        None => std::env::remove_var("CARGO_HOME"),
-    }
 }
 
 #[tokio::test]
@@ -297,20 +328,7 @@ async fn network_deny_blocks_egress() {
     if !landlock_or_skip().await {
         return;
     }
-
-    let dir = tempdir().unwrap();
-    let jail = dir.path().canonicalize().unwrap();
-    let broker = broker_for_jail(jail.clone()).await.unwrap();
-
-    // Under netns with only lo, connecting to a public address must fail.
-    // Prefer python3 (present on ubuntu-latest); skip honestly if missing.
-    if std::process::Command::new("python3")
-        .arg("-c")
-        .arg("1")
-        .status()
-        .map(|s| !s.success())
-        .unwrap_or(true)
-    {
+    if !python3_ok() {
         if require_landlock() {
             panic!("python3 required for network_deny_blocks_egress under ALLOY_REQUIRE_LANDLOCK");
         }
@@ -318,21 +336,45 @@ async fn network_deny_blocks_egress() {
         return;
     }
 
+    // Positive baseline: host can reach a local listener (RFC §11).
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+    let baseline = Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import socket; s=socket.create_connection(('127.0.0.1', {port}), 1); s.close()"
+        ))
+        .status()
+        .expect("python3 baseline");
+    assert!(
+        baseline.success(),
+        "positive baseline: host must reach local listener before deny"
+    );
+    // Keep `listener` alive through the sandboxed connect: under netns the
+    // child's 127.0.0.1 is not the host's, so the connect must still fail.
+
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let broker = broker_for_jail(jail.clone()).await.unwrap();
+
     let script = jail.join("net.sh");
     std::fs::write(
         &script,
-        r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
 python3 - <<'PY'
 import socket,sys
 s=socket.socket()
 s.settimeout(1)
 try:
-    s.connect(("1.1.1.1", 80))
+    s.connect(("127.0.0.1", {port}))
     sys.exit(0)
 except Exception:
     sys.exit(2)
 PY
-"#,
+"#
+        ),
     )
     .unwrap();
     chmod_755(&script);
@@ -346,10 +388,11 @@ PY
     assert_eq!(
         result.exit_code,
         Some(2),
-        "egress should fail under network deny; stdout={} stderr={}",
+        "egress to host listener should fail under network deny; stdout={} stderr={}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+    drop(listener);
 }
 
 #[tokio::test]
@@ -383,7 +426,7 @@ async fn cancel_drop_no_orphan() {
     );
     let handle = tokio::spawn(async move { broker.exec(req).await });
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let pid = loop {
         if let Ok(s) = std::fs::read_to_string(&pidfile) {
             if let Ok(pid) = s.trim().parse::<i32>() {
@@ -446,7 +489,6 @@ async fn timeout_kills_process_group() {
     let err = broker.exec(req).await.unwrap_err();
     assert!(matches!(err, SandboxError::Timeout(_)), "got {err:?}");
 
-    // Grandchild must be gone after timeout kill of the process group.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let alive = std::fs::read_to_string(&pidfile)
@@ -475,12 +517,111 @@ async fn token_expired_via_exec() {
     let broker = broker_for_jail(jail.clone()).await.unwrap();
 
     let mut perms = token(true_bin(), None);
-    // Inclusive boundary: now == expires → TokenExpired.
     perms.expires = Some(Timestamp(Timestamp::now().0));
 
     let req = SandboxExecRequest::new(vec![true_bin().into()], jail, perms, ExecClass::Check);
     let err = broker.exec(req).await.unwrap_err();
     assert!(matches!(err, SandboxError::TokenExpired), "got {err:?}");
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn landlock_cargo_version_fixture() {
+    if !landlock_or_skip().await {
+        return;
+    }
+    let cargo = which_cargo();
+    let Some(cargo) = cargo else {
+        if require_landlock() {
+            panic!("cargo required for landlock_cargo_version_fixture");
+        }
+        eprintln!("skip: cargo not on PATH");
+        return;
+    };
+
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let broker = broker_for_jail(jail.clone()).await.unwrap();
+    let req = SandboxExecRequest::new(
+        vec![cargo.clone(), "--version".into()],
+        jail,
+        token(&cargo, Some("--version*")),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.to_ascii_lowercase().contains("cargo"),
+        "unexpected cargo --version output: {stdout:?}"
+    );
+}
+
+#[tokio::test]
+async fn container_backend_probe_status() {
+    // Always runs: asserts the container probe returns a typed status rather
+    // than panicking. When a runtime is present the optional CI job can go
+    // further via container_runtime_smoke.
+    let dir = tempdir().unwrap();
+    let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
+    profile.check_backend = SandboxBackend::Landlock;
+    profile.test_backend = SandboxBackend::Container;
+    // Landlock may be unavailable → new fails; that's fine for this probe peek.
+    match NativeSandboxBroker::new(profile).await {
+        Ok(b) => {
+            let _ = &b.capabilities().container;
+        }
+        Err(SandboxError::BackendUnavailable { .. }) | Err(SandboxError::UnsupportedOs) => {}
+        Err(e) => panic!("unexpected new error: {e:?}"),
+    }
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn container_runtime_smoke() {
+    // Optional: only asserts when docker/podman is Available.
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
+    profile.check_backend = SandboxBackend::Container;
+    profile.test_backend = SandboxBackend::Container;
+    profile.container_image =
+        std::env::var("ALLOY_CONTAINER_IMAGE").unwrap_or_else(|_| "rust:1.97.1-bookworm".into());
+
+    let broker = match NativeSandboxBroker::new(profile).await {
+        Ok(b) => b,
+        Err(SandboxError::BackendUnavailable { .. }) => {
+            eprintln!("skip: container runtime unavailable");
+            return;
+        }
+        Err(e) => panic!("unexpected: {e:?}"),
+    };
+    if !matches!(
+        broker.capabilities().container,
+        BackendStatus::Available { .. }
+    ) {
+        eprintln!("skip: container probe Unavailable");
+        return;
+    }
+
+    let req = SandboxExecRequest::new(
+        vec!["/bin/true".into()],
+        jail,
+        token("/bin/true", None),
+        ExecClass::Test,
+    );
+    let result = broker.exec(req).await.unwrap();
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "container true failed: stderr={}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 #[tokio::test]
@@ -494,4 +635,20 @@ async fn load_sandbox_from_workspace_profile() {
     let profile = load_sandbox_profile(&profile_path, jail.path().to_path_buf()).unwrap();
     assert_eq!(profile.network, NetworkPolicy::Deny);
     assert!(profile.quarantine_deps);
+}
+
+fn which_cargo() -> Option<String> {
+    for p in [
+        std::env::var_os("CARGO").map(PathBuf::from),
+        Some(PathBuf::from("/usr/bin/cargo")),
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo/bin/cargo")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if p.is_file() {
+            return Some(p.display().to_string());
+        }
+    }
+    None
 }

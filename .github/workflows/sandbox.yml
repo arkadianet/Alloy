@@ -36,12 +36,12 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - name: Test alloy-tools
-        run: cargo test -p alloy-tools -- --nocapture
+        run: cargo test -p alloy-tools --features test-hooks -- --nocapture
       - name: Require Landlock enforcement test ran
         run: |
-          cargo test -p alloy-tools --test sandbox_rfc0005 landlock_actually_applied -- --nocapture --exact
+          cargo test -p alloy-tools --features test-hooks --test sandbox_rfc0005 landlock_actually_applied -- --nocapture --exact
       - name: Clippy (deny warnings)
-        run: cargo clippy -p alloy-tools --all-targets -- -D warnings
+        run: cargo clippy -p alloy-tools --all-targets --features test-hooks -- -D warnings
       - name: Fmt
         run: cargo fmt --all -- --check
 
@@ -56,7 +56,7 @@ jobs:
           toolchain: 1.97.1
           components: clippy
       - name: Test alloy-tools
-        run: cargo test -p alloy-tools -- --nocapture
+        run: cargo test -p alloy-tools --features test-hooks -- --nocapture
 
   container:
     name: Container backend (optional)
@@ -67,7 +67,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
-      - name: Test container-related filters
-        # continue-on-error on the job covers missing docker; do not `|| true`
-        # (that would hide real assertion failures when the runtime is present).
-        run: cargo test -p alloy-tools container_ -- --nocapture
+      - name: Container smoke + probe tests
+        # Matches container_* integration tests (probe + runtime smoke).
+        # Job continues on error when docker/podman is missing; do not `|| true`
+        # so real assertion failures still show as failed steps.
+        run: cargo test -p alloy-tools --features test-hooks --test sandbox_rfc0005 container_ -- --nocapture

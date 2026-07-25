@@ -214,6 +214,7 @@ impl NativeSandboxBroker {
             child_tmpdir: &exec.tmp,
             cargo_home: &homes.cargo_home,
             rustup_home: &homes.rustup_home,
+            cargo_target_dir: Some(&exec.cargo_cache),
             env_allow: &req.env_allow,
             quarantine: self.profile.quarantine_deps,
             path_value: Some(path_value(&path_dirs)),

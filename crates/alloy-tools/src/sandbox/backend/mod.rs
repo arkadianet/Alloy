@@ -84,30 +84,34 @@ pub async fn run_isolated(
     }
 }
 
-/// Directories skipped during deny-glob walks (build/VCS noise).
-const SKIP_DIR_NAMES: &[&str] = &[
-    "target",
-    ".git",
-    "node_modules",
-    ".alloy-sbx",
-    "alloy-sbx-binds",
-];
+/// Directories skipped during deny-glob walks (build/VCS noise only).
+///
+/// Do **not** prune `node_modules` — it commonly holds `.env` / secrets that
+/// deny-globs must still bind over. Truncation is fail-closed (see below).
+const SKIP_DIR_NAMES: &[&str] = &["target", ".git", ".alloy-sbx", "alloy-sbx-binds"];
 
 /// Collect deny-glob matches under `jail`.
 ///
-/// - Does **not** fail closed when the entry budget is exhausted (logs + returns
-///   what was found). Ordinary large workspaces must still exec.
+/// - Fail closed when the entry budget is exhausted: a truncated list would
+///   leave in-jail secrets readable (the jail is Landlock RW).
 /// - Uses `DirEntry::file_type()` so symlinks are never followed out of the jail.
-/// - Prunes common build/VCS directories.
+/// - Prunes only build/VCS directories that are not expected to hold deny matches.
 pub fn collect_deny_paths(
     jail: &Path,
     deny: &globset::GlobSet,
 ) -> Result<Vec<PathBuf>, SandboxError> {
+    collect_deny_paths_with_budget(jail, deny, 10_000)
+}
+
+/// Same as [`collect_deny_paths`] with an explicit entry budget (testable).
+pub fn collect_deny_paths_with_budget(
+    jail: &Path,
+    deny: &globset::GlobSet,
+    max_entries: usize,
+) -> Result<Vec<PathBuf>, SandboxError> {
     let mut out = Vec::new();
     let mut stack = vec![jail.to_path_buf()];
     let mut visited = 0usize;
-    const MAX: usize = 10_000;
-    let mut truncated = false;
 
     while let Some(dir) = stack.pop() {
         let rd = match std::fs::read_dir(&dir) {
@@ -116,9 +120,12 @@ pub fn collect_deny_paths(
         };
         for ent in rd.flatten() {
             visited += 1;
-            if visited > MAX {
-                truncated = true;
-                break;
+            if visited > max_entries {
+                return Err(SandboxError::Internal(format!(
+                    "deny-glob walk exceeded {max_entries} entries under {}; \
+                     refusing to exec with a partial credential bind-over list",
+                    jail.display()
+                )));
             }
             let path = ent.path();
             let name = ent.file_name();
@@ -149,18 +156,8 @@ pub fn collect_deny_paths(
                 stack.push(path);
             }
         }
-        if truncated {
-            break;
-        }
     }
 
-    if truncated {
-        tracing::warn!(
-            visited,
-            matches = out.len(),
-            "deny-glob walk truncated; spawn-time binds are a best-effort snapshot"
-        );
-    }
     Ok(out)
 }
 
@@ -204,4 +201,41 @@ pub fn credential_bind_targets(cargo_home: &Path) -> Vec<PathBuf> {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::glob::{compile_deny_globs, default_deny_globs};
+
+    #[test]
+    fn deny_walk_budget_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let jail = dir.path();
+        // Enough sibling files to blow a tiny budget before hitting `.env`.
+        for i in 0..40 {
+            std::fs::write(jail.join(format!("pad-{i}")), b"x").unwrap();
+        }
+        std::fs::write(jail.join(".env"), b"SECRET=1\n").unwrap();
+        let set = compile_deny_globs(&default_deny_globs()).unwrap();
+        let err = collect_deny_paths_with_budget(jail, &set, 10).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::Internal(ref m) if m.contains("exceeded")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn deny_walk_finds_env_under_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let jail = dir.path();
+        std::fs::create_dir_all(jail.join("node_modules/pkg")).unwrap();
+        std::fs::write(jail.join("node_modules/pkg/.env"), b"SECRET=1\n").unwrap();
+        let set = compile_deny_globs(&default_deny_globs()).unwrap();
+        let found = collect_deny_paths_with_budget(jail, &set, 10_000).unwrap();
+        assert!(
+            found.iter().any(|p| p.ends_with(".env")),
+            "node_modules .env must be collected; got {found:?}"
+        );
+    }
 }

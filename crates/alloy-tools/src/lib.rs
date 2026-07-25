@@ -20,3 +20,6 @@ pub use sandbox::{
     SandboxBackend, SandboxBroker, SandboxCapabilities, SandboxError, SandboxExecRequest,
     SandboxExecResult, SandboxProfile,
 };
+
+#[cfg(feature = "test-hooks")]
+pub use sandbox::override_operator_homes;
