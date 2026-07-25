@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Snapshot of session-plane counters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SessionMetrics {
     /// Sessions created.
     pub sessions_created: u64,

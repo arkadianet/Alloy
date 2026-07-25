@@ -16,13 +16,13 @@ use super::goal_record::RunGoalRecord;
 use super::inner::SessionInner;
 use super::map_err::{runtime_to_run, store_to_run};
 use super::run_state::RunControlState;
-use super::traits::{ReplanReason, RunController};
+use super::traits::{ReplanReason, RunController, MAX_EVENTS_PAGE};
 use crate::adapters::Approval;
 use crate::error::{RunError, RuntimeError, SchedError};
 use crate::events::{NewSessionEvent, RuntimeEvent, SessionEventType};
 use crate::runtime::RuntimePhase;
 use crate::scheduler::{DagOutcome, DagState};
-use crate::storage::{RunRow, SessionRows};
+use crate::storage::{EventStore, RunRow, SessionRows};
 use crate::types::ids::{DagId, GateId, RunId, SessionId, Timestamp};
 
 /// Phase gate for `start` / `approve` / `request_replan` / `register_gate_waiter`.
@@ -169,6 +169,111 @@ pub(super) async fn emit_run_finished(
         .map_err(runtime_to_run)
 }
 
+/// True if this run already has a durable `RunCompleted` (retry idempotency).
+pub(super) async fn has_run_completed(
+    inner: &SessionInner,
+    session: SessionId,
+    run: RunId,
+) -> Result<bool, RunError> {
+    let store = inner.storage.events();
+    let mut after = None;
+    loop {
+        let page = store
+            .list_session_events(session, after, MAX_EVENTS_PAGE)
+            .await
+            .map_err(store_to_run)?;
+        if page
+            .iter()
+            .any(|e| e.run_id == Some(run) && e.type_ == SessionEventType::RunCompleted)
+        {
+            return Ok(true);
+        }
+        match page.last() {
+            Some(last) if page.len() == MAX_EVENTS_PAGE => after = Some(last.seq),
+            _ => return Ok(false),
+        }
+    }
+}
+
+/// True if this run already has a host `RunFinished` (retry idempotency).
+pub(super) async fn has_run_finished(inner: &SessionInner, run: RunId) -> Result<bool, RunError> {
+    runtime_event_for_run(
+        inner,
+        run,
+        |ev| matches!(ev, RuntimeEvent::RunFinished { run_id, .. } if *run_id == run),
+    )
+    .await
+}
+
+/// True if this run already has a host `RunAccepted`.
+///
+/// Used when durable state is `cancelling` / being finalized: that state is reachable from
+/// `created` without acceptance, so `was_accepted(run, Cancelling)` would lie.
+pub(super) async fn has_run_accepted(inner: &SessionInner, run: RunId) -> Result<bool, RunError> {
+    if inner.was_accepted(run, RunControlState::Created) {
+        return Ok(true);
+    }
+    runtime_event_for_run(
+        inner,
+        run,
+        |ev| matches!(ev, RuntimeEvent::RunAccepted { run_id, .. } if *run_id == run),
+    )
+    .await
+}
+
+async fn runtime_event_for_run(
+    inner: &SessionInner,
+    _run: RunId,
+    mut pred: impl FnMut(&RuntimeEvent) -> bool,
+) -> Result<bool, RunError> {
+    let store = inner.storage.events();
+    let mut after = None;
+    loop {
+        let page = store
+            .list_runtime_events(after, MAX_EVENTS_PAGE)
+            .await
+            .map_err(store_to_run)?;
+        if page.iter().any(|(_, ev)| pred(ev)) {
+            return Ok(true);
+        }
+        match page.last() {
+            Some((rowid, _)) if page.len() == MAX_EVENTS_PAGE => after = Some(*rowid),
+            _ => return Ok(false),
+        }
+    }
+}
+
+/// Write cancel terminal events, then the `Cancelled` row (events-before-upsert).
+pub(super) async fn finalize_cancelled(
+    inner: &SessionInner,
+    row: &RunRow,
+    dag_id: Option<DagId>,
+    accepted: bool,
+    completed_reason: Option<&str>,
+) -> Result<(), RunError> {
+    let session = row.session_id;
+    let run = row.id;
+    if !has_run_completed(inner, session, run).await? {
+        append_run_completed(inner, session, run, DagState::Cancelled, completed_reason).await?;
+    }
+    if let Some(dag_id) = dag_id.filter(|_| accepted) {
+        if !has_run_finished(inner, run).await? {
+            emit_run_finished(inner, run, synthetic_outcome(dag_id, DagState::Cancelled)).await?;
+        }
+    }
+    upsert_state(inner, row, RunControlState::Cancelled).await?;
+    inner.metrics.bump_runs_cancelled();
+    Ok(())
+}
+
+/// Failure from [`RunControllerView::persist_approval`], noting whether the control row left
+/// `waiting_approval` so the caller can decide whether to restore the gate sender.
+struct PersistApprovalError {
+    err: RunError,
+    /// `true` when the durable state write already committed.
+    row_committed: bool,
+}
+
 /// Outcome recorded when a run terminates without a scheduler-provided outcome.
 pub(super) fn synthetic_outcome(dag_id: DagId, state: DagState) -> DagOutcome {
     DagOutcome {
@@ -255,16 +360,7 @@ impl RunControllerView {
             Ok(outcome) => self.apply_ok_outcome(&row, session, run, outcome).await,
             Err(RuntimeError::Scheduler(SchedError::Cancelled)) => {
                 // Cancellation from the scheduler is a success path, not `runtime_to_run`.
-                upsert_state(&self.inner, &row, RunControlState::Cancelled).await?;
-                append_run_completed(&self.inner, session, run, DagState::Cancelled, None).await?;
-                emit_run_finished(
-                    &self.inner,
-                    run,
-                    synthetic_outcome(dag_id, DagState::Cancelled),
-                )
-                .await?;
-                self.inner.metrics.bump_runs_cancelled();
-                Ok(())
+                finalize_cancelled(&self.inner, &row, Some(dag_id), true, None).await
             }
             Err(
                 RuntimeError::SchedulerUnavailable
@@ -323,16 +419,19 @@ impl RunControllerView {
                 return Err(RunError::Internal("unexpected pending outcome".into()));
             }
         };
-        upsert_state(&self.inner, row, control).await?;
 
         if !control.is_terminal() {
+            upsert_state(&self.inner, row, control).await?;
             info!(run_id = %run, state = control.as_str(), "run not terminal after run_dag");
             return Ok(());
         }
 
+        // Terminal pair before the row write: a crash after upsert would leave a terminal
+        // row that resume skips, with no other writer to emit the events.
         let state = outcome.state;
         append_run_completed(&self.inner, session, run, state, None).await?;
         emit_run_finished(&self.inner, run, outcome).await?;
+        upsert_state(&self.inner, row, control).await?;
         if control == RunControlState::Cancelled {
             self.inner.metrics.bump_runs_cancelled();
         }
@@ -346,7 +445,7 @@ impl RunControllerView {
         row: &RunRow,
         gate: GateId,
         decision: Approval,
-    ) -> Result<(), RunError> {
+    ) -> Result<(), PersistApprovalError> {
         let session = row.session_id;
         let run = row.id;
         let resolved = json!({ "gate_id": gate, "decision": decision });
@@ -355,43 +454,65 @@ impl RunControllerView {
             // `row` is still `waiting_approval`, so acceptance is implied even when the
             // `RunAccepted` emission happened in an earlier process. Sample it before the
             // terminal write prunes the process-local marker.
-            let accepted = self.inner.was_accepted(run, parse_state(row)?);
-            upsert_state(&self.inner, row, RunControlState::Failed).await?;
-            self.inner.gates.clear_run(run);
-            append_run_event(
-                &self.inner,
-                session,
+            let accepted = self.inner.was_accepted(
                 run,
-                SessionEventType::ApprovalResolved,
-                resolved,
-            )
-            .await?;
-            append_run_completed(
-                &self.inner,
-                session,
-                run,
-                DagState::Failed,
-                Some("approval_denied"),
-            )
-            .await?;
-            match parse_goal(row) {
-                Ok(record) if accepted => {
-                    emit_run_finished(
-                        &self.inner,
-                        run,
-                        synthetic_outcome(record.dag_id, DagState::Failed),
-                    )
-                    .await?;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    warn!(run_id = %run, error = %e, "corrupt goal_json: skipping RunFinished for denied gate");
-                }
+                parse_state(row).map_err(|err| PersistApprovalError {
+                    err,
+                    row_committed: false,
+                })?,
+            );
+            if let Err(err) = upsert_state(&self.inner, row, RunControlState::Failed).await {
+                return Err(PersistApprovalError {
+                    err,
+                    row_committed: false,
+                });
             }
-            return Ok(());
+            self.inner.gates.clear_run(run);
+            let after = async {
+                append_run_event(
+                    &self.inner,
+                    session,
+                    run,
+                    SessionEventType::ApprovalResolved,
+                    resolved,
+                )
+                .await?;
+                append_run_completed(
+                    &self.inner,
+                    session,
+                    run,
+                    DagState::Failed,
+                    Some("approval_denied"),
+                )
+                .await?;
+                match parse_goal(row) {
+                    Ok(record) if accepted => {
+                        emit_run_finished(
+                            &self.inner,
+                            run,
+                            synthetic_outcome(record.dag_id, DagState::Failed),
+                        )
+                        .await?;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(run_id = %run, error = %e, "corrupt goal_json: skipping RunFinished for denied gate");
+                    }
+                }
+                Ok(())
+            };
+            return after.await.map_err(|err| PersistApprovalError {
+                err,
+                row_committed: true,
+            });
         }
 
-        upsert_state(&self.inner, row, RunControlState::Running).await?;
+        if let Err(err) = upsert_state(&self.inner, row, RunControlState::Running).await {
+            return Err(PersistApprovalError {
+                err,
+                row_committed: false,
+            });
+        }
         append_run_event(
             &self.inner,
             session,
@@ -400,6 +521,10 @@ impl RunControllerView {
             resolved,
         )
         .await
+        .map_err(|err| PersistApprovalError {
+            err,
+            row_committed: true,
+        })
     }
 }
 
@@ -481,7 +606,6 @@ impl RunController for RunControllerView {
         let lock = self.inner.lock_run(run).await;
 
         let row = load_run(&self.inner, run).await?;
-        let session = row.session_id;
         let state = parse_state(&row)?;
         if state.is_terminal() {
             return Ok(());
@@ -493,10 +617,28 @@ impl RunController for RunControllerView {
                 None
             }
         };
-        // Sampled before any terminal write prunes the process-local acceptance marker.
-        let accepted = self.inner.was_accepted(run, state);
 
-        upsert_state(&self.inner, &row, RunControlState::Cancelling).await?;
+        // Never-started runs were never admitted: finalize in one shot so we never write
+        // `cancelling` (which would erase the "never accepted" fact for retries/resume).
+        if state == RunControlState::Created {
+            self.inner.gates.clear_run(run);
+            finalize_cancelled(&self.inner, &row, None, false, None).await?;
+            info!(run_id = %run, "run cancelled");
+            drop(lock);
+            return Ok(());
+        }
+
+        // `cancelling` is reachable from `created`, so durable state alone cannot decide
+        // whether `RunAccepted` was announced — consult the event log / process marker.
+        let accepted = if state == RunControlState::Cancelling {
+            has_run_accepted(&self.inner, run).await?
+        } else {
+            self.inner.was_accepted(run, state)
+        };
+
+        if state != RunControlState::Cancelling {
+            upsert_state(&self.inner, &row, RunControlState::Cancelling).await?;
+        }
         self.inner.gates.clear_run(run);
 
         let ticket = lock.unlock();
@@ -522,21 +664,7 @@ impl RunController for RunControllerView {
             return Ok(());
         }
 
-        upsert_state(&self.inner, &fresh, RunControlState::Cancelled).await?;
-        append_run_completed(&self.inner, session, run, DagState::Cancelled, None).await?;
-
-        if let Some(dag_id) = dag_id {
-            if accepted {
-                emit_run_finished(
-                    &self.inner,
-                    run,
-                    synthetic_outcome(dag_id, DagState::Cancelled),
-                )
-                .await?;
-            }
-        }
-
-        self.inner.metrics.bump_runs_cancelled();
+        finalize_cancelled(&self.inner, &fresh, dag_id, accepted, None).await?;
         info!(run_id = %run, "run cancelled");
         drop(lock);
         Ok(())
@@ -571,9 +699,13 @@ impl RunController for RunControllerView {
             .ok_or(RunError::UnknownGate(gate))?;
 
         if let Err(e) = self.persist_approval(&row, gate, decision).await {
-            // The gate must not be consumed as approved when persistence failed.
-            self.inner.gates.restore(run, gate, sender);
-            return Err(e);
+            // Restore only when the row write itself failed. If the state already left
+            // `waiting_approval`, putting the sender back permanently strands Deny waiters
+            // (terminal guards block every release path) — drop it so they observe closure.
+            if !e.row_committed {
+                self.inner.gates.restore(run, gate, sender);
+            }
+            return Err(e.err);
         }
 
         sender

@@ -2,6 +2,7 @@
 
 /// Control-plane run state (not the DAG state machine).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum RunControlState {
     /// Row created by `submit_goal`; not yet accepted by `start`.
     Created,

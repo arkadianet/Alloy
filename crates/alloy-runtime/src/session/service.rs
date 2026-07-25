@@ -15,15 +15,12 @@ use super::goal_record::RunGoalRecord;
 use super::inner::SessionInner;
 use super::map_err::{run_to_session, runtime_to_session};
 use super::profiles::validate_mvp_profile;
-use super::run_controller::{
-    append_run_completed, emit_run_finished, synthetic_outcome, upsert_state,
-};
+use super::run_controller::{finalize_cancelled, has_run_accepted, upsert_state};
 use super::run_state::RunControlState;
-use super::traits::{clamp_events_page_limit, Session, SessionService, MAX_EVENTS_PAGE};
+use super::traits::{clamp_events_page_limit, Session, SessionService};
 use crate::error::SessionError;
-use crate::events::{NewSessionEvent, RuntimeEvent, SessionEvent, SessionEventType};
+use crate::events::{NewSessionEvent, SessionEvent, SessionEventType};
 use crate::runtime::RuntimePhase;
-use crate::scheduler::DagState;
 use crate::storage::{store_to_session, EventStore, RunRow, SessionRows};
 use crate::types::budget::{CreateSession, Goal};
 use crate::types::ids::{DagId, EventSeq, RunId, SessionId, Timestamp};
@@ -82,7 +79,9 @@ impl SessionServiceView {
     /// Cancel finalization writes terminal events **before** the `Cancelled` upsert so a
     /// failed append/emit cannot leave the row permanently `Cancelled` with those events
     /// missing. Existence checks keep a retry from duplicating events already written by a
-    /// prior attempt that failed on the upsert.
+    /// prior attempt that failed on the upsert. `RunFinished` is gated on a durable
+    /// `RunAccepted` (not on `cancelling` alone), because `created → cancelling` never
+    /// announced acceptance.
     async fn rearm_run(
         &self,
         row: &RunRow,
@@ -96,37 +95,20 @@ impl SessionServiceView {
             RunControlState::Cancelling => RunControlState::Cancelled,
             _ => return Ok(()),
         };
-        // `cancelling` is only reachable once a run has left `created`, so its acceptance
-        // was announced before the crash.
-        let accepted = self.inner.was_accepted(row.id, state);
 
         if target == RunControlState::Cancelled {
-            if !self.has_run_completed(row.session_id, row.id).await? {
-                append_run_completed(
-                    &self.inner,
-                    row.session_id,
-                    row.id,
-                    DagState::Cancelled,
-                    Some("resume_finalized_cancel"),
-                )
+            let accepted = has_run_accepted(&self.inner, row.id)
                 .await
                 .map_err(run_to_session)?;
-            }
-            if let Some(dag_id) = dag_id.filter(|_| accepted) {
-                if !self.has_run_finished(row.id).await? {
-                    emit_run_finished(
-                        &self.inner,
-                        row.id,
-                        synthetic_outcome(dag_id, DagState::Cancelled),
-                    )
-                    .await
-                    .map_err(run_to_session)?;
-                }
-            }
-            upsert_state(&self.inner, row, target)
-                .await
-                .map_err(run_to_session)?;
-            self.inner.metrics.bump_runs_cancelled();
+            finalize_cancelled(
+                &self.inner,
+                row,
+                dag_id,
+                accepted,
+                Some("resume_finalized_cancel"),
+            )
+            .await
+            .map_err(run_to_session)?;
             info!(
                 run_id = %row.id,
                 from = state.as_str(),
@@ -146,53 +128,6 @@ impl SessionServiceView {
             "resume re-armed run control state"
         );
         Ok(())
-    }
-
-    /// True if this run already has a durable `RunCompleted` (retry idempotency).
-    async fn has_run_completed(
-        &self,
-        session: SessionId,
-        run: RunId,
-    ) -> Result<bool, SessionError> {
-        let store = self.inner.storage.events();
-        let mut after = None;
-        loop {
-            let page = store
-                .list_session_events(session, after, MAX_EVENTS_PAGE)
-                .await
-                .map_err(store_to_session)?;
-            if page
-                .iter()
-                .any(|e| e.run_id == Some(run) && e.type_ == SessionEventType::RunCompleted)
-            {
-                return Ok(true);
-            }
-            match page.last() {
-                Some(last) if page.len() == MAX_EVENTS_PAGE => after = Some(last.seq),
-                _ => return Ok(false),
-            }
-        }
-    }
-
-    /// True if this run already has a host `RunFinished` (retry idempotency).
-    async fn has_run_finished(&self, run: RunId) -> Result<bool, SessionError> {
-        let store = self.inner.storage.events();
-        let mut after = None;
-        loop {
-            let page = store
-                .list_runtime_events(after, MAX_EVENTS_PAGE)
-                .await
-                .map_err(store_to_session)?;
-            if page.iter().any(
-                |(_, ev)| matches!(ev, RuntimeEvent::RunFinished { run_id, .. } if *run_id == run),
-            ) {
-                return Ok(true);
-            }
-            match page.last() {
-                Some((rowid, _)) if page.len() == MAX_EVENTS_PAGE => after = Some(*rowid),
-                _ => return Ok(false),
-            }
-        }
     }
 }
 

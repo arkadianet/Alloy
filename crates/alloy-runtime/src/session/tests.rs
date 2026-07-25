@@ -1,6 +1,7 @@
 //! Unit tests for the RFC-0003 control plane (§14 unit matrix).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +43,7 @@ struct MockScheduler {
     entered: Arc<Notify>,
     release: Arc<Notify>,
     cancels: Mutex<Vec<DagId>>,
+    fail_next_cancel: AtomicBool,
 }
 
 impl MockScheduler {
@@ -51,11 +53,16 @@ impl MockScheduler {
             entered: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
             cancels: Mutex::new(Vec::new()),
+            fail_next_cancel: AtomicBool::new(false),
         })
     }
 
     fn cancelled_dags(&self) -> Vec<DagId> {
         self.cancels.lock().unwrap().clone()
+    }
+
+    fn fail_next_cancel(&self) {
+        self.fail_next_cancel.store(true, Ordering::SeqCst);
     }
 }
 
@@ -85,6 +92,9 @@ impl Scheduler for MockScheduler {
 
     async fn cancel(&self, dag_id: DagId) -> Result<(), SchedError> {
         self.cancels.lock().unwrap().push(dag_id);
+        if self.fail_next_cancel.swap(false, Ordering::SeqCst) {
+            return Err(SchedError::Internal("injected cancel failure".into()));
+        }
         Ok(())
     }
 }
@@ -503,6 +513,7 @@ async fn session_resume_finalizes_cancelling_with_run_completed() {
     let session = h.create_session().await;
     let run = h.submit(session).await;
     // A crash between `cancelling` and `cancelled` leaves nobody to finish the cancel.
+    // This fixture never accepted the run, so resume must not invent RunFinished.
     h.set_run_state(run, RunControlState::Cancelling).await;
 
     h.sessions().resume(session).await.unwrap();
@@ -518,9 +529,34 @@ async fn session_resume_finalizes_cancelling_with_run_completed() {
         completed[0].payload["reason"],
         json!("resume_finalized_cancel")
     );
-    // `cancelling` is only reachable after the run left `created`, so the host is told.
-    assert_eq!(h.count_finished(run).await, 1);
+    assert_eq!(h.count_finished(run).await, 0);
     assert_eq!(h.plane.metrics().runs_cancelled, 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn session_resume_finalizes_accepted_cancelling_emits_finished() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    // Announce acceptance, then crash mid-cancel.
+    assert!(matches!(
+        h.runs().start(run).await.unwrap_err(),
+        RunError::SchedulerUnavailable
+    ));
+    assert_eq!(h.count_accepted(run).await, 1);
+    h.set_run_state(run, RunControlState::Cancelling).await;
+
+    h.sessions().resume(session).await.unwrap();
+
+    assert_eq!(h.run_state(run).await, RunControlState::Cancelled);
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::RunCompleted)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(h.count_finished(run).await, 1);
     h.close().await;
 }
 
@@ -530,6 +566,10 @@ async fn session_resume_cancel_events_precede_cancelled_upsert() {
     let session = h.create_session().await;
     let cancelling = h.submit(session).await;
     let running = h.submit(session).await;
+    assert!(matches!(
+        h.runs().start(cancelling).await.unwrap_err(),
+        RunError::SchedulerUnavailable
+    ));
     h.set_run_state(cancelling, RunControlState::Cancelling)
         .await;
     h.set_run_state(running, RunControlState::Running).await;
@@ -591,6 +631,10 @@ async fn session_resume_does_not_clobber_concurrent_cancel() {
     h.install_scheduler(MockScheduler::new([]));
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    assert!(matches!(
+        h.runs().start(run).await.unwrap_err(),
+        RunError::SchedulerUnavailable
+    ));
     h.set_run_state(run, RunControlState::Cancelling).await;
 
     // Resume and a live `cancel` both want to finalize this row. They serialize on the
@@ -993,6 +1037,59 @@ async fn run_cancel_from_created_skips_run_finished() {
 }
 
 #[tokio::test]
+async fn run_cancel_retry_after_cancel_dag_failure_skips_unpaired_finished() {
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    // Force the historical created→cancelling shape so a retry must consult RunAccepted.
+    h.set_run_state(run, RunControlState::Cancelling).await;
+    sched.fail_next_cancel();
+
+    assert!(matches!(
+        h.runs().cancel(run).await.unwrap_err(),
+        RunError::Internal(m) if m.contains("injected cancel failure")
+    ));
+    assert_eq!(h.run_state(run).await, RunControlState::Cancelling);
+
+    h.runs().cancel(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::Cancelled);
+    assert_eq!(h.count_finished(run).await, 0);
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::RunCompleted)
+            .await
+            .len(),
+        1
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn run_cancel_retry_after_cancel_dag_failure_emits_finished_when_accepted() {
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    assert!(matches!(
+        h.runs().start(run).await.unwrap_err(),
+        RunError::SchedulerUnavailable
+    ));
+    assert_eq!(h.count_accepted(run).await, 1);
+
+    sched.fail_next_cancel();
+    assert!(matches!(
+        h.runs().cancel(run).await.unwrap_err(),
+        RunError::Internal(m) if m.contains("injected cancel failure")
+    ));
+    assert_eq!(h.run_state(run).await, RunControlState::Cancelling);
+
+    h.runs().cancel(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::Cancelled);
+    assert_eq!(h.count_finished(run).await, 1);
+    h.close().await;
+}
+
+#[tokio::test]
 async fn run_cancel_corrupt_goal_skips_run_finished() {
     let h = Harness::new().await;
     let sched = h.install_scheduler(MockScheduler::new([]));
@@ -1125,8 +1222,9 @@ async fn run_approve_persists_before_notify() {
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ));
 
-    // A failed event append lands after the row write, so the state moves but the waiter
-    // still must not observe a decision it cannot audit.
+    // A failed event append lands after the row write: state advances, but the waiter
+    // must not observe a decision it cannot audit. The sender is dropped (not restored)
+    // so a Deny path cannot permanently strand the receiver behind a terminal row.
     h.plane.fail_next_append();
     assert!(matches!(
         h.runs().approve(run, gate, Approval::Allow).await.unwrap_err(),
@@ -1135,15 +1233,15 @@ async fn run_approve_persists_before_notify() {
     assert_eq!(h.run_state(run).await, RunControlState::Running);
     assert!(matches!(
         rx.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
     ));
     assert!(h
         .events_of_type(session, SessionEventType::ApprovalResolved)
         .await
         .is_empty());
 
-    // Both failures restored the gate, so a retry with no fault resolves it exactly once.
-    h.set_run_state(run, RunControlState::WaitingApproval).await;
+    // Re-register after the closed waiter and resolve exactly once.
+    let rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
     h.runs().approve(run, gate, Approval::Allow).await.unwrap();
     assert_eq!(rx.await.unwrap(), Approval::Allow);
     assert_eq!(
@@ -1153,6 +1251,33 @@ async fn run_approve_persists_before_notify() {
         1
     );
     assert_eq!(h.plane.metrics().approvals_resolved, 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn run_approve_deny_drops_waiter_when_append_fails() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.set_run_state(run, RunControlState::Accepted).await;
+    let gate = GateId::new();
+    let mut rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
+
+    h.plane.fail_next_append();
+    assert!(matches!(
+        h.runs().approve(run, gate, Approval::Deny).await.unwrap_err(),
+        RunError::Internal(m) if m.contains("injected append failure")
+    ));
+    assert_eq!(h.run_state(run).await, RunControlState::Failed);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    ));
+    // Terminal + closed: no production path can release a restored sender.
+    assert!(matches!(
+        h.runs().approve(run, gate, Approval::Deny).await.unwrap_err(),
+        RunError::InvalidPhase(m) if m == "terminal"
+    ));
     h.close().await;
 }
 

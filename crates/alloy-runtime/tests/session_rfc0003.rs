@@ -294,8 +294,11 @@ async fn cancelling_run_is_finalized_after_restart() {
         .submit_goal(session, goal("cancel me"))
         .await
         .unwrap();
-    // The process dies between the `cancelling` row write and the terminal write, so no
-    // live caller is left to complete the cancel.
+    // Accept once so RunAccepted is durable, then crash mid-cancel.
+    assert!(matches!(
+        host.plane.runs().start(run).await.unwrap_err(),
+        RunError::SchedulerUnavailable
+    ));
     host.force_run_state(run, RunControlState::Cancelling).await;
     host.shutdown().await;
 
@@ -313,14 +316,38 @@ async fn cancelling_run_is_finalized_after_restart() {
         .collect();
     assert_eq!(completed.len(), 1, "resume owes exactly one RunCompleted");
     assert_eq!(completed[0].run_id, Some(run));
-    // Acceptance was announced before the crash, so the host is told the run ended even
-    // though this process never dispatched it.
     assert_eq!(host.finished_events(run).await, 1);
 
     // Finalization is durable: a second resume is a no-op.
     host.sessions().resume(session).await.unwrap();
     assert_eq!(host.run_state(run).await, RunControlState::Cancelled);
     assert_eq!(host.finished_events(run).await, 1);
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn created_cancelling_resume_skips_run_finished() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let host = Host::open(dir.path()).await;
+    let session = host
+        .sessions()
+        .create(create_req(dir.path()))
+        .await
+        .unwrap();
+    let run = host
+        .sessions()
+        .submit_goal(session, goal("never started"))
+        .await
+        .unwrap();
+    // Historical shape: created → cancelling without RunAccepted.
+    host.force_run_state(run, RunControlState::Cancelling).await;
+    host.shutdown().await;
+
+    let host = Host::open(dir.path()).await;
+    host.sessions().resume(session).await.unwrap();
+    assert_eq!(host.run_state(run).await, RunControlState::Cancelled);
+    assert_eq!(host.finished_events(run).await, 0);
     host.shutdown().await;
 }
 
