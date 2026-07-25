@@ -89,6 +89,9 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
     let start = Instant::now();
 
     if spec.argv.is_empty() {
+        if let Some(hook) = spec.after_spawn.take() {
+            hook();
+        }
         return Err(SandboxError::Invalid("empty argv".into()));
     }
 

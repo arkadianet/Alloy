@@ -256,7 +256,7 @@ pub(crate) enum QuarantineOutcome {
 /// `authority_basename` is the security authority for "is this cargo", never
 /// `argv[0]` on its own: for native backends it is
 /// [`ResolvedBinary::authority_basename`], which prefers the invocation name
-/// when a trusted-root shim renamed the target (`cargo` → `rustup`); for the
+/// only when that path came from a trusted root (rustup shim); for the
 /// container backend it is the basename-form `argv[0]`, since the image — not
 /// the host — supplies the tool.
 ///

@@ -21,19 +21,23 @@ pub(crate) struct ResolvedBinary {
     pub resolved_basename: String,
     /// Basename used at PATH lookup / invocation (e.g. `cargo` before rustup symlink).
     ///
-    /// When the resolved file lives under a trusted immutable root, grant matching
-    /// and quarantine may also accept this name (RFC §5.3 rustup shim semantics).
+    /// When the *pre-canonicalization* path sits under a trusted immutable root,
+    /// grant matching and quarantine may also accept this name (RFC §5.3 rustup
+    /// shim semantics). Jail-writable symlink shadows must not.
     pub invocation_basename: String,
+    /// True iff the pre-canonicalization `chosen` path lives under a trusted root.
+    pub invocation_from_trusted: bool,
 }
 
 impl ResolvedBinary {
     /// Security name for quarantine cargo detection.
     ///
-    /// Prefers the invocation basename when the canonical target is a trusted-root
-    /// shim (e.g. `cargo` → `rustup`); otherwise uses the canonical basename.
+    /// Prefers the invocation basename only when that name came from a trusted
+    /// root path (rustup shim). Jail-writable symlink shadows fall back to the
+    /// canonical basename so they cannot reclassify `/bin/sh` as `cargo`.
     #[must_use]
     pub fn authority_basename(&self) -> &str {
-        if self.invocation_basename != self.resolved_basename {
+        if self.invocation_from_trusted && self.invocation_basename != self.resolved_basename {
             &self.invocation_basename
         } else {
             &self.resolved_basename
@@ -207,11 +211,10 @@ fn binary_matches(
                 };
                 Ok(res.resolved == allow_canon)
             } else {
-                // Canonical basename OR trusted-root invocation basename (rustup shim).
-                Ok(
-                    res.resolved_basename == allow.binary
-                        || res.invocation_basename == allow.binary,
-                )
+                // Canonical basename, or trusted-root invocation basename only
+                // (rustup shim). Jail-writable symlink shadows must not count.
+                Ok(res.resolved_basename == allow.binary
+                    || (res.invocation_from_trusted && res.invocation_basename == allow.binary))
             }
         }
     }
@@ -252,12 +255,20 @@ pub(crate) fn resolve_executable(
         .unwrap_or(argv0)
         .to_string();
 
-    let chosen = if Path::new(argv0).is_absolute() {
-        PathBuf::from(argv0)
+    // PATH hits are always under a trusted bin dir. Absolute/relative path forms
+    // are trusted for *invocation authority* only when the pre-canonicalization
+    // path itself sits under a trusted root (rustup shim). A jail-writable
+    // symlink named `cargo` → `/bin/sh` must not inherit the `cargo` grant.
+    let (chosen, invocation_from_trusted) = if Path::new(argv0).is_absolute() {
+        let chosen = PathBuf::from(argv0);
+        let trusted = path_under_trusted(&chosen, trusted_path);
+        (chosen, trusted)
     } else if argv0.contains('/') {
-        cwd.join(argv0)
+        let chosen = cwd.join(argv0);
+        let trusted = path_under_trusted(&chosen, trusted_path);
+        (chosen, trusted)
     } else {
-        find_on_trusted_path(argv0, trusted_path)?
+        (find_on_trusted_path(argv0, trusted_path)?, true)
     };
 
     let resolved = chosen.canonicalize().map_err(|e| {
@@ -286,6 +297,21 @@ pub(crate) fn resolve_executable(
         original_argv0: argv0.to_string(),
         resolved_basename,
         invocation_basename,
+        invocation_from_trusted,
+    })
+}
+
+/// Whether `path` (pre-canonicalization) lives under a trusted immutable root.
+fn path_under_trusted(path: &Path, trusted_path: &[PathBuf]) -> bool {
+    trusted_path.iter().any(|root| {
+        let r = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if path.starts_with(&r) {
+            return true;
+        }
+        // Relative joins: compare the canonical parent directory.
+        path.parent()
+            .and_then(|p| p.canonicalize().ok())
+            .is_some_and(|parent| parent.starts_with(&r))
     })
 }
 
@@ -473,6 +499,7 @@ mod tests {
         let resolved = resolve_executable("cargo", dir.path(), &roots).unwrap();
         assert_eq!(resolved.invocation_basename, "cargo");
         assert_eq!(resolved.resolved_basename, "rustup");
+        assert!(resolved.invocation_from_trusted);
         assert_eq!(resolved.authority_basename(), "cargo");
 
         let allow = ExecAllow {
@@ -483,7 +510,7 @@ mod tests {
         assert!(binary_matches(&allow, &subject, dir.path()).unwrap());
 
         // Workspace shadow rejected: binary under non-trusted cwd.
-        let shadow = dir.path().join("cargo");
+        let shadow = dir.path().join("cargo-shadow");
         std::fs::write(&shadow, b"evil").unwrap();
         #[cfg(unix)]
         {
@@ -492,7 +519,56 @@ mod tests {
             p.set_mode(0o755);
             std::fs::set_permissions(&shadow, p).unwrap();
         }
-        let err = resolve_executable("./cargo", dir.path(), &roots).unwrap_err();
+        let err = resolve_executable("./cargo-shadow", dir.path(), &roots).unwrap_err();
         assert!(matches!(err, SandboxError::Invalid(_)));
+    }
+
+    /// Jail-writable symlink named `cargo` → `/bin/sh` must not inherit a
+    /// basename `cargo` grant (RFC §5.3: authority from resolved, never the
+    /// pre-canonicalization basename alone when the link is untrusted).
+    #[test]
+    #[cfg(unix)]
+    fn binary_resolution_rejects_symlink_shadow() {
+        let dir = tempfile::tempdir().unwrap();
+        let jail = dir.path();
+        let sh = ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+            .expect("sh");
+        std::os::unix::fs::symlink(&sh, jail.join("cargo")).unwrap();
+
+        let roots = trusted_path_dirs(None, None);
+        let resolved = resolve_executable("./cargo", jail, &roots).unwrap();
+        assert_eq!(resolved.invocation_basename, "cargo");
+        assert!(!resolved.invocation_from_trusted);
+        assert_eq!(
+            resolved.authority_basename(),
+            resolved.resolved_basename.as_str()
+        );
+        assert_ne!(resolved.authority_basename(), "cargo");
+
+        let allow = ExecAllow {
+            binary: "cargo".into(),
+            args_glob: None,
+        };
+        assert!(!binary_matches(&allow, &BinarySubject::Native(resolved), jail).unwrap());
+
+        let tok = token(vec![Grant::Exec(ExecAllow {
+            binary: "cargo".into(),
+            args_glob: None,
+        })]);
+        let err = match_exec_grant(
+            &tok,
+            &["./cargo".into(), "-c".into(), "echo pwned".into()],
+            SandboxBackend::Landlock,
+            jail,
+            &roots,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SandboxError::Denied(DenialReason::ExecNotAllowlisted)),
+            "got {err:?}"
+        );
     }
 }

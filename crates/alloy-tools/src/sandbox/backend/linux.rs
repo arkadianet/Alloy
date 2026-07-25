@@ -142,7 +142,7 @@ fn map_isolation_outcome(
 
 fn isolation_pipe() -> Result<(std::fs::File, std::fs::File), SandboxError> {
     let mut fds = [0i32; 2];
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if rc != 0 {
         return Err(SandboxError::Io(std::io::Error::last_os_error()));
     }
