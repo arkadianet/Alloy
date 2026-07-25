@@ -38,3 +38,7 @@ harness = false
 [[bench]]
 name = "storage_append"
 harness = false
+
+[[bench]]
+name = "obs_cost_redact"
+harness = false

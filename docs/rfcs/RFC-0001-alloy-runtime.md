@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Ready for Implementation |
+| **Status** | Implemented |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | — |

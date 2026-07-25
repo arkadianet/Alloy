@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Ready for Implementation (architecture review APPROVE) |
+| **Status** | Implemented |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged) |
@@ -306,6 +306,7 @@ pub trait EventStore: EventSink {
         mut on_event: F,
     ) -> Result<Option<EventSeq>, StoreError>
     where
+        Self: Sized, // ADDITIVE for RFC-0004 — enables `&dyn EventStore` for other methods
         F: FnMut(&SessionEvent) -> Result<(), StoreError> + Send;
 
     /// Highest assigned seq for session, or None if no events.
