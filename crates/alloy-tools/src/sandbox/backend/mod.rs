@@ -1,6 +1,13 @@
-//! Sandbox backend dispatch and probes.
+//! Collect deny-glob matches and shared backend helpers.
 
-#![allow(clippy::disallowed_methods)]
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use crate::sandbox::glob::deny_matches;
+use crate::sandbox::process::SupervisedOutcome;
+use crate::sandbox::profile::SandboxProfile;
+use crate::sandbox::types::{NetworkPolicy, SandboxBackend, SandboxError};
 
 mod container;
 #[cfg(target_os = "linux")]
@@ -15,14 +22,6 @@ pub use linux::LinuxLandlockBackend;
 #[cfg(target_os = "macos")]
 pub use macos::MacosSeatbeltBackend;
 pub use probe::probe_all;
-
-use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-
-use crate::sandbox::process::SupervisedOutcome;
-use crate::sandbox::profile::SandboxProfile;
-use crate::sandbox::types::{NetworkPolicy, SandboxBackend, SandboxError};
 
 /// Prepared isolation for one exec.
 pub struct IsolateContext {
@@ -52,17 +51,17 @@ pub async fn run_isolated(
     profile: &SandboxProfile,
     ctx: IsolateContext,
 ) -> Result<SupervisedOutcome, SandboxError> {
+    // Every backend refuses policies it will not enforce.
+    if matches!(profile.network, NetworkPolicy::Allow) {
+        return Err(SandboxError::Invalid(
+            "network=allow unsupported in MVP".into(),
+        ));
+    }
     match backend {
         SandboxBackend::Landlock => {
             #[cfg(target_os = "linux")]
             {
-                if matches!(profile.network, NetworkPolicy::Deny) {
-                    LinuxLandlockBackend::exec(profile, ctx).await
-                } else {
-                    Err(SandboxError::Invalid(
-                        "network=allow unsupported in MVP".into(),
-                    ))
-                }
+                LinuxLandlockBackend::exec(profile, ctx).await
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -85,17 +84,31 @@ pub async fn run_isolated(
     }
 }
 
-/// Collect deny-glob matches under `jail` (bounded walk).
+/// Directories skipped during deny-glob walks (build/VCS noise).
+const SKIP_DIR_NAMES: &[&str] = &[
+    "target",
+    ".git",
+    "node_modules",
+    ".alloy-sbx",
+    "alloy-sbx-binds",
+];
+
+/// Collect deny-glob matches under `jail`.
+///
+/// - Does **not** fail closed when the entry budget is exhausted (logs + returns
+///   what was found). Ordinary large workspaces must still exec.
+/// - Uses `DirEntry::file_type()` so symlinks are never followed out of the jail.
+/// - Prunes common build/VCS directories.
 pub fn collect_deny_paths(
     jail: &Path,
     deny: &globset::GlobSet,
 ) -> Result<Vec<PathBuf>, SandboxError> {
-    use crate::sandbox::glob::deny_matches;
-
     let mut out = Vec::new();
     let mut stack = vec![jail.to_path_buf()];
     let mut visited = 0usize;
     const MAX: usize = 10_000;
+    let mut truncated = false;
+
     while let Some(dir) = stack.pop() {
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
@@ -104,27 +117,61 @@ pub fn collect_deny_paths(
         for ent in rd.flatten() {
             visited += 1;
             if visited > MAX {
-                return Err(SandboxError::Internal(
-                    "deny-glob walk exceeded 10000 entries".into(),
-                ));
+                truncated = true;
+                break;
             }
             let path = ent.path();
+            let name = ent.file_name();
+            let name_str = name.to_string_lossy();
+
+            let ft = match ent.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            // Never follow symlinks for descent; still deny-match the link path.
             let rel = match path.strip_prefix(jail) {
-                Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                Ok(r) => relative_components(r),
                 Err(_) => continue,
             };
             if deny_matches(deny, &rel) {
                 out.push(path.clone());
+                continue; // do not descend into denied dirs
             }
-            if path.is_dir() {
-                // Don't descend into denied dirs for further matches? Still collect the dir itself.
-                if !deny_matches(deny, &rel) {
-                    stack.push(path);
+
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if SKIP_DIR_NAMES.iter().any(|s| *s == name_str.as_ref()) {
+                    continue;
                 }
+                stack.push(path);
             }
         }
+        if truncated {
+            break;
+        }
+    }
+
+    if truncated {
+        tracing::warn!(
+            visited,
+            matches = out.len(),
+            "deny-glob walk truncated; spawn-time binds are a best-effort snapshot"
+        );
     }
     Ok(out)
+}
+
+fn relative_components(rel: &Path) -> String {
+    rel.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Allowlisted RO cargo/rustup subtrees that exist.

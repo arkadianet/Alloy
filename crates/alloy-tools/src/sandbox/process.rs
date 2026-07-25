@@ -1,19 +1,41 @@
 //! Process spawn and supervision — sole `Command::new` seam (RFC-0005 §6.4).
+//!
+//! # Why `unsafe` lives here
+//!
+//! The RFC keeps isolation in backends, but `CommandExt::pre_exec` is only
+//! reachable where the `Command` is built and a `Command` holds a single hook.
+//! So this module owns the one `unsafe` block: `setsid` — which puts the child
+//! in a fresh process group so the timeout and drop paths can signal the whole
+//! tree — followed by the optional backend hook. Backends hand over a closure
+//! instead of spawning themselves.
+//!
+//! Author: arkadianet
 
 #![allow(unsafe_code)]
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
 use crate::sandbox::types::{SandboxError, SandboxExecResult};
+
+/// Grace between SIGTERM and SIGKILL of the process group (RFC-0005 §6.4).
+const GROUP_KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Backend-supplied hook run in the child between `fork` and `execve`.
+///
+/// `Send` only. `std`/`tokio` demand `Sync` on `pre_exec`, but propagating that
+/// bound would force backends to park non-`Sync` isolation state (Landlock's
+/// `RulesetCreated`) behind a `Mutex` for no benefit; [`SyncHook`] absorbs it.
+#[cfg(unix)]
+pub type PreExecHook = Box<dyn FnMut() -> std::io::Result<()> + Send>;
 
 /// Specification for a supervised spawn.
 pub struct SpawnSpec {
@@ -33,7 +55,7 @@ pub struct SpawnSpec {
     pub exec_timeout: Duration,
     /// Optional Unix pre-exec hook (Landlock apply, etc.).
     #[cfg(unix)]
-    pub pre_exec: Option<Box<dyn FnMut() -> std::io::Result<()> + Send + Sync>>,
+    pub pre_exec: Option<PreExecHook>,
 }
 
 /// Outcome before attaching policy metadata.
@@ -59,12 +81,14 @@ pub struct SupervisedOutcome {
 pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, SandboxError> {
     let start = Instant::now();
 
-    let mut cmd = Command::new(&spec.program);
-    // argv[0] for the child should be original; remaining args follow.
     if spec.argv.is_empty() {
         return Err(SandboxError::Invalid("empty argv".into()));
     }
-    cmd.arg0(OsStr::new(&spec.argv[0]));
+
+    let mut cmd = Command::new(&spec.program);
+    // argv[0] for the child should be original; remaining args follow.
+    #[cfg(unix)]
+    cmd.arg0(std::ffi::OsStr::new(&spec.argv[0]));
     if spec.argv.len() > 1 {
         cmd.args(&spec.argv[1..]);
     }
@@ -76,18 +100,22 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // Belt and suspenders for the direct child; ChildGuard kills the group.
     cmd.kill_on_drop(true);
 
     #[cfg(unix)]
     {
         use rustix::process::setsid;
-        // Single pre_exec: setsid then optional backend isolate (Command keeps one hook).
-        let mut backend_hook = spec.pre_exec.take();
-        // SAFETY: pre_exec runs in the child after fork; only async-signal-safe work.
+
+        // A Command keeps one hook, so chain setsid and the backend's isolate.
+        // SyncHook lets the backend hook stay `Send`-only.
+        let mut hook = SyncHook(spec.pre_exec.take());
+        // SAFETY: runs in the forked child before execve; setsid and the backend
+        // hook are async-signal-safe syscall wrappers and allocate nothing.
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
-                if let Some(ref mut hook) = backend_hook {
+                if let Some(hook) = hook.get_mut().as_mut() {
                     hook()?;
                 }
                 Ok(())
@@ -98,6 +126,7 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
     let mut child = cmd.spawn().map_err(SandboxError::Io)?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let mut guard = ChildGuard::new(child);
 
     let stdout_cap = spec.stdout_cap;
     let stderr_cap = spec.stderr_cap;
@@ -114,18 +143,19 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
         }
     });
 
-    let wait_fut = child.wait();
-    let timed = timeout(spec.exec_timeout, wait_fut).await;
-
-    let status = match timed {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+    let status = match guard.wait_for(spec.exec_timeout).await {
+        Some(Ok(status)) => {
+            // Reaped: Drop must not signal a pid the kernel may have recycled.
+            guard.disarm();
+            status
+        }
+        Some(Err(e)) => {
+            guard.kill_group().await;
             return Err(SandboxError::Io(e));
         }
-        Err(_elapsed) => {
-            kill_process_group(&mut child).await;
+        None => {
+            guard.kill_group().await;
+            // Pipes are closed once the group is gone, so these joins finish.
             let _ = out_task.await;
             let _ = err_task.await;
             return Err(SandboxError::Timeout(spec.exec_timeout));
@@ -151,6 +181,161 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
         stderr_truncated,
         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
+}
+
+/// Carries a `Send`-only value through an API that asks for `Sync`.
+///
+/// `pre_exec` requires `Sync` conservatively. We never alias the value: it is
+/// owned by exactly one `Command`, moved into it, and the closure inside runs
+/// only in the forked child, which has a single thread.
+#[cfg(unix)]
+struct SyncHook<T>(T);
+
+#[cfg(unix)]
+impl<T> SyncHook<T> {
+    /// Access through the wrapper: a closure that touched `.0` directly would
+    /// capture the field alone (edition 2021) and lose the `Sync` assertion.
+    fn get_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+// SAFETY: no reference to the inner value is ever observed from a second
+// thread — see the type docs.
+#[cfg(unix)]
+unsafe impl<T: Send> Sync for SyncHook<T> {}
+
+/// Process group of a supervised child; `setsid` makes pgid == child pid.
+#[derive(Clone, Copy)]
+struct Group {
+    #[cfg(unix)]
+    pgid: Option<rustix::process::Pid>,
+}
+
+#[cfg(unix)]
+impl Group {
+    fn of(child: &Child) -> Self {
+        let pgid = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(rustix::process::Pid::from_raw);
+        Self { pgid }
+    }
+
+    /// Best-effort group signal; `ESRCH` is expected once the group is empty.
+    fn signal(self, sig: rustix::process::Signal) {
+        if let Some(pgid) = self.pgid {
+            let _ = rustix::process::kill_process_group(pgid, sig);
+        }
+    }
+
+    fn term(self) {
+        self.signal(rustix::process::Signal::Term);
+    }
+
+    fn kill(self) {
+        self.signal(rustix::process::Signal::Kill);
+    }
+}
+
+#[cfg(not(unix))]
+impl Group {
+    fn of(_child: &Child) -> Self {
+        Self {}
+    }
+
+    fn term(self) {}
+
+    fn kill(self) {}
+}
+
+/// Owns the child until it is reaped, killing the whole group otherwise.
+///
+/// RFC-0005 §6.4 requires the same kill path on timeout *and* on drop of the
+/// `exec` future: SIGTERM the group, wait up to [`GROUP_KILL_GRACE`], SIGKILL,
+/// reap — no orphans either way. `Drop` cannot await, so it signals inline and
+/// hands the child to a detached escalation task.
+struct ChildGuard {
+    /// `None` once the child has been reaped or handed off.
+    child: Option<Child>,
+    group: Group,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        let group = Group::of(&child);
+        Self {
+            child: Some(child),
+            group,
+        }
+    }
+
+    /// Wait for the direct child; `None` if `limit` elapsed first.
+    async fn wait_for(&mut self, limit: Duration) -> Option<std::io::Result<ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Some(Err(std::io::Error::other("child already reaped")));
+        };
+        timeout(limit, child.wait()).await.ok()
+    }
+
+    /// Give up ownership after a successful `wait`, so `Drop` stays quiet.
+    fn disarm(&mut self) {
+        self.child = None;
+    }
+
+    /// Run the kill path to completion (timeout / spawn error path).
+    async fn kill_group(&mut self) {
+        if let Some(child) = self.child.take() {
+            kill_group_and_reap(child, self.group).await;
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let group = self.group;
+
+        // Signal now: the escalation below may never get scheduled.
+        group.term();
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move { kill_group_and_reap(child, group).await });
+            }
+            Err(_) => {
+                // Dropped off-runtime: nothing will poll a future, so kill the
+                // direct child here and escalate on a plain thread.
+                std::thread::spawn(move || {
+                    std::thread::sleep(GROUP_KILL_GRACE);
+                    group.kill();
+                });
+                let _ = child.start_kill();
+                drop(child);
+            }
+        }
+    }
+}
+
+/// SIGTERM the group, wait up to [`GROUP_KILL_GRACE`], SIGKILL, then reap.
+async fn kill_group_and_reap(mut child: Child, group: Group) {
+    group.term();
+    #[cfg(not(unix))]
+    let _ = child.start_kill();
+
+    // Returns as soon as the leader exits — never an unconditional 2s sleep.
+    let graceful = timeout(GROUP_KILL_GRACE, child.wait()).await.is_ok();
+
+    // Sweep the group even on a graceful exit: a leader that honoured SIGTERM
+    // can still leave children behind, and orphans are forbidden (§6.4).
+    group.kill();
+
+    if !graceful {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
 }
 
 async fn drain_capped<R: AsyncRead + Unpin>(
@@ -180,28 +365,7 @@ async fn drain_capped<R: AsyncRead + Unpin>(
     Ok((buf, truncated))
 }
 
-#[cfg(unix)]
-async fn kill_process_group(child: &mut tokio::process::Child) {
-    if let Some(id) = child.id() {
-        // Negative pgid: we called setsid so pgid == pid.
-        let pid = rustix::process::Pid::from_raw(id as i32);
-        if let Some(pid) = pid {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Term);
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::Kill);
-        }
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-#[cfg(not(unix))]
-async fn kill_process_group(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-fn encode_status(status: std::process::ExitStatus) -> (Option<i32>, Option<i32>) {
+fn encode_status(status: ExitStatus) -> (Option<i32>, Option<i32>) {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -259,62 +423,128 @@ pub async fn spawn_runtime_command(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn signal_status_encoding_and_timeout() {
-        // /bin/sleep should exist on Unix CI.
-        let program = PathBuf::from("/bin/sleep");
-        if !program.exists() {
-            return;
-        }
-        let err = spawn_supervised(SpawnSpec {
-            program,
-            argv: vec!["sleep".into(), "30".into()],
+    /// `/bin/sh` exists on every supported host; skip rather than fail if not.
+    fn shell() -> Option<PathBuf> {
+        let sh = PathBuf::from("/bin/sh");
+        sh.exists().then_some(sh)
+    }
+
+    /// Spec running `script` under `sh -c`.
+    ///
+    /// Deliberately not a temp script file: a file written moments earlier may
+    /// still be open for write elsewhere in the process, and exec'ing it then
+    /// fails with `ETXTBSY`.
+    fn sh_spec(sh: &Path, script: &str, exec_timeout: Duration, cap: usize) -> SpawnSpec {
+        SpawnSpec {
+            program: sh.to_path_buf(),
+            argv: vec!["sh".into(), "-c".into(), script.into()],
             cwd: PathBuf::from("/"),
-            env: BTreeMap::new(),
-            stdout_cap: 1024,
-            stderr_cap: 1024,
-            exec_timeout: Duration::from_millis(200),
+            env: BTreeMap::from([(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))]),
+            stdout_cap: cap,
+            stderr_cap: cap,
+            exec_timeout,
             pre_exec: None,
-        })
-        .await
-        .unwrap_err();
+        }
+    }
+
+    /// Alive means present and not a zombie: a victim reparented to a pid 1
+    /// that does not reap lingers as a zombie, which is not "still running".
+    fn process_alive(pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            // `comm` may contain ')', so state is the field after the last one.
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            rustix::process::Pid::from_raw(pid)
+                .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+        }
+    }
+
+    fn read_pid(path: &Path) -> Option<i32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_child() {
+        let Some(sh) = shell() else { return };
+        let err = spawn_supervised(sh_spec(&sh, "sleep 30", Duration::from_millis(200), 1024))
+            .await
+            .unwrap_err();
         assert!(matches!(err, SandboxError::Timeout(_)));
     }
 
     #[tokio::test]
     async fn output_cap_truncates() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("spam.sh");
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::PermissionsExt;
-            let mut f = std::fs::File::create(&script).unwrap();
-            writeln!(f, "#!/bin/sh").unwrap();
-            writeln!(f, "dd if=/dev/zero bs=1 count=5000 2>/dev/null").unwrap();
-            drop(f);
-            let mut perms = std::fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
-        let out = spawn_supervised(SpawnSpec {
-            program: script.clone(),
-            argv: vec![script.display().to_string()],
-            cwd: PathBuf::from("/"),
-            env: BTreeMap::from([(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))]),
-            stdout_cap: 100,
-            stderr_cap: 100,
-            exec_timeout: Duration::from_secs(10),
-            pre_exec: None,
-        })
+        let Some(sh) = shell() else { return };
+        let out = spawn_supervised(sh_spec(
+            &sh,
+            "dd if=/dev/zero bs=1 count=5000 2>/dev/null",
+            Duration::from_secs(10),
+            100,
+        ))
         .await
         .unwrap();
         assert!(out.stdout_truncated);
         assert!(out.stdout.len() <= 100);
         assert_eq!(out.exit_code, Some(0));
+    }
+
+    /// Dropping the future must take the whole group down. The grandchild traps
+    /// SIGTERM, so it dies only if the guard escalates to SIGKILL on the group.
+    #[tokio::test]
+    async fn dropping_exec_kills_process_group() {
+        let Some(sh) = shell() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let script = format!(
+            "sh -c 'trap \"\" TERM; while :; do sleep 1; done' & echo $! > {} ; sleep 30",
+            pidfile.display()
+        );
+        let mut fut = Box::pin(spawn_supervised(sh_spec(
+            &sh,
+            &script,
+            Duration::from_secs(30),
+            1024,
+        )));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            tokio::select! {
+                res = &mut fut => panic!("exec finished before the grandchild started: {res:?}"),
+                () = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+            if let Some(pid) = read_pid(&pidfile) {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild never reported its pid"
+            );
+        };
+        assert!(
+            process_alive(grandchild),
+            "grandchild {grandchild} never ran"
+        );
+
+        drop(fut);
+
+        let deadline = Instant::now() + GROUP_KILL_GRACE + Duration::from_secs(5);
+        while process_alive(grandchild) {
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {grandchild} survived drop of the exec future"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

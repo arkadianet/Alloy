@@ -8,7 +8,8 @@
 //! # Residual risk
 //!
 //! `cargo check` still executes `build.rs` and procedural macros **inside** the
-//! sandbox. See `docs/security/sandbox-residual-risk.md`.
+//! sandbox. Deny-glob bind-overs apply only to paths present at spawn time.
+//! See `docs/security/sandbox-residual-risk.md`.
 //!
 //! Author: arkadianet
 
@@ -25,11 +26,8 @@ mod recording;
 mod types;
 
 pub use broker::NativeSandboxBroker;
-pub use env::{apply_quarantine, scrub_env, validate_env_allow_name, QuarantineOutcome};
 pub use glob::default_deny_globs;
-pub use grant::{exec_allow_matches, resolve_executable, ResolvedBinary};
 pub use path::{PathAccess, PathPolicy};
-pub use policy_digest::compute_policy_digest;
 pub use profile::{load_sandbox_profile, SandboxProfile};
 pub use recording::RecordingSandboxBroker;
 pub use types::{

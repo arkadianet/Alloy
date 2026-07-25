@@ -26,6 +26,9 @@ jobs:
   linux-landlock:
     name: Linux Landlock (required)
     runs-on: ubuntu-latest
+    env:
+      # Fail closed: Unavailable Landlock must fail the job, not skip green.
+      ALLOY_REQUIRE_LANDLOCK: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -36,7 +39,6 @@ jobs:
         run: cargo test -p alloy-tools -- --nocapture
       - name: Require Landlock enforcement test ran
         run: |
-          # Fail the job if landlock_actually_applied was ignored/filtered away.
           cargo test -p alloy-tools --test sandbox_rfc0005 landlock_actually_applied -- --nocapture --exact
       - name: Clippy (deny warnings)
         run: cargo clippy -p alloy-tools --all-targets -- -D warnings
@@ -65,5 +67,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
-      - name: Test with docker available
-        run: cargo test -p alloy-tools container_ -- --nocapture || true
+      - name: Test container-related filters
+        # continue-on-error on the job covers missing docker; do not `|| true`
+        # (that would hide real assertion failures when the runtime is present).
+        run: cargo test -p alloy-tools container_ -- --nocapture

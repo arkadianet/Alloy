@@ -175,7 +175,7 @@ fn parse_network(s: &str) -> Result<NetworkPolicy, SandboxError> {
     }
 }
 
-fn canonicalize_jail(fs_jail: PathBuf) -> Result<PathBuf, SandboxError> {
+pub(crate) fn canonicalize_jail(fs_jail: PathBuf) -> Result<PathBuf, SandboxError> {
     let canon = fs_jail.canonicalize().map_err(|e| {
         SandboxError::Invalid(format!("fs_jail canonicalize {}: {e}", fs_jail.display()))
     })?;

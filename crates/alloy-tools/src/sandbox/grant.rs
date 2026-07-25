@@ -12,17 +12,46 @@ const MAX_ARGV_BYTES: usize = 64 * 1024;
 
 /// Resolved native executable after canonicalize-before-auth.
 #[derive(Debug, Clone)]
-pub struct ResolvedBinary {
-    /// Canonical absolute path of the executable.
+pub(crate) struct ResolvedBinary {
+    /// Canonical absolute path of the executable (spawn target).
     pub resolved: PathBuf,
     /// Original `argv[0]` preserved for child argv0-dispatch.
     pub original_argv0: String,
-    /// Basename of the resolved path (security authority).
+    /// Basename of the canonical target (never sole authority for shims).
     pub resolved_basename: String,
+    /// Basename used at PATH lookup / invocation (e.g. `cargo` before rustup symlink).
+    ///
+    /// When the resolved file lives under a trusted immutable root, grant matching
+    /// and quarantine may also accept this name (RFC §5.3 rustup shim semantics).
+    pub invocation_basename: String,
+}
+
+impl ResolvedBinary {
+    /// Security name for quarantine cargo detection.
+    ///
+    /// Prefers the invocation basename when the canonical target is a trusted-root
+    /// shim (e.g. `cargo` → `rustup`); otherwise uses the canonical basename.
+    #[must_use]
+    pub fn authority_basename(&self) -> &str {
+        if self.invocation_basename != self.resolved_basename {
+            &self.invocation_basename
+        } else {
+            &self.resolved_basename
+        }
+    }
+}
+
+/// Result of a successful exec-grant match.
+#[derive(Debug)]
+pub(crate) struct MatchedExec<'a> {
+    /// Matching allow entry.
+    pub allow: &'a ExecAllow,
+    /// Native resolution (None for container basename-form).
+    pub resolved: Option<ResolvedBinary>,
 }
 
 /// Validate argv size caps and reject `..` in argv0.
-pub fn validate_argv(argv: &[String]) -> Result<(), SandboxError> {
+pub(crate) fn validate_argv(argv: &[String]) -> Result<(), SandboxError> {
     if argv.is_empty() {
         return Err(SandboxError::Invalid("empty argv".into()));
     }
@@ -57,14 +86,14 @@ pub fn validate_argv(argv: &[String]) -> Result<(), SandboxError> {
 
 /// Match `Grant::Exec` allows against **pre-quarantine** argv.
 ///
-/// Returns the first matching allow, or a typed denial.
-pub fn match_exec_grant<'a>(
+/// Returns the matching allow and the authorized resolved binary (when native).
+pub(crate) fn match_exec_grant<'a>(
     perms: &'a PermissionToken,
     argv: &[String],
     backend: SandboxBackend,
     cwd: &Path,
     trusted_path: &[PathBuf],
-) -> Result<&'a ExecAllow, SandboxError> {
+) -> Result<MatchedExec<'a>, SandboxError> {
     validate_argv(argv)?;
 
     let allows: Vec<&ExecAllow> = perms
@@ -101,7 +130,11 @@ pub fn match_exec_grant<'a>(
         }
         binary_matched = true;
         if exec_allow_matches_args(allow, argv)? {
-            return Ok(allow);
+            let resolved = match &binary_subject {
+                BinarySubject::Native(r) => Some(r.clone()),
+                BinarySubject::ContainerBasename(_) => None,
+            };
+            return Ok(MatchedExec { allow, resolved });
         }
         args_failed = true;
     }
@@ -117,7 +150,7 @@ pub fn match_exec_grant<'a>(
 
 #[derive(Debug)]
 enum BinarySubject {
-    /// Native: canonical path + basename.
+    /// Native: canonical path + invocation basename.
     Native(ResolvedBinary),
     /// Container basename-form: basename only (image supplies tool).
     ContainerBasename(String),
@@ -133,7 +166,6 @@ fn binary_match_subject(
         SandboxBackend::Container => {
             let argv0 = &argv[0];
             if Path::new(argv0).is_absolute() || argv0.contains('/') {
-                // Path-form: host canonicalize under trusted roots.
                 let resolved = resolve_executable(argv0, cwd, trusted_path)?;
                 Ok(BinarySubject::Native(resolved))
             } else {
@@ -176,15 +208,19 @@ fn binary_matches(
                 })?;
                 Ok(res.resolved == allow_canon)
             } else {
-                Ok(res.resolved_basename == allow.binary)
+                // Canonical basename OR trusted-root invocation basename (rustup shim).
+                Ok(
+                    res.resolved_basename == allow.binary
+                        || res.invocation_basename == allow.binary,
+                )
             }
         }
     }
 }
 
 /// Test `args_glob` against `argv[1..]` space-joined (RFC-0005 §5.3 table).
-pub fn exec_allow_matches(allow: &ExecAllow, argv: &[String]) -> Result<bool, SandboxError> {
-    // Used by unit tests for the normative examples table (binary already assumed matched).
+#[cfg(test)]
+pub(crate) fn exec_allow_matches(allow: &ExecAllow, argv: &[String]) -> Result<bool, SandboxError> {
     exec_allow_matches_args(allow, argv)
 }
 
@@ -206,11 +242,17 @@ fn exec_allow_matches_args(allow: &ExecAllow, argv: &[String]) -> Result<bool, S
 }
 
 /// Resolve executable under trusted immutable PATH roots only.
-pub fn resolve_executable(
+pub(crate) fn resolve_executable(
     argv0: &str,
     cwd: &Path,
     trusted_path: &[PathBuf],
 ) -> Result<ResolvedBinary, SandboxError> {
+    let invocation_basename = Path::new(argv0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(argv0)
+        .to_string();
+
     let chosen = if Path::new(argv0).is_absolute() {
         PathBuf::from(argv0)
     } else if argv0.contains('/') {
@@ -223,23 +265,15 @@ pub fn resolve_executable(
         SandboxError::Invalid(format!("canonicalize binary {}: {e}", chosen.display()))
     })?;
 
-    if !trusted_path.iter().any(|root| {
-        root.canonicalize()
-            .map(|r| resolved.starts_with(r))
-            .unwrap_or(false)
-            || resolved.starts_with(root)
-    }) {
-        // Also accept if resolved is under any trusted root after canonicalize of root.
-        let ok = trusted_path.iter().any(|root| {
-            let r = root.canonicalize().unwrap_or_else(|_| root.clone());
-            resolved.starts_with(&r)
-        });
-        if !ok {
-            return Err(SandboxError::Invalid(format!(
-                "binary {} is outside trusted immutable roots",
-                resolved.display()
-            )));
-        }
+    let under_trusted = trusted_path.iter().any(|root| {
+        let r = root.canonicalize().unwrap_or_else(|_| root.clone());
+        resolved.starts_with(&r)
+    });
+    if !under_trusted {
+        return Err(SandboxError::Invalid(format!(
+            "binary {} is outside trusted immutable roots",
+            resolved.display()
+        )));
     }
 
     let resolved_basename = resolved
@@ -252,11 +286,27 @@ pub fn resolve_executable(
         resolved,
         original_argv0: argv0.to_string(),
         resolved_basename,
+        invocation_basename,
     })
 }
 
 fn find_on_trusted_path(name: &str, trusted_path: &[PathBuf]) -> Result<PathBuf, SandboxError> {
     for dir in trusted_path {
+        // Only search directory entries that look like PATH bins (…/bin), not bare roots.
+        let meta = match dir.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        // Skip broad roots like /usr used only for absolute-path membership.
+        let file_name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let is_bin_dir =
+            matches!(file_name, "bin" | "sbin") || dir.ends_with("bin") || dir.ends_with("sbin");
+        if !is_bin_dir {
+            continue;
+        }
         let candidate = dir.join(name);
         if candidate.is_file() {
             #[cfg(unix)]
@@ -273,27 +323,21 @@ fn find_on_trusted_path(name: &str, trusted_path: &[PathBuf]) -> Result<PathBuf,
             return Ok(candidate);
         }
     }
-    // Fallback: which within filtered PATH string for convenience when dirs listed.
     Err(SandboxError::Invalid(format!(
         "binary not found on trusted PATH: {name}"
     )))
 }
 
 /// Build trusted immutable PATH directories from system roots + cargo/rustup.
-pub fn trusted_path_dirs(cargo_home: Option<&Path>, rustup_home: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn trusted_path_dirs(
+    cargo_home: Option<&Path>,
+    rustup_home: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for p in ["/usr/bin", "/usr/sbin", "/bin", "/sbin", "/usr/local/bin"] {
         let pb = PathBuf::from(p);
         if pb.is_dir() {
             dirs.push(pb);
-        }
-    }
-    // Also allow /usr as root for absolute tools under /usr/...
-    for p in ["/usr", "/bin", "/sbin"] {
-        let pb = PathBuf::from(p);
-        if pb.is_dir() && !dirs.iter().any(|d| d == &pb) {
-            // Used as trusted root for absolute-path grants; PATH search uses bin dirs above.
-            let _ = pb;
         }
     }
     if let Some(ch) = cargo_home {
@@ -305,7 +349,6 @@ pub fn trusted_path_dirs(cargo_home: Option<&Path>, rustup_home: Option<&Path>) 
     if let Some(rh) = rustup_home {
         let toolchains = rh.join("toolchains");
         if toolchains.is_dir() {
-            // Each toolchain bin is trusted; walk one level.
             if let Ok(rd) = std::fs::read_dir(&toolchains) {
                 for ent in rd.flatten() {
                     let bin = ent.path().join("bin");
@@ -320,7 +363,7 @@ pub fn trusted_path_dirs(cargo_home: Option<&Path>, rustup_home: Option<&Path>) 
 }
 
 /// Trusted roots for absolute-path membership (broader than PATH search dirs).
-pub fn trusted_roots(cargo_home: Option<&Path>, rustup_home: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn trusted_roots(cargo_home: Option<&Path>, rustup_home: Option<&Path>) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = ["/usr", "/bin", "/sbin"]
         .into_iter()
         .map(PathBuf::from)
@@ -408,5 +451,49 @@ mod tests {
             err,
             SandboxError::Denied(DenialReason::MissingExecGrant)
         ));
+    }
+
+    #[test]
+    fn binary_resolution_path_basename_shim() {
+        // Simulate rustup shim: PATH entry named `cargo` that resolves to a
+        // different basename under a trusted root.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let target = bin.join("rustup");
+        std::fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&target).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&target, p).unwrap();
+            std::os::unix::fs::symlink(&target, bin.join("cargo")).unwrap();
+        }
+        let roots = vec![bin.clone()];
+        let resolved = resolve_executable("cargo", dir.path(), &roots).unwrap();
+        assert_eq!(resolved.invocation_basename, "cargo");
+        assert_eq!(resolved.resolved_basename, "rustup");
+        assert_eq!(resolved.authority_basename(), "cargo");
+
+        let allow = ExecAllow {
+            binary: "cargo".into(),
+            args_glob: Some("check*".into()),
+        };
+        let subject = BinarySubject::Native(resolved.clone());
+        assert!(binary_matches(&allow, &subject, dir.path()).unwrap());
+
+        // Workspace shadow rejected: binary under non-trusted cwd.
+        let shadow = dir.path().join("cargo");
+        std::fs::write(&shadow, b"evil").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&shadow).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&shadow, p).unwrap();
+        }
+        let err = resolve_executable("./cargo", dir.path(), &roots).unwrap_err();
+        assert!(matches!(err, SandboxError::Invalid(_)));
     }
 }

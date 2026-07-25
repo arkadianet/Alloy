@@ -25,7 +25,7 @@ const HARD_DENY_EXACT: &[&str] = &[
 const HARD_DENY_SUBSTRINGS: &[&str] = &["api_key", "api-key", "secret", "password", "token"];
 
 /// Validate an `env_allow` name (RFC-0005 §6.3).
-pub fn validate_env_allow_name(name: &str) -> Result<(), SandboxError> {
+pub(crate) fn validate_env_allow_name(name: &str) -> Result<(), SandboxError> {
     if name.is_empty() {
         return Err(SandboxError::Invalid("env_allow name is empty".into()));
     }
@@ -58,7 +58,7 @@ pub fn validate_env_allow_name(name: &str) -> Result<(), SandboxError> {
 
 /// Returns true if the env name is hard-denied.
 #[must_use]
-pub fn is_hard_denied(name: &str) -> bool {
+pub(crate) fn is_hard_denied(name: &str) -> bool {
     if HARD_DENY_EXACT.contains(&name) {
         return true;
     }
@@ -68,7 +68,7 @@ pub fn is_hard_denied(name: &str) -> bool {
 
 /// Homes resolved from the parent environment (RFC-0005 §5.5).
 #[derive(Debug, Clone)]
-pub struct OperatorHomes {
+pub(crate) struct OperatorHomes {
     /// Parent `HOME`.
     #[allow(dead_code)] // retained for future credential path derivation
     pub op_home: PathBuf,
@@ -80,7 +80,7 @@ pub struct OperatorHomes {
 
 impl OperatorHomes {
     /// Resolve from parent env; requires `HOME` on Unix.
-    pub fn resolve() -> Result<Self, SandboxError> {
+    pub(crate) fn resolve() -> Result<Self, SandboxError> {
         let op_home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| SandboxError::Invalid("HOME unset".into()))?;
@@ -100,7 +100,7 @@ impl OperatorHomes {
 
 /// Inputs for building the child environment map.
 #[derive(Debug, Clone)]
-pub struct ScrubInput<'a> {
+pub(crate) struct ScrubInput<'a> {
     /// Per-exec sandbox home.
     pub child_home: &'a Path,
     /// Per-exec TMPDIR.
@@ -120,7 +120,9 @@ pub struct ScrubInput<'a> {
 /// Scrub parent env into a deny-by-default child map (native backends).
 ///
 /// Never parses `.env` files. Never logs values.
-pub fn scrub_env(input: &ScrubInput<'_>) -> Result<BTreeMap<OsString, OsString>, SandboxError> {
+pub(crate) fn scrub_env(
+    input: &ScrubInput<'_>,
+) -> Result<BTreeMap<OsString, OsString>, SandboxError> {
     for name in input.env_allow {
         validate_env_allow_name(name)?;
         if is_hard_denied(name) {
@@ -179,7 +181,7 @@ pub fn scrub_env(input: &ScrubInput<'_>) -> Result<BTreeMap<OsString, OsString>,
 
 /// Outcome of quarantine argv rewrite.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QuarantineOutcome {
+pub(crate) enum QuarantineOutcome {
     /// No cargo detection — argv unchanged.
     Unchanged,
     /// Inserted `--offline` after subcommand.
@@ -190,17 +192,23 @@ pub enum QuarantineOutcome {
 
 /// Apply quarantine argv rewrite **after** grant match on original argv.
 ///
-/// `cargo_basename` is the security authority (`basename(resolved)` native, or
-/// basename-form argv0 for container).
-pub fn apply_quarantine(
+/// `authority_basename` is the security authority for "is this cargo", never
+/// `argv[0]` on its own: for native backends it is
+/// [`ResolvedBinary::authority_basename`], which prefers the invocation name
+/// when a trusted-root shim renamed the target (`cargo` → `rustup`); for the
+/// container backend it is the basename-form `argv[0]`, since the image — not
+/// the host — supplies the tool.
+///
+/// [`ResolvedBinary::authority_basename`]: crate::sandbox::grant::ResolvedBinary::authority_basename
+pub(crate) fn apply_quarantine(
     argv: &[String],
-    cargo_basename: Option<&str>,
+    authority_basename: Option<&str>,
     quarantine: bool,
 ) -> Result<(Vec<String>, QuarantineOutcome), SandboxError> {
     if !quarantine {
         return Ok((argv.to_vec(), QuarantineOutcome::Unchanged));
     }
-    let Some("cargo") = cargo_basename else {
+    let Some("cargo") = authority_basename else {
         return Ok((argv.to_vec(), QuarantineOutcome::Unchanged));
     };
 
@@ -267,7 +275,7 @@ fn cargo_subcommand(argv: &[String]) -> Option<String> {
 }
 
 /// Compose container `--env-file` contents (RFC-0005 §5.5 container table).
-pub fn compose_container_env(
+pub(crate) fn compose_container_env(
     input: &ScrubInput<'_>,
 ) -> Result<BTreeMap<String, String>, SandboxError> {
     for name in input.env_allow {
@@ -309,7 +317,7 @@ pub fn compose_container_env(
 }
 
 /// Serialize env map to docker `--env-file` format (mode 0600 applied by caller).
-pub fn format_env_file(map: &BTreeMap<String, String>) -> Result<String, SandboxError> {
+pub(crate) fn format_env_file(map: &BTreeMap<String, String>) -> Result<String, SandboxError> {
     let mut out = String::new();
     for (k, v) in map {
         validate_env_allow_name(k).or_else(|_| {
@@ -339,29 +347,37 @@ mod tests {
 
     #[test]
     fn env_scrub_strips_ld_preload() {
-        // Safety: test-only env mutation in unit test process.
-        std::env::set_var("LD_PRELOAD", "/evil.so");
-        std::env::set_var("USER", "tester");
         let home = PathBuf::from("/tmp/sbx-home");
         let tmp = PathBuf::from("/tmp/sbx-tmp");
         let cargo = PathBuf::from("/tmp/cargo");
         let rustup = PathBuf::from("/tmp/rustup");
+        let denied = vec!["LD_PRELOAD".to_string()];
         let input = ScrubInput {
             child_home: &home,
             child_tmpdir: &tmp,
             cargo_home: &cargo,
             rustup_home: &rustup,
-            env_allow: &[],
+            // Hard-denied names must never enter the child map via env_allow.
+            env_allow: &denied,
             quarantine: false,
             path_value: Some(OsString::from("/usr/bin")),
         };
-        let map = scrub_env(&input).unwrap();
+        let err = scrub_env(&input).unwrap_err();
+        assert!(matches!(
+            err,
+            SandboxError::Denied(DenialReason::EnvDenied(_))
+        ));
+
+        let input_ok = ScrubInput {
+            env_allow: &[],
+            ..input
+        };
+        let map = scrub_env(&input_ok).unwrap();
         assert!(!map.contains_key(OsStr::new("LD_PRELOAD")));
         assert_eq!(
             map.get(OsStr::new("HOME")).map(|s| s.as_os_str()),
             Some(home.as_os_str())
         );
-        std::env::remove_var("LD_PRELOAD");
     }
 
     use std::ffi::OsStr;

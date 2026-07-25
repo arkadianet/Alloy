@@ -5,6 +5,8 @@
 //! - [`sandbox`] — SandboxBroker, PathPolicy, backends (RFC-0005)
 //! - MCP host surface lands in RFC-0006 (not implemented here)
 //!
+//! Public surface matches RFC-0005 §3.1. Internal helpers stay crate-private.
+//!
 //! Author: arkadianet
 
 #![deny(missing_docs)]

@@ -1,19 +1,24 @@
 //! Integration tests for RFC-0005 Sandbox Broker.
 //!
-//! Landlock tests are required on Linux CI when the probe reports Available.
+//! Landlock tests are required on Linux CI when `ALLOY_REQUIRE_LANDLOCK=1`.
+//! Without that env var, Unavailable hosts skip (local nested-userns) rather
+//! than reporting a dishonest green pass for enforcement.
 
 #![allow(clippy::disallowed_methods)] // positive baselines may use host Command
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use alloy_runtime::{ExecAllow, Grant, PermissionToken, ProfileId, RunId};
+use alloy_runtime::{ExecAllow, Grant, PermissionToken, ProfileId, RunId, Timestamp};
 use alloy_tools::{
     load_sandbox_profile, BackendStatus, ExecClass, NativeSandboxBroker, NetworkPolicy,
     SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
 };
 use tempfile::tempdir;
+
+/// Serializes tests that mutate process environment (`CARGO_HOME`, …).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn token(binary: &str, args_glob: Option<&str>) -> PermissionToken {
     PermissionToken {
@@ -51,6 +56,32 @@ fn sleep_bin() -> &'static str {
     }
 }
 
+fn require_landlock() -> bool {
+    std::env::var_os("ALLOY_REQUIRE_LANDLOCK").is_some()
+}
+
+/// Returns `true` when Landlock is Available. When required by CI, panics if not.
+async fn landlock_or_skip() -> bool {
+    let dir = tempdir().unwrap();
+    let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
+    profile.check_backend = SandboxBackend::Landlock;
+    let available = match NativeSandboxBroker::new(profile).await {
+        Ok(b) => matches!(b.capabilities().landlock, BackendStatus::Available { .. }),
+        Err(_) => false,
+    };
+    if available {
+        return true;
+    }
+    if require_landlock() {
+        panic!(
+            "ALLOY_REQUIRE_LANDLOCK=1 but Landlock is Unavailable \
+             (need unprivileged userns identity maps + Landlock ABI >= 2)"
+        );
+    }
+    eprintln!("skip: landlock unavailable (set ALLOY_REQUIRE_LANDLOCK=1 to fail)");
+    false
+}
+
 async fn broker_for_jail(jail: PathBuf) -> Result<NativeSandboxBroker, SandboxError> {
     let mut profile = SandboxProfile::default_for_jail(jail)?;
     profile.check_backend = SandboxBackend::Landlock;
@@ -60,13 +91,29 @@ async fn broker_for_jail(jail: PathBuf) -> Result<NativeSandboxBroker, SandboxEr
     NativeSandboxBroker::new(profile).await
 }
 
-async fn landlock_available_via_new() -> bool {
-    let dir = tempdir().unwrap();
-    let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
-    profile.check_backend = SandboxBackend::Landlock;
-    match NativeSandboxBroker::new(profile).await {
-        Ok(b) => matches!(b.capabilities().landlock, BackendStatus::Available { .. }),
-        Err(_) => false,
+fn chmod_755(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(path).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(path, p).unwrap();
+    }
+}
+
+fn process_alive(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -93,23 +140,20 @@ async fn backend_unavailable_fail_closed() {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn landlock_actually_applied() {
-    if !landlock_available_via_new().await {
-        eprintln!("skip: landlock unavailable");
+    if !landlock_or_skip().await {
         return;
     }
     let dir = tempdir().unwrap();
     let jail = dir.path().canonicalize().unwrap();
 
-    // Positive baseline: sentinel outside jail (and outside /tmp allow) readable unsandboxed.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/tmp"));
-    let sentinel_dir = home.join(".alloy-sbx-test-sentinel");
-    let _ = std::fs::create_dir_all(&sentinel_dir);
-    let sentinel = sentinel_dir.join("secret.txt");
+    // Sentinel outside the jail and outside Landlock RO roots (sibling tempdir).
+    let outer = tempdir().unwrap();
+    let sentinel = outer.path().join("secret.txt");
     std::fs::write(&sentinel, b"outside-secret").unwrap();
-    let baseline = std::fs::read_to_string(&sentinel).unwrap();
-    assert_eq!(baseline, "outside-secret");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap(),
+        "outside-secret"
+    );
 
     let broker = broker_for_jail(jail.clone()).await.unwrap();
     assert!(matches!(
@@ -117,22 +161,14 @@ async fn landlock_actually_applied() {
         BackendStatus::Available { .. }
     ));
 
-    // Inside sandbox, reading the outside sentinel must fail.
     let script = jail.join("try_read.sh");
     std::fs::write(
         &script,
         format!("#!/bin/sh\ncat '{}'\n", sentinel.display()),
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&script).unwrap().permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&script, p).unwrap();
-    }
+    chmod_755(&script);
 
-    // Grant must allow the path-form shell (basename grants fail when /bin/sh → dash).
     let req = SandboxExecRequest::new(
         vec![sh_bin().into(), script.display().to_string()],
         jail.clone(),
@@ -140,22 +176,23 @@ async fn landlock_actually_applied() {
         ExecClass::Check,
     );
     let result = broker.exec(req).await.unwrap();
-    // Landlock should deny the read → non-zero exit, empty/error output.
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
     assert_ne!(
         result.exit_code,
         Some(0),
-        "sandboxed read of outside sentinel should fail; stdout={} stderr={}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
+        "sandboxed read of outside sentinel should fail; stdout={stdout:?} stderr={stderr:?}"
     );
-    let _ = std::fs::remove_dir_all(&sentinel_dir);
+    assert!(
+        !stdout.contains("outside-secret"),
+        "sentinel contents leaked via stdout: {stdout:?}"
+    );
 }
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn child_cannot_read_dotenv_in_jail() {
-    if !landlock_available_via_new().await {
-        eprintln!("skip: landlock unavailable");
+    if !landlock_or_skip().await {
         return;
     }
     let dir = tempdir().unwrap();
@@ -166,13 +203,7 @@ async fn child_cannot_read_dotenv_in_jail() {
     let broker = broker_for_jail(jail.clone()).await.unwrap();
     let script = jail.join("read_env.sh");
     std::fs::write(&script, "#!/bin/sh\ncat .env\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&script).unwrap().permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&script, p).unwrap();
-    }
+    chmod_755(&script);
 
     let req = SandboxExecRequest::new(
         vec![sh_bin().into(), script.display().to_string()],
@@ -193,8 +224,7 @@ async fn child_cannot_read_dotenv_in_jail() {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn dotenv_sentinel_unchanged() {
-    if !landlock_available_via_new().await {
-        eprintln!("skip: landlock unavailable");
+    if !landlock_or_skip().await {
         return;
     }
     let dir = tempdir().unwrap();
@@ -218,35 +248,30 @@ async fn dotenv_sentinel_unchanged() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+#[allow(clippy::await_holding_lock)] // serializes CARGO_HOME mutation across awaits
 async fn credentials_sentinel_unchanged() {
-    if !landlock_available_via_new().await {
-        eprintln!("skip: landlock unavailable");
+    if !landlock_or_skip().await {
         return;
     }
+    let _env = ENV_LOCK.lock().unwrap();
+
     let dir = tempdir().unwrap();
     let jail = dir.path().canonicalize().unwrap();
 
-    // Fake cargo home with credentials under a temp dir; set env for OperatorHomes.
     let cargo_home = dir.path().join("fake-cargo");
     std::fs::create_dir_all(&cargo_home).unwrap();
     let creds = cargo_home.join("credentials.toml");
     let original = b"token = \"sentinel\"\n";
     std::fs::write(&creds, original).unwrap();
 
-    // Safety: test-only env mutation.
+    // Safety: test-only env mutation, serialized by ENV_LOCK.
     let old = std::env::var_os("CARGO_HOME");
     std::env::set_var("CARGO_HOME", &cargo_home);
 
     let broker = broker_for_jail(jail.clone()).await.unwrap();
     let script = jail.join("try_creds.sh");
     std::fs::write(&script, format!("#!/bin/sh\ncat '{}'\n", creds.display())).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&script).unwrap().permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&script, p).unwrap();
-    }
+    chmod_755(&script);
     let req = SandboxExecRequest::new(
         vec![sh_bin().into(), script.display().to_string()],
         jail,
@@ -269,25 +294,30 @@ async fn credentials_sentinel_unchanged() {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn network_deny_blocks_egress() {
-    if !landlock_available_via_new().await {
-        eprintln!("skip: landlock unavailable");
+    if !landlock_or_skip().await {
         return;
     }
-    // Positive baseline: local listener reachable before deny.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let baseline = Command::new("bash")
-        .args(["-c", &format!("echo hi | nc -w 1 127.0.0.1 {port} || true")])
-        .status();
-    let _ = baseline; // environment may lack nc; baseline is best-effort
-    drop(listener);
 
     let dir = tempdir().unwrap();
     let jail = dir.path().canonicalize().unwrap();
     let broker = broker_for_jail(jail.clone()).await.unwrap();
 
-    // Under netns with only lo, connecting to a host listener on a non-forwarded
-    // address should fail. Use python if present.
+    // Under netns with only lo, connecting to a public address must fail.
+    // Prefer python3 (present on ubuntu-latest); skip honestly if missing.
+    if std::process::Command::new("python3")
+        .arg("-c")
+        .arg("1")
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        if require_landlock() {
+            panic!("python3 required for network_deny_blocks_egress under ALLOY_REQUIRE_LANDLOCK");
+        }
+        eprintln!("skip: python3 unavailable for network deny test");
+        return;
+    }
+
     let script = jail.join("net.sh");
     std::fs::write(
         &script,
@@ -305,13 +335,7 @@ PY
 "#,
     )
     .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&script).unwrap().permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&script, p).unwrap();
-    }
+    chmod_755(&script);
     let req = SandboxExecRequest::new(
         vec![sh_bin().into(), script.display().to_string()],
         jail,
@@ -319,34 +343,144 @@ PY
         ExecClass::Check,
     );
     let result = broker.exec(req).await.unwrap();
-    assert_ne!(
+    assert_eq!(
         result.exit_code,
-        Some(0),
-        "egress should fail under network deny"
+        Some(2),
+        "egress should fail under network deny; stdout={} stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
     );
 }
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn cancel_drop_no_orphan() {
-    if !landlock_available_via_new().await {
-        eprintln!("skip: landlock unavailable");
+    if !landlock_or_skip().await {
         return;
     }
     let dir = tempdir().unwrap();
     let jail = dir.path().canonicalize().unwrap();
     let broker = broker_for_jail(jail.clone()).await.unwrap();
+
+    let pidfile = jail.join("child.pid");
+    let script = jail.join("sleep.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho $$ > '{}'\nexec '{}' 60\n",
+            pidfile.display(),
+            sleep_bin()
+        ),
+    )
+    .unwrap();
+    chmod_755(&script);
+
     let req = SandboxExecRequest::new(
-        vec![sleep_bin().into(), "60".into()],
+        vec![sh_bin().into(), script.display().to_string()],
         jail,
-        token(sleep_bin(), None),
+        token(sh_bin(), None),
         ExecClass::Check,
     );
     let handle = tokio::spawn(async move { broker.exec(req).await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(s) = std::fs::read_to_string(&pidfile) {
+            if let Ok(pid) = s.trim().parse::<i32>() {
+                break pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never wrote pidfile"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(process_alive(pid), "child {pid} never ran");
+
     handle.abort();
-    // Allow kill_on_drop / drop guard to run.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = handle.await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while process_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child {pid} survived abort/drop of the exec future"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn timeout_kills_process_group() {
+    if !landlock_or_skip().await {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
+    profile.check_backend = SandboxBackend::Landlock;
+    profile.exec_timeout = Duration::from_millis(400);
+    let broker = NativeSandboxBroker::new(profile).await.unwrap();
+
+    let pidfile = jail.join("grandchild.pid");
+    let script = jail.join("group.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsh -c 'trap \"\" TERM; while :; do sleep 1; done' &\necho $! > '{}'\nexec '{}' 60\n",
+            pidfile.display(),
+            sleep_bin()
+        ),
+    )
+    .unwrap();
+    chmod_755(&script);
+
+    let req = SandboxExecRequest::new(
+        vec![sh_bin().into(), script.display().to_string()],
+        jail,
+        token(sh_bin(), None),
+        ExecClass::Check,
+    );
+    let err = broker.exec(req).await.unwrap_err();
+    assert!(matches!(err, SandboxError::Timeout(_)), "got {err:?}");
+
+    // Grandchild must be gone after timeout kill of the process group.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .is_some_and(process_alive);
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "grandchild survived timeout process-group kill"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn token_expired_via_exec() {
+    if !landlock_or_skip().await {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let broker = broker_for_jail(jail.clone()).await.unwrap();
+
+    let mut perms = token(true_bin(), None);
+    // Inclusive boundary: now == expires → TokenExpired.
+    perms.expires = Some(Timestamp(Timestamp::now().0));
+
+    let req = SandboxExecRequest::new(vec![true_bin().into()], jail, perms, ExecClass::Check);
+    let err = broker.exec(req).await.unwrap_err();
+    assert!(matches!(err, SandboxError::TokenExpired), "got {err:?}");
 }
 
 #[tokio::test]

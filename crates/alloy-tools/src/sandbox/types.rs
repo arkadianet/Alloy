@@ -53,8 +53,10 @@ pub struct SandboxExecRequest {
     /// Extra env **names** permitted beyond the broker base set.
     ///
     /// Values always come from the parent process environment — no value
-    /// injection API in MVP. Each name must pass
-    /// [`crate::sandbox::validate_env_allow_name`].
+    /// injection API in MVP. Each name must be a portable identifier (leading
+    /// ASCII letter or `_`, then letters, digits, or `_`); hard-denied names are
+    /// rejected with [`DenialReason::EnvDenied`] and can never be re-enabled
+    /// here.
     pub env_allow: Vec<String>,
     /// Authoritative permission token (includes `run_id`).
     pub perms: PermissionToken,
