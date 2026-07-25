@@ -59,6 +59,7 @@ RFC-0001 published `WorkerMetrics`, `RuntimeMetrics`, `SessionEventType::{Decisi
 - OTLP export, Observability TUI → **Architecture V2 deferred** (§15.2).
 - Redesigning V2, RFC-0001/0002/0003; new crates; new runtime services; parallel `EventStore`; second event log.
 - Replacing, wrapping, or forking `EventSink` / `EventStore` / `SessionEventType` / `RuntimeHandle` / `WorkerMetrics` / `BudgetSnapshot`.
+- Constraint evaluation including `Constraint::MaxUsd` on goals → **RFC-0010** / **RFC-0015** (this RFC only meters against `BudgetPolicy`).
 - Writing or overwriting `.env`.
 
 ### Day-1 MVP (normative)
@@ -142,6 +143,7 @@ This RFC **supplies metering** that invokes the existing hook. It MUST NOT assum
 | Query helpers over `EventStore` | **0004** |
 | `ObsError` + mappings | **0004** |
 | `obs` module + crate-root re-exports | **0004** |
+| Additive `EventStore::replay_session` `where Self: Sized` | **0004** (storage seam) |
 | Budget exhaustion **accounting** + hook invocation helpers | **0004** |
 | ModelRouter route/complete attribution | **0007** |
 | Scheduler execution / node_state producers | **0010** |
@@ -183,15 +185,33 @@ pub mod obs;
 pub use obs::{
     hash_content, hash_prompt, hash_tool_body,
     list_decision_events, parse_decision_event, parse_model_call_event, parse_tool_call_event,
-    redact_secrets, apply_prompt_retention, apply_tool_retention,
-    BudgetCheck, CostMeter, CostSnapshot, SharedCostMeter,
-    DecisionKind, DecisionLog, DecisionRecord, EventDecisionLog,
+    reaccumulate_cost_from_events, redact_json_strings, redact_secrets,
+    apply_prompt_retention, apply_tool_retention,
+    BudgetCheck, CostByTier, CostMeter, CostSnapshot, DecisionPage, SharedCostMeter, TierCost,
+    DecisionKind, DecisionLog, DecisionRecord, EventDecisionLog, RecordingDecisionLog,
     ModelCallRecord, ObsError, RetentionPolicy, ToolCallRecord,
     maybe_signal_budget_warning,
 };
 ```
 
 `WorkerMetrics` / `RuntimeMetrics` / `BudgetSnapshot` / `SessionEventType` remain re-exported from their existing modules — **do not** re-export a conflicting `WorkerMetrics` from `obs`.
+
+### 3.1a Additive EventStore seam (authorized)
+
+`EventStore::replay_session` is generic and currently makes the trait **not dyn-compatible** on main. RFC-0004 **authorizes** this additive change to RFC-0002’s trait (same class of seam as RFC-0003’s existence probes):
+
+```rust
+async fn replay_session<F>(
+    &self,
+    session: SessionId,
+    on_event: F,
+) -> Result<Option<EventSeq>, StoreError>
+where
+    Self: Sized, // ADDITIVE — enables `&dyn EventStore` for other methods
+    F: FnMut(&SessionEvent) -> Result<(), StoreError> + Send;
+```
+
+MVP query/reaccumulate helpers MUST page via `list_session_events` (dyn-safe) and MUST NOT require `replay_session` on a trait object. The `Sized` bound is still REQUIRED so future typed helpers can use `&dyn EventStore`.
 
 ### 3.2 `ObsError`
 
@@ -264,42 +284,38 @@ Externally tagged (serde default) + `rename_all = "snake_case"`:
 
 Implementers MUST lock these shapes with a unit-test golden JSON suite. Unknown unit strings on `DecisionKind` deserialize MUST fail (surfaced as `ObsError::Invalid` by parse helpers). Outer event payloads MUST NOT use `deny_unknown_fields` (forward-compatible metadata), but `kind` itself MUST be a valid `DecisionKind`.
 
-### 3.4 `DecisionRecord`
+### 3.4 `DecisionRecord` (in-memory API — not the wire format)
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecisionRecord {
     pub session: SessionId,
     pub run: Option<RunId>,
     pub node: Option<NodeId>,
     pub kind: DecisionKind,
-    /// Structured metadata (candidates, scores, reasons, capability ids, …).
-    /// MUST NOT contain raw secrets; helpers redact string values when configured.
+    /// MUST be a JSON **object** or `Null` (normalized to `{}` on record). Other shapes → `ObsError::Invalid`.
     pub metadata: serde_json::Value,
-    /// SHA-256 of the attributable content (prompt / context pack / tool args) when applicable.
     pub content_hash: Option<Digest>,
-    /// Full prompt/body — retained only when policy allows; DecisionLog strips otherwise.
     pub prompt_body: Option<String>,
 }
 ```
 
 **Ownership:** callers own construction; `DecisionLog::record` takes `DecisionRecord` by value.
 
-### 3.5 `ModelCallRecord` / `ToolCallRecord`
+**Wire format:** private `DecisionPayload` (§5.3). Public records MUST NOT derive `Serialize` for event append — hand-build / map through payload structs so envelope fields are not duplicated incorrectly.
+
+### 3.5 `ModelCallRecord` / `ToolCallRecord` (in-memory API)
 
 ```rust
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelCallRecord {
     pub session: SessionId,
     pub run: Option<RunId>,
     pub node: Option<NodeId>,
     pub provider_id: ProviderId,
     pub model_tier: ModelTier,
-    /// `None` when the provider did not report input tokens — MUST NOT invent.
     pub input_tokens: Option<u64>,
-    /// `None` when the provider did not report output tokens — MUST NOT invent.
     pub output_tokens: Option<u64>,
-    /// Estimated USD when the provider/router supplies it — MUST NOT invent.
     pub usd: Option<f64>,
     pub duration_ms: Option<u64>,
     pub confidence: Option<f32>,
@@ -308,7 +324,7 @@ pub struct ModelCallRecord {
     pub prompt_body: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCallRecord {
     pub session: SessionId,
     pub run: Option<RunId>,
@@ -318,10 +334,11 @@ pub struct ToolCallRecord {
     pub latency_ms: Option<u64>,
     pub denied: bool,
     pub content_hash: Option<Digest>,
-    /// Tool args / result body — retained only when `retain_tool_bodies`.
     pub body: Option<String>,
 }
 ```
+
+Same rule: wire payloads are private structs in §5.4–5.5; `usage_unknown` exists only on the wire.
 
 ### 3.6 `DecisionLog` trait
 
@@ -345,16 +362,23 @@ pub trait DecisionLog: Send + Sync {
 /// DecisionLog backed by `RuntimeHandle::append_session` + retention from config.
 pub struct EventDecisionLog {
     handle: RuntimeHandle,
+    storage: Arc<AlloyStorage>,
     retention: RetentionPolicy,
 }
 
 impl EventDecisionLog {
-    /// Construct with an explicit retention policy.
     #[must_use]
-    pub fn new(handle: RuntimeHandle, retention: RetentionPolicy) -> Self { /* … */ }
+    pub fn new(
+        handle: RuntimeHandle,
+        storage: Arc<AlloyStorage>,
+        retention: RetentionPolicy,
+    ) -> Self { /* … */ }
 
     /// Load retention from `handle.config()` (requires configure).
-    pub fn from_handle(handle: RuntimeHandle) -> Result<Self, ObsError> { /* … */ }
+    pub fn from_handle(
+        handle: RuntimeHandle,
+        storage: Arc<AlloyStorage>,
+    ) -> Result<Self, ObsError> { /* … */ }
 }
 
 #[async_trait]
@@ -365,11 +389,34 @@ impl DecisionLog for EventDecisionLog { /* §5 */ }
 
 | Context | Construction |
 | --- | --- |
-| Production (after `configure`/`start` + SQLite install) | `EventDecisionLog::from_handle(handle.clone())` or `new(handle, RetentionPolicy::from(&*handle.config()?))` |
-| Tests (in-memory sink) | Same; sink already default on handle |
-| Injection into 0007/0010/0013 | `Arc<dyn DecisionLog>` |
+| Production | `EventDecisionLog::from_handle(handle.clone(), storage)` after SQLite install |
+| Tests | Same with in-memory/SQLite store |
+| Injection | `Arc<dyn DecisionLog>` |
 
-`EventDecisionLog` MUST NOT open storage itself. It MUST NOT call `install_sqlite_event_sink`. It appends only through `RuntimeHandle`.
+`EventDecisionLog` MUST NOT call `install_sqlite_event_sink`. Appends go through `RuntimeHandle`.
+
+**Session existence (normative):** before every successful append, `get_session(session)` MUST return `Some`. Missing → `ObsError::Session(SessionError::NotFound(session))`. Orphan decision events (no session row) are **forbidden**.
+
+### 3.7a `RecordingDecisionLog` (test double)
+
+```rust
+pub struct RecordingDecisionLog {
+    retention: RetentionPolicy,
+    records: Mutex<Vec<DecisionRecord>>,
+    model_calls: Mutex<Vec<ModelCallRecord>>,
+    tool_calls: Mutex<Vec<ToolCallRecord>>,
+    next_seq: AtomicU64,
+}
+
+impl RecordingDecisionLog {
+    pub fn new(retention: RetentionPolicy) -> Self;
+    /// Returns records **post-retention/redaction** (what `EventDecisionLog` would have appended).
+    pub fn recorded_decisions(&self) -> Vec<DecisionRecord>;
+    // analogous accessors for model/tool (also post-retention)
+}
+```
+
+No I/O; assigns monotonic fake `EventSeq` starting at 0. Applies `RetentionPolicy` on `record*` the same way as `EventDecisionLog` (minus persistence). For unit tests in 0007/0010/0013.
 
 ### 3.8 SessionEventType mappings (pinned)
 
@@ -501,6 +548,7 @@ impl CostMeter {
     pub fn new() -> Self { Self::default() }
 
     /// Record model usage. `input`/`output`/`usd` use `None` for unknown — NEVER fabricate.
+    /// Non-finite `usd` (`NaN` / ±∞) → skip USD update, `tracing::warn`, tokens still apply.
     pub fn add_model_usage(
         &mut self,
         tier: ModelTier,
@@ -509,10 +557,17 @@ impl CostMeter {
         usd: Option<f64>,
     );
 
-    /// Feed a completed `WorkerMetrics`. Token fields on `WorkerMetrics` are `u64`
-    /// (RFC-0001); when a producer truly lacks usage it MUST NOT invent nonzero counts —
-    /// producers that lack usage MUST call `add_model_usage(..., None, None, usd)` instead
-    /// of synthesizing a zeroed `WorkerMetrics` solely to satisfy metering.
+    /// Feed a completed `WorkerMetrics`.
+    ///
+    /// Normative behaviour:
+    /// - Uses `metrics.model_tier_used` for tier buckets.
+    /// - Treats `input_tokens` / `output_tokens` as **known** (`Some`) — never bumps
+    ///   `unknown_token_events` (producers lacking usage MUST call `add_model_usage` with `None`s).
+    /// - Increments `model_calls` / tier `calls` once even when `error_class` is `Some`
+    ///   (failed calls still count toward budget ceilings).
+    /// - Ignores `confidence`, `duration_ms`, `tool_calls`, `cache_hits`, `provider_id` for metering
+    ///   (provider attribution belongs on `ModelCall` events / RFC-0007).
+    /// - `usd` non-finite → same skip+warn as `add_model_usage`.
     pub fn add_worker_metrics(&mut self, metrics: &WorkerMetrics, usd: Option<f64>);
 
     #[must_use]
@@ -574,11 +629,14 @@ impl SharedCostMeter {
     pub fn check_budget(&self, policy: &BudgetPolicy) -> BudgetCheck { /* … */ }
 
     /// Run a closure under the meter lock (keep critical sections short — §8).
+    /// Non-reentrant: calling other `SharedCostMeter` methods inside `f` deadlocks.
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut CostMeter) -> R) -> R { /* … */ }
 }
 ```
 
 **Poisoned mutex:** on poison, `SharedCostMeter` MUST recover via `PoisonError::into_inner` (same pattern as existing runtime locks on main) and continue; it MUST NOT panic.
+
+`SharedCostMeter` and `EventDecisionLog` MUST implement `Debug` (manual impl OK for the mutex wrapper).
 
 ### 3.13 Budget warning helper
 
@@ -608,24 +666,41 @@ Callers (0007/0010) MAY then `request_replan(..., ReplanReason::BudgetPolicy)` o
 ### 3.14 Query helpers
 
 ```rust
-/// Page session events whose type is `Decision` | `ModelCall` | `ToolCall`.
-/// Uses `EventStore::list_session_events` internally, filtering in-process.
-/// `limit` is the max number of **matching** events returned (helpers MAY scan
-/// multiple store pages until filled or store exhausted). Clamp store page size
-/// via `clamp_events_page_limit`.
+#[derive(Debug, Clone)]
+pub struct DecisionPage {
+    pub events: Vec<SessionEvent>,
+    /// Exclusive resume cursor: pass as `after` on the next call.
+    /// `None` means the scan reached the end of the session log (no more events to scan).
+    pub next_after: Option<EventSeq>,
+}
+
+/// Page matching `Decision` | `ModelCall` | `ToolCall`.
+///
+/// Uses only `EventStore::list_session_events` (dyn-safe). Ascending `seq` order.
+///
+/// - `limit == 0` → treated as `1` matching event max (same spirit as `clamp_events_page_limit`).
+/// - `limit` is max **matching** events returned (clamped to `MAX_EVENTS_PAGE`).
+/// - Internally scans store pages of size `clamp_events_page_limit(MAX_EVENTS_PAGE)` until
+///   `events.len() == limit`, a store page returns short/empty, **or** `max_scan_pages` (normative default **16**) store pages have been read — then return with `next_after` set so the caller can resume.
+/// - `next_after` is always the `seq` of the last **scanned** store event (matching or not)
+///   when more store events may exist; `None` when the store page was short/empty.
 pub async fn list_decision_events(
     store: &dyn EventStore,
     session: SessionId,
     after: Option<EventSeq>,
     limit: usize,
-) -> Result<Vec<SessionEvent>, ObsError>;
+) -> Result<DecisionPage, ObsError>;
 
 pub fn parse_decision_event(ev: &SessionEvent) -> Result<DecisionRecord, ObsError>;
 pub fn parse_model_call_event(ev: &SessionEvent) -> Result<ModelCallRecord, ObsError>;
 pub fn parse_tool_call_event(ev: &SessionEvent) -> Result<ToolCallRecord, ObsError>;
 ```
 
-`parse_*` MUST require `ev.type_` to match the expected variant; otherwise `ObsError::Invalid`. Session/run ids are taken from the envelope (`ev.session_id` / `ev.run_id`), not duplicated as authoritative inside payload when both exist — payload MAY echo them for readability; on conflict, **envelope wins**.
+`parse_*` MUST require matching `ev.type_`; else `ObsError::Invalid`. Envelope `session_id` / `run_id` win over any payload echo.
+
+`parse_model_call_event`: if wire `usage_unknown` disagrees with token nullness (`usage_unknown != (input is null || output is null)`), return `ObsError::Invalid("usage_unknown inconsistent")`.
+
+`AlloyStorage::events()` returns `Arc<SqliteEventStore>` which coerces to `&dyn EventStore` after the §3.1a seam.
 
 ### 3.15 `WorkerMetrics` relationship (usage contract)
 
@@ -652,7 +727,7 @@ pub fn parse_tool_call_event(ev: &SessionEvent) -> Result<ToolCallRecord, ObsErr
 | Operation | API |
 | --- | --- |
 | Append decisions | `RuntimeHandle::append_session` (active sink = SQLite after install) |
-| Query/replay | `storage.events()` as `Arc<dyn EventStore>` / `list_decision_events` |
+| Query/replay | `storage.events()` (`Arc<SqliteEventStore>` / `&dyn EventStore` after §3.1a) + `list_decision_events` |
 | Budget warning | `SessionPlane::signal_budget_warning` (appends via same handle) |
 
 MUST NOT introduce `ObsStore`, dual-write, or artifact-CAS-as-decision-log for MVP.
@@ -669,8 +744,9 @@ alloy-runtime/src/obs/
   cost.rs          # CostMeter, CostSnapshot, SharedCostMeter, BudgetCheck, CostByTier, TierCost
   hash.rs          # hash_content, hash_prompt, hash_tool_body
   redact.rs        # redact_secrets, apply_*_retention, deny lists
-  query.rs         # list_decision_events, parse_* 
+  query.rs         # list_decision_events, DecisionPage, parse_*
   budget.rs        # maybe_signal_budget_warning
+  recording.rs     # RecordingDecisionLog
 ```
 
 ### Dependency direction
@@ -710,14 +786,36 @@ Still exactly **five** workspace members. No `alloy-obs` crate. No OTLP dependen
 
 ### 5.1 Recording algorithm (`DecisionLog::record`)
 
-1. Validate `metadata` is a JSON object or array or null-compatible value — if `metadata` is a raw JSON string that looks like a secret blob, still pass through `redact_json_strings` (§5.6). Empty object `{}` is allowed.
-2. Compute body retention:
+1. If `storage.sessions().get_session(rec.session)` is `None` → `ObsError::Session(NotFound)`.
+2. Normalize `metadata`: `Null` → `{}`. If not `Object` after normalize → `ObsError::Invalid("metadata must be object")`. Key `idempotency_key` is reserved for caller dedupe (§5.8); DecisionLog does not interpret it beyond redaction.
+3. Enforce size caps (§5.1a). Excess → `ObsError::Invalid`.
+4. Compute body retention:
    - Let `raw = rec.prompt_body.as_deref()`.
    - `(hash, body) = apply_prompt_retention(raw, self.retention)?`.
-   - If `rec.content_hash` is `Some(h)` and `raw` is `Some`, the helper-computed hash MUST equal `h` **or** DecisionLog replaces with the helper hash and `tracing::warn`s once (`content_hash mismatch; using recomputed`). If `raw` is `None`, keep caller `content_hash` as-is.
-3. Build payload JSON (§5.3) with **stripped** body when retention denies.
-4. `handle.append_session(NewSessionEvent { session_id: rec.session, run_id: rec.run, type_: Decision, payload })`.
-5. On success return `EventSeq`. On failure return `ObsError::Append` — **fail closed** (do not pretend the decision was recorded).
+   - If `rec.content_hash` is `Some(h)` and `raw` is `Some` and helper hash ≠ `h`: replace with helper hash and `tracing::warn` **once per record** (`content_hash mismatch; using recomputed`). If `raw` is `None`, keep caller `content_hash`.
+5. Build **private** `DecisionPayload` JSON (§5.3) with stripped body when retention denies; `metadata` after `redact_json_strings`.
+6. `handle.append_session(NewSessionEvent { session_id, run_id, type_: Decision, payload })`.
+7. On success return `EventSeq`. On failure return `ObsError::Append` — **fail closed**.
+
+#### 5.1a Size caps (normative)
+
+| Field | Max |
+| --- | --- |
+| `metadata` JSON byte length (after normalize, before redaction) | 64 KiB |
+| `prompt_body` / tool `body` UTF-8 bytes (pre-redaction) | 256 KiB |
+
+Exceed → `ObsError::Invalid` (do not truncate silently — caller must hash and omit body). Caps are measured **pre-redaction**; `[REDACTED]` substitution may grow the appended payload by a bounded amount — do not re-reject after redaction.
+
+#### 5.1b `record_model_call` / `record_tool_call` order
+
+Same validation order as §5.1:
+
+1. Session existence (`NotFound` / probe `StoreError` → `ObsError::Store`).
+2. Size caps on bodies.
+3. Non-finite `usd` on model calls → `ObsError::Invalid` (wire must not carry NaN/∞).
+4. Retention / redaction / hash-mismatch warn-and-replace (same as §5.1 step 4).
+5. Synthesize `usage_unknown` for model calls.
+6. Append private payload; fail closed on sink error.
 
 ### 5.2 Content hash computation
 
@@ -729,87 +827,102 @@ Still exactly **five** workspace members. No `alloy-obs` crate. No OTLP dependen
 
 Secret redaction for **retained bodies** happens after hashing: hash covers original attributable bytes; retained body is redacted. When retention is off, only the hash (if any) is stored.
 
-### 5.3 `Decision` payload JSON
+### 5.3 `Decision` wire payload (private `DecisionPayload`)
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct DecisionPayload {
+    kind: DecisionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<NodeId>,
+    metadata: serde_json::Value,
+    content_hash: Option<Digest>,
+    prompt_body: Option<String>,
+}
+```
+
+Wire JSON example:
 
 ```json
 {
   "kind": "model_route",
-  "node_id": "<uuid>|null",
+  "node_id": "<uuid>",
   "metadata": { },
-  "content_hash": "<64 lowercase hex>|null",
-  "prompt_body": "<string>|null"
-}
-```
-
-- `kind`: `DecisionKind` serde.
-- `node_id`: present as string when `DecisionRecord.node` is `Some`; JSON `null` when `None`.
-- `prompt_body`: JSON `null` when stripped / absent.
-- `content_hash`: hex via `Digest` serde; JSON `null` when absent.
-- `metadata`: after `redact_json_strings`.
-
-### 5.4 `ModelCall` payload JSON
-
-```json
-{
-  "node_id": "<uuid>|null",
-  "provider_id": "<name>",
-  "model_tier": "standard",
-  "input_tokens": 123,
-  "output_tokens": 45,
-  "usage_unknown": false,
-  "usd": 0.002,
-  "duration_ms": 10,
-  "confidence": null,
-  "error_class": null,
-  "content_hash": "<hex>|null",
+  "content_hash": "<64 lowercase hex>",
   "prompt_body": null
 }
 ```
 
-Normative field rules:
+- No `session` / `run` fields on payload (envelope owns them).
+- `node_id` omitted or null when `None`.
+- Public `DecisionRecord` maps to this via field rename `node` → `node_id`.
 
-| Field | Rule |
-| --- | --- |
-| `input_tokens` / `output_tokens` | Omit as JSON `null` when `Option::None` |
-| `usage_unknown` | `true` iff `input_tokens` is `None` **or** `output_tokens` is `None` |
-| `usd` | JSON `null` when unknown — MUST NOT write `0` to mean unknown |
-| `model_tier` | `ModelTier` snake_case |
-| `confidence` | JSON `null` when `None` |
-| `prompt_body` | subject to `retain_full_prompts` |
+### 5.4 `ModelCall` wire payload (private `ModelCallPayload`)
 
-`record_model_call` applies the same prompt retention path as `record`.
-
-### 5.5 `ToolCall` payload JSON
-
-```json
-{
-  "node_id": "<uuid>|null",
-  "tool_name": "cargo_check",
-  "tool_server": "builtin"|null,
-  "latency_ms": 10,
-  "denied": false,
-  "content_hash": "<hex>|null",
-  "body": null
+```rust
+#[derive(Serialize, Deserialize)]
+struct ModelCallPayload {
+    node_id: Option<NodeId>,
+    provider_id: ProviderId,
+    model_tier: ModelTier,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    usage_unknown: bool, // synthesized: input.is_none() || output.is_none()
+    usd: Option<f64>,    // never non-finite on wire
+    duration_ms: Option<u64>,
+    confidence: Option<f32>,
+    error_class: Option<ErrorClass>,
+    content_hash: Option<Digest>,
+    prompt_body: Option<String>,
 }
 ```
 
-`body` subject to `retain_tool_bodies` + secret redaction + deny list.
+| Field | Rule |
+| --- | --- |
+| `usage_unknown` | `true` iff `input_tokens.is_none() \|\| output_tokens.is_none()` at append time |
+| `usd` | JSON `null` when unknown; MUST NOT write non-finite (reject before append as `Invalid`) |
+| `prompt_body` | subject to `retain_full_prompts` + size cap |
+
+### 5.5 `ToolCall` wire payload (private `ToolCallPayload`)
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct ToolCallPayload {
+    node_id: Option<NodeId>,
+    tool_name: String,
+    tool_server: Option<String>,
+    latency_ms: Option<u64>,
+    denied: bool,
+    content_hash: Option<Digest>,
+    body: Option<String>,
+}
+```
+
+`body` subject to `retain_tool_bodies` + redaction + deny list + size cap.
 
 ### 5.6 Secret redaction & deny lists
 
-**`redact_secrets` MUST mask (replace match with `[REDACTED]`) at least:**
+**Dependency:** MVP MUST implement matchers **hand-rolled** (string scans / simple state machines). **MUST NOT** add a `regex` crate dependency for RFC-0004.
 
-| Pattern class | Examples |
+**`redact_secrets` replacement rule:** each match span is replaced with the literal `[REDACTED]` (the matched text including prefixes like `api_key=` is entirely replaced — `api_key=sk-1` → `[REDACTED]`, not `api_key=[REDACTED]`). Case-insensitive for ASCII letters. Leftmost-longest; non-overlapping; scan left to right.
+
+**Token boundary for env-style names:** the secret name must be bounded on the left by start-of-string or a non-alphanumeric/`_` character (so `MY_API_KEY=abc` matches as a whole assignment starting at `API_KEY` **only if** using substring — **normative:** require the name to match as a full identifier token: `[A-Za-z_][A-Za-z0-9_]*` equality against the deny-name set after lowercasing, **or** the identifier ends with `_api_key` / `_secret` / `_token` / `_password`. `MY_API_KEY=abc` → entire `MY_API_KEY=abc` replaced with `[REDACTED]`.
+
+**Bare `sk-` tokens:** `sk-` + 8+ alphanumeric characters is redacted in **both** free text (`redact_secrets`) and JSON string leaves.
+
+**MUST mask at least:**
+
+| Pattern class | Detection (hand-rolled) |
 | --- | --- |
-| Env assignment lines | `(?i)(api[_-]?key|secret|token|password|authorization)\s*=\s*\S+` |
-| Bearer headers | `(?i)authorization:\s*bearer\s+\S+` |
-| Common PEM blocks | `-----BEGIN [A-Z ]*PRIVATE KEY-----` … `-----END …-----` |
+| Env-style assignment | name in `{api_key, api-key, secret, token, password, authorization}` (case-insensitive) followed by optional spaces, `=`, optional spaces, then one or more non-whitespace → redact whole assignment span |
+| Bearer headers | `authorization:` (ci) + whitespace + `bearer` (ci) + whitespace + non-whitespace token |
+| PEM private key blocks | from `-----BEGIN` through `PRIVATE KEY-----` … matching `-----END …-----` |
 
-**Path deny list (tool bodies / retained prompts):** if the body contains a path segment equal to `.env` or ends with `/.env`, DecisionLog MUST strip the retained body (keep hash if computed) and `tracing::warn` (`denied path in retained body`). This is retention refusal, not `ObsError`, so auditing still records the hash.
+**JSON key-name deny-list (`redact_json_strings`):** recursively walk `Value`. For each `Object`, if a key’s ASCII-lowercased form equals or contains `api_key` / `api-key` / `secret` / `password` / `token` / `authorization` / `credential`, replace that entry’s **value** with `"[REDACTED]"` (whether string or nested). For every `Value::String` leaf, also apply `redact_secrets`. Bare token strings matching `sk-` + 8+ alphanumerics → `[REDACTED]` (same rule as `redact_secrets`).
 
-**`redact_json_strings`:** recursively walk `serde_json::Value`; apply `redact_secrets` to every `Value::String`.
+**Path deny list:** if retained body contains a path segment equal to `.env` or ends with `/.env`, strip retained body (keep hash), `tracing::warn`. Not an `ObsError`.
 
-Redaction helper misuse (e.g. internal invariant) → `ObsError::Redaction`.
+Helper misuse → `ObsError::Redaction`.
 
 ### 5.7 Prompt / tool retention
 
@@ -835,11 +948,15 @@ DecisionLog MUST NOT silently drop duplicates.
 
 | Failure | Behaviour |
 | --- | --- |
-| `RuntimeError::EventSink` / busy / phase | Return `ObsError::Append`; no seq consumed (0002 contract) |
-| Partial redaction | Still append metadata+hash when body stripped; not a failure |
-| Missing config on `from_handle` | `ObsError::Append(RuntimeError::InvalidPhase { … })` or map config miss to `Invalid` |
+| `RuntimeError` / `EventSinkError` from append | `ObsError::Append`; no seq consumed (0002) |
+| Session missing | `ObsError::Session(NotFound)` before append |
+| Session existence probe `StoreError` | `ObsError::Store` |
+| Partial redaction / deny-list strip | Still append metadata+hash; not a failure |
+| Missing config on `from_handle` | `ObsError::Append(RuntimeError::InvalidPhase { … })` via `handle.config()?` |
 
-MUST NOT emit a synthetic `SessionEventType::Error` as a substitute for a failed decision append (avoids masking audit gaps). Callers MAY emit `Error` events themselves via `append_session` if product UX requires it.
+**Phase note (normative vs incorrect draft claim):** `RuntimeHandle::append_session` has **no** phase gate on main — it can succeed in `Draining`. `SessionPlane::signal_budget_warning` **does** require `Running` via `require_mutating_phase`. During drain: decision appends may still succeed; budget signaling returns `SessionError::Invalid` → `ObsError::Session`. Callers MUST treat signaling failure during drain as non-retryable for that process.
+
+MUST NOT emit synthetic `SessionEventType::Error` as a substitute for a failed decision append.
 
 ### 5.10 Sequence — decision → redact → append → replay
 
@@ -877,14 +994,15 @@ sequenceDiagram
 `CostMeter::add_model_usage`:
 
 1. `model_calls += 1`; tier `calls += 1`.
-2. If `input` is `Some(n)`: add to `tokens_in` and tier `tokens_in`; else `unknown_token_events += 1` (count once per call even if both None).
-3. If `output` is `Some(n)`: add to `tokens_out` and tier `tokens_out`; if `input` was `Some` and `output` is `None`, still increment `unknown_token_events` once for that call (already counted if input was also None — **count at most one unknown bump per call**).
-4. If `usd` is `Some(x)`:  
-   - if meter `usd_spent` is `None`, set to `Some(x)`; else add `x`.  
-   - same for tier `usd`.  
-   If `usd` is `None`, leave `usd_spent` unchanged.
+2. If `input` is `Some(n)`: saturating-add to `tokens_in` and tier `tokens_in`.
+3. If `output` is `Some(n)`: saturating-add to `tokens_out` and tier `tokens_out`.
+4. If `input.is_none() || output.is_none()`: `unknown_token_events += 1` (**at most once per call**).
+5. If `usd` is `Some(x)`:
+   - If `!x.is_finite()`: do **not** update USD; `tracing::warn!("non-finite usd ignored")`.
+   - Else if meter `usd_spent` is `None`, set `Some(x)`; else add `x`. Same for tier `usd`.
+   - If `usd` is `None`, leave `usd_spent` unchanged.
 
-**Saturating arithmetic:** token counters use `u64::saturating_add`. USD uses `f64` addition (same caveat as `BudgetPolicy.max_usd_per_run` on main — do not rely on exact equality; budget compare uses `>=`).
+Token counters use `u64::saturating_add`. Budget compare uses `>=` on finite values only.
 
 ### 6.2 `CostSnapshot` semantics
 
@@ -910,11 +1028,17 @@ USD is optional end-to-end. Missing provider USD MUST NOT be replaced with estim
 ### 6.6 Interaction with `BudgetPolicy`
 
 ```text
-TokensExhausted  iff tokens_in + tokens_out >= policy.max_tokens_per_run
-UsdExhausted     iff usd_spent.is_some() && usd_spent.unwrap() >= policy.max_usd_per_run
+max_tok = policy.max_tokens_per_run   // u64 — always finite; no is_finite check
+max_usd = policy.max_usd_per_run
+
+If max_tok == 0: TokensExhausted is true even at zero spend (immediately exhausted).
+TokensExhausted  iff tokens_in + tokens_out >= max_tok
+
+If !max_usd.is_finite() || max_usd < 0.0: treat as UsdExhausted immediately (fail closed).
+Else UsdExhausted iff usd_spent.is_some() && usd_spent.unwrap() >= max_usd
 ```
 
-When `usd_spent` is `None`, USD ceiling MUST NOT trigger exhaustion (unknown cost ≠ zero cost for enforcement). Token ceiling still applies from known token sums.
+When `usd_spent` is `None` and `max_usd` is finite and ≥ 0, USD ceiling MUST NOT trigger.
 
 `to_budget_snapshot()`:
 
@@ -925,6 +1049,8 @@ BudgetSnapshot {
     tokens_out: ...,
 }
 ```
+
+**`Constraint::MaxUsd`:** NOT evaluated by RFC-0004. Owned by goal/scheduler policy in **RFC-0010** / CLI in **RFC-0015**. Listed under Non-goals.
 
 ### 6.7 Interaction with `signal_budget_warning`
 
@@ -976,7 +1102,7 @@ Payloads are `serde_json::Value` objects per §5.3–5.5. Field names are snake_
 | State | Recovery |
 | --- | --- |
 | Durable appended decision events | Visible via query helpers after reopen + install |
-| In-memory `CostMeter` | **Not** durable — rebuild by scanning `ModelCall` events if a caller needs resume totals (helper MAY be added as `reaccumulate_cost_from_events(store, session, run) -> Result<CostMeter, ObsError>` and is **in scope** for MVP) |
+| In-memory `CostMeter` | **Not** durable — rebuild via `reaccumulate_cost_from_events` |
 
 #### `reaccumulate_cost_from_events` (MVP required)
 
@@ -990,11 +1116,16 @@ pub async fn reaccumulate_cost_from_events(
 
 Behaviour:
 
-1. Replay/list all session events.
-2. For each `ModelCall`, parse payload; if `run` filter is `Some`, skip events whose envelope `run_id` differs.
-3. Apply `add_model_usage` with parsed `Option` token/usd fields and `model_tier`.
-4. Ignore non-model events.
-5. Return the rebuilt `CostMeter`.
+1. Page all session events via `list_session_events` (not `replay_session` on a trait object).
+2. For each `ModelCall`, parse payload; on parse error → `ObsError::Invalid` (fail the rebuild).
+3. **Run filter:**
+   - `run: Some(id)` — include only events whose envelope `run_id == Some(id)`.
+   - `run: None` — include **all** `ModelCall` events in the session (every run).
+4. Apply `add_model_usage` with parsed `Option` token/usd fields and `model_tier` (skip non-finite usd per §6.1).
+5. Ignore non-`ModelCall` events.
+6. Return rebuilt `CostMeter`.
+
+**Invariant:** rebuild is complete only for usage that was recorded via `record_model_call`. Meter-only updates without a durable `ModelCall` are **lossy** on restart. Producers that need durable metering MUST call `record_model_call` (RFC-0007/0013 contract). Document this in residual comments / this section — not best-effort silent.
 
 ---
 
@@ -1030,9 +1161,9 @@ Concurrent appenders of decisions are safe. Cost aggregation races are resolved 
 | --- | --- |
 | Successful `append_session` commit | Decision/model/tool event durable per RFC-0002 |
 | Crash before append commit | Event absent; caller receives error if still running |
-| Graceful drain/shutdown | New appends follow handle phase rules (`InvalidPhase` when not admitting); already-committed events remain |
-| In-memory `CostMeter` on crash | Lost; rebuild via `reaccumulate_cost_from_events` |
-| Budget warning commit | Durable via 0003/0002 path |
+| Graceful drain/shutdown | `append_session` has **no** phase gate (may still succeed in `Draining`); `signal_budget_warning` fails when not `Running` |
+| In-memory `CostMeter` on crash | Lost; rebuild via `reaccumulate_cost_from_events` (ModelCall-backed only) |
+| Budget warning commit | Durable via 0003/0002 when phase allows |
 
 Durability of observability data equals EventStore durability. No extra fsync API.
 
@@ -1044,9 +1175,9 @@ Durability of observability data equals EventStore durability. No extra fsync AP
 
 | Class | Examples | Caller action |
 | --- | --- | --- |
-| Recoverable | `ObsError::Append` busy/phase; `Session` NotFound; `Store` Busy | Retry or surface; do not invent events |
-| Invalid input | `ObsError::Invalid` | Fix caller record |
-| Fatal process | Runtime `Failed` phase | Host shutdown |
+| Recoverable | `ObsError::Append` (sink/io); `Session` NotFound; `Store` Busy | Retry or surface; do not invent events |
+| Invalid input | `ObsError::Invalid` (metadata, caps, usd, usage_unknown) | Fix caller record |
+| Drain-phase budget warn | `ObsError::Session(Invalid)` | Non-retryable in this process |
 
 ### Append failures
 
@@ -1112,32 +1243,49 @@ Counters: optional private atomics under `obs` for tests (`records_appended`, `r
 | --- | --- |
 | `hash_prompt_stable` | Same string → same `Digest`; matches `Digest::sha256` |
 | `hash_tool_body_stable` | Same as above for tool bodies |
-| `prompt_redaction_strips_api_key` | `redact_secrets` masks `api_key=` / Bearer |
+| `prompt_redaction_strips_api_key` | `api_key=sk-1` → `[REDACTED]` entirely |
+| `json_key_redaction_masks_secret_values` | `{"api_key":"sk-…"}` value becomes `[REDACTED]` |
 | `tool_redaction_strips_env_path` | deny-list prevents retained body when `.env` path present |
+| `prompt_deny_list_strips_env_path` | same for retained prompts |
 | `retention_default_strips_prompt_body` | `retain_full_prompts=false` → body `None`, hash `Some` |
 | `retention_opt_in_keeps_redacted_body` | `true` → body present and redacted |
 | `retention_tool_bodies_default_off` | analogous for tools |
-| `cost_snapshot_arithmetic` | known token/usd sums; tier buckets |
+| `cost_snapshot_arithmetic` | known token/usd sums; all four tiers distinct |
 | `cost_unknown_usage_no_fabricated_tokens` | `None` inputs → `unknown_token_events`, tokens unchanged |
 | `cost_unknown_usd_none` | no usd updates → `usd_spent.is_none()` |
+| `cost_non_finite_usd_ignored` | NaN/∞ skipped; finite usd still works after |
+| `add_worker_metrics_counts_failed_calls` | `error_class: Some(_)` still increments calls; tokens known |
 | `budget_check_tokens_and_usd` | thresholds with `>=` |
+| `budget_zero_tokens_immediately_exhausted` | `max_tokens_per_run=0` → exhausted at zero |
+| `budget_non_finite_usd_ceiling_exhausted` | fail closed |
 | `decision_kind_serde_golden` | wire JSON locked |
+| `decision_payload_no_session_fields` | wire payload omits session/run |
+| `usage_unknown_consistency_parse` | contradicting flag → Invalid |
 | `worker_metrics_confidence_option` | `ModelCallRecord` round-trips `confidence: None` |
+| `shared_cost_meter_no_lost_updates` | concurrent adds; totals match |
+| `shared_cost_meter_poison_recovers` | poisoned mutex → into_inner, continues |
+| `metadata_rejects_non_object` | array/string → Invalid |
+| `size_cap_rejects_huge_body` | >256 KiB → Invalid |
 
 ### Integration tests (`tests/obs_rfc0004.rs`)
 
 | Test | Asserts |
 | --- | --- |
-| `decision_append_and_list` | `EventDecisionLog::record` → `list_decision_events` sees payload with hash, null body under defaults |
+| `decision_append_and_list` | record → `DecisionPage` with hash, null body under defaults |
 | `model_call_and_tool_call_round_trip` | parse helpers restore records |
-| `replay_after_restart` | close/reopen storage; same seq/type/payload JSON |
-| `opt_in_prompt_retention` | with config flags true, body present (redacted) |
-| `budget_warning_hook_integration` | drive `SharedCostMeter` past policy; `maybe_signal_budget_warning` → `BudgetWarning` event with snapshot |
-| `reaccumulate_cost_from_events` | rebuild meter from ModelCall events matches original snapshot totals |
-| `append_failure_surfaces_obs_error` | fault injection / closed store → `ObsError::Append` / `Store` |
-| `never_writes_dotenv` | temp workspace load/record leaves `.env` sentinel untouched |
+| `list_decision_events_cursor` | `next_after` resumes without skipping/duping |
+| `replay_after_restart` | close/reopen; same seq/type/payload JSON |
+| `opt_in_prompt_retention` | flags true → body present (redacted) |
+| `budget_warning_hook_integration` | past policy → `BudgetWarning` |
+| `budget_warning_fails_when_draining` | phase drain → `ObsError::Session` |
+| `reaccumulate_cost_from_events` | rebuild matches; `run: None` aggregates all runs |
+| `reaccumulate_run_filter` | `Some(run)` excludes other runs |
+| `session_missing_rejects_record` | no session row → NotFound |
+| `append_failure_surfaces_obs_error` | `AlloyStorage::close()` then append → `ObsError` |
+| `never_writes_dotenv` | `.env` sentinel untouched |
+| `obs_module_not_imported_by_session_storage_runtime` | static/architecture check or module graph comment test |
 
-Harness: reuse RFC-0002/0003 patterns (`AlloyRuntime` configure/start, `install_sqlite_event_sink`, `SessionPlane::new`, temp `data_dir`).
+Harness: reuse RFC-0002/0003 patterns (`AlloyRuntime`, `install_sqlite_event_sink`, `SessionPlane`, temp `data_dir`).
 
 ---
 
@@ -1145,13 +1293,14 @@ Harness: reuse RFC-0002/0003 patterns (`AlloyRuntime` configure/start, `install_
 
 ### MVP (this RFC)
 
-- `DecisionLog` / `EventDecisionLog`
-- `DecisionRecord` / `DecisionKind` / `ModelCallRecord` / `ToolCallRecord`
-- `CostMeter` / `CostSnapshot` / `SharedCostMeter` / `BudgetCheck`
+- `DecisionLog` / `EventDecisionLog` / `RecordingDecisionLog`
+- `DecisionRecord` / `DecisionKind` / `ModelCallRecord` / `ToolCallRecord` + private wire payloads
+- `CostMeter` / `CostSnapshot` / `SharedCostMeter` / `BudgetCheck` / `CostByTier` / `TierCost`
 - Hash helpers / redaction helpers / `RetentionPolicy`
-- Query helpers + `reaccumulate_cost_from_events`
+- Query helpers (`DecisionPage`) + `reaccumulate_cost_from_events`
 - `maybe_signal_budget_warning`
 - `ObsError`
+- Additive `EventStore::replay_session` `where Self: Sized`
 - Tests in §14
 
 ### Deferred (do not implement here)
@@ -1176,22 +1325,27 @@ Implementation checklist — all items REQUIRED before merge:
 
 - [ ] Default log = **metadata + content hashes only** (`retain_*=false`)
 - [ ] Opt-in full prompts / tool bodies honored via `RuntimeConfig` / `RetentionPolicy`
-- [ ] Secret redaction + `.env` path deny-list applied before retained bodies
-- [ ] `DecisionLog` maps to `SessionEventType::{Decision, ModelCall, ToolCall}` exactly as §3.8
-- [ ] Reusable `CostMeter` / `SharedCostMeter` / `CostSnapshot` APIs available to later RFCs
+- [ ] Secret redaction (incl. JSON key-name deny-list) + `.env` path deny-list; hand-rolled (no `regex` crate)
+- [ ] Size caps enforced (64 KiB metadata / 256 KiB bodies)
+- [ ] `DecisionLog` maps to `SessionEventType::{Decision, ModelCall, ToolCall}` exactly as §3.8; private wire payloads
+- [ ] Session existence checked before append (no orphans)
+- [ ] Reusable `CostMeter` / `SharedCostMeter` / `CostSnapshot` APIs; non-finite USD ignored
 - [ ] Unknown provider usage NEVER fabricates tokens or USD
-- [ ] Persistence is **EventStore-only** (via `RuntimeHandle::append_session`) — no parallel obs DB
-- [ ] No OTLP crate / exporter added
+- [ ] `EventStore::replay_session` gains `where Self: Sized` (§3.1a); helpers use `&dyn EventStore` + `list_session_events`
+- [ ] `DecisionPage` cursor semantics implemented
+- [ ] Persistence is **EventStore-only** — no parallel obs DB
+- [ ] No OTLP crate / exporter; no `regex` crate added for this RFC
 - [ ] No numeric savings claims in code or docs output
-- [ ] `maybe_signal_budget_warning` integrates with RFC-0003 `SessionPlane::signal_budget_warning`
-- [ ] `WorkerMetrics.confidence: Option<f32>` compatibility preserved (no revert to required `f32`)
-- [ ] `reaccumulate_cost_from_events` rebuilds meter after restart
-- [ ] Unit + integration tests in §14 passing
+- [ ] `maybe_signal_budget_warning` integrates with RFC-0003 hook; drain-phase behavior documented
+- [ ] `WorkerMetrics.confidence: Option<f32>` compatibility preserved
+- [ ] `reaccumulate_cost_from_events` rebuilds meter; `run: None` = all runs; ModelCall-backed only
+- [ ] Unit + integration tests in §14 passing (incl. concurrency, poison, redaction, caps)
 - [ ] `cargo fmt -p alloy-runtime -- --check` clean
 - [ ] `cargo clippy -p alloy-runtime --all-targets -- -D warnings` clean
+- [ ] `session` / `storage` / `runtime` do not depend on `obs`
 - [ ] Workspace still **≤5 crates** / exactly five members
-- [ ] `.env` never written; `example.env` policy preserved (unchanged)
-- [ ] Crate root re-exports updated explicitly (no glob)
+- [ ] `.env` never written; `example.env` policy preserved
+- [ ] Crate root re-exports updated explicitly (no glob); `#![deny(missing_docs)]` satisfied
 - [ ] Series [Definition of Done](./README.md#definition-of-done-merge-gate) satisfied
 
 ## Definition of Done
@@ -1221,7 +1375,7 @@ Only genuine unresolved implementation spikes — settled V2/0001/0002/0003 deci
 **Settled (do not reopen):**
 
 - ADR F-17 metadata+hashes default; prompts/bodies opt-in
-- No separate OTel/OTLP crate in MVP
+- No separate OTel/OTLP crate in MVP; no `regex` crate for this RFC
 - No numeric savings claims until Eval (V2 §18 / ADR F-08)
 - EventStore is the only decision persistence substrate (RFC-0002)
 - `WorkerMetrics.confidence` is `Option<f32>` on main
@@ -1231,6 +1385,10 @@ Only genuine unresolved implementation spikes — settled V2/0001/0002/0003 deci
 - `SessionEventType` vocabulary is fixed by RFC-0001 — do not add variants for obs
 - Node state events are not owned by this RFC
 - Unknown usage MUST NOT fabricate values
+- `append_session` has no phase gate; budget warning requires `Running`
+- Orphan decision appends forbidden (session row required)
+- `Constraint::MaxUsd` not owned here
+- Wire payloads are private structs distinct from public records
 
 ---
 
