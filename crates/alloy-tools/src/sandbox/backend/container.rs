@@ -135,8 +135,8 @@ impl ContainerBackend {
         // network=Deny is required (validated above); always enforce.
         args.push("--network=none".into());
 
-        for p in crate::sandbox::backend::allowlisted_ro_subtrees(&ctx.cargo_home, &ctx.rustup_home)
-        {
+        for p in &ctx.read_only_roots {
+            // Container image supplies its own toolchain/bin; skip host ones.
             if p.ends_with("bin") && p.starts_with(&ctx.cargo_home) {
                 continue;
             }

@@ -654,6 +654,136 @@ async fn landlock_cargo_version_fixture() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "macos")]
+async fn seatbelt_cargo_check_fixture() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixture_root = fixtures.join("sbx_check");
+    assert!(fixture_root.join("Cargo.toml").is_file());
+    let jail = fixtures.canonicalize().unwrap();
+    let cwd = fixture_root.canonicalize().unwrap();
+
+    let mut profile = SandboxProfile::default_for_jail(jail).unwrap();
+    profile.check_backend = SandboxBackend::Seatbelt;
+    profile.test_backend = SandboxBackend::Seatbelt;
+    let broker = match NativeSandboxBroker::new(profile).await {
+        Ok(b) => b,
+        Err(e) => panic!("Seatbelt broker required on macOS CI: {e}"),
+    };
+    assert!(matches!(
+        broker.capabilities().seatbelt,
+        BackendStatus::Available { .. }
+    ));
+
+    let cargo = which_cargo().expect("cargo on PATH");
+    let req = SandboxExecRequest::new(
+        vec![
+            cargo.clone(),
+            "check".into(),
+            "--offline".into(),
+            "--quiet".into(),
+        ],
+        cwd,
+        token(&cargo, Some("check*")),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "seatbelt cargo check failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "macos")]
+async fn seatbelt_denies_outside_jail_read() {
+    let outer = tempdir().unwrap();
+    let sentinel = outer.path().join("secret.txt");
+    std::fs::write(&sentinel, b"outside-secret").unwrap();
+
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
+    profile.check_backend = SandboxBackend::Seatbelt;
+    let broker = NativeSandboxBroker::new(profile).await.expect("seatbelt");
+
+    let script = jail.join("try_read.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ncat '{}'\n", sentinel.display()),
+    )
+    .unwrap();
+    chmod_755(&script);
+
+    let req = SandboxExecRequest::new(
+        vec![sh_bin().into(), script.display().to_string()],
+        jail,
+        token(sh_bin(), None),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        !stdout.contains("outside-secret"),
+        "seatbelt leaked outside-jail read: {stdout:?}"
+    );
+    assert_ne!(result.exit_code, Some(0));
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn container_cargo_check_fixture() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixture_root = fixtures.join("sbx_check");
+    let jail = fixtures.canonicalize().unwrap();
+    let cwd = fixture_root.canonicalize().unwrap();
+
+    let mut profile = SandboxProfile::default_for_jail(jail).unwrap();
+    profile.check_backend = SandboxBackend::Container;
+    profile.test_backend = SandboxBackend::Container;
+    profile.container_image = std::env::var("ALLOY_CONTAINER_IMAGE")
+        .unwrap_or_else(|_| "rust:1.97.1-bookworm".into());
+
+    let broker = match NativeSandboxBroker::new(profile).await {
+        Ok(b) => b,
+        Err(SandboxError::BackendUnavailable { .. }) => {
+            eprintln!("skip: container runtime unavailable");
+            return;
+        }
+        Err(e) => panic!("unexpected: {e:?}"),
+    };
+    if !matches!(
+        broker.capabilities().container,
+        BackendStatus::Available { .. }
+    ) {
+        eprintln!("skip: container probe Unavailable");
+        return;
+    }
+
+    let req = SandboxExecRequest::new(
+        vec![
+            "cargo".into(),
+            "check".into(),
+            "--offline".into(),
+            "--quiet".into(),
+        ],
+        cwd,
+        token("cargo", Some("check*")),
+        ExecClass::Test,
+    );
+    let result = broker.exec(req).await.unwrap();
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "container cargo check failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[tokio::test]
 async fn container_backend_probe_status() {
     // Always runs: asserts the container probe returns a typed status rather
     // than panicking. When a runtime is present the optional CI job can go

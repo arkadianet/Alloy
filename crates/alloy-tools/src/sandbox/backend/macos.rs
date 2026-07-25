@@ -236,32 +236,46 @@ fn render_sbpl(
     ctx: &IsolateContext,
     broker_dir: &Path,
 ) -> Result<String, SandboxError> {
-    let cargo_registry = ctx.cargo_home.join("registry");
-    let cargo_git = ctx.cargo_home.join("git");
-    let cargo_bin = ctx.cargo_home.join("bin");
-    let rustup_toolchains = ctx.rustup_home.join("toolchains");
-    let rustup_settings = ctx.rustup_home.join("settings.toml");
-
     let mut deny_clauses = String::new();
     for path in crate::sandbox::backend::credential_bind_targets(&ctx.cargo_home)
         .into_iter()
         .chain(ctx.deny_paths.iter().cloned())
     {
-        let lit = sbpl_literal(&path);
-        deny_clauses.push_str(&format!("(deny file-read* file-write* (subpath {lit}))\n"));
+        let matcher = if path.is_file() {
+            format!("(literal {})", sbpl_literal(&path))
+        } else {
+            format!("(subpath {})", sbpl_literal(&path))
+        };
+        deny_clauses.push_str(&format!("(deny file-read* file-write* {matcher})\n"));
+    }
+
+    // Match Linux: grant every allowlisted RO root from IsolateContext
+    // (config.toml, .package-cache, toolchains, …).
+    let mut ro_clauses = String::new();
+    for p in &ctx.read_only_roots {
+        if !p.exists() {
+            continue;
+        }
+        if p.is_file() {
+            ro_clauses.push_str(&format!(
+                "(allow file-read* (literal {}))\n",
+                sbpl_literal(p)
+            ));
+        } else {
+            ro_clauses.push_str(&format!(
+                "(allow file-read* (subpath {}))\n",
+                sbpl_literal(p)
+            ));
+        }
     }
 
     let mut body = TEMPLATE
         .replace("{{JAIL}}", &sbpl_literal(&profile.fs_jail))
         .replace("{{TMP}}", &sbpl_literal(&ctx.exec_dir.join("tmp")))
         .replace("{{HOME}}", &sbpl_literal(&ctx.exec_dir.join("home")))
-        .replace("{{BROKER_DIR}}", &sbpl_literal(broker_dir))
-        .replace("{{CARGO_REGISTRY}}", &sbpl_literal(&cargo_registry))
-        .replace("{{CARGO_GIT}}", &sbpl_literal(&cargo_git))
-        .replace("{{CARGO_BIN}}", &sbpl_literal(&cargo_bin))
-        .replace("{{RUSTUP_TOOLCHAINS}}", &sbpl_literal(&rustup_toolchains))
-        .replace("{{RUSTUP_SETTINGS}}", &sbpl_literal(&rustup_settings));
+        .replace("{{BROKER_DIR}}", &sbpl_literal(broker_dir));
     body.push('\n');
+    body.push_str(&ro_clauses);
     body.push_str(&deny_clauses);
     Ok(body)
 }

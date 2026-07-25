@@ -1,8 +1,9 @@
 ;; Alloy Seatbelt profile template (RFC-0005).
-;; Placeholders: {{JAIL}} {{TMP}} {{HOME}} {{BROKER_DIR}} {{CARGO_REGISTRY}} {{CARGO_GIT}} {{CARGO_BIN}} {{RUSTUP_TOOLCHAINS}} {{RUSTUP_SETTINGS}}
-;; Deny clauses for credential/deny-glob paths are appended by the broker.
-;; Whole CARGO_HOME / RUSTUP_HOME are NOT granted — allowlisted subtrees only.
+;; Placeholders: {{JAIL}} {{TMP}} {{HOME}} {{BROKER_DIR}}
+;; RO cargo/rustup roots and deny clauses are appended by the broker from
+;; IsolateContext (must match Linux allowlisted_ro_subtrees).
 ;; {{BROKER_DIR}} is outside the jail (SBPL + trampoline); never jail-writable.
+;; Do NOT grant whole /tmp — only the broker-owned leaf directory.
 (version 1)
 (deny default)
 (allow process*)
@@ -19,16 +20,9 @@
 (allow file-read* (subpath "/sbin"))
 (allow file-read* (subpath "/System"))
 (allow file-read* (subpath "/Library"))
-(allow file-read* (subpath "/private/tmp"))
-(allow file-read* (subpath "/tmp"))
 (allow file-read* file-write* (literal "/dev/null"))
 (allow file-read* (literal "/dev/urandom"))
 (allow file-read* (literal "/dev/zero"))
 (allow file-read* (subpath "/dev"))
 (allow file-read* (subpath "/private/var/db/timezone"))
-(allow file-read* (subpath {{CARGO_REGISTRY}}))
-(allow file-read* (subpath {{CARGO_GIT}}))
-(allow file-read* (subpath {{CARGO_BIN}}))
-(allow file-read* (subpath {{RUSTUP_TOOLCHAINS}}))
-(allow file-read* (literal {{RUSTUP_SETTINGS}}))
 (deny network*)

@@ -73,9 +73,11 @@ arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
   failure at **probe** time marks Landlock `Unavailable` (fail closed on
   `NativeSandboxBroker::new`). Nested user namespaces (some CI / cloud agent
   hosts) may refuse `uid_map` writes → Unavailable even when Landlock ABI exists.
-  After binds apply, the broker drops `CAP_SYS_ADMIN` from the bounding/effective
-  sets and locks `SECBIT_NOROOT` so the child cannot `umount` deny-glob binds
-  (verified by `child_cannot_umount_dotenv_bind`).
+  After binds apply, the broker also drops `CAP_SYS_ADMIN` and locks
+  `SECBIT_NOROOT`. The load-bearing umount defense is the **Landlock domain**
+  itself (Landlock's mount hooks deny `umount`/`mount` for sandboxed tasks even
+  if a nested userns restores capabilities); the cap drop is defense-in-depth.
+  Verified by `child_cannot_umount_dotenv_bind`.
 - **Seatbelt** uses `/usr/bin/sandbox-exec` (Apple-deprecated). MVP uses a bash
   trampoline for the ready-byte handshake and `exec -a` argv0 preservation;
   arguments are never re-joined into an unquoted `bash -c` string. The SBPL and

@@ -66,10 +66,7 @@ jobs:
           components: clippy
       - name: Compile alloy-tools (required — Seatbelt must build)
         run: cargo check -p alloy-tools --features test-hooks
-      - name: Test alloy-tools
-        # Seatbelt probe/exec may still be environment-dependent; keep tests
-        # best-effort but never allow a non-compiling backend to merge.
-        continue-on-error: true
+      - name: Test alloy-tools (Seatbelt enforcement)
         run: cargo test -p alloy-tools --features test-hooks -- --nocapture
       - name: Clippy
         run: cargo clippy -p alloy-tools --all-targets --features test-hooks -- -D warnings
