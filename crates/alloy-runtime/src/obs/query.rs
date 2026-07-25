@@ -23,7 +23,7 @@ pub struct DecisionPage {
     ///
     /// - `None` — the scan reached the end of the session log (no more events to scan).
     /// - `Some(seq)` — more store events may exist after `seq` (including when the
-    ///   [`MAX_SCAN_PAGES`] budget was exhausted **with zero matches**). Callers MUST
+    ///   `MAX_SCAN_PAGES` budget was exhausted **with zero matches**). Callers MUST
     ///   resume with `after = next_after` rather than stopping on empty `events`.
     pub next_after: Option<EventSeq>,
 }
@@ -43,7 +43,7 @@ fn is_decision_related(t: SessionEventType) -> bool {
 /// - `limit == 0` is treated as `1` matching event max.
 /// - `limit` is the max **matching** events returned (clamped to [`MAX_EVENTS_PAGE`]).
 /// - Internally scans store pages of size `clamp_events_page_limit(MAX_EVENTS_PAGE)` until
-///   `events.len() == limit`, a store page returns short/empty, **or** [`MAX_SCAN_PAGES`]
+///   `events.len() == limit`, a store page returns short/empty, **or** `MAX_SCAN_PAGES`
 ///   (16) store pages have been read — then returns with `next_after` set so the caller
 ///   can resume. Empty `events` with `Some(next_after)` means “no matches in this scan
 ///   window; keep paging.”

@@ -1,0 +1,54 @@
+# Workspace CI — mechanises the RFC Definition of Done merge gate.
+#
+# Gates 3/4 (unit + integration tests), 7 (clippy), 8 (fmt) and the docs half of
+# gate 5 run here, workspace-wide and unfiltered by path. Sandbox-specific
+# backend coverage (Landlock / Seatbelt / container) lives in `sandbox.yml`.
+#
+# See docs/rfcs/README.md#definition-of-done-merge-gate
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: fmt · clippy · test · doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep in sync with rust-toolchain.toml (MSRV 1.97.1) — CI builds at MSRV
+      # so a too-new language feature fails here rather than for a user.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting (DoD 8)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (DoD 7)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests (DoD 3, 4)
+        run: cargo test --workspace
+
+      # `alloy-runtime` is `#![deny(missing_docs)]`; this also catches broken
+      # intra-doc links, which the compiler does not surface during a normal build.
+      - name: Docs (DoD 5)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
