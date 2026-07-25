@@ -1,0 +1,10 @@
+[package]
+name = "sbx_check"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+sbx_dep = { path = "../sbx_dep" }

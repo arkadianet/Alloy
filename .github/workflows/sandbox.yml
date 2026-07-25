@@ -1,0 +1,97 @@
+# RFC-0005 Sandbox Broker CI
+
+name: sandbox
+
+on:
+  push:
+    paths:
+      - "crates/alloy-tools/**"
+      - "crates/alloy-runtime/**"
+      - "profiles/**"
+      - "docs/security/sandbox-residual-risk.md"
+      - ".github/workflows/sandbox.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "crates/alloy-tools/**"
+      - "crates/alloy-runtime/**"
+      - "profiles/**"
+      - "docs/security/sandbox-residual-risk.md"
+      - ".github/workflows/sandbox.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-landlock:
+    name: Linux Landlock (required)
+    runs-on: ubuntu-latest
+    env:
+      # Fail closed: Unavailable Landlock must fail the job, not skip green.
+      ALLOY_REQUIRE_LANDLOCK: "1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (1.97.1)
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Enable unprivileged user namespaces
+        run: |
+          # ubuntu-24.04 defaults to apparmor_restrict_unprivileged_userns=1,
+          # which makes Landlock+userns probes Unavailable and fails the suite.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+      - name: Test alloy-tools
+        run: cargo test -p alloy-tools --locked -- --nocapture
+      - name: Require Landlock enforcement test ran
+        run: |
+          cargo test -p alloy-tools --locked --test sandbox_rfc0005 landlock_actually_applied -- --nocapture --exact
+      - name: Clippy (deny warnings)
+        run: cargo clippy -p alloy-tools --locked --all-targets -- -D warnings
+      - name: Fmt
+        run: cargo fmt --all -- --check
+
+  macos-seatbelt:
+    name: macOS Seatbelt (compile + test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (1.97.1)
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - name: Compile alloy-tools (required — Seatbelt must build)
+        run: cargo check -p alloy-tools --locked
+      - name: Test alloy-tools
+        # Seatbelt deny-default profiles currently SIGABRT on macOS 26 runners
+        # (sandbox-exec deprecated). Probe marks Unavailable (fail closed);
+        # enforcement tests skip unless ALLOY_REQUIRE_SEATBELT=1.
+        run: cargo test -p alloy-tools --locked -- --nocapture
+      - name: Clippy
+        run: cargo clippy -p alloy-tools --locked --all-targets -- -D warnings
+
+  container:
+    name: Container backend (optional)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (1.97.1)
+        with:
+          toolchain: 1.97.1
+      - name: Container smoke + probe tests
+        # Tests self-skip when the daemon is Unavailable. Real assertion
+        # failures fail the job (this job is optional in branch protection).
+        run: cargo test -p alloy-tools --locked --test sandbox_rfc0005 container_ -- --nocapture

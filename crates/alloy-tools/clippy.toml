@@ -1,0 +1,5 @@
+# RFC-0005: bare process spawn only in sandbox::process / sandbox::backend.
+disallowed-methods = [
+    "std::process::Command::new",
+    "tokio::process::Command::new",
+]

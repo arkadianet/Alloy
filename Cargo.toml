@@ -26,7 +26,7 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 time = { version = "0.3", features = ["serde", "serde-human-readable", "formatting", "parsing"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "process", "io-util", "test-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.8"
 tracing = "0.1"
@@ -37,3 +37,7 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 assert_cmd = "2"
 predicates = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
+globset = "0.4"
+rustix = { version = "0.38", features = ["process", "fs", "thread", "mount", "net", "stdio", "pipe"] }
+libc = "0.2"
+landlock = "0.4"
