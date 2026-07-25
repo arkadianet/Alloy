@@ -13,14 +13,17 @@ use tracing::{info, warn};
 
 use super::goal_record::RunGoalRecord;
 use super::inner::SessionInner;
-use super::map_err::runtime_to_session;
-use super::metrics::AtomicSessionMetrics;
+use super::map_err::{run_to_session, runtime_to_session};
 use super::profiles::validate_mvp_profile;
+use super::run_controller::{
+    append_run_completed, emit_run_finished, synthetic_outcome, upsert_state,
+};
 use super::run_state::RunControlState;
 use super::traits::{clamp_events_page_limit, Session, SessionService};
 use crate::error::SessionError;
 use crate::events::{NewSessionEvent, SessionEvent, SessionEventType};
 use crate::runtime::RuntimePhase;
+use crate::scheduler::DagState;
 use crate::storage::{store_to_session, EventStore, RunRow, SessionRows};
 use crate::types::budget::{CreateSession, Goal};
 use crate::types::ids::{DagId, EventSeq, RunId, SessionId, Timestamp};
@@ -69,8 +72,18 @@ impl SessionServiceView {
             .ok_or(SessionError::NotFound(id))
     }
 
-    /// §5.3 step 9: rewrite one crash-recovery row. Returns the new state when rewritten.
-    async fn rearm_run(&self, row: &RunRow, state: RunControlState) -> Result<(), SessionError> {
+    /// §5.3 step 9: rewrite one crash-recovery row, holding the per-run mutex.
+    ///
+    /// `running` / `waiting_approval` go back to `accepted` so the run is re-dispatchable.
+    /// A `cancelling` row is instead **finalized**: the cancel that wrote it died with the
+    /// process that owned it, so resume owes the durable terminal state plus the
+    /// `RunCompleted` / `RunFinished` pair that no other writer will ever produce.
+    async fn rearm_run(
+        &self,
+        row: &RunRow,
+        state: RunControlState,
+        dag_id: Option<DagId>,
+    ) -> Result<(), SessionError> {
         let target = match state {
             RunControlState::Running | RunControlState::WaitingApproval => {
                 RunControlState::Accepted
@@ -78,21 +91,41 @@ impl SessionServiceView {
             RunControlState::Cancelling => RunControlState::Cancelled,
             _ => return Ok(()),
         };
-        let rewritten = RunRow {
-            state: target.as_str().to_owned(),
-            updated_at: Timestamp::now(),
-            ..row.clone()
-        };
-        self.rows()
-            .upsert_run(&rewritten)
+        // `cancelling` is only reachable once a run has left `created`, so its acceptance
+        // was announced before the crash.
+        let accepted = self.inner.was_accepted(row.id, state);
+        upsert_state(&self.inner, row, target)
             .await
-            .map_err(store_to_session)?;
+            .map_err(run_to_session)?;
         info!(
             run_id = %row.id,
             from = state.as_str(),
             to = target.as_str(),
             "resume re-armed run control state"
         );
+
+        if target != RunControlState::Cancelled {
+            return Ok(());
+        }
+        append_run_completed(
+            &self.inner,
+            row.session_id,
+            row.id,
+            DagState::Cancelled,
+            Some("resume_finalized_cancel"),
+        )
+        .await
+        .map_err(run_to_session)?;
+        if let Some(dag_id) = dag_id.filter(|_| accepted) {
+            emit_run_finished(
+                &self.inner,
+                row.id,
+                synthetic_outcome(dag_id, DagState::Cancelled),
+            )
+            .await
+            .map_err(run_to_session)?;
+        }
+        self.inner.metrics.bump_runs_cancelled();
         Ok(())
     }
 }
@@ -154,10 +187,10 @@ impl SessionService for SessionServiceView {
             .await
             .map_err(|e| {
                 warn!(session_id = %id, error = %e, "session row persisted without SessionCreated");
-                SessionError::Internal(format!("append SessionCreated for {id}: {e}"))
+                runtime_to_session(e)
             })?;
 
-        AtomicSessionMetrics::inc(&self.inner.metrics.sessions_created);
+        self.inner.metrics.bump_sessions_created();
         info!(session_id = %id, profile = session.profile.as_str(), "session created");
         Ok(id)
     }
@@ -169,6 +202,9 @@ impl SessionService for SessionServiceView {
     /// instead of being re-armed. Gate waiters and `live_execution` are process-local
     /// and start empty in a fresh process; a resume in a live process leaves in-flight
     /// leases alone because in-process outcomes are not crash recovery.
+    ///
+    /// Each row is re-read under its per-run mutex, so resume serializes against a
+    /// concurrent `cancel` / `start` instead of racing the listing snapshot.
     async fn resume(&self, id: SessionId) -> Result<Session, SessionError> {
         require_read_phase(&self.inner)?;
         let session = match self.load_session(id).await {
@@ -180,30 +216,38 @@ impl SessionService for SessionServiceView {
             Err(e) => return Err(e),
         };
 
-        for row in self.rows().list_runs(id).await.map_err(store_to_session)? {
-            let Some(state) = RunControlState::parse(&row.state) else {
-                warn!(run_id = %row.id, state = %row.state, "skipping run with unknown control state");
+        let listed = self.rows().list_runs(id).await.map_err(store_to_session)?;
+        for run in listed.into_iter().map(|row| row.id) {
+            // The listing is a snapshot. Every run-control write is serialized on the
+            // per-run mutex, so take it and re-read the row before deciding anything:
+            // otherwise a concurrent `cancel` can be rewritten from a stale state.
+            let _lock = self.inner.lock_run(run).await;
+            let Some(row) = self.rows().get_run(run).await.map_err(store_to_session)? else {
                 continue;
             };
-            let goal_ok = match serde_json::from_value::<RunGoalRecord>(row.goal_json.clone()) {
-                Ok(_) => true,
+            let Some(state) = RunControlState::parse(&row.state) else {
+                warn!(run_id = %run, state = %row.state, "skipping run with unknown control state");
+                continue;
+            };
+            let dag_id = match serde_json::from_value::<RunGoalRecord>(row.goal_json.clone()) {
+                Ok(record) => Some(record.dag_id),
                 Err(e) => {
-                    warn!(run_id = %row.id, error = %e, "skipping run binding: corrupt goal_json");
-                    false
+                    warn!(run_id = %run, error = %e, "skipping run binding: corrupt goal_json");
+                    None
                 }
             };
             // A corrupt run is never dispatched, so re-arming it would only hide the
             // problem — except for `cancelling`, which MUST still be finalized (§5.3).
-            if !goal_ok && state != RunControlState::Cancelling {
+            if dag_id.is_none() && state != RunControlState::Cancelling {
                 continue;
             }
-            if self.inner.has_live(row.id) {
+            if self.inner.has_live(run) {
                 continue;
             }
-            self.rearm_run(&row, state).await?;
+            self.rearm_run(&row, state, dag_id).await?;
         }
 
-        AtomicSessionMetrics::inc(&self.inner.metrics.sessions_resumed);
+        self.inner.metrics.bump_sessions_resumed();
         info!(session_id = %id, "session resumed");
         Ok(session)
     }
@@ -252,7 +296,7 @@ impl SessionService for SessionServiceView {
             .await
             .map_err(runtime_to_session)?;
 
-        AtomicSessionMetrics::inc(&self.inner.metrics.goals_submitted);
+        self.inner.metrics.bump_goals_submitted();
         info!(session_id = %id, run_id = %run, dag_id = %dag_id, "goal submitted");
         Ok(run)
     }
