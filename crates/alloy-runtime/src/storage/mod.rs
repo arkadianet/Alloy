@@ -129,7 +129,13 @@ impl AlloyStorage {
 
     /// Force WAL checkpoint (uses connection `synchronous` from open).
     pub async fn checkpoint(&self) -> Result<(), StoreError> {
-        let _permit = self.gate.enter()?;
+        // Admit briefly, then release before `spawn_blocking` so `close`'s
+        // drain (which may itself run on the blocking pool) is not stuck
+        // waiting on `in_flight` while this task waits for a pool thread.
+        // `DbHandle`'s mutex still serializes connection use vs `take_connection`.
+        {
+            let _permit = self.gate.enter()?;
+        }
         match checkpoint::checkpoint_truncate_async(Arc::clone(&self.db)).await {
             Ok(()) => {
                 self.metrics.inc_checkpoints();
@@ -187,11 +193,15 @@ impl AlloyStorage {
                             Err(StoreError::Busy) => {
                                 metrics.inc_busy_errors();
                                 // Still close — but surface busy so callers know flush was incomplete.
-                                let _ = db.take_connection().ok().flatten().map(|c| c.close());
+                                if let Ok(Some(conn)) = db.take_connection() {
+                                    let _ = conn.close();
+                                }
                                 return Err(StoreError::Busy);
                             }
                             Err(e) => {
-                                let _ = db.take_connection().ok().flatten().map(|c| c.close());
+                                if let Ok(Some(conn)) = db.take_connection() {
+                                    let _ = conn.close();
+                                }
                                 return Err(e);
                             }
                         }
