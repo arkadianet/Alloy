@@ -15,7 +15,6 @@ use tracing::{info, warn};
 use super::goal_record::RunGoalRecord;
 use super::inner::SessionInner;
 use super::map_err::{runtime_to_run, store_to_run};
-use super::metrics::AtomicSessionMetrics;
 use super::run_state::RunControlState;
 use super::traits::{ReplanReason, RunController};
 use crate::adapters::Approval;
@@ -63,6 +62,10 @@ pub(super) fn parse_state(row: &RunRow) -> Result<RunControlState, RunError> {
 }
 
 /// Persist a new control state for `row` (row-first ordering).
+///
+/// A terminal write also prunes process-local run tracking via
+/// [`SessionInner::on_terminal`], so no caller has to remember to release the
+/// execution lease or the `RunAccepted` marker itself.
 pub(super) async fn upsert_state(
     inner: &SessionInner,
     row: &RunRow,
@@ -73,12 +76,19 @@ pub(super) async fn upsert_state(
         updated_at: Timestamp::now(),
         ..row.clone()
     };
+    if inner.take_fail_run_upsert() {
+        return Err(RunError::Internal("injected upsert failure".into()));
+    }
     inner
         .storage
         .sessions()
         .upsert_run(&next)
         .await
-        .map_err(store_to_run)
+        .map_err(store_to_run)?;
+    if state.is_terminal() {
+        inner.on_terminal(row.id);
+    }
+    Ok(())
 }
 
 /// Deserialize the goal envelope; corrupt JSON is an internal error (§4).
@@ -95,6 +105,9 @@ async fn append_run_event(
     type_: SessionEventType,
     payload: Value,
 ) -> Result<(), RunError> {
+    if inner.take_fail_append() {
+        return Err(RunError::Internal("injected append failure".into()));
+    }
     inner
         .handle
         .append_session(NewSessionEvent {
@@ -126,7 +139,7 @@ async fn append_error_event(
 }
 
 /// `RunCompleted` payload carries the DAG state that terminated the run.
-async fn append_run_completed(
+pub(super) async fn append_run_completed(
     inner: &SessionInner,
     session: SessionId,
     run: RunId,
@@ -141,7 +154,7 @@ async fn append_run_completed(
 }
 
 /// Emit the host `RunFinished` event (terminal outcomes only).
-async fn emit_run_finished(
+pub(super) async fn emit_run_finished(
     inner: &SessionInner,
     run: RunId,
     outcome: DagOutcome,
@@ -157,7 +170,7 @@ async fn emit_run_finished(
 }
 
 /// Outcome recorded when a run terminates without a scheduler-provided outcome.
-fn synthetic_outcome(dag_id: DagId, state: DagState) -> DagOutcome {
+pub(super) fn synthetic_outcome(dag_id: DagId, state: DagState) -> DagOutcome {
     DagOutcome {
         dag_id,
         generation: 0,
@@ -167,16 +180,23 @@ fn synthetic_outcome(dag_id: DagId, state: DagState) -> DagOutcome {
     }
 }
 
-/// Control states that a late `run_dag` completion must not clobber (§6.3 step 9a).
-fn is_advanced(state: RunControlState) -> bool {
+/// States written by an explicit control call — `cancel`, `request_replan`, or
+/// `register_gate_waiter` — that a late `run_dag` completion must not clobber (§6.3 step
+/// 9a). Losing this race is the designed outcome, not an anomaly.
+fn is_control_protected(state: RunControlState) -> bool {
     matches!(
         state,
         RunControlState::ReplanRequested
             | RunControlState::Cancelling
             | RunControlState::Cancelled
-            | RunControlState::Succeeded
-            | RunControlState::Failed
+            | RunControlState::WaitingApproval
     )
+}
+
+/// Terminal states no control call in §6 writes without going through `start` itself, so
+/// finding one here means a second writer finalized the run mid-`run_dag`.
+fn is_terminal_durable(state: RunControlState) -> bool {
+    matches!(state, RunControlState::Succeeded | RunControlState::Failed)
 }
 
 /// `Arc<dyn RunController>` view over the shared session plane.
@@ -200,16 +220,30 @@ impl RunControllerView {
         let session = row.session_id;
         let durable = parse_state(&row)?;
 
-        if is_advanced(durable) {
+        if is_control_protected(durable) {
+            // A cancel, replan, or gate registration landed while we awaited. Preserving
+            // it is the contract, so this is an expected merge rather than a fault.
+            info!(
+                run_id = %run,
+                state = durable.as_str(),
+                "start outcome merged: control transition took precedence"
+            );
+            if matches!(
+                result,
+                Err(RuntimeError::SchedulerUnavailable
+                    | RuntimeError::Scheduler(SchedError::Unavailable))
+            ) {
+                self.inner.metrics.bump_runs_start_unavailable();
+            }
+            return Ok(());
+        }
+
+        if is_terminal_durable(durable) {
             warn!(
                 run_id = %run,
                 state = durable.as_str(),
-                "start outcome merged: durable state advanced during run_dag"
+                "start outcome merged: durable state already terminal"
             );
-            // A cancel or replan landed while we awaited: preserve it, drop this outcome.
-            if durable != RunControlState::Succeeded && durable != RunControlState::Failed {
-                return Ok(());
-            }
             return match result {
                 Ok(_) => Err(RunError::InvalidPhase("state advanced during run".into())),
                 Err(RuntimeError::Scheduler(SchedError::Cancelled)) => Ok(()),
@@ -229,7 +263,7 @@ impl RunControllerView {
                     synthetic_outcome(dag_id, DagState::Cancelled),
                 )
                 .await?;
-                AtomicSessionMetrics::inc(&self.inner.metrics.runs_cancelled);
+                self.inner.metrics.bump_runs_cancelled();
                 Ok(())
             }
             Err(
@@ -237,7 +271,7 @@ impl RunControllerView {
                 | RuntimeError::Scheduler(SchedError::Unavailable),
             ) => {
                 // Durable state stays `accepted`: the run remains re-dispatchable.
-                AtomicSessionMetrics::inc(&self.inner.metrics.runs_start_unavailable);
+                self.inner.metrics.bump_runs_start_unavailable();
                 warn!(run_id = %run, "start unavailable: no executable scheduler");
                 append_error_event(&self.inner, session, run, "scheduler_unavailable", None).await;
                 Err(RunError::SchedulerUnavailable)
@@ -300,7 +334,7 @@ impl RunControllerView {
         append_run_completed(&self.inner, session, run, state, None).await?;
         emit_run_finished(&self.inner, run, outcome).await?;
         if control == RunControlState::Cancelled {
-            AtomicSessionMetrics::inc(&self.inner.metrics.runs_cancelled);
+            self.inner.metrics.bump_runs_cancelled();
         }
         info!(run_id = %run, dag_state = ?state, "run finished");
         Ok(())
@@ -318,6 +352,10 @@ impl RunControllerView {
         let resolved = json!({ "gate_id": gate, "decision": decision });
 
         if decision == Approval::Deny {
+            // `row` is still `waiting_approval`, so acceptance is implied even when the
+            // `RunAccepted` emission happened in an earlier process. Sample it before the
+            // terminal write prunes the process-local marker.
+            let accepted = self.inner.was_accepted(run, parse_state(row)?);
             upsert_state(&self.inner, row, RunControlState::Failed).await?;
             self.inner.gates.clear_run(run);
             append_run_event(
@@ -337,7 +375,7 @@ impl RunControllerView {
             )
             .await?;
             match parse_goal(row) {
-                Ok(record) if self.inner.was_accepted_emitted(run) => {
+                Ok(record) if accepted => {
                     emit_run_finished(
                         &self.inner,
                         run,
@@ -379,9 +417,11 @@ impl RunController for RunControllerView {
 
         let row = load_run(&self.inner, run).await?;
         let state = parse_state(&row)?;
-        let dag_id = parse_goal(&row)?.dag_id;
         let live = self.inner.has_live(run);
 
+        // State guards run before the goal envelope is parsed: a live, cancelling,
+        // replan-pending, or terminal run is not dispatchable whatever its payload says,
+        // and the state error is the one the caller can act on.
         match state {
             RunControlState::Created | RunControlState::Accepted if live => {
                 return Err(RunError::AlreadyStarted(run));
@@ -401,6 +441,7 @@ impl RunController for RunControllerView {
             }
         }
 
+        let dag_id = parse_goal(&row)?.dag_id;
         let first_dispatch = state == RunControlState::Created;
         if first_dispatch {
             upsert_state(&self.inner, &row, RunControlState::Accepted).await?;
@@ -415,8 +456,10 @@ impl RunController for RunControllerView {
             self.inner.mark_accepted_emitted(run);
         }
 
-        self.inner.set_live(run, true);
-        AtomicSessionMetrics::inc(&self.inner.metrics.runs_started);
+        // The lease is held across the await so a cancelled/aborted `start` future still
+        // releases it via `Drop`; a completed dispatch releases it explicitly below.
+        let lease = self.inner.acquire_lease(run);
+        self.inner.metrics.bump_runs_started();
         info!(run_id = %run, dag_id = %dag_id, redispatch = !first_dispatch, "run start");
 
         let ticket = lock.unlock();
@@ -424,8 +467,10 @@ impl RunController for RunControllerView {
         let lock = ticket.relock().await;
 
         let applied = self.apply_start_outcome(run, dag_id, result).await;
-        // Lease is released only after the durable transition for this result.
-        self.inner.set_live(run, false);
+        // The durable transition for this dispatch is recorded, so the run may be
+        // re-dispatched. `disarm` keeps `Drop` from repeating a release we just did.
+        self.inner.clear_lease(run);
+        lease.disarm();
         drop(lock);
         applied
     }
@@ -438,6 +483,9 @@ impl RunController for RunControllerView {
         let row = load_run(&self.inner, run).await?;
         let session = row.session_id;
         let state = parse_state(&row)?;
+        if state.is_terminal() {
+            return Ok(());
+        }
         let dag_id = match parse_goal(&row) {
             Ok(record) => Some(record.dag_id),
             Err(e) => {
@@ -445,10 +493,8 @@ impl RunController for RunControllerView {
                 None
             }
         };
-        if state.is_terminal() {
-            return Ok(());
-        }
-        let left_created = state != RunControlState::Created;
+        // Sampled before any terminal write prunes the process-local acceptance marker.
+        let accepted = self.inner.was_accepted(run, state);
 
         upsert_state(&self.inner, &row, RunControlState::Cancelling).await?;
         self.inner.gates.clear_run(run);
@@ -467,12 +513,20 @@ impl RunController for RunControllerView {
             return Err(runtime_to_run(e));
         }
 
-        upsert_state(&self.inner, &row, RunControlState::Cancelled).await?;
-        self.inner.set_live(run, false);
+        // The row was writable by others while `cancel_dag` was awaited (a resume
+        // finalizing this cancel, for instance), so finalize from a fresh read.
+        let fresh = load_run(&self.inner, run).await?;
+        if parse_state(&fresh)?.is_terminal() {
+            info!(run_id = %run, "cancel found the run already finalized");
+            drop(lock);
+            return Ok(());
+        }
+
+        upsert_state(&self.inner, &fresh, RunControlState::Cancelled).await?;
         append_run_completed(&self.inner, session, run, DagState::Cancelled, None).await?;
 
         if let Some(dag_id) = dag_id {
-            if self.inner.was_accepted_emitted(run) || left_created {
+            if accepted {
                 emit_run_finished(
                     &self.inner,
                     run,
@@ -482,7 +536,7 @@ impl RunController for RunControllerView {
             }
         }
 
-        AtomicSessionMetrics::inc(&self.inner.metrics.runs_cancelled);
+        self.inner.metrics.bump_runs_cancelled();
         info!(run_id = %run, "run cancelled");
         drop(lock);
         Ok(())
@@ -526,7 +580,7 @@ impl RunController for RunControllerView {
             .send(decision)
             .map_err(|_| RunError::Internal("gate waiter dropped".into()))?;
 
-        AtomicSessionMetrics::inc(&self.inner.metrics.approvals_resolved);
+        self.inner.metrics.bump_approvals_resolved();
         info!(run_id = %run, gate_id = %gate, decision = ?decision, "approval resolved");
         Ok(())
     }
@@ -538,10 +592,10 @@ impl RunController for RunControllerView {
 
         let row = load_run(&self.inner, run).await?;
         let session = row.session_id;
-        let state = parse_state(&row)?;
-        parse_goal(&row)?;
 
-        match state {
+        // Replan records intent only; it never dispatches, so the goal envelope is
+        // irrelevant here and a corrupt one must not block recording the request.
+        match parse_state(&row)? {
             RunControlState::Accepted
             | RunControlState::Running
             | RunControlState::WaitingApproval => {}
@@ -568,7 +622,7 @@ impl RunController for RunControllerView {
         )
         .await?;
 
-        AtomicSessionMetrics::inc(&self.inner.metrics.replans_requested);
+        self.inner.metrics.bump_replans_requested();
         info!(run_id = %run, "replan requested");
         Ok(())
     }
