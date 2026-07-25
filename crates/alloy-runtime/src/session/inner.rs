@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -27,8 +28,10 @@ pub(crate) struct SessionInner {
     pub gates: GateWaiterRegistry,
     pub metrics: AtomicSessionMetrics,
     /// Test-only: next `upsert_run` via control plane fails once.
+    #[cfg(test)]
     pub(crate) fail_next_run_upsert: AtomicBool,
     /// Test-only: next session-event append via control plane fails once.
+    #[cfg(test)]
     pub(crate) fail_next_append: AtomicBool,
 }
 
@@ -43,7 +46,9 @@ impl SessionInner {
             accepted_emitted: StdMutex::new(HashSet::new()),
             gates: GateWaiterRegistry::new(),
             metrics: AtomicSessionMetrics::new(),
+            #[cfg(test)]
             fail_next_run_upsert: AtomicBool::new(false),
+            #[cfg(test)]
             fail_next_append: AtomicBool::new(false),
         }
     }
@@ -144,10 +149,12 @@ impl SessionInner {
         self.clear_lease(run);
     }
 
+    #[cfg(test)]
     pub(crate) fn take_fail_run_upsert(&self) -> bool {
         self.fail_next_run_upsert.swap(false, Ordering::SeqCst)
     }
 
+    #[cfg(test)]
     pub(crate) fn take_fail_append(&self) -> bool {
         self.fail_next_append.swap(false, Ordering::SeqCst)
     }

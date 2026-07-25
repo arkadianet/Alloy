@@ -76,6 +76,7 @@ pub(super) async fn upsert_state(
         updated_at: Timestamp::now(),
         ..row.clone()
     };
+    #[cfg(test)]
     if inner.take_fail_run_upsert() {
         return Err(RunError::Internal("injected upsert failure".into()));
     }
@@ -105,6 +106,7 @@ async fn append_run_event(
     type_: SessionEventType,
     payload: Value,
 ) -> Result<(), RunError> {
+    #[cfg(test)]
     if inner.take_fail_append() {
         return Err(RunError::Internal("injected append failure".into()));
     }
