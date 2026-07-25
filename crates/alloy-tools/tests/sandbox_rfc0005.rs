@@ -9,16 +9,24 @@
 
 #![allow(clippy::disallowed_methods)] // positive baselines may use host Command
 
-use std::net::TcpListener;
 use std::path::PathBuf;
+
+#[cfg(target_os = "linux")]
+use std::net::TcpListener;
+#[cfg(target_os = "linux")]
 use std::process::Command;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
-use alloy_runtime::{ExecAllow, Grant, PermissionToken, ProfileId, RunId, Timestamp};
+use alloy_runtime::{ExecAllow, Grant, PermissionToken, ProfileId, RunId};
+#[cfg(target_os = "linux")]
+use alloy_runtime::Timestamp;
 use alloy_tools::{
-    load_sandbox_profile, override_operator_homes, BackendStatus, ExecClass, NativeSandboxBroker,
-    NetworkPolicy, SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
+    load_sandbox_profile, BackendStatus, ExecClass, NativeSandboxBroker, NetworkPolicy,
+    SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
 };
+#[cfg(target_os = "linux")]
+use alloy_tools::override_operator_homes;
 use tempfile::tempdir;
 
 fn token(binary: &str, args_glob: Option<&str>) -> PermissionToken {
@@ -41,6 +49,7 @@ fn sh_bin() -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn true_bin() -> &'static str {
     if PathBuf::from("/bin/true").exists() {
         "/bin/true"
@@ -49,6 +58,7 @@ fn true_bin() -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn sleep_bin() -> &'static str {
     if PathBuf::from("/bin/sleep").exists() {
         "/bin/sleep"
@@ -57,6 +67,7 @@ fn sleep_bin() -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn require_landlock() -> bool {
     std::env::var_os("ALLOY_REQUIRE_LANDLOCK").is_some()
 }
@@ -94,6 +105,7 @@ async fn seatbelt_or_skip() -> bool {
 }
 
 /// Returns `true` when Landlock is Available. When required by CI, panics if not.
+#[cfg(target_os = "linux")]
 async fn landlock_or_skip() -> bool {
     let dir = tempdir().unwrap();
     let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
@@ -120,6 +132,7 @@ async fn landlock_or_skip() -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 async fn broker_for_jail(jail: PathBuf) -> Result<NativeSandboxBroker, SandboxError> {
     let mut profile = SandboxProfile::default_for_jail(jail)?;
     profile.check_backend = SandboxBackend::Landlock;
@@ -139,22 +152,16 @@ fn chmod_755(path: &std::path::Path) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn process_alive(pid: i32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        stat.rsplit_once(')')
-            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        false
-    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(')')
+        .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
 }
 
+#[cfg(target_os = "linux")]
 fn python3_ok() -> bool {
     Command::new("python3")
         .arg("-c")
