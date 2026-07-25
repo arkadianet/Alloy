@@ -62,7 +62,8 @@ impl LinuxLandlockBackend {
         // failure from a missing binary — this pipe is the structural signal.
         let (mut ready_r, ready_w) = isolation_pipe()?;
         let ready_fd = ready_w.as_raw_fd();
-        clear_cloexec(ready_fd)?;
+        // Keep FD_CLOEXEC: the ready byte is written in `pre_exec` before
+        // execve, so the sandboxed payload must not inherit the write end.
         let ready_w_fd = ready_w.into_raw_fd();
         let after_spawn = Box::new(move || unsafe {
             libc::close(ready_w_fd);
@@ -86,7 +87,8 @@ impl LinuxLandlockBackend {
                     .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
                 // No allocation/formatting in the multi-threaded child (§5.5).
                 apply_plan(plan)?;
-                // Signal isolation applied before execve.
+                // Signal isolation applied before execve. `ready_fd` is still
+                // open in this forked child (CLOEXEC has not run yet).
                 loop {
                     let n = unsafe { libc::write(ready_fd, b"x".as_ptr().cast(), 1) };
                     if n == 1 {
@@ -147,18 +149,6 @@ fn isolation_pipe() -> Result<(std::fs::File, std::fs::File), SandboxError> {
     let r = unsafe { std::fs::File::from_raw_fd(fds[0]) };
     let w = unsafe { std::fs::File::from_raw_fd(fds[1]) };
     Ok((r, w))
-}
-
-fn clear_cloexec(fd: i32) -> Result<(), SandboxError> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(SandboxError::Io(std::io::Error::last_os_error()));
-    }
-    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
-    if rc != 0 {
-        return Err(SandboxError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
 }
 
 fn read_isolation_ready(ready_r: &mut std::fs::File, wait: std::time::Duration) -> bool {

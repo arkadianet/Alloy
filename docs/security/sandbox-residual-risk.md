@@ -130,7 +130,8 @@ Per-exec trees live under `<jail>/.alloy-sbx/<uuid>/`. Broker-owned bind and
 Seatbelt policy sources live in unique `tempfile` directories under the host temp
 dir (prefix `alloy-sbx-binds-` / `alloy-sbx-seatbelt-`), **outside** the jail,
 mode 0700, removed when the exec returns. Concurrent execs never share a fixed
-parent name.
+parent name. (`tempfile` is a production dependency for these RAII dirs; RFC §10
+still lists it under `dev` — amend on the next RFC editorial pass.)
 
 ---
 

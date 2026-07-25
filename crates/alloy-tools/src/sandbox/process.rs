@@ -56,10 +56,12 @@ pub struct SpawnSpec {
     /// Optional Unix pre-exec hook (Landlock apply, etc.).
     #[cfg(unix)]
     pub pre_exec: Option<PreExecHook>,
-    /// Runs in the parent immediately after `spawn` returns (before wait).
+    /// Runs in the parent immediately after the `spawn` *attempt* returns
+    /// (success or failure), before wait.
     ///
-    /// Used by Seatbelt to close the ready-byte pipe write end once the child
-    /// has inherited it — must not run before fork.
+    /// Used by Seatbelt/Landlock to close the ready-byte pipe write end. Must
+    /// run even when `pre_exec` fails — otherwise the parent stays a writer and
+    /// the ready-byte poll hangs for the full `exec_timeout`.
     pub after_spawn: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -130,10 +132,14 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
 
     let deadline = start + spec.exec_timeout;
 
-    let mut child = cmd.spawn().map_err(SandboxError::Io)?;
+    let spawn_result = cmd.spawn();
+    // Always run after_spawn (success or failure): backends use it to close the
+    // parent's ready-pipe write end. Skipping on spawn Err leaves a writer alive,
+    // so the ready-byte poll hangs for the full exec_timeout and leaks an fd.
     if let Some(hook) = spec.after_spawn.take() {
         hook();
     }
+    let mut child = spawn_result.map_err(SandboxError::Io)?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut guard = ChildGuard::new(child);
@@ -570,6 +576,67 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::Timeout(_)));
+    }
+
+    /// `after_spawn` must run when `pre_exec` fails so ready-pipe writers close
+    /// promptly (otherwise the ready-byte poll hangs for `exec_timeout`).
+    #[tokio::test]
+    async fn after_spawn_runs_on_pre_exec_failure() {
+        use std::io::Read;
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let Some(sh) = shell() else { return };
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let mut ready_r = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let ready_w = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        let ready_w_fd = ready_w.into_raw_fd();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_flag = Arc::clone(&closed);
+        let after_spawn = Box::new(move || {
+            unsafe {
+                libc::close(ready_w_fd);
+            }
+            closed_flag.store(true, Ordering::SeqCst);
+        });
+
+        let start = Instant::now();
+        let err = spawn_supervised(SpawnSpec {
+            program: sh,
+            argv: vec!["sh".into(), "-c".into(), "true".into()],
+            cwd: PathBuf::from("/"),
+            env: BTreeMap::from([(OsString::from("PATH"), OsString::from("/bin:/usr/bin"))]),
+            stdout_cap: 1024,
+            stderr_cap: 1024,
+            exec_timeout: Duration::from_secs(30),
+            pre_exec: Some(Box::new(|| {
+                Err(std::io::Error::from_raw_os_error(libc::EPERM))
+            })),
+            after_spawn: Some(after_spawn),
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "after_spawn must run when pre_exec fails"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "pre_exec failure must not wait for exec_timeout; took {:?}",
+            start.elapsed()
+        );
+        assert!(matches!(err, SandboxError::Io(_)), "got {err:?}");
+
+        // Write end closed → read sees EOF promptly (no hang).
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            ready_r.read(&mut buf).unwrap(),
+            0,
+            "ready pipe must be at EOF after after_spawn"
+        );
     }
 
     #[tokio::test]
