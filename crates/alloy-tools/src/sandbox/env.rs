@@ -534,10 +534,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(
-            out,
-            vec!["cargo", "-C", "/tmp/proj", "build", "--offline"]
-        );
+        assert_eq!(out, vec!["cargo", "-C", "/tmp/proj", "build", "--offline"]);
     }
 
     #[test]
