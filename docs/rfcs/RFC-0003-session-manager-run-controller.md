@@ -765,7 +765,7 @@ sequenceDiagram
 4. Persist before notify (row/event first):
    - On `Deny`: upsert `failed`; clear any remaining waiters for run; append `ApprovalResolved`; append `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`; emit `RunFinished` with failed outcome if the run had been accepted, under the §6.4 step 11 rule — durable state is `waiting_approval` here, so acceptance is implied even when the `RunAccepted` emission happened in an earlier process.
    - On `Allow` / `AllowOnce`: upsert `running`; append `ApprovalResolved` with `{ "gate_id": "…", "decision": "allow"|"deny"|"allow_once" }` using `RunRow.session_id`.
-   - On any persistence / emit failure: map via §7, **do not** call `sender.send` (waiter remains registered only if take was reverted — **pin:** on persist failure after take, put sender back or drop without send and return error so the gate is not consumed as approved).
+   - On any persistence / emit failure: map via §7, **do not** call `sender.send`. **Pin:** restore the sender into the registry **only when the durable row write itself failed** (state still `waiting_approval`). If the row already left `waiting_approval` (e.g. Deny upserted `failed` then append failed), **drop** the sender without send so the waiter observes closure — restoring would permanently strand a Deny waiter behind a terminal row that no production path can release.
 5. Only after durable persistence succeeds: `sender.send(decision)` — if receiver dropped ⇒ `Internal("gate waiter dropped")` (decision is already durable).
 6. Release lock. Return `Ok(())`.
 
