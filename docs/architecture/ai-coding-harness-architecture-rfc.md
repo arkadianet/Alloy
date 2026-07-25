@@ -3037,7 +3037,7 @@ Podman quadlet/example:
 ```toml
 # example only
 [Container]
-Image = docker.io/library/rust:1.88
+Image = docker.io/library/rust:1.97
 WorkDir = /workspace
 Network = none
 ```
