@@ -7,8 +7,8 @@ use alloy_runtime::session::SessionPlane;
 use alloy_runtime::storage::{EventStore, SessionRows, StorageOpenOptions};
 use alloy_runtime::{
     install_sqlite_event_sink, AlloyRuntime, AlloyStorage, BudgetPolicy, ConfigPaths,
-    CreateSession, EventSeq, Goal, LanguageId, ProfileId, RunControlState, RunError, RuntimeEvent,
-    SessionEvent, SessionId, SessionService,
+    CreateSession, EventSeq, Goal, LanguageId, ProfileId, RunControlState, RunError, RunRow,
+    RuntimeEvent, SessionEvent, SessionEventType, SessionId, SessionService,
 };
 
 /// Runtime + storage + plane over `dir`, reusable across simulated restarts.
@@ -54,6 +54,38 @@ impl Host {
             .unwrap()
             .expect("run row");
         RunControlState::parse(&row.state).expect("known state")
+    }
+
+    /// Simulate a crash mid-transition by writing a control state directly.
+    async fn force_run_state(&self, run: alloy_runtime::RunId, state: RunControlState) {
+        let row = self
+            .storage
+            .sessions()
+            .get_run(run)
+            .await
+            .unwrap()
+            .expect("run row");
+        self.storage
+            .sessions()
+            .upsert_run(&RunRow {
+                state: state.as_str().to_owned(),
+                ..row
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn finished_events(&self, run: alloy_runtime::RunId) -> usize {
+        self.storage
+            .events()
+            .list_runtime_events(None, 1000)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(
+                |(_, ev)| matches!(ev, RuntimeEvent::RunFinished { run_id, .. } if *run_id == run),
+            )
+            .count()
     }
 
     async fn accepted_events(&self) -> usize {
@@ -244,6 +276,51 @@ async fn run_accepted_survives_restart_and_redispatch() {
     assert_eq!(host.run_state(run).await, RunControlState::Accepted);
     assert_eq!(host.accepted_events().await, 1);
     assert_eq!(host.plane.metrics().runs_start_unavailable, 1);
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelling_run_is_finalized_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let host = Host::open(dir.path()).await;
+    let session = host
+        .sessions()
+        .create(create_req(dir.path()))
+        .await
+        .unwrap();
+    let run = host
+        .sessions()
+        .submit_goal(session, goal("cancel me"))
+        .await
+        .unwrap();
+    // The process dies between the `cancelling` row write and the terminal write, so no
+    // live caller is left to complete the cancel.
+    host.force_run_state(run, RunControlState::Cancelling).await;
+    host.shutdown().await;
+
+    let host = Host::open(dir.path()).await;
+    host.sessions().resume(session).await.unwrap();
+
+    assert_eq!(host.run_state(run).await, RunControlState::Cancelled);
+    let completed: Vec<_> = host
+        .sessions()
+        .events(session, None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.type_ == SessionEventType::RunCompleted)
+        .collect();
+    assert_eq!(completed.len(), 1, "resume owes exactly one RunCompleted");
+    assert_eq!(completed[0].run_id, Some(run));
+    // Acceptance was announced before the crash, so the host is told the run ended even
+    // though this process never dispatched it.
+    assert_eq!(host.finished_events(run).await, 1);
+
+    // Finalization is durable: a second resume is a no-op.
+    host.sessions().resume(session).await.unwrap();
+    assert_eq!(host.run_state(run).await, RunControlState::Cancelled);
+    assert_eq!(host.finished_events(run).await, 1);
     host.shutdown().await;
 }
 

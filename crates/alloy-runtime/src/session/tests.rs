@@ -235,6 +235,14 @@ impl Harness {
             .count()
     }
 
+    async fn events_of_type(&self, session: SessionId, ty: SessionEventType) -> Vec<SessionEvent> {
+        self.session_events(session)
+            .await
+            .into_iter()
+            .filter(|e| e.type_ == ty)
+            .collect()
+    }
+
     async fn close(self) {
         let Self { rt, storage, .. } = self;
         rt.shutdown().await.unwrap();
@@ -440,8 +448,12 @@ async fn session_resume_rearms_crash_recovery_states() {
     assert_eq!(h.run_state(waiting).await, RunControlState::Accepted);
     assert_eq!(h.run_state(cancelling).await, RunControlState::Cancelled);
     assert_eq!(h.run_state(created).await, RunControlState::Created);
-    // Resume never invents events (§5.3 / §7 write table).
-    assert_eq!(h.session_events(session).await.len(), before);
+    // Re-arming invents no events; finalizing the abandoned cancel owes exactly one
+    // `RunCompleted`, because no other writer will ever produce it (§5.3).
+    let events = h.session_events(session).await;
+    assert_eq!(events.len(), before + 1);
+    assert_eq!(events.last().unwrap().type_, SessionEventType::RunCompleted);
+    assert_eq!(events.last().unwrap().run_id, Some(cancelling));
     assert_eq!(h.plane.metrics().sessions_resumed, 1);
     h.close().await;
 }
@@ -470,10 +482,74 @@ async fn session_resume_skips_corrupt_goal_json() {
     // Corrupt row stays listable and undispatched; the healthy run is re-armed.
     assert_eq!(h.run_state(corrupt).await, RunControlState::Running);
     assert_eq!(h.run_state(healthy).await, RunControlState::Accepted);
+
+    // `start` guards on state before it parses the envelope, so reach the parse by
+    // putting the corrupt row into a dispatchable state by hand.
+    assert!(matches!(
+        h.runs().start(corrupt).await.unwrap_err(),
+        RunError::AlreadyStarted(_)
+    ));
+    h.set_run_state(corrupt, RunControlState::Accepted).await;
     assert!(matches!(
         h.runs().start(corrupt).await.unwrap_err(),
         RunError::Internal(_)
     ));
+    h.close().await;
+}
+
+#[tokio::test]
+async fn session_resume_finalizes_cancelling_with_run_completed() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    // A crash between `cancelling` and `cancelled` leaves nobody to finish the cancel.
+    h.set_run_state(run, RunControlState::Cancelling).await;
+
+    h.sessions().resume(session).await.unwrap();
+
+    assert_eq!(h.run_state(run).await, RunControlState::Cancelled);
+    let completed = h
+        .events_of_type(session, SessionEventType::RunCompleted)
+        .await;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].run_id, Some(run));
+    assert_eq!(completed[0].payload["dag_state"], json!("cancelled"));
+    assert_eq!(
+        completed[0].payload["reason"],
+        json!("resume_finalized_cancel")
+    );
+    // `cancelling` is only reachable after the run left `created`, so the host is told.
+    assert_eq!(h.count_finished(run).await, 1);
+    assert_eq!(h.plane.metrics().runs_cancelled, 1);
+    h.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_resume_does_not_clobber_concurrent_cancel() {
+    let h = Harness::new().await;
+    h.install_scheduler(MockScheduler::new([]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.set_run_state(run, RunControlState::Cancelling).await;
+
+    // Resume and a live `cancel` both want to finalize this row. They serialize on the
+    // per-run mutex and each re-reads the row under it, so exactly one of them writes the
+    // terminal state and its events — whichever order the executor picks.
+    let runs = h.runs();
+    let sessions = h.sessions();
+    let cancelling = tokio::spawn(async move { runs.cancel(run).await });
+    let resuming = tokio::spawn(async move { sessions.resume(session).await });
+    cancelling.await.unwrap().unwrap();
+    resuming.await.unwrap().unwrap();
+
+    assert_eq!(h.run_state(run).await, RunControlState::Cancelled);
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::RunCompleted)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(h.count_finished(run).await, 1);
     h.close().await;
 }
 
@@ -722,6 +798,55 @@ async fn run_double_start_while_live_already_started() {
 }
 
 #[tokio::test]
+async fn run_start_abort_clears_lease() {
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(DagState::Succeeded)]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+
+    let runs = h.runs();
+    let started = tokio::spawn(async move { runs.start(run).await });
+    sched.entered.notified().await;
+    started.abort();
+    assert!(started.await.unwrap_err().is_cancelled());
+
+    // Dropping the `start` future releases the execution lease, so the run is
+    // re-dispatchable instead of stuck behind `AlreadyStarted` for the process lifetime.
+    let err = h.runs().start(run).await.unwrap_err();
+    assert!(
+        matches!(err, RunError::SchedulerUnavailable),
+        "expected a fresh dispatch attempt, got {err}"
+    );
+    assert_eq!(h.run_state(run).await, RunControlState::Accepted);
+    assert_eq!(h.count_accepted(run).await, 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn lock_maps_evict_after_drop() {
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(DagState::Succeeded)]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+
+    // `submit_goal` took the per-session mutex and gave it back.
+    assert_eq!(h.plane.session_lock_map_len(), 0);
+    assert_eq!(h.plane.run_lock_map_len(), 0);
+
+    let runs = h.runs();
+    let started = tokio::spawn(async move { runs.start(run).await });
+    sched.entered.notified().await;
+    // The ticket held across `run_dag` keeps the entry alive so `relock` re-acquires the
+    // same mutex rather than a fresh one.
+    assert_eq!(h.plane.run_lock_map_len(), 1);
+
+    sched.release.notify_one();
+    started.await.unwrap().unwrap();
+    assert_eq!(h.plane.run_lock_map_len(), 0);
+    h.close().await;
+}
+
+#[tokio::test]
 async fn run_request_replan_not_overwritten_by_late_start() {
     let h = Harness::new().await;
     let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(DagState::Succeeded)]));
@@ -915,6 +1040,100 @@ async fn run_approve_deny_fails_run() {
         .collect();
     assert_eq!(completed[0].payload["dag_state"], json!("failed"));
     assert_eq!(completed[0].payload["reason"], json!("approval_denied"));
+    h.close().await;
+}
+
+#[tokio::test]
+async fn run_approve_persists_before_notify() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.set_run_state(run, RunControlState::Accepted).await;
+    let gate = GateId::new();
+    let mut rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
+
+    // A failed row write must leave the gate unresolved and the waiter untouched.
+    h.plane.fail_next_run_upsert();
+    assert!(matches!(
+        h.runs().approve(run, gate, Approval::Allow).await.unwrap_err(),
+        RunError::Internal(m) if m.contains("injected upsert failure")
+    ));
+    assert_eq!(h.run_state(run).await, RunControlState::WaitingApproval);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+
+    // A failed event append lands after the row write, so the state moves but the waiter
+    // still must not observe a decision it cannot audit.
+    h.plane.fail_next_append();
+    assert!(matches!(
+        h.runs().approve(run, gate, Approval::Allow).await.unwrap_err(),
+        RunError::Internal(m) if m.contains("injected append failure")
+    ));
+    assert_eq!(h.run_state(run).await, RunControlState::Running);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(h
+        .events_of_type(session, SessionEventType::ApprovalResolved)
+        .await
+        .is_empty());
+
+    // Both failures restored the gate, so a retry with no fault resolves it exactly once.
+    h.set_run_state(run, RunControlState::WaitingApproval).await;
+    h.runs().approve(run, gate, Approval::Allow).await.unwrap();
+    assert_eq!(rx.await.unwrap(), Approval::Allow);
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::ApprovalResolved)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(h.plane.metrics().approvals_resolved, 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn run_approve_deny_emits_run_finished_after_redispatch() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+
+    // First dispatch announces acceptance, then fails to find a scheduler.
+    assert!(matches!(
+        h.runs().start(run).await.unwrap_err(),
+        RunError::SchedulerUnavailable
+    ));
+    assert_eq!(h.count_accepted(run).await, 1);
+
+    h.install_scheduler(MockScheduler::new([Plan::State(DagState::WaitingApproval)]));
+    h.runs().start(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::WaitingApproval);
+
+    let gate = GateId::new();
+    let rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
+    h.runs().approve(run, gate, Approval::Deny).await.unwrap();
+    assert_eq!(rx.await.unwrap(), Approval::Deny);
+    assert_eq!(h.run_state(run).await, RunControlState::Failed);
+    assert_eq!(h.count_finished(run).await, 1);
+    assert_eq!(h.count_accepted(run).await, 1);
+
+    // A run this process never dispatched still gets its terminal event: durable state
+    // having left `created` is what proves acceptance was already announced.
+    let restored = h.submit(session).await;
+    h.set_run_state(restored, RunControlState::WaitingApproval)
+        .await;
+    let gate = GateId::new();
+    let rx = h.plane.register_gate_waiter(restored, gate).await.unwrap();
+    h.runs()
+        .approve(restored, gate, Approval::Deny)
+        .await
+        .unwrap();
+    assert_eq!(rx.await.unwrap(), Approval::Deny);
+    assert_eq!(h.run_state(restored).await, RunControlState::Failed);
+    assert_eq!(h.count_finished(restored).await, 1);
     h.close().await;
 }
 
@@ -1115,6 +1334,26 @@ async fn register_gate_waiter_rejects_created_and_terminal() {
             .unwrap_err(),
         RunError::NotFound(_)
     ));
+    h.close().await;
+}
+
+#[tokio::test]
+async fn register_gate_waiter_rejects_replan_requested() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.set_run_state(run, RunControlState::Accepted).await;
+    h.runs()
+        .request_replan(run, ReplanReason::UserRequested)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        h.plane.register_gate_waiter(run, GateId::new()).await.unwrap_err(),
+        RunError::InvalidPhase(m) if m == "replan pending"
+    ));
+    // Registering must not rewrite a pending replan back to `waiting_approval`.
+    assert_eq!(h.run_state(run).await, RunControlState::ReplanRequested);
     h.close().await;
 }
 
