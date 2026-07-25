@@ -548,7 +548,8 @@ impl CostMeter {
     pub fn new() -> Self { Self::default() }
 
     /// Record model usage. `input`/`output`/`usd` use `None` for unknown — NEVER fabricate.
-    /// Non-finite `usd` (`NaN` / ±∞) → skip USD update, `tracing::warn`, tokens still apply.
+    /// Non-finite or negative finite `usd` → skip USD update, `tracing::warn`, tokens still apply.
+    /// Cumulative meter/tier USD uses finite saturating add (never decreases; never overflows to ±∞).
     pub fn add_model_usage(
         &mut self,
         tier: ModelTier,
@@ -567,7 +568,7 @@ impl CostMeter {
     ///   (failed calls still count toward budget ceilings).
     /// - Ignores `confidence`, `duration_ms`, `tool_calls`, `cache_hits`, `provider_id` for metering
     ///   (provider attribution belongs on `ModelCall` events / RFC-0007).
-    /// - `usd` non-finite → same skip+warn as `add_model_usage`.
+    /// - `usd` non-finite or negative → same skip+warn as `add_model_usage`.
     pub fn add_worker_metrics(&mut self, metrics: &WorkerMetrics, usd: Option<f64>);
 
     #[must_use]
@@ -999,10 +1000,17 @@ sequenceDiagram
 4. If `input.is_none() || output.is_none()`: `unknown_token_events += 1` (**at most once per call**).
 5. If `usd` is `Some(x)`:
    - If `!x.is_finite()`: do **not** update USD; `tracing::warn!("non-finite usd ignored")`.
-   - Else if meter `usd_spent` is `None`, set `Some(x)`; else add `x`. Same for tier `usd`.
+   - Else if `x < 0.0`: do **not** update USD; `tracing::warn!("negative usd ignored")`.
+   - Else apply **finite saturating add** to meter `usd_spent` and the matching tier `usd`:
+     - If the field is `None`, set `Some(x)` (already finite and ≥ 0).
+     - If the field is `Some(cur)`, let `sum = cur + x`. If `sum.is_finite()`, store `Some(sum)`;
+       otherwise store `Some(f64::MAX)` (explicit overflow saturation — totals MUST NOT become ±∞
+       or decrease).
    - If `usd` is `None`, leave `usd_spent` unchanged.
 
-Token counters use `u64::saturating_add`. Budget compare uses `>=` on finite values only.
+Token counters use `u64::saturating_add`. USD totals MUST NOT decrease and MUST NOT leave the
+finite non-negative range except via the `f64::MAX` saturation above. Budget compare uses `>=`
+on finite values only.
 
 ### 6.2 `CostSnapshot` semantics
 
@@ -1022,7 +1030,8 @@ USD is optional end-to-end. Missing provider USD MUST NOT be replaced with estim
 | --- | --- |
 | Provider omits usage | `add_model_usage(..., None, None, None)`; `usage_unknown: true` on event |
 | Provider omits USD only | tokens recorded; `usd: null` |
-| Overflow | saturate tokens; do not panic |
+| Overflow | saturate tokens (`u64::saturating_add`); saturate USD to `f64::MAX`; do not panic |
+| Negative finite USD | ignore + warn (same class as non-finite); tokens still apply |
 | Marketing savings % | **MUST NOT** appear in code, docs strings, or event payloads |
 
 ### 6.6 Interaction with `BudgetPolicy`
@@ -1032,13 +1041,14 @@ max_tok = policy.max_tokens_per_run   // u64 — always finite; no is_finite che
 max_usd = policy.max_usd_per_run
 
 If max_tok == 0: TokensExhausted is true even at zero spend (immediately exhausted).
-TokensExhausted  iff tokens_in + tokens_out >= max_tok
+TokensExhausted  iff tokens_in.saturating_add(tokens_out) >= max_tok
 
 If !max_usd.is_finite() || max_usd < 0.0: treat as UsdExhausted immediately (fail closed).
 Else UsdExhausted iff usd_spent.is_some() && usd_spent.unwrap() >= max_usd
 ```
 
-When `usd_spent` is `None` and `max_usd` is finite and ≥ 0, USD ceiling MUST NOT trigger.
+`TokensExhausted` MUST use `u64::saturating_add` for the sum (wrapping `+` is forbidden). Threshold
+semantics remain `>=`. When `usd_spent` is `None` and `max_usd` is finite and ≥ 0, USD ceiling MUST NOT trigger.
 
 `to_budget_snapshot()`:
 
@@ -1121,7 +1131,7 @@ Behaviour:
 3. **Run filter:**
    - `run: Some(id)` — include only events whose envelope `run_id == Some(id)`.
    - `run: None` — include **all** `ModelCall` events in the session (every run).
-4. Apply `add_model_usage` with parsed `Option` token/usd fields and `model_tier` (skip non-finite usd per §6.1).
+4. Apply `add_model_usage` with parsed `Option` token/usd fields and `model_tier` (skip non-finite / negative usd per §6.1; saturate overflow).
 5. Ignore non-`ModelCall` events.
 6. Return rebuilt `CostMeter`.
 
@@ -1254,8 +1264,10 @@ Counters: optional private atomics under `obs` for tests (`records_appended`, `r
 | `cost_unknown_usage_no_fabricated_tokens` | `None` inputs → `unknown_token_events`, tokens unchanged |
 | `cost_unknown_usd_none` | no usd updates → `usd_spent.is_none()` |
 | `cost_non_finite_usd_ignored` | NaN/∞ skipped; finite usd still works after |
+| `cost_negative_usd_ignored` | finite `usd < 0` skipped + warn; meter/tier totals unchanged; later finite ≥ 0 still applies |
+| `cost_usd_overflow_saturates` | large finite adds that would yield ±∞ store `f64::MAX`; totals never decrease |
 | `add_worker_metrics_counts_failed_calls` | `error_class: Some(_)` still increments calls; tokens known |
-| `budget_check_tokens_and_usd` | thresholds with `>=` |
+| `budget_check_tokens_and_usd` | thresholds with `>=`; token sum via `saturating_add` |
 | `budget_zero_tokens_immediately_exhausted` | `max_tokens_per_run=0` → exhausted at zero |
 | `budget_non_finite_usd_ceiling_exhausted` | fail closed |
 | `decision_kind_serde_golden` | wire JSON locked |
@@ -1329,7 +1341,7 @@ Implementation checklist — all items REQUIRED before merge:
 - [ ] Size caps enforced (64 KiB metadata / 256 KiB bodies)
 - [ ] `DecisionLog` maps to `SessionEventType::{Decision, ModelCall, ToolCall}` exactly as §3.8; private wire payloads
 - [ ] Session existence checked before append (no orphans)
-- [ ] Reusable `CostMeter` / `SharedCostMeter` / `CostSnapshot` APIs; non-finite USD ignored
+- [ ] Reusable `CostMeter` / `SharedCostMeter` / `CostSnapshot` APIs; non-finite / negative USD ignored; USD saturate to `f64::MAX`; `TokensExhausted` uses `saturating_add`
 - [ ] Unknown provider usage NEVER fabricates tokens or USD
 - [ ] `EventStore::replay_session` gains `where Self: Sized` (§3.1a); helpers use `&dyn EventStore` + `list_session_events`
 - [ ] `DecisionPage` cursor semantics implemented
