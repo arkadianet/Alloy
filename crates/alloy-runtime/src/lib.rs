@@ -1,8 +1,8 @@
 //! Alloy runtime host and shared intermediate representation.
 //!
 //! This crate is the foundation defined by **RFC-0001**, extended by **RFC-0002**
-//! (durable storage, artifacts, session event log) and **RFC-0003** (session manager
-//! and run controller control plane).
+//! (durable storage, artifacts, session event log), **RFC-0003** (session manager
+//! and run controller), and **RFC-0004** (observability & cost metering).
 //!
 //! # Crate map
 //!
@@ -13,6 +13,7 @@
 //! - [`scheduler`] — [`Scheduler`] trait + [`NullScheduler`]
 //! - [`adapters`] — Verify*/GateHuman stub traits
 //! - [`session`] — [`SessionPlane`] control plane: Session/RunController (RFC-0003)
+//! - [`obs`] — DecisionLog, CostMeter, redaction/query helpers (RFC-0004)
 //! - [`dag`] — TaskDag type sketches (store in RFC-0009)
 //! - [`config`] — TOML + env load (never writes `.env`)
 //!
@@ -27,6 +28,7 @@ pub mod dag;
 pub mod error;
 pub mod events;
 pub mod logging;
+pub mod obs;
 pub mod runtime;
 pub mod scheduler;
 pub mod session;
@@ -47,6 +49,14 @@ pub use error::{AdapterError, RunError, RuntimeError, SchedError, SessionError};
 pub use events::{
     EventSink, EventSinkError, HandoffSnapshot, InMemoryEventSink, NewSessionEvent, RuntimeEvent,
     SessionEvent, SessionEventType,
+};
+pub use obs::{
+    apply_prompt_retention, apply_tool_retention, hash_content, hash_prompt, hash_tool_body,
+    list_decision_events, maybe_signal_budget_warning, parse_decision_event,
+    parse_model_call_event, parse_tool_call_event, reaccumulate_cost_from_events,
+    redact_json_strings, redact_secrets, BudgetCheck, CostByTier, CostMeter, CostSnapshot,
+    DecisionKind, DecisionLog, DecisionPage, DecisionRecord, EventDecisionLog, ModelCallRecord,
+    ObsError, RecordingDecisionLog, RetentionPolicy, SharedCostMeter, TierCost, ToolCallRecord,
 };
 pub use runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
 pub use scheduler::{DagOutcome, DagState, NullScheduler, Scheduler};
