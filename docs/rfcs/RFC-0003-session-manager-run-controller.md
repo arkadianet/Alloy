@@ -541,19 +541,20 @@ Corrupt `goal_json` on `start` / `request_replan` ⇒ `RunError::Internal`. On `
 
 8. Return `id`.
 
-**Crash window:** upsert then append. If append fails after upsert, return `SessionError::Internal` (log session id). Do not invent compensating deletes (0002 has none). `resume` succeeds from the row alone; `submit_goal` requires the row and does **not** require a `SessionCreated` event.
+**Crash window:** upsert then append. If append fails after upsert, log the session id and return the append error mapped through `runtime_to_session` (§7) — a stopped or wrong-phase runtime is an `Invalid` request, not an `Internal` fault, and mislabelling it hides a retryable condition. Do not invent compensating deletes (0002 has none). `resume` succeeds from the row alone; `submit_goal` requires the row and does **not** require a `SessionCreated` event.
 
 ### 5.3 `resume`
 
 1. `get_session(id)` → `None` ⇒ `SessionError::NotFound(id)` (**do not** use `store_to_session` for this miss).
 2. Store errors ⇒ `store_to_session`.
 3. Return `Session` snapshot as stored.
-4. MUST NOT invent missing events.
+4. MUST NOT invent missing events, except the terminal pair owed by step 9 finalization.
 5. MUST NOT auto-start runs.
 6. Rebuild **process-local** run→dag bindings by scanning `list_runs` and deserializing `RunGoalRecord` from `goal_json`. On per-run deser failure: `tracing::warn`, skip that run’s binding, continue. The corrupt row remains persisted and listable, is not dispatched, is not entered into `live_execution`, and MUST NOT block resume of the session or restoration of other valid runs.
 7. Gate waiters start empty (0010 re-registers).
 8. `live_execution` starts empty.
-9. **Re-arm after restart (explicit recovery only):** for rows in `running` or `waiting_approval`, upsert durable state to `accepted` (crash recovery), then they follow the `Accepted` re-dispatch path in §6.3. Rows already `accepted` stay re-dispatchable. Rows in `cancelling` MUST be finalized to `cancelled` on resume (best-effort `cancel_dag` skipped if no live scheduler work). Do not invent DAG progress. In-process non-terminal outcomes MUST NOT be treated as crash recovery (see §6.3).
+9. **Re-arm after restart (explicit recovery only):** for rows in `running` or `waiting_approval`, upsert durable state to `accepted` (crash recovery), then they follow the `Accepted` re-dispatch path in §6.3. Rows already `accepted` stay re-dispatchable. Rows in `cancelling` MUST be finalized to `cancelled` on resume (best-effort `cancel_dag` skipped if no live scheduler work), together with the `RunCompleted` / `RunFinished` pair §6.4 would have written: the cancel that wrote `cancelling` died with its process, so no other writer will ever produce them. Do not invent DAG progress. In-process non-terminal outcomes MUST NOT be treated as crash recovery (see §6.3).
+10. Each row is re-read under its per-run mutex before step 9 decides anything: the `list_runs` result is a snapshot, and a concurrent `cancel` in the same process must not be rewritten from a stale state.
 
 ### 5.4 `submit_goal`
 
@@ -686,8 +687,8 @@ sequenceDiagram
 
 1. Acquire per-run mutex.
 2. Load `RunRow` → missing ⇒ `NotFound`.
-3. Let `session_id = row.session_id`. Deserialize `RunGoalRecord` from `goal_json` → corrupt ⇒ `Internal`.
-4. Parse `RunControlState` and apply guards:
+3. Let `session_id = row.session_id`. Parse `RunControlState` → unknown string ⇒ `InvalidPhase`.
+4. Apply the state guards below, then deserialize `RunGoalRecord` from `goal_json` → corrupt ⇒ `Internal`. State comes first: a run that is live, cancelling, replan-pending, or terminal is not dispatchable whatever its envelope says, and the state error is the one the caller can act on.
 
 | Current state | `live_execution` | Action |
 | --- | --- | --- |
@@ -705,7 +706,9 @@ sequenceDiagram
 6. Insert `run` into `live_execution` (execution lease). The lease is the sole in-process liveness indicator that `run_dag` is outstanding for this run.
 7. **Release per-run mutex** before any host await.
 8. `result = handle.run_dag(dag_id).await`.
-9. Re-acquire per-run mutex. Clear the execution lease (`live_execution`) **only after** applying step 10’s durable state transition for this result (still under the same lock acquisition). Order under the lock: (a) if durable state is already `replan_requested`, `cancelling`, `cancelled`, `succeeded`, or `failed`, **reject/merge** the outcome — do not overwrite those states; clear lease; return `Ok(())` if terminal cancel/replan already recorded, else `InvalidPhase("state advanced during run")` for conflicting success; (b) otherwise apply the step 10 row; (c) then clear lease. This prevents a late `run_dag` completion from clobbering `request_replan` / `cancel` and prevents a second `start` from admitting duplicate execution while the lease is held.
+9. Re-acquire per-run mutex. Clear the execution lease (`live_execution`) **only after** applying step 10’s durable state transition for this result (still under the same lock acquisition). Order under the lock: (a) if durable state is `replan_requested`, `cancelling`, `cancelled`, or `waiting_approval`, an explicit control call won the race — **merge**: do not overwrite that state, clear the lease, return `Ok(())`, and still count `runs_start_unavailable` when the host result was unavailable; (b) if durable state is `succeeded` or `failed`, a second writer already finalized the run: return `Ok(())` for an already-recorded cancel, else `InvalidPhase("state advanced during run")` for a conflicting success; (c) otherwise apply the step 10 row; (d) then clear lease. This prevents a late `run_dag` completion from clobbering `request_replan` / `cancel` / a registered gate, and prevents a second `start` from admitting duplicate execution while the lease is held.
+
+**Lease ownership:** the lease is an RAII guard held across the step 8 await, so a `start` future that is dropped (task abort, caller cancellation, panic) releases it instead of stranding the run behind `AlreadyStarted` for the life of the process.
 10. Map `result` while holding the lock (when step 9(a) does not suppress):
 
 | Host result | RunController result | Required side effects |
@@ -736,10 +739,10 @@ sequenceDiagram
 5. Upsert `cancelling`. Drop **all** gate waiters for this `run` (senders dropped).
 6. Release per-run mutex.
 7. If `goal_ok`: `handle.cancel_dag(dag_id).await` (map errors via §7; NullScheduler `Ok(())`). If `!goal_ok`, skip `cancel_dag`.
-8. Re-acquire per-run mutex.
-9. Upsert `cancelled`; clear `live_execution` for run.
+8. Re-acquire per-run mutex and **re-read the row**: the mutex was released in step 6, so a resume finalizing this same cancel (§5.3 step 9) may already have written the row. If the fresh state is terminal, return `Ok(())` without repeating steps 9–11.
+9. Upsert `cancelled` from the fresh row; clear `live_execution` for run.
 10. Append `RunCompleted` with `{ "dag_state": "cancelled" }` using `session_id` / `run_id`.
-11. Emit `RunFinished` **only when** `goal_ok` is true **and** (a `RunAccepted` was previously emitted for this run in this process **or** durable state had left `Created`). Synthetic `DagOutcome { state: Cancelled, … }` (generation `0` / empty failure) when no scheduler outcome. If `!goal_ok`, skip `RunFinished` (permitted cancellation updates in steps 5–10 still apply).
+11. Emit `RunFinished` **only when** `goal_ok` is true **and** (a `RunAccepted` was previously emitted for this run in this process **or** durable state had left `Created`), sampled from the step 2 state before any terminal write prunes the process-local marker. Synthetic `DagOutcome { state: Cancelled, … }` (generation `0` / empty failure) when no scheduler outcome. If `!goal_ok`, skip `RunFinished` (permitted cancellation updates in steps 5–10 still apply).
 12. Return `Ok(())`.
 
 ### 6.5 `approve`
@@ -760,7 +763,7 @@ sequenceDiagram
 2. Load run; apply state table above (every existing non-`WaitingApproval` run returns its `InvalidPhase` **regardless of waiter presence**).
 3. Only if `WaitingApproval`: take waiter for `(run, gate)` from registry. None ⇒ `UnknownGate(gate)`.
 4. Persist before notify (row/event first):
-   - On `Deny`: upsert `failed`; clear any remaining waiters for run; append `ApprovalResolved`; append `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`; emit `RunFinished` with failed outcome if run had been accepted.
+   - On `Deny`: upsert `failed`; clear any remaining waiters for run; append `ApprovalResolved`; append `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`; emit `RunFinished` with failed outcome if the run had been accepted, under the §6.4 step 11 rule — durable state is `waiting_approval` here, so acceptance is implied even when the `RunAccepted` emission happened in an earlier process.
    - On `Allow` / `AllowOnce`: upsert `running`; append `ApprovalResolved` with `{ "gate_id": "…", "decision": "allow"|"deny"|"allow_once" }` using `RunRow.session_id`.
    - On any persistence / emit failure: map via §7, **do not** call `sender.send` (waiter remains registered only if take was reverted — **pin:** on persist failure after take, put sender back or drop without send and return error so the gate is not consumed as approved).
 5. Only after durable persistence succeeds: `sender.send(decision)` — if receiver dropped ⇒ `Internal("gate waiter dropped")` (decision is already durable).
@@ -795,7 +798,7 @@ A second `approve` for the same gate finds no waiter ⇒ `UnknownGate`.
 ### 6.7 `register_gate_waiter` (SessionPlane)
 
 1. Acquire per-run mutex.
-2. Load run; reject terminal / cancelling / created with `InvalidPhase` / `NotFound`.
+2. Load run; reject terminal / cancelling / created with `InvalidPhase` / `NotFound`. Also reject `replan_requested` with `InvalidPhase("replan pending")`: the replan discarded the DAG that owns the gate, and step 3 would otherwise rewrite the pending replan back to `waiting_approval`. Allowed states are exactly `Accepted` \| `Running` \| `WaitingApproval`.
 3. Upsert `waiting_approval` (**row first**).
 4. Replace registry entry for `(run, gate)` with a new oneshot; return receiver.
 5. Release lock.
@@ -838,7 +841,7 @@ stateDiagram-v2
 | Operation | SessionRows | EventSink via handle | RuntimeEvent |
 | --- | --- | --- | --- |
 | create | `upsert_session` | `SessionCreated` | — |
-| resume | `get_session` (+ list_runs for re-arm) | — | — |
+| resume | `get_session` (+ list_runs for re-arm) | `RunCompleted` cancelled when finalizing a `cancelling` row (§5.3 step 9) | `RunFinished` with the same finalization, when applicable |
 | submit_goal | `upsert_run` | `GoalSubmitted` | — |
 | events | `get_session` + EventStore list | — | — |
 | start (first) | `upsert_run` → `accepted` **before** emit | `Error` on unavailable | `RunAccepted` after row |
@@ -928,6 +931,7 @@ fn runtime_to_session(e: RuntimeError) -> SessionError {
 | Other `StoreError` on session APIs | `store_to_session` |
 | Other `StoreError` on run APIs | `store_to_run` |
 | `RuntimeError` from `emit` / `append_session` / `run_dag` / `cancel_dag` | `runtime_to_run` or `runtime_to_session` |
+| `RunError` from a run-control helper reused by `resume` (§5.3 step 9) | `run_to_session`: `InvalidPhase` → `Invalid`, everything else → `Internal` |
 
 Note: `RuntimeHandle` returns `RuntimeError` (including `EventSink` via `#[from]`). Callers MUST map `RuntimeError`, not raw `EventSinkError`.
 
@@ -1092,6 +1096,12 @@ Profile **catalog files** (`profiles/default.toml`, etc.) remain 0015/0001 confi
 | `runtime_error_invalid_phase_maps` | `runtime_to_run` preserves `InvalidPhase` |
 | `start_lock_not_held_across_run_dag` | with a mock scheduler that blocks until approve, approve succeeds |
 | `session_resume_skips_corrupt_goal_json` | warn + skip binding; other runs restored |
+| `run_start_abort_clears_lease` | aborting a `start` task releases the lease; next `start` is a fresh dispatch, not `AlreadyStarted` |
+| `run_approve_deny_emits_run_finished_after_redispatch` | `Deny` emits `RunFinished` even when this process never emitted `RunAccepted` |
+| `register_gate_waiter_rejects_replan_requested` | `InvalidPhase("replan pending")`; pending replan not rewritten |
+| `session_resume_finalizes_cancelling_with_run_completed` | `cancelling` → `cancelled` + one `RunCompleted` + `RunFinished` |
+| `session_resume_does_not_clobber_concurrent_cancel` | resume racing `cancel` yields one terminal write and one `RunCompleted` in any order |
+| `lock_maps_evict_after_drop` | lock maps return to empty once guards/tickets drop |
 
 ### Integration tests
 
@@ -1100,6 +1110,7 @@ Profile **catalog files** (`profiles/default.toml`, etc.) remain 0015/0001 confi
 | `session_resume` (roadmap M5 name) | create/submit → reopen storage/runtime → resume + events bit-identical seq/payload |
 | `session_sqlite_cursor_after_restart` | exclusive cursor continues |
 | `run_accepted_survives_restart_and_redispatch` | accepted row re-dispatchable after reopen |
+| `cancelling_run_is_finalized_after_restart` | `cancelling` row finalized once on resume; second resume is a no-op |
 | Concurrent: N readers `events` + M `submit_goal` on distinct sessions | no deadlocks; seq gapless per session |
 
 ### Commands
