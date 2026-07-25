@@ -1,12 +1,13 @@
 //! Alloy runtime host and shared intermediate representation.
 //!
-//! This crate is the foundation defined by **RFC-0001**. It owns process lifecycle,
-//! shared IR, configuration load, and stub injection points for later RFCs.
+//! This crate is the foundation defined by **RFC-0001**, extended by **RFC-0002**
+//! (durable storage, artifacts, session event log).
 //!
 //! # Crate map
 //!
 //! - [`types`] — IDs, budgets, diagnostics, permissions, metrics
 //! - [`events`] — session event envelopes and [`EventSink`]
+//! - [`storage`] — SQLite event log, artifact CAS, handoff (RFC-0002)
 //! - [`runtime`] — [`AlloyRuntime`] host lifecycle
 //! - [`scheduler`] — [`Scheduler`] trait + [`NullScheduler`]
 //! - [`adapters`] — Verify*/GateHuman stub traits
@@ -28,6 +29,7 @@ pub mod logging;
 pub mod runtime;
 pub mod scheduler;
 pub mod session;
+pub mod storage;
 pub mod types;
 
 pub use adapters::{
@@ -42,13 +44,19 @@ pub use dag::{
 };
 pub use error::{AdapterError, RunError, RuntimeError, SchedError, SessionError};
 pub use events::{
-    EventSink, EventSinkError, InMemoryEventSink, NewSessionEvent, RuntimeEvent, SessionEvent,
-    SessionEventType,
+    EventSink, EventSinkError, HandoffSnapshot, InMemoryEventSink, NewSessionEvent, RuntimeEvent,
+    SessionEvent, SessionEventType,
 };
 pub use runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
 pub use scheduler::{DagOutcome, DagState, NullScheduler, Scheduler};
 pub use session::{
     clamp_events_page_limit, ReplanReason, RunController, Session, SessionService, MAX_EVENTS_PAGE,
+};
+pub use storage::{
+    install_sqlite_event_sink, store_to_runtime, store_to_session, AlloyStorage, ArtifactBlob,
+    ArtifactKind, ArtifactMeta, ArtifactPut, ArtifactStore, EventStore, FsArtifactStore, RunRow,
+    SessionRows, SqliteEventStore, SqliteSessionRows, SqliteSynchronous, StorageLayout,
+    StorageMetricsSnapshot, StorageOpenOptions, StoreError,
 };
 pub use types::budget::{
     BudgetPolicy, BudgetSnapshot, Constraint, CreateSession, Goal, ModelTier, TokenBudget,

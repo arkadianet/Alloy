@@ -4,7 +4,7 @@ mod runtime_event;
 mod sink;
 
 pub use runtime_event::RuntimeEvent;
-pub use sink::{EventSink, EventSinkError, InMemoryEventSink};
+pub use sink::{EventSink, EventSinkError, HandoffSnapshot, InMemoryEventSink};
 
 use serde::{Deserialize, Serialize};
 
