@@ -118,6 +118,21 @@ async fn start_before_configure_rejected() {
 }
 
 #[tokio::test]
+async fn config_before_configure_is_invalid_phase() {
+    let rt = AlloyRuntime::new();
+    let err = rt.handle().config().unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeError::InvalidPhase {
+            op: "config",
+            current: RuntimePhase::Created,
+            ..
+        }
+    ));
+    rt.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn double_start_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = AlloyRuntime::new();

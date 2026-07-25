@@ -89,7 +89,7 @@ impl AlloyRuntime {
 
     async fn start_inner(&mut self) -> Result<RuntimeHandle, RuntimeError> {
         logging::init_tracing();
-        let cfg = self.handle.config();
+        let cfg = self.handle.config()?;
         // RFC failure table: data_dir create → RuntimeError::Io; start → Failed.
         tokio::fs::create_dir_all(&cfg.data_dir)
             .await

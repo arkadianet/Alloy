@@ -98,6 +98,7 @@ macro_rules! uuid_id {
         impl $name {
             pub fn new() -> Self { Self(Uuid::new_v4()) }
             pub fn as_uuid(&self) -> &Uuid { &self.0 }
+            // No Default — callers must use `new()` so random UUIDs are never implicit.
         }
 
         impl std::fmt::Display for $name {
@@ -465,7 +466,9 @@ pub struct RuntimeHandle {
 impl RuntimeHandle {
     pub fn phase(&self) -> RuntimePhase { /* … */ }
     pub fn cancellation(&self) -> CancellationToken { /* … */ }
-    pub fn config(&self) -> Arc<RuntimeConfig> { /* clone Arc, never return & from lock */ }
+    /// Clone Arc of loaded config. Errors with `InvalidPhase` if not yet `configure`d
+    /// (never panics; never returns a lock guard).
+    pub fn config(&self) -> Result<Arc<RuntimeConfig>, RuntimeError> { /* … */ }
 
     /// Install or replace Scheduler.
     /// - Allowed in `Configured` (pre-start inject) and `Running` when no DAG is active.

@@ -13,7 +13,11 @@ macro_rules! uuid_id {
 
         impl $name {
             /// Allocate a new random identifier.
+            ///
+            /// Explicit only — these IDs do **not** implement [`Default`] so
+            /// `..Default::default()` cannot silently mint random UUIDs.
             #[must_use]
+            #[allow(clippy::new_without_default)]
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
@@ -22,12 +26,6 @@ macro_rules! uuid_id {
             #[must_use]
             pub fn as_uuid(&self) -> &Uuid {
                 &self.0
-            }
-        }
-
-        impl Default for $name {
-            fn default() -> Self {
-                Self::new()
             }
         }
 

@@ -40,16 +40,18 @@ impl RuntimeHandle {
 
     /// Clone of the configured runtime config.
     ///
-    /// # Panics
-    /// Panics if called before [`crate::AlloyRuntime::configure`].
-    #[must_use]
-    pub fn config(&self) -> Arc<RuntimeConfig> {
+    /// Returns [`RuntimeError::InvalidPhase`] if called before
+    /// [`crate::AlloyRuntime::configure`].
+    pub fn config(&self) -> Result<Arc<RuntimeConfig>, RuntimeError> {
         self.inner
             .config
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .expect("RuntimeHandle::config requires configure()")
+            .ok_or(RuntimeError::InvalidPhase {
+                current: self.phase(),
+                op: "config",
+            })
     }
 
     /// Snapshot of runtime counters.
