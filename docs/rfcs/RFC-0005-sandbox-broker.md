@@ -665,7 +665,7 @@ Composition: prepare ruleset FD + uid/gid map buffers + deny bind `CString` pair
 
 **Network:** FS-only Landlock under Deny → `BackendCannotEnforce`.
 
-**Host-untouched assertion:** after `child_cannot_read_cargo_credentials` / dotenv tests, host `credentials.toml` / `.env` must still be the original file (not a lingering `/dev/null` bind) — covered by `dotenv_sentinel_unchanged` and an equivalent credentials sentinel check.
+**Host-untouched assertion:** after sandbox tests, host `credentials.toml` / `.env` must still be the original file (not a lingering `/dev/null` bind) — covered by `dotenv_sentinel_unchanged` and `credentials_sentinel_unchanged`.
 
 #### Seatbelt (macOS)
 
@@ -875,6 +875,7 @@ landlock = "0.4"
 | `cancel_drop_no_orphan` | drop future → no child |
 | `output_cap_truncates` | flags |
 | `dotenv_sentinel_unchanged` | host `.env` bytes unchanged |
+| `credentials_sentinel_unchanged` | host `credentials.toml` bytes unchanged after sandbox |
 | `backend_unavailable_fail_closed` | no bare exec |
 | `landlock_actually_applied` | child `open(/etc/shadow)` or out-of-jail path fails under Landlock (proves non-skip) |
 
