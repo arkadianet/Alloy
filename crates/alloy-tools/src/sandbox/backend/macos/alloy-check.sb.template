@@ -5,7 +5,8 @@
 ;; {{BROKER_DIR}} is outside the jail (SBPL + trampoline); never jail-writable.
 (version 1)
 (deny default)
-;; Explicit process rules only — no broad process* / process-exec*.
+;; Explicit process rules only — no broad process* / process-exec*, and no
+;; process-exec subpath over /usr/bin, /bin, or /sbin (literals + toolchain dirs).
 (allow process-fork)
 (allow process-info*)
 (allow signal)
@@ -38,9 +39,6 @@
 (allow process-exec (literal "/usr/bin/codesign"))
 (allow process-exec (literal "/usr/bin/sw_vers"))
 (allow process-exec (subpath "/usr/lib"))
-(allow process-exec (subpath "/usr/bin"))
-(allow process-exec (subpath "/bin"))
-(allow process-exec (subpath "/sbin"))
 (allow process-exec (subpath "/Library/Developer/CommandLineTools"))
 (allow process-exec (subpath "/Applications/Xcode.app"))
 (allow file-read* (subpath "/usr"))

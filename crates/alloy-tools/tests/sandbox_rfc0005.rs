@@ -177,8 +177,13 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     std::fs::create_dir_all(dst)?;
     for ent in std::fs::read_dir(src)? {
         let ent = ent?;
+        let name = ent.file_name();
+        // Skip build artifacts — fixtures may carry a local target/ from prior runs.
+        if name.as_os_str() == "target" {
+            continue;
+        }
         let ty = ent.file_type()?;
-        let to = dst.join(ent.file_name());
+        let to = dst.join(&name);
         if ty.is_dir() {
             copy_dir_all(&ent.path(), &to)?;
         } else if ty.is_file() {
@@ -1230,15 +1235,25 @@ async fn container_child_cannot_read_cargo_credentials() {
     }
 
     let script = jail.join("try_creds.sh");
+    // Read the container-visible path via $CARGO_HOME (scrubbed env), not a
+    // host absolute path that may not exist inside the image layout.
     std::fs::write(
         &script,
-        format!(
-            "#!/bin/sh\nprintf 'VISIBLE_OK\\n'\n\
-             content=$(cat '{}' 2>/dev/null || true)\n\
-             printf 'CREDS_LEN:%s\\n' \"${{#content}}\"\n\
-             printf '%s' \"$content\"\n",
-            creds.display()
-        ),
+        "#!/bin/sh\n\
+printf 'VISIBLE_OK\\n'\n\
+creds=\"$CARGO_HOME/credentials.toml\"\n\
+if [ ! -e \"$creds\" ]; then\n\
+  printf 'CREDS_MISSING\\n'\n\
+  exit 1\n\
+fi\n\
+if [ ! -r \"$creds\" ]; then\n\
+  printf 'CREDS_UNREADABLE\\n'\n\
+  exit 1\n\
+fi\n\
+printf 'CREDS_PRESENT\\n'\n\
+content=$(cat \"$creds\" 2>/dev/null || true)\n\
+printf 'CREDS_LEN:%s\\n' \"${#content}\"\n\
+printf '%s' \"$content\"\n",
     )
     .unwrap();
     chmod_755(&script);
@@ -1253,6 +1268,10 @@ async fn container_child_cannot_read_cargo_credentials() {
     assert!(
         stdout.contains("VISIBLE_OK"),
         "positive control failed: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("CREDS_PRESENT"),
+        "credentials path must exist and be readable (masked), got: {stdout:?}"
     );
     assert!(
         stdout.contains("CREDS_LEN:0"),

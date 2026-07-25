@@ -59,10 +59,13 @@ pub(crate) fn validate_env_allow_name(name: &str) -> Result<(), SandboxError> {
 /// Returns true if the env name is hard-denied.
 #[must_use]
 pub(crate) fn is_hard_denied(name: &str) -> bool {
-    if HARD_DENY_EXACT.contains(&name) {
+    let lower = name.to_ascii_lowercase();
+    if HARD_DENY_EXACT
+        .iter()
+        .any(|exact| lower == exact.to_ascii_lowercase())
+    {
         return true;
     }
-    let lower = name.to_ascii_lowercase();
     HARD_DENY_SUBSTRINGS.iter().any(|sub| lower.contains(sub))
 }
 
@@ -157,10 +160,8 @@ pub(crate) fn scrub_env(
 
     if let Some(path) = &input.path_value {
         map.insert(OsString::from("PATH"), path.clone());
-    } else if let Some(v) = std::env::var_os("PATH") {
-        // Still insert only if caller didn't supply filtered PATH; broker should pass filtered.
-        map.insert(OsString::from("PATH"), v);
     }
+    // Never forward the raw host PATH — callers must supply a filtered value.
 
     map.insert(
         OsString::from("HOME"),
@@ -299,6 +300,7 @@ fn cargo_subcommand(argv: &[String]) -> Option<(usize, String)> {
         "--color",
         "--jobs",
         "-Z",
+        "-C",
         "-j",
         "-p",
         "-F",
@@ -450,6 +452,10 @@ mod tests {
         assert!(is_hard_denied("CARGO_REGISTRY_TOKEN"));
         assert!(is_hard_denied("MY_API_KEY"));
         assert!(!is_hard_denied("USER"));
+        // Exact names are case-insensitive (same normalization as substrings).
+        assert!(is_hard_denied("ld_preload"));
+        assert!(is_hard_denied("Ld_Preload"));
+        assert!(is_hard_denied("AWS_secret_access_key"));
     }
 
     #[test]
@@ -514,6 +520,23 @@ mod tests {
                 "check",
                 "--offline"
             ]
+        );
+
+        // `-C` takes a path value; must not be treated as the subcommand.
+        let (out, _) = apply_quarantine(
+            &[
+                "cargo".into(),
+                "-C".into(),
+                "/tmp/proj".into(),
+                "build".into(),
+            ],
+            Some("cargo"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec!["cargo", "-C", "/tmp/proj", "build", "--offline"]
         );
     }
 

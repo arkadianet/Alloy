@@ -840,7 +840,6 @@ No full argv, no env values, no OTLP, no SessionEvent emission, no savings metri
 | `globset` | `0.4` |
 | `rustix` | `0.38` — `unshare`, `setsid`, `kill`, procfs uid_map helpers preferred over raw `libc` where possible |
 | `libc` | `0.2` — only if rustix lacks a needed call |
-| `which` | `6` — PATH search |
 | `landlock` | `0.4` (Linux target) — must support hard-requirement / ABI check ≥ 2 |
 | `tempfile` | production — unique 0700 bind/SBPL dirs outside the jail (`alloy-sbx-binds-` / `alloy-sbx-seatbelt-`); also used in tests |
 | `uuid` | workspace — per-exec scratch / container names |
