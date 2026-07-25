@@ -6,3 +6,6 @@
 .env
 .env.*
 !.env.example
+
+# Active router config is user-owned and local; only router.toml.example is tracked.
+/router.toml

@@ -128,6 +128,24 @@ async fn graceful_shutdown(
 mod signal_path {
     use super::*;
 
+    /// The default log filter must cover *this* binary's tracing target.
+    ///
+    /// `module_path!()`'s root is the crate name the compiler assigned, which for a
+    /// `[[bin]]` target is its `name` (`alloy`) — not the package name (`alloy-cli`).
+    /// A filter naming `alloy_cli` silently drops every CLI log line, including
+    /// "SIGTERM received" and the `host failed` error.
+    #[test]
+    fn default_log_filter_covers_this_binarys_tracing_target() {
+        let target = module_path!().split("::").next().unwrap();
+        let directive = format!("{target}=");
+        assert!(
+            alloy_runtime::logging::DEFAULT_FILTER.contains(&directive),
+            "DEFAULT_FILTER {:?} has no directive for this binary's tracing target {:?}",
+            alloy_runtime::logging::DEFAULT_FILTER,
+            target,
+        );
+    }
+
     #[tokio::test]
     async fn graceful_shutdown_helper() {
         let dir = tempfile::tempdir().unwrap();

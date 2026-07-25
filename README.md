@@ -33,7 +33,10 @@ crates/
 cargo build --workspace
 cargo test --workspace
 ./target/debug/alloy --help
-./target/debug/alloy host --workspace .
+
+# `alloy host` needs an active router.toml (only the .example is tracked):
+cp router.toml.example router.toml
+./target/debug/alloy host --workspace .   # Ctrl-C / SIGTERM to stop
 ```
 
 Copy [`example.env`](example.env) only if you want a local `.env` — Alloy never
