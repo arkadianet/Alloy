@@ -21,9 +21,11 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use alloy_runtime::Timestamp;
 use alloy_runtime::{ExecAllow, Grant, PermissionToken, ProfileId, RunId};
+#[cfg(target_os = "linux")]
+use alloy_tools::OperatorHomes;
 use alloy_tools::{
     load_sandbox_profile, BackendStatus, ExecClass, NativeSandboxBroker, NetworkPolicy,
-    OperatorHomes, SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
+    SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
 };
 use tempfile::tempdir;
 
@@ -423,10 +425,19 @@ async fn child_cannot_read_dotenv_in_jail() {
     let jail = dir.path().canonicalize().unwrap();
     let dotenv = jail.join(".env");
     std::fs::write(&dotenv, b"SUPER_SECRET=1\n").unwrap();
+    // Positive control: a non-denied sibling must still be readable.
+    std::fs::write(jail.join("visible.txt"), b"VISIBLE_BODY\n").unwrap();
 
     let broker = broker_for_jail(jail.clone()).await.unwrap();
     let script = jail.join("read_env.sh");
-    std::fs::write(&script, "#!/bin/sh\ncat .env\n").unwrap();
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'VISIBLE_OK\\n'\ncat visible.txt\n\
+         content=$(cat .env 2>/dev/null || true)\n\
+         printf 'DOTENV_LEN:%s\\n' \"${#content}\"\n\
+         printf '%s' \"$content\"\n",
+    )
+    .unwrap();
     chmod_755(&script);
 
     let req = SandboxExecRequest::new(
@@ -437,6 +448,14 @@ async fn child_cannot_read_dotenv_in_jail() {
     );
     let result = broker.exec(req).await.unwrap();
     let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("VISIBLE_OK") && stdout.contains("VISIBLE_BODY"),
+        "positive control failed (sandbox did not read sibling): {stdout:?}"
+    );
+    assert!(
+        stdout.contains("DOTENV_LEN:0"),
+        "expected /dev/null bind-over (empty read), got: {stdout:?}"
+    );
     assert!(
         !stdout.contains("SUPER_SECRET"),
         "child read .env contents: {stdout:?} exit={:?}",
@@ -471,7 +490,7 @@ async fn dotenv_sentinel_unchanged() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
-async fn credentials_sentinel_unchanged() {
+async fn child_cannot_read_cargo_credentials() {
     if !landlock_or_skip().await {
         return;
     }
@@ -495,7 +514,17 @@ async fn credentials_sentinel_unchanged() {
     .await
     .unwrap();
     let script = jail.join("try_creds.sh");
-    std::fs::write(&script, format!("#!/bin/sh\ncat '{}'\n", creds.display())).unwrap();
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf 'VISIBLE_OK\\n'\n\
+             content=$(cat '{}' 2>/dev/null || true)\n\
+             printf 'CREDS_LEN:%s\\n' \"${{#content}}\"\n\
+             printf '%s' \"$content\"\n",
+            creds.display()
+        ),
+    )
+    .unwrap();
     chmod_755(&script);
     let req = SandboxExecRequest::new(
         vec![sh_bin().into(), script.display().to_string()],
@@ -505,10 +534,54 @@ async fn credentials_sentinel_unchanged() {
     );
     let result = broker.exec(req).await.unwrap();
     let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("VISIBLE_OK"),
+        "positive control failed: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("CREDS_LEN:0"),
+        "expected credentials bind-over, got: {stdout:?}"
+    );
     assert!(!stdout.contains("sentinel"), "creds leaked: {stdout}");
 
     let after = std::fs::read(&creds).unwrap();
-    assert_eq!(after, original);
+    assert_eq!(
+        after, original,
+        "host credentials.toml must remain untouched"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn credentials_sentinel_unchanged() {
+    // Host-bytes invariant after a benign sandboxed exec (AC7 companion to
+    // child_cannot_read_cargo_credentials).
+    if !landlock_or_skip().await {
+        return;
+    }
+
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let cargo_home = dir.path().join("fake-cargo");
+    let rustup_home = dir.path().join("fake-rustup");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::create_dir_all(&rustup_home).unwrap();
+    let creds = cargo_home.join("credentials.toml");
+    let original = b"token = \"sentinel\"\n";
+    std::fs::write(&creds, original).unwrap();
+
+    let broker =
+        broker_for_jail_with_homes(jail.clone(), OperatorHomes::new(cargo_home, rustup_home))
+            .await
+            .unwrap();
+    let req = SandboxExecRequest::new(
+        vec![true_bin().into()],
+        jail,
+        token(true_bin(), None),
+        ExecClass::Check,
+    );
+    let _ = broker.exec(req).await.unwrap();
+    assert_eq!(std::fs::read(&creds).unwrap(), original);
 }
 
 /// File RO roots (rustup `settings.toml`) must not receive WriteFile/Truncate.
@@ -1053,6 +1126,199 @@ async fn container_cargo_check_fixture() {
         "container cargo check failed: stdout={} stderr={}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn container_child_cannot_read_dotenv_in_jail() {
+    // AC7 for Container backend (self-skips when runtime Unavailable).
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let dotenv = jail.join(".env");
+    std::fs::write(&dotenv, b"SUPER_SECRET=1\n").unwrap();
+    std::fs::write(jail.join("visible.txt"), b"VISIBLE_BODY\n").unwrap();
+
+    let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
+    profile.check_backend = SandboxBackend::Container;
+    profile.test_backend = SandboxBackend::Container;
+    profile.container_image = default_container_image();
+    let broker = match NativeSandboxBroker::new(profile).await {
+        Ok(b) => b,
+        Err(SandboxError::BackendUnavailable { .. }) => {
+            eprintln!("skip: container runtime unavailable");
+            return;
+        }
+        Err(e) => panic!("unexpected: {e:?}"),
+    };
+    if !matches!(
+        broker.capabilities().container,
+        BackendStatus::Available { .. }
+    ) {
+        eprintln!("skip: container probe Unavailable");
+        return;
+    }
+
+    let script = jail.join("read_env.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'VISIBLE_OK\\n'\ncat visible.txt\n\
+         content=$(cat .env 2>/dev/null || true)\n\
+         printf 'DOTENV_LEN:%s\\n' \"${#content}\"\n\
+         printf '%s' \"$content\"\n",
+    )
+    .unwrap();
+    chmod_755(&script);
+    let req = SandboxExecRequest::new(
+        vec!["/bin/sh".into(), script.display().to_string()],
+        jail,
+        token("/bin/sh", None),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("VISIBLE_OK") && stdout.contains("VISIBLE_BODY"),
+        "positive control failed: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("DOTENV_LEN:0"),
+        "expected /dev/null bind-over, got: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("SUPER_SECRET"),
+        "container backend leaked .env: {stdout:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn container_child_cannot_read_cargo_credentials() {
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let cargo_home = dir.path().join("fake-cargo");
+    let rustup_home = dir.path().join("fake-rustup");
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::create_dir_all(&rustup_home).unwrap();
+    let creds = cargo_home.join("credentials.toml");
+    let original = b"token = \"sentinel\"\n";
+    std::fs::write(&creds, original).unwrap();
+
+    let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
+    profile.check_backend = SandboxBackend::Container;
+    profile.test_backend = SandboxBackend::Container;
+    profile.container_image = default_container_image();
+    let broker = match NativeSandboxBroker::with_operator_homes(
+        profile,
+        OperatorHomes::new(cargo_home.clone(), rustup_home),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(SandboxError::BackendUnavailable { .. }) => {
+            eprintln!("skip: container runtime unavailable");
+            return;
+        }
+        Err(e) => panic!("unexpected: {e:?}"),
+    };
+    if !matches!(
+        broker.capabilities().container,
+        BackendStatus::Available { .. }
+    ) {
+        eprintln!("skip: container probe Unavailable");
+        return;
+    }
+
+    let script = jail.join("try_creds.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf 'VISIBLE_OK\\n'\n\
+             content=$(cat '{}' 2>/dev/null || true)\n\
+             printf 'CREDS_LEN:%s\\n' \"${{#content}}\"\n\
+             printf '%s' \"$content\"\n",
+            creds.display()
+        ),
+    )
+    .unwrap();
+    chmod_755(&script);
+    let req = SandboxExecRequest::new(
+        vec!["/bin/sh".into(), script.display().to_string()],
+        jail,
+        token("/bin/sh", None),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("VISIBLE_OK"),
+        "positive control failed: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("CREDS_LEN:0"),
+        "expected credentials bind-over, got: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("sentinel"),
+        "container leaked creds: {stdout}"
+    );
+    assert_eq!(std::fs::read(&creds).unwrap(), original);
+}
+
+#[tokio::test]
+#[cfg(target_os = "macos")]
+async fn seatbelt_child_cannot_read_dotenv_in_jail() {
+    if !seatbelt_or_skip().await {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let dotenv = jail.join(".env");
+    std::fs::write(&dotenv, b"SUPER_SECRET=1\n").unwrap();
+    std::fs::write(jail.join("visible.txt"), b"VISIBLE_BODY\n").unwrap();
+
+    let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
+    profile.check_backend = SandboxBackend::Seatbelt;
+    profile.test_backend = SandboxBackend::Seatbelt;
+    let broker = NativeSandboxBroker::new(profile)
+        .await
+        .expect("seatbelt available");
+
+    let script = jail.join("read_env.sh");
+    // Seatbelt denies file-read of .env (not a /dev/null bind). Keep the
+    // attempt inside the jail — do not rely on /tmp.
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf 'VISIBLE_OK\\n'\ncat visible.txt\n\
+         content=$(cat .env 2>/dev/null || true)\n\
+         if [ -n \"$content\" ]; then\n\
+           printf 'DOTENV_READ_OK\\n'\n\
+           printf '%s' \"$content\"\n\
+         else\n\
+           printf 'DOTENV_DENIED\\n'\n\
+         fi\n",
+    )
+    .unwrap();
+    chmod_755(&script);
+    let req = SandboxExecRequest::new(
+        vec![sh_bin().into(), script.display().to_string()],
+        jail,
+        token(sh_bin(), None),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("VISIBLE_OK") && stdout.contains("VISIBLE_BODY"),
+        "positive control failed: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("DOTENV_DENIED"),
+        "expected Seatbelt deny of .env read, got: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("SUPER_SECRET"),
+        "seatbelt leaked .env: {stdout:?}"
     );
 }
 

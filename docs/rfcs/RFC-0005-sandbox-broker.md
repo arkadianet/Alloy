@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Ready for Implementation |
+| **Status** | Implemented |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged) |
@@ -131,7 +131,8 @@ All new items in `alloy-tools`. Permission types imported from `alloy-runtime`.
 //! Alloy tooling: sandbox broker (RFC-0005) and MCP host (RFC-0006).
 #![deny(missing_docs)]
 // This RFC replaces the stub's `#![forbid(unsafe_code)]` with `deny`, so
-// `backend/linux.rs` and `backend/macos.rs` may `#![allow(unsafe_code)]`.
+// `backend/linux.rs`, `backend/macos.rs`, and `process.rs` (setsid seam)
+// may `#![allow(unsafe_code)]`.
 #![deny(unsafe_code)]
 
 pub mod sandbox; // submodule visibility: `pub use` below; other sandbox::* remain pub(crate) unless listed
@@ -139,8 +140,9 @@ pub mod sandbox; // submodule visibility: `pub use` below; other sandbox::* rema
 pub use sandbox::{
     default_deny_globs, load_sandbox_profile,
     BackendStatus, DenialReason, ExecClass, NativeSandboxBroker, NetworkPolicy,
-    PathAccess, PathPolicy, RecordingSandboxBroker, SandboxBackend, SandboxBroker,
-    SandboxCapabilities, SandboxError, SandboxExecRequest, SandboxExecResult, SandboxProfile,
+    OperatorHomes, PathAccess, PathPolicy, RecordingSandboxBroker, SandboxBackend,
+    SandboxBroker, SandboxCapabilities, SandboxError, SandboxExecRequest,
+    SandboxExecResult, SandboxProfile,
 };
 ```
 
@@ -689,8 +691,8 @@ Composition: prepare ruleset FD + uid/gid map buffers + deny bind `CString` pair
 | Cargo/rustup cache | Bind RO only allowlisted subtrees (§5.5 homes); **not** host toolchain `bin` as the executed binary |
 | User | `--user <uid>:<gid>` |
 | Network | `--network none` when Deny |
-| Identity | `--cidfile <exec_dir>/cid` (required, per-execution); timeout: `kill --signal TERM` then after 2s `kill` (SIGKILL) using **this** cidfile’s container id; missing container on second kill = success |
-| Lifecycle | `--rm`; `--init` |
+| Identity | `--cidfile <exec_dir>/cid` (required per RFC path layout; contents are **untrusted** because the file lives under the jail-writable tree). Kill/timeout use the broker-chosen `--name=alloy-sbx-<uuid>` only. Confirm isolation via runtime `inspect` of that name before mapping exit status; then `rm -f` the container. |
+| Lifecycle | `--init`; **no** `--rm` — keep the named container until inspect confirms it existed, then explicit `rm -f` (avoids racing confirmation against auto-remove) |
 | Env | Env composed per the container env composition table, written to `<exec_dir>/envfile` mode 0600 via `--env-file` (after `validate_env_allow_name`); reject values containing `\n`; delete with `exec_dir` after run |
 | Workdir | `--workdir <canonical cwd>` |
 
@@ -840,14 +842,15 @@ No full argv, no env values, no OTLP, no SessionEvent emission, no savings metri
 | `libc` | `0.2` — only if rustix lacks a needed call |
 | `which` | `6` — PATH search |
 | `landlock` | `0.4` (Linux target) — must support hard-requirement / ABI check ≥ 2 |
-| `tempfile` | dev |
+| `tempfile` | production — unique 0700 bind/SBPL dirs outside the jail (`alloy-sbx-binds-` / `alloy-sbx-seatbelt-`); also used in tests |
+| `uuid` | workspace — per-exec scratch / container names |
 
 ```toml
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 ```
 
-`unsafe`: `deny` at crate root; `allow` only in `backend/linux.rs` and `backend/macos.rs` with per-block comments. New deps are human-gated per V2 §14.6 (this RFC is the gate record).
+`unsafe`: `deny` at crate root; `allow` only in `backend/linux.rs`, `backend/macos.rs`, and `process.rs` (the `setsid` / process-group seam required because `CommandExt::pre_exec` is owned where `Command` is built) with per-block comments. New deps are human-gated per V2 §14.6 (this RFC is the gate record).
 
 ---
 
@@ -880,8 +883,11 @@ landlock = "0.4"
 | `landlock_cargo_check_fixture` | Linux |
 | `seatbelt_cargo_check_fixture` | macOS |
 | `container_cargo_check_fixture` | runtime present |
-| `child_cannot_read_dotenv_in_jail` | place `.env` in jail; sandboxed read fails |
-| `child_cannot_read_cargo_credentials` | sentinel `credentials.toml` unreadable inside sandbox |
+| `child_cannot_read_dotenv_in_jail` | place `.env` in jail; sandboxed read fails (Landlock) |
+| `container_child_cannot_read_dotenv_in_jail` | same for Container (skips if runtime Unavailable) |
+| `seatbelt_child_cannot_read_dotenv_in_jail` | same for Seatbelt (macOS; skips unless Available / `ALLOY_REQUIRE_SEATBELT`) |
+| `child_cannot_read_cargo_credentials` | sentinel `credentials.toml` unreadable inside sandbox (Landlock) |
+| `container_child_cannot_read_cargo_credentials` | same for Container |
 | `netns_probe_marks_unavailable` | probe-time netns failure → Landlock Unavailable / `BackendUnavailable` |
 | `network_deny_blocks_egress` | Positive baseline: controlled local listener reachable **before** deny; then denied connect fails (no ambient CI egress) |
 | `timeout_kills_process_group` | grandchild dead |
@@ -926,7 +932,7 @@ Skip policy: individual tests may `ignore` with reason when probe says Unavailab
 | 4 | Non-zero exit `Ok`; denial `Err`; signal `Ok{signal}` | `signal_status_encoding` + integration cargo fail |
 | 5 | `network=deny` via netns/Seatbelt/`--network none`; probe-time netns failure → Unavailable/`BackendUnavailable`; FS-only Landlock at exec → `BackendCannotEnforce` | `netns_probe_marks_unavailable` + `network_deny_blocks_egress` |
 | 6 | Quarantine forces offline + blocks fetch/update/install | `quarantine_rewrites_and_blocks_fetch` |
-| 7 | Deny globs + in-sandbox `.env` unreadable; cargo credentials unreadable; host `.env` / credentials untouched | `child_cannot_read_dotenv_in_jail` + `child_cannot_read_cargo_credentials` + `dotenv_sentinel_unchanged` + `credentials_sentinel_unchanged` |
+| 7 | Deny globs + in-sandbox `.env` unreadable; cargo credentials unreadable; host `.env` / credentials untouched | `child_cannot_read_dotenv_in_jail` + `container_child_cannot_read_dotenv_in_jail` + `seatbelt_child_cannot_read_dotenv_in_jail` + `child_cannot_read_cargo_credentials` + `container_child_cannot_read_cargo_credentials` + `dotenv_sentinel_unchanged` + `credentials_sentinel_unchanged` |
 | 8 | `PathPolicy` exported for 0006 | public API + path policy tests |
 | 9 | Unavailable backend fail closed | `backend_unavailable_fail_closed` |
 | 10 | Timeout/drop kill process group | `timeout_kills_process_group` + `cancel_drop_no_orphan` |
@@ -941,22 +947,22 @@ Skip policy: individual tests may `ignore` with reason when probe says Unavailab
 
 ## Definition of Done
 
-- [ ] Architecture compliance: **PASS**
-- [ ] RFC acceptance criteria: **100% satisfied** (§13)
-- [ ] Unit tests: **passing**
-- [ ] Integration tests: **passing** on CI Landlock job
-- [ ] Documentation: **complete**
-- [ ] Public APIs: **reviewed and stable**
-- [ ] Clippy: **clean**
-- [ ] Formatting: **clean**
-- [ ] No TODO/placeholders in scope
-- [ ] Code review: **approved**
+- [x] Architecture compliance: **PASS**
+- [x] RFC acceptance criteria: **100% satisfied** (§13) — Landlock proven in required CI; Seatbelt/Container AC7 covered by tests that self-skip when Unavailable (RFC §11 skip policy); macOS operators use `check=container` when Seatbelt probe reports Unavailable
+- [x] Unit tests: **passing**
+- [x] Integration tests: **passing** on CI Landlock job
+- [x] Documentation: **complete** (RFC + residual-risk + design review + profile + `example.env`)
+- [x] Public APIs: **reviewed and stable** (`OperatorHomes` DI surface documented in §3.1 / §7)
+- [x] Clippy: **clean**
+- [x] Formatting: **clean**
+- [x] No TODO/placeholders in scope
+- [ ] Code review: **approved** (human gate)
 
 ---
 
 ## 14. Open Questions
 
-1. **Userns identity-map + netns on CI:** if ubuntu-latest blocks unprivileged userns, CI Landlock job uses Container for `check` via a CI-only profile overlay — production default remains Appendix B. Confirm on first green CI run.
+1. ~~**Userns identity-map + netns on CI:**~~ Settled: ubuntu workflow sets `apparmor_restrict_unprivileged_userns=0` and requires `landlock_actually_applied`.
 2. **rustup shim basename rule:** §5.3 basename grant rule is pinned; if dogfood finds false denies, adjust with a test before widening.
 
 **Settled (do not reopen):** ADR F-07; fail closed; main permission types; `network=deny` + quarantine defaults; never write `.env`; residual build.rs risk; broker in `alloy-tools`; nonzero exit is `Ok`; `ExecClass` explicit; Allow network rejected in MVP; ≤5 crates; container bind-mount at identical host path; Landlock ABI ≥ 2 with HardRequirement; args_glob space-joined full match with `literal_separator(true)`.

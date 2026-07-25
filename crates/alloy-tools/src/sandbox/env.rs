@@ -74,9 +74,6 @@ pub(crate) fn is_hard_denied(name: &str) -> bool {
 /// [`crate::sandbox::NativeSandboxBroker`] — never a process-global override.
 #[derive(Debug, Clone)]
 pub struct OperatorHomes {
-    /// Parent `HOME` (retained for credential-path derivation / tests).
-    #[allow(dead_code)]
-    pub op_home: PathBuf,
     /// Operator cargo home (absolute).
     pub cargo_home: PathBuf,
     /// Operator rustup home (absolute).
@@ -87,11 +84,7 @@ impl OperatorHomes {
     /// Explicit homes for tests or custom layouts (dependency injection).
     #[must_use]
     pub fn new(cargo_home: PathBuf, rustup_home: PathBuf) -> Self {
-        let op_home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"));
         Self {
-            op_home,
             cargo_home,
             rustup_home,
         }
@@ -109,7 +102,6 @@ impl OperatorHomes {
             .map(PathBuf::from)
             .unwrap_or_else(|| op_home.join(".rustup"));
         Ok(Self {
-            op_home,
             cargo_home,
             rustup_home,
         })

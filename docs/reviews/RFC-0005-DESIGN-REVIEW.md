@@ -4,8 +4,8 @@
 | --- | --- |
 | **Author** | arkadianet |
 | **Date** | 2026-07-25 |
-| **RFC** | [RFC-0005](../rfcs/RFC-0005-sandbox-broker.md) (Ready for Implementation) |
-| **Status** | Approved for implementation |
+| **RFC** | [RFC-0005](../rfcs/RFC-0005-sandbox-broker.md) (Implemented) |
+| **Status** | Implementation complete — awaiting human code-review approval |
 
 Authority order: `main` source → RFC-0005 → RFC-0001 → Architecture V2.
 

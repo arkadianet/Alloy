@@ -341,12 +341,6 @@ impl ChildGuard {
         timeout(limit, child.wait()).await.ok()
     }
 
-    /// Give up ownership after a successful `wait`, so `Drop` stays quiet.
-    #[allow(dead_code)] // kept for clarity next to kill_group / sweep_group
-    fn disarm(&mut self) {
-        self.child = None;
-    }
-
     /// Run the kill path to completion (timeout / spawn error path).
     async fn kill_group(&mut self) {
         if let Some(child) = self.child.take() {
@@ -360,6 +354,11 @@ impl ChildGuard {
     async fn sweep_group(&mut self) {
         self.group.kill();
         // Drop a waited Child if still held; Drop must not signal again.
+        self.disarm();
+    }
+
+    /// Give up ownership after a successful `wait`, so `Drop` stays quiet.
+    fn disarm(&mut self) {
         self.child = None;
     }
 }
@@ -490,6 +489,13 @@ pub fn into_exec_result(
     backend: crate::sandbox::types::SandboxBackend,
     policy_digest: alloy_runtime::Digest,
 ) -> SandboxExecResult {
+    // RFC-0005 §9: truncate events at debug with stream name only.
+    if outcome.stdout_truncated {
+        tracing::debug!(stream = "stdout", "sandbox output truncated");
+    }
+    if outcome.stderr_truncated {
+        tracing::debug!(stream = "stderr", "sandbox output truncated");
+    }
     SandboxExecResult {
         exit_code: outcome.exit_code,
         signal: outcome.signal,

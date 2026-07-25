@@ -59,11 +59,11 @@ Quarantine forces offline mode for known cargo subcommands and blocks the
 network-facing cargo family (`fetch` / `update` / `install` / …). Other cargo
 subcommands are allowed with `CARGO_NET_OFFLINE` only (no `--offline` insert).
 
-**Known holes:** cargo flags such as `--config` / value-taking flags can make
-`cargo_subcommand` mis-classify the subcommand, so the **QuarantineBlocked**
-denial may not fire (network deny + `CARGO_NET_OFFLINE` still apply). Basename
-grants match rustup shims (`cargo` → `rustup`) via invocation authority, but
-arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
+Value-taking flags (`--config`, `--manifest-path`, `-Z`, …) are skipped when
+detecting the subcommand so `cargo --config fetch build` still inserts
+`--offline` after `build`. Basename grants match rustup shims (`cargo` →
+`rustup`) via invocation authority, but arbitrary `rustup run` wrappers are out
+of scope for MVP quarantine rewriting.
 
 ---
 
@@ -111,9 +111,10 @@ arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
   (`rust:1.97.1-bookworm` by default). Probe requires a reachable daemon
   (`info` success); CLI-present-but-daemon-down is `Unavailable`. Runtime
   cleanup kills by broker-chosen `--name` (not the jail-writable cidfile).
-  Exec refuses to map a child exit code when the cidfile is empty (no positive
-  confirmation a container ran). The cidfile and env-file still live under the
-  jail (RFC-mandated paths) and are visible to the container as RW.
+  Exec confirms isolation via runtime `inspect` of that name before mapping a
+  child exit code (cidfile contents are never trusted). The cidfile and env-file
+  still live under the jail (RFC-mandated paths) and are visible to the
+  container as RW.
 
 ---
 
@@ -137,8 +138,8 @@ Per-exec trees live under `<jail>/.alloy-sbx/<uuid>/`. Broker-owned bind and
 Seatbelt policy sources live in unique `tempfile` directories under the host temp
 dir (prefix `alloy-sbx-binds-` / `alloy-sbx-seatbelt-`), **outside** the jail,
 mode 0700, removed when the exec returns. Concurrent execs never share a fixed
-parent name. (`tempfile` is a production dependency for these RAII dirs; RFC §10
-still lists it under `dev` — amend on the next RFC editorial pass.)
+parent name. (`tempfile` is a production dependency for these RAII dirs; see
+RFC-0005 §10.)
 
 ---
 
