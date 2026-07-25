@@ -306,6 +306,7 @@ pub trait EventStore: EventSink {
         mut on_event: F,
     ) -> Result<Option<EventSeq>, StoreError>
     where
+        Self: Sized, // ADDITIVE for RFC-0004 — enables `&dyn EventStore` for other methods
         F: FnMut(&SessionEvent) -> Result<(), StoreError> + Send;
 
     /// Highest assigned seq for session, or None if no events.
