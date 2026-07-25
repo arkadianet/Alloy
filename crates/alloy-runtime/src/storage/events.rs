@@ -41,6 +41,7 @@ pub trait EventStore: EventSink {
         on_event: F,
     ) -> Result<Option<EventSeq>, StoreError>
     where
+        Self: Sized, // RFC-0004 §3.1a — enables `&dyn EventStore` for other methods
         F: FnMut(&SessionEvent) -> Result<(), StoreError> + Send;
 
     /// Highest assigned seq for session, or `None` if no events.
@@ -243,6 +244,7 @@ impl EventStore for SqliteEventStore {
         mut on_event: F,
     ) -> Result<Option<EventSeq>, StoreError>
     where
+        Self: Sized,
         F: FnMut(&SessionEvent) -> Result<(), StoreError> + Send,
     {
         let mut cursor: Option<EventSeq> = None;
