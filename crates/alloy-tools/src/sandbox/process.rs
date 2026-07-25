@@ -128,6 +128,8 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
         }
     }
 
+    let deadline = start + spec.exec_timeout;
+
     let mut child = cmd.spawn().map_err(SandboxError::Io)?;
     if let Some(hook) = spec.after_spawn.take() {
         hook();
@@ -150,15 +152,16 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
             None => Ok((Vec::new(), false)),
         }
     });
+    let out_abort = out_task.abort_handle();
+    let err_abort = err_task.abort_handle();
 
-    let status = match guard.wait_for(spec.exec_timeout).await {
-        Some(Ok(status)) => {
-            // Reaped: Drop must not signal a pid the kernel may have recycled.
-            guard.disarm();
-            status
-        }
+    let wait_budget = deadline.saturating_duration_since(Instant::now());
+    let status = match guard.wait_for(wait_budget).await {
+        Some(Ok(status)) => status,
         Some(Err(e)) => {
             guard.kill_group().await;
+            let _ = out_task.await;
+            let _ = err_task.await;
             return Err(SandboxError::Io(e));
         }
         None => {
@@ -170,25 +173,50 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
         }
     };
 
-    let (stdout, stdout_truncated) = out_task
-        .await
-        .map_err(|e| SandboxError::Internal(format!("stdout join: {e}")))?
-        .map_err(SandboxError::Io)?;
-    let (stderr, stderr_truncated) = err_task
-        .await
-        .map_err(|e| SandboxError::Internal(format!("stderr join: {e}")))?
-        .map_err(SandboxError::Io)?;
-
-    let (exit_code, signal) = encode_status(status);
-    Ok(SupervisedOutcome {
-        exit_code,
-        signal,
-        stdout,
-        stderr,
-        stdout_truncated,
-        stderr_truncated,
-        duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+    // Direct child reaped. Drain stdio under the remaining wall-clock budget —
+    // an orphan holding a pipe must not hang past `exec_timeout`. Always sweep
+    // the process group before returning so no descendant survives (§6.4).
+    let drain_budget = deadline.saturating_duration_since(Instant::now());
+    let drained = timeout(drain_budget, async {
+        let stdout = out_task
+            .await
+            .map_err(|e| SandboxError::Internal(format!("stdout join: {e}")))?
+            .map_err(SandboxError::Io)?;
+        let stderr = err_task
+            .await
+            .map_err(|e| SandboxError::Internal(format!("stderr join: {e}")))?
+            .map_err(SandboxError::Io)?;
+        Ok::<_, SandboxError>((stdout, stderr))
     })
+    .await;
+
+    match drained {
+        Ok(Ok(((stdout, stdout_truncated), (stderr, stderr_truncated)))) => {
+            guard.sweep_group().await;
+            let (exit_code, signal) = encode_status(status);
+            Ok(SupervisedOutcome {
+                exit_code,
+                signal,
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            })
+        }
+        Ok(Err(e)) => {
+            guard.sweep_group().await;
+            Err(e)
+        }
+        Err(_) => {
+            // Orphan held a pipe past the deadline — kill the group to unblock
+            // (and abort) the drains, then fail closed as Timeout.
+            out_abort.abort();
+            err_abort.abort();
+            guard.sweep_group().await;
+            Err(SandboxError::Timeout(spec.exec_timeout))
+        }
+    }
 }
 
 /// Carries a `Send`-only value through an API that asks for `Sync`.
@@ -287,6 +315,7 @@ impl ChildGuard {
     }
 
     /// Give up ownership after a successful `wait`, so `Drop` stays quiet.
+    #[allow(dead_code)] // kept for clarity next to kill_group / sweep_group
     fn disarm(&mut self) {
         self.child = None;
     }
@@ -296,6 +325,15 @@ impl ChildGuard {
         if let Some(child) = self.child.take() {
             kill_group_and_reap(child, self.group).await;
         }
+    }
+
+    /// After the direct child is reaped: SIGKILL any remaining group members
+    /// (orphans), then disarm. No grace sleep — the leader already exited, and
+    /// a 2s stall on every successful exec is unacceptable on the hot path.
+    async fn sweep_group(&mut self) {
+        self.group.kill();
+        // Drop a waited Child if still held; Drop must not signal again.
+        self.child = None;
     }
 }
 
@@ -580,6 +618,53 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "grandchild {grandchild} survived drop of the exec future"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A child that exits while a background process holds stdout must not
+    /// hang past `exec_timeout` (§6.4 wall-clock bound).
+    #[tokio::test]
+    async fn orphan_holding_stdout_times_out() {
+        let Some(sh) = shell() else { return };
+        // Leader exits immediately; background loop keeps the stdout pipe open.
+        let script = "while :; do sleep 1; done & exit 0";
+        let err = spawn_supervised(sh_spec(&sh, script, Duration::from_millis(500), 1024))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SandboxError::Timeout(_)),
+            "expected Timeout when orphan holds stdout, got {err:?}"
+        );
+    }
+
+    /// A daemonizing grandchild that detaches stdio must not survive return.
+    #[tokio::test]
+    async fn orphan_detached_stdio_swept_on_return() {
+        let Some(sh) = shell() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("daemon.pid");
+        // Background job redirects stdio away from the pipes, writes its pid,
+        // then loops. Leader waits for the pidfile before exiting so the test
+        // can observe the orphan — then sweep must still kill the group.
+        let script = format!(
+            "sh -c 'trap \"\" TERM; exec >/dev/null 2>&1 </dev/null; echo $$ > {pid}; while :; do sleep 1; done' & \
+             while [ ! -s {pid} ]; do sleep 0.01; done; \
+             exit 0",
+            pid = pidfile.display()
+        );
+        let out = spawn_supervised(sh_spec(&sh, &script, Duration::from_secs(5), 1024))
+            .await
+            .expect("exec should return after leader exits");
+        assert_eq!(out.exit_code, Some(0));
+
+        let pid = read_pid(&pidfile).expect("daemon wrote pidfile before leader exit");
+        let dead_deadline = Instant::now() + Duration::from_secs(3);
+        while process_alive(pid) {
+            assert!(
+                Instant::now() < dead_deadline,
+                "detached orphan {pid} survived successful exec return"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

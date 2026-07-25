@@ -50,9 +50,9 @@ impl PathPolicy {
     /// replaced by a symlink since load. RO roots that do not resolve are
     /// dropped (e.g. `cargo_home/git` on a machine that never fetched a git
     /// dependency). The carve-out must resolve and must sit inside the jail —
-    /// RFC-0005 §5.5 places it at `fs_jail/.alloy-sbx/<id>/cargo-cache` — so a
+    /// RFC-0005 §5.5 places it at `fs_jail/.alloy-sbx/<id>/…` — so a
     /// carve-out pointing at persistent state is rejected rather than accepted.
-    pub fn from_profile_with_carve_out(
+    pub(crate) fn from_profile_with_carve_out(
         profile: &SandboxProfile,
         read_only_roots: Vec<PathBuf>,
         write_carve_out: Option<PathBuf>,
@@ -137,7 +137,7 @@ impl PathPolicy {
 
     /// Borrow the canonical jail root.
     #[must_use]
-    pub fn jail(&self) -> &Path {
+    pub(crate) fn jail(&self) -> &Path {
         &self.jail
     }
 

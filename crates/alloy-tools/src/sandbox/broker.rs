@@ -24,7 +24,7 @@ use crate::sandbox::backend::{
 use crate::sandbox::env::{apply_quarantine, scrub_env, OperatorHomes, ScrubInput};
 use crate::sandbox::glob::compile_deny_globs;
 use crate::sandbox::grant::{match_exec_grant, trusted_path_dirs, trusted_roots};
-use crate::sandbox::path::{PathAccess, PathPolicy};
+use crate::sandbox::path::PathPolicy;
 use crate::sandbox::policy_digest::compute_policy_digest;
 use crate::sandbox::process::into_exec_result;
 use crate::sandbox::profile::{canonicalize_jail, SandboxProfile};
@@ -155,15 +155,12 @@ impl NativeSandboxBroker {
 
         let exec = ExecDir::create(self.base_policy.jail(), &Uuid::new_v4().to_string())?;
 
-        // Allowlisted operator subtrees are readable (§5.5); the per-exec cargo
-        // cache is the single writable carve-out.
+        // Allowlisted operator subtrees are readable (§5.5). Build artifacts
+        // persist under the jail's own `target/` (do not force a per-exec
+        // `CARGO_TARGET_DIR` that is deleted on every return).
         let read_only_roots = allowlisted_ro_subtrees(&homes.cargo_home, &homes.rustup_home);
-        let policy = PathPolicy::from_profile_with_carve_out(
-            &self.profile,
-            read_only_roots.clone(),
-            Some(exec.cargo_cache.clone()),
-        )?;
-        // `from_profile_with_carve_out` re-canonicalizes the jail. Backends bind
+        let policy = PathPolicy::from_profile(&self.profile, read_only_roots.clone())?;
+        // `from_profile` re-canonicalizes the jail. Backends bind
         // `profile.fs_jail` verbatim, so a jail that moved since construction
         // would isolate a different tree than the one being authorized.
         if policy.jail() != self.base_policy.jail() {
@@ -174,9 +171,6 @@ impl NativeSandboxBroker {
             )));
         }
         let cwd = policy.authorize_cwd(&req.cwd)?;
-        // The carve-out is the one path where the policy permits writes against
-        // an otherwise read-only cache; prove that before the child gets it.
-        policy.authorize(&exec.cargo_cache, PathAccess::Write)?;
 
         // Native backends always resolve to a host binary. Container
         // basename-form argv has none: the image supplies the tool, and the
@@ -214,7 +208,7 @@ impl NativeSandboxBroker {
             child_tmpdir: &exec.tmp,
             cargo_home: &homes.cargo_home,
             rustup_home: &homes.rustup_home,
-            cargo_target_dir: Some(&exec.cargo_cache),
+            cargo_target_dir: None,
             env_allow: &req.env_allow,
             quarantine: self.profile.quarantine_deps,
             path_value: Some(path_value(&path_dirs)),
@@ -362,17 +356,16 @@ fn ensure_backend_available(
 
 /// Per-execution scratch tree at `<jail>/.alloy-sbx/<exec_id>` (RFC-0005 §5.5).
 ///
-/// Holds the child `HOME`, `TMPDIR`, and the writable cargo cache carve-out.
-/// Dropping removes the tree, so a cancelled `exec` future leaves nothing
-/// behind; the shared `.alloy-sbx` parent is removed only when it is empty,
-/// which keeps concurrent executions in one jail out of each other's way.
-/// Broker-owned bind sources outside the jail belong to the Linux backend.
+/// Holds the child `HOME` and `TMPDIR`. Dropping removes the tree, so a
+/// cancelled `exec` future leaves nothing behind; the shared `.alloy-sbx`
+/// parent is removed only when it is empty, which keeps concurrent executions
+/// in one jail out of each other's way. Broker-owned bind sources outside the
+/// jail belong to the backends. Build artifacts use the jail's `target/`.
 #[derive(Debug)]
 struct ExecDir {
     root: PathBuf,
     home: PathBuf,
     tmp: PathBuf,
-    cargo_cache: PathBuf,
 }
 
 impl ExecDir {
@@ -381,9 +374,9 @@ impl ExecDir {
         std::fs::create_dir_all(&root).map_err(SandboxError::Io)?;
 
         // A sandboxed child can leave `.alloy-sbx` behind as a symlink, and
-        // creating through it would put the child's HOME, TMPDIR, and writable
-        // cache outside the jail. The jail is canonical, so the tree just
-        // created must equal its own canonical form.
+        // creating through it would put the child's HOME/TMPDIR outside the
+        // jail. The jail is canonical, so the tree just created must equal its
+        // own canonical form.
         let canonical = root.canonicalize().map_err(SandboxError::Io)?;
         if canonical != root {
             let _ = std::fs::remove_dir(&canonical);
@@ -397,11 +390,10 @@ impl ExecDir {
         let dir = Self {
             home: root.join("home"),
             tmp: root.join("tmp"),
-            cargo_cache: root.join("cargo-cache"),
             root,
         };
         // `dir` owns the tree from here: a failure below cleans up on drop.
-        for path in [&dir.home, &dir.tmp, &dir.cargo_cache] {
+        for path in [&dir.home, &dir.tmp] {
             std::fs::create_dir_all(path).map_err(SandboxError::Io)?;
         }
         Ok(dir)
@@ -566,7 +558,6 @@ mod tests {
             let exec = ExecDir::create(&jail, "exec-1").unwrap();
             assert!(exec.home.is_dir());
             assert!(exec.tmp.is_dir());
-            assert!(exec.cargo_cache.is_dir());
             exec.root.clone()
         };
 

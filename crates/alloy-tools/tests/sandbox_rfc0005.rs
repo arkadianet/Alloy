@@ -18,15 +18,15 @@ use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
-use alloy_runtime::{ExecAllow, Grant, PermissionToken, ProfileId, RunId};
 #[cfg(target_os = "linux")]
 use alloy_runtime::Timestamp;
+use alloy_runtime::{ExecAllow, Grant, PermissionToken, ProfileId, RunId};
+#[cfg(target_os = "linux")]
+use alloy_tools::override_operator_homes;
 use alloy_tools::{
     load_sandbox_profile, BackendStatus, ExecClass, NativeSandboxBroker, NetworkPolicy,
     SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
 };
-#[cfg(target_os = "linux")]
-use alloy_tools::override_operator_homes;
 use tempfile::tempdir;
 
 fn token(binary: &str, args_glob: Option<&str>) -> PermissionToken {

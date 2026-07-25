@@ -44,8 +44,9 @@ it. Paths created *after* spawn are **not** retroactively bound over.
 The jail itself is Landlock-writable, so deny-glob coverage for **in-jail**
 secrets depends on the walk finding them. The walk therefore **fails closed**
 when its entry budget is exhausted (refuses the exec) rather than returning a
-partial bind list. `target/` and `.git/` are pruned as build/VCS noise;
-`node_modules/` is **not** pruned (it commonly holds `.env` files).
+partial bind list. `target/` is pruned as build noise; `.git/` is **not** pruned (hooks and
+credentials can live there and PathPolicy would deny them). `node_modules/`
+is **not** pruned (it commonly holds `.env` files).
 
 **Operator guidance:** keep secrets out of the jail when possible; treat
 deny-globs as defense-in-depth on top of fail-closed walks, not a live FS monitor.
@@ -81,7 +82,7 @@ arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
 - **Seatbelt** uses `/usr/bin/sandbox-exec` (Apple-deprecated). MVP uses a bash
   trampoline for the ready-byte handshake and `exec -a` argv0 preservation;
   arguments are never re-joined into an unquoted `bash -c` string. The SBPL and
-  trampoline are written under a broker-owned 0700 directory **outside** the jail
+  trampoline are written under a broker-owned 0700 tempdir **outside** the jail
   (never under `.alloy-sbx`), so jail-writable `build.rs` cannot rewrite policy.
   **Host caveat:** on current macOS 26 GitHub runners, `sandbox-exec` SIGABRTs
   when applying deny-default profiles (even a minimal probe of `/usr/bin/true`).
@@ -89,33 +90,40 @@ arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
   `NativeSandboxBroker::new` fails closed when `check=seatbelt`. Operators on
   affected hosts should set `check = "container"` (or run Linux Landlock) until
   a non-deprecated Seatbelt/AppSandbox path replaces `sandbox-exec`.
+  **CI note:** the macOS job compiles and runs unit/integration tests but does
+  not set `ALLOY_REQUIRE_SEATBELT=1`, so Seatbelt enforcement is not proven in
+  CI on those hosts (allowed by RFC §11; Container is the practical macOS check).
 - **Container** depends on docker/podman availability and a pinned image
-  (`rust:1.97.1-bookworm` by default). Runtime cleanup uses a cidfile drop-guard
-  on every exit path. The cidfile and env-file live under the jail (RFC-mandated
-  paths) and are therefore visible to the container as RW — a compromised child
-  could rewrite the id the broker later signals.
+  (`rust:1.97.1-bookworm` by default). Probe requires a reachable daemon
+  (`info` success); CLI-present-but-daemon-down is `Unavailable`. Runtime
+  cleanup kills by broker-chosen `--name` (not the jail-writable cidfile).
+  Exec refuses to map a child exit code when the cidfile is empty (no positive
+  confirmation a container ran). The cidfile and env-file still live under the
+  jail (RFC-mandated paths) and are visible to the container as RW.
 
 ---
 
 ## Native `cargo check` layout
 
-Per-exec `CARGO_TARGET_DIR` points at the scratch carve-out. Operator
-`CARGO_HOME` RO grants follow the closed RFC-0005 §5.5 list (`registry`,
-`git`, `bin`, `toolchains`, `settings.toml`) — **not** `config.toml`, which
-may hold registry tokens the credential bind-over does not cover. Full online
-registry fetches remain blocked by quarantine + netns. The Landlock
-`landlock_cargo_check_fixture` proves offline `cargo check` against a path
-dependency; registry-dependent checks with custom `config.toml` may need the
-Container backend or an operator-owned config that does not embed tokens.
+Sandboxed cargo uses the jail's persistent `target/` directory (no forced
+per-exec `CARGO_TARGET_DIR`). Operator `CARGO_HOME` RO grants follow the closed
+RFC-0005 §5.5 list (`registry`, `git`, `bin`, `toolchains`, `settings.toml`) —
+**not** `config.toml`, which may hold registry tokens the credential bind-over
+does not cover. Full online registry fetches remain blocked by quarantine +
+netns. The Landlock `landlock_cargo_check_fixture` proves offline `cargo check`
+against a path dependency; registry-dependent checks with custom `config.toml`
+may need the Container backend or an operator-owned config that does not embed
+tokens.
 
 ---
 
 ## Scratch and bind concurrency
 
-Per-exec trees live under `<jail>/.alloy-sbx/<uuid>/`. Broker-owned bind sources
-live under the host temp dir (`alloy-sbx-binds/`), **outside** the jail, so
-sandboxed children cannot rewrite deny bind sources. Concurrent execs use unique
-UUIDs; operators should not share a single scratch uuid across brokers.
+Per-exec trees live under `<jail>/.alloy-sbx/<uuid>/`. Broker-owned bind and
+Seatbelt policy sources live in unique `tempfile` directories under the host temp
+dir (prefix `alloy-sbx-binds-` / `alloy-sbx-seatbelt-`), **outside** the jail,
+mode 0700, removed when the exec returns. Concurrent execs never share a fixed
+parent name.
 
 ---
 

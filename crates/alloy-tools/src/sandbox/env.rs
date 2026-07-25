@@ -157,7 +157,11 @@ pub(crate) struct ScrubInput<'a> {
     pub cargo_home: &'a Path,
     /// Operator rustup home (native absolute).
     pub rustup_home: &'a Path,
-    /// Per-exec writable cargo cache (RFC §5.5 carve-out) → `CARGO_TARGET_DIR`.
+    /// Optional per-exec writable cargo cache → `CARGO_TARGET_DIR`.
+    ///
+    /// Prefer `None` so cargo uses the jail's persistent `target/`. A Some
+    /// value is reserved for callers that intentionally isolate the build
+    /// cache (tests).
     pub cargo_target_dir: Option<&'a Path>,
     /// Extra allowlisted names from the request.
     pub env_allow: &'a [String],

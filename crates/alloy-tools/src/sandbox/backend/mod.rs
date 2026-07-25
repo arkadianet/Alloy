@@ -84,11 +84,13 @@ pub async fn run_isolated(
     }
 }
 
-/// Directories skipped during deny-glob walks (build/VCS noise only).
+/// Directories skipped during deny-glob walks (build noise only).
 ///
 /// Do **not** prune `node_modules` — it commonly holds `.env` / secrets that
-/// deny-globs must still bind over. Truncation is fail-closed (see below).
-const SKIP_DIR_NAMES: &[&str] = &["target", ".git", ".alloy-sbx", "alloy-sbx-binds"];
+/// deny-globs must still bind over. Do **not** prune `.git` — credentials and
+/// hooks can live there and PathPolicy would deny them. Truncation is
+/// fail-closed (see below).
+const SKIP_DIR_NAMES: &[&str] = &["target", ".alloy-sbx", "alloy-sbx-binds"];
 
 /// Collect deny-glob matches under `jail`.
 ///

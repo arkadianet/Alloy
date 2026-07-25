@@ -26,8 +26,8 @@ pub struct MacosSeatbeltBackend;
 
 const TEMPLATE: &str = include_str!("macos/alloy-check.sb.template");
 
-/// Ready-byte wait after spawn (profile apply / trampoline handoff).
-const READY_WAIT: Duration = Duration::from_secs(2);
+/// Trampoline exit when `exec -a` fails after the ready-byte was written.
+const TRAMPOLINE_EXEC_FAIL: i32 = 76;
 
 impl MacosSeatbeltBackend {
     /// Execute under `/usr/bin/sandbox-exec` with argv0 preserved.
@@ -52,7 +52,21 @@ impl MacosSeatbeltBackend {
         // Policy + trampoline live outside the jail: the SBPL grants write to
         // the whole jail, so an in-jail path would be mutable by the child
         // (policy mutable by workspace text — V2 §14.5).
-        let outside = broker_owned_dir()?;
+        let outside_dir = tempfile::Builder::new()
+            .prefix("alloy-sbx-seatbelt-")
+            .tempdir()
+            .map_err(SandboxError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(outside_dir.path())
+                .map_err(SandboxError::Io)?
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(outside_dir.path(), perms).map_err(SandboxError::Io)?;
+        }
+        // SBPL matching is on resolved paths; /var → /private/var on macOS.
+        let outside = std::fs::canonicalize(outside_dir.path()).map_err(SandboxError::Io)?;
         let sbpl = outside.join("alloy-check.sb");
         let body = render_sbpl(profile, &ctx, &outside)?;
         write_mode_0600(&sbpl, body.as_bytes())?;
@@ -96,9 +110,12 @@ impl MacosSeatbeltBackend {
             }
         });
 
+        // Bound the ready wait by the exec timeout — a fixed 2s window falsely
+        // fails slow sandbox-exec handoffs on loaded hosts.
+        let ready_wait = profile.exec_timeout;
         let mut ready_r = ready_r;
         let ready_task =
-            tokio::task::spawn_blocking(move || read_ready_byte(&mut ready_r, READY_WAIT));
+            tokio::task::spawn_blocking(move || read_ready_byte(&mut ready_r, ready_wait));
 
         let outcome = spawn_supervised(SpawnSpec {
             program: sandbox_exec,
@@ -114,12 +131,19 @@ impl MacosSeatbeltBackend {
         .await;
 
         let got_ready = ready_task.await.unwrap_or(false);
+        let sbpl_preview = std::fs::read_to_string(&sbpl).unwrap_or_default();
+        // Hold SBPL/trampoline dir until after we read the preview above.
+        drop(outside_dir);
 
         match outcome {
+            Ok(out) if got_ready && out.exit_code == Some(TRAMPOLINE_EXEC_FAIL) => {
+                Err(SandboxError::Internal(format!(
+                    "seatbelt trampoline exec -a failed (exit {TRAMPOLINE_EXEC_FAIL})"
+                )))
+            }
             Ok(out) if got_ready => Ok(out),
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                let sbpl_preview = std::fs::read_to_string(&sbpl).unwrap_or_default();
                 Err(SandboxError::BackendCannotEnforce(format!(
                     "sandbox-exec/trampoline exited before ready-byte \
                      (exit={:?} signal={:?}): {stderr}; sbpl={sbpl} preview:\n{sbpl_preview}",
@@ -148,7 +172,7 @@ if [[ "${1:-}" != "--" ]]; then
 fi
 shift
 printf 'x' >&"$ready_fd" || exit 75
-exec -a "$argv0" "$program" "$@"
+exec -a "$argv0" "$program" "$@" || exit 76
 "#;
     write_mode_0600(path, BODY.as_bytes())?;
     #[cfg(unix)]
@@ -161,25 +185,6 @@ exec -a "$argv0" "$program" "$@"
         std::fs::set_permissions(path, perms).map_err(SandboxError::Io)?;
     }
     Ok(())
-}
-
-fn broker_owned_dir() -> Result<PathBuf, SandboxError> {
-    let dir = std::env::temp_dir()
-        .join("alloy-sbx-seatbelt")
-        .join(uuid::Uuid::new_v4().to_string());
-    std::fs::create_dir_all(&dir).map_err(SandboxError::Io)?;
-    // SBPL matching is on resolved paths; /var → /private/var on macOS.
-    let dir = std::fs::canonicalize(&dir).map_err(SandboxError::Io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dir)
-            .map_err(SandboxError::Io)?
-            .permissions();
-        perms.set_mode(0o700);
-        std::fs::set_permissions(&dir, perms).map_err(SandboxError::Io)?;
-    }
-    Ok(dir)
 }
 
 fn write_mode_0600(path: &Path, bytes: &[u8]) -> Result<(), SandboxError> {

@@ -200,12 +200,11 @@ fn binary_matches(
                 } else {
                     cwd.join(&allow.binary)
                 };
-                let allow_canon = allow_path.canonicalize().map_err(|e| {
-                    SandboxError::Invalid(format!(
-                        "canonicalize ExecAllow.binary {}: {e}",
-                        allow.binary
-                    ))
-                })?;
+                let allow_canon = match allow_path.canonicalize() {
+                    Ok(p) => p,
+                    // Stale path grant: no match, keep scanning other grants.
+                    Err(_) => return Ok(false),
+                };
                 Ok(res.resolved == allow_canon)
             } else {
                 // Canonical basename OR trusted-root invocation basename (rustup shim).

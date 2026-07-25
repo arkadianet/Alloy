@@ -40,5 +40,4 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 globset = "0.4"
 rustix = { version = "0.38", features = ["process", "fs", "thread", "mount", "net", "stdio", "pipe"] }
 libc = "0.2"
-which = "6"
 landlock = "0.4"

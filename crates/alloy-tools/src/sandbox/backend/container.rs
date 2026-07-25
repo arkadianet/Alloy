@@ -21,17 +21,19 @@ use crate::sandbox::types::{NetworkPolicy, SandboxBackend, SandboxError};
 pub struct ContainerBackend;
 
 /// Ensures the container is killed on every exit path (including drop).
+///
+/// Kill authority is the broker-chosen `--name`, not the jail-writable cidfile.
 struct CidGuard {
     runtime: PathBuf,
-    cidfile: PathBuf,
+    name: String,
     armed: bool,
 }
 
 impl CidGuard {
-    fn new(runtime: PathBuf, cidfile: PathBuf) -> Self {
+    fn new(runtime: PathBuf, name: String) -> Self {
         Self {
             runtime,
-            cidfile,
+            name,
             armed: true,
         }
     }
@@ -47,19 +49,13 @@ impl Drop for CidGuard {
             return;
         }
         // Best-effort synchronous kill; async kill is used on the Timeout path too.
-        if let Ok(cid) = std::fs::read_to_string(&self.cidfile) {
-            let cid = cid.trim();
-            if cid.is_empty() {
-                return;
-            }
-            let _ = std::process::Command::new(&self.runtime)
-                .args(["kill", "--signal", "TERM", cid])
-                .status();
-            std::thread::sleep(Duration::from_millis(200));
-            let _ = std::process::Command::new(&self.runtime)
-                .args(["kill", cid])
-                .status();
-        }
+        let _ = std::process::Command::new(&self.runtime)
+            .args(["kill", "--signal", "TERM", &self.name])
+            .status();
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = std::process::Command::new(&self.runtime)
+            .args(["kill", &self.name])
+            .status();
     }
 }
 
@@ -80,17 +76,17 @@ impl ContainerBackend {
 
         let home = ctx.exec_dir.join("home");
         let tmp = ctx.exec_dir.join("tmp");
-        let cargo_cache = ctx.exec_dir.join("cargo-cache");
         std::fs::create_dir_all(&home).map_err(SandboxError::Io)?;
         std::fs::create_dir_all(&tmp).map_err(SandboxError::Io)?;
-        std::fs::create_dir_all(&cargo_cache).map_err(SandboxError::Io)?;
 
         let scrub = ScrubInput {
             child_home: &home,
             child_tmpdir: &tmp,
             cargo_home: &ctx.cargo_home,
             rustup_home: &ctx.rustup_home,
-            cargo_target_dir: Some(&cargo_cache),
+            // Persist build cache under the jail's `target/` (not a deleted
+            // per-exec scratch dir). RFC §5.5 carve-out is for offline unpack.
+            cargo_target_dir: None,
             env_allow: &[],
             quarantine: profile.quarantine_deps,
             path_value: None,
@@ -112,7 +108,10 @@ impl ContainerBackend {
 
         let cidfile = ctx.exec_dir.join("cid");
         let _ = std::fs::remove_file(&cidfile);
-        let mut cid_guard = CidGuard::new(runtime.clone(), cidfile.clone());
+        // Broker-chosen name is the kill authority — never trust a child-writable
+        // cidfile under the jail (residual risk: cidfile is RFC-mandated there).
+        let container_name = format!("alloy-sbx-{}", uuid::Uuid::new_v4());
+        let mut cid_guard = CidGuard::new(runtime.clone(), container_name.clone());
 
         let uid = rustix::process::getuid().as_raw();
         let gid = rustix::process::getgid().as_raw();
@@ -121,6 +120,7 @@ impl ContainerBackend {
             "run".into(),
             "--rm".into(),
             "--init".into(),
+            format!("--name={container_name}"),
             format!("--cidfile={}", cidfile.display()),
             format!("--user={uid}:{gid}"),
             format!("--workdir={}", ctx.cwd.display()),
@@ -148,17 +148,12 @@ impl ContainerBackend {
             }
             args.push(format!("--volume={}:{}:ro", p.display(), p.display()));
         }
-        args.push(format!(
-            "--volume={}:{}:rw",
-            cargo_cache.display(),
-            cargo_cache.display()
-        ));
 
-        // Empty RO dirs for directory denies — outside the jail.
-        let bind_root = std::env::temp_dir()
-            .join("alloy-sbx-binds")
-            .join(uuid::Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&bind_root).map_err(SandboxError::Io)?;
+        // Empty RO dirs for directory denies — unique 0700 tempdir per exec.
+        let bind_root = tempfile::Builder::new()
+            .prefix("alloy-sbx-binds-")
+            .tempdir()
+            .map_err(SandboxError::Io)?;
         let mut empty_idx = 0usize;
 
         for path in crate::sandbox::backend::credential_bind_targets(&ctx.cargo_home)
@@ -172,7 +167,7 @@ impl ContainerBackend {
             if meta.is_file() || meta.file_type().is_symlink() {
                 args.push(format!("--volume=/dev/null:{}:ro", path.display()));
             } else if meta.is_dir() {
-                let empty = bind_root.join(format!("empty-{empty_idx}"));
+                let empty = bind_root.path().join(format!("empty-{empty_idx}"));
                 empty_idx += 1;
                 std::fs::create_dir_all(&empty).map_err(SandboxError::Io)?;
                 args.push(format!(
@@ -199,20 +194,33 @@ impl ContainerBackend {
         )
         .await;
 
+        // Keep bind_root alive until the runtime returns (volume sources).
+        drop(bind_root);
+
         match &outcome {
             Err(SandboxError::Timeout(_)) => {
-                kill_cid_async(&runtime, &cidfile).await;
+                kill_named_async(&runtime, &container_name).await;
             }
             Err(_) => {
                 // Drop guard also kills; kick TERM early for non-timeout failures.
-                kill_cid_async(&runtime, &cidfile).await;
+                kill_named_async(&runtime, &container_name).await;
             }
-            Ok(_) => {
-                cid_guard.disarm();
-            }
+            Ok(_) => {}
         }
 
         let outcome = outcome?;
+        // Positive confirmation the runtime created a container — never map a
+        // fabricated exit code when nothing was isolated.
+        let cid = std::fs::read_to_string(&cidfile).unwrap_or_default();
+        if cid.trim().is_empty() {
+            return Err(SandboxError::BackendUnavailable {
+                backend: SandboxBackend::Container,
+                message: format!(
+                    "container runtime produced no cidfile (command may not have run): {}",
+                    String::from_utf8_lossy(&outcome.stderr)
+                ),
+            });
+        }
         cid_guard.disarm();
         map_container_status(outcome)
     }
@@ -268,34 +276,33 @@ fn map_container_status(mut outcome: SupervisedOutcome) -> Result<SupervisedOutc
     Ok(outcome)
 }
 
-async fn kill_cid_async(runtime: &Path, cidfile: &Path) {
-    if let Ok(cid) = std::fs::read_to_string(cidfile) {
-        let cid = cid.trim().to_string();
-        if cid.is_empty() {
-            return;
-        }
-        let _ = spawn_runtime_command(
-            runtime,
-            &["kill".into(), "--signal".into(), "TERM".into(), cid.clone()],
-            Path::new("/"),
-            &runtime_host_env(),
-            1024,
-            1024,
-            Duration::from_secs(5),
-        )
-        .await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let _ = spawn_runtime_command(
-            runtime,
-            &["kill".into(), cid],
-            Path::new("/"),
-            &runtime_host_env(),
-            1024,
-            1024,
-            Duration::from_secs(5),
-        )
-        .await;
-    }
+async fn kill_named_async(runtime: &Path, name: &str) {
+    let _ = spawn_runtime_command(
+        runtime,
+        &[
+            "kill".into(),
+            "--signal".into(),
+            "TERM".into(),
+            name.to_string(),
+        ],
+        Path::new("/"),
+        &runtime_host_env(),
+        1024,
+        1024,
+        Duration::from_secs(5),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _ = spawn_runtime_command(
+        runtime,
+        &["kill".into(), name.to_string()],
+        Path::new("/"),
+        &runtime_host_env(),
+        1024,
+        1024,
+        Duration::from_secs(5),
+    )
+    .await;
 }
 
 fn write_mode_0600(path: &Path, bytes: &[u8]) -> Result<(), SandboxError> {
@@ -383,12 +390,10 @@ fn ensure_trusted(path: &Path, roots: &[PathBuf]) -> Result<(), SandboxError> {
     }
 }
 
-/// Probe container runtime availability (CLI present under trusted roots).
+/// Probe container runtime availability (CLI present + daemon reachable).
 pub fn probe_container_sync() -> Result<String, String> {
     match resolve_runtime() {
         Ok(p) => {
-            // Best-effort daemon ping; absence is still Available for CLI presence
-            // but detail notes whether the daemon answered.
             let ping = std::process::Command::new(&p)
                 .args(["info"])
                 .stdout(std::process::Stdio::null())
@@ -396,10 +401,12 @@ pub fn probe_container_sync() -> Result<String, String> {
                 .status();
             match ping {
                 Ok(s) if s.success() => Ok(format!("runtime={} daemon=ok", p.display())),
-                _ => Ok(format!(
-                    "runtime={} daemon=unreachable (exec may return 125)",
-                    p.display()
+                Ok(s) => Err(format!(
+                    "runtime={} daemon=unreachable (info exit={})",
+                    p.display(),
+                    s.code().unwrap_or(-1)
                 )),
+                Err(e) => Err(format!("runtime={} daemon=unreachable ({e})", p.display())),
             }
         }
         Err(e) => Err(e.to_string()),

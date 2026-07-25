@@ -74,17 +74,15 @@ jobs:
       - name: Clippy
         run: cargo clippy -p alloy-tools --all-targets --features test-hooks -- -D warnings
 
-  container:
+    container:
     name: Container backend (optional)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
       - name: Container smoke + probe tests
-        # Matches container_* integration tests (probe + runtime smoke).
-        # Job continues on error when docker/podman is missing; do not `|| true`
-        # so real assertion failures still show as failed steps.
+        # Tests self-skip when the daemon is Unavailable. Real assertion
+        # failures fail the job (this job is optional in branch protection).
         run: cargo test -p alloy-tools --features test-hooks --test sandbox_rfc0005 container_ -- --nocapture

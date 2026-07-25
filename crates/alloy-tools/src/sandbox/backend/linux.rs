@@ -33,6 +33,10 @@ struct LandlockPlan {
     require_id_maps: bool,
 }
 
+/// Marker in `pre_exec` I/O errors so missing binaries are not misreported as
+/// isolation failures.
+const ISOLATE_ERR: &str = "alloy.sandbox.landlock_isolate";
+
 impl LinuxLandlockBackend {
     /// Execute under Landlock + userns + netns.
     pub async fn exec(
@@ -45,7 +49,12 @@ impl LinuxLandlockBackend {
             ));
         }
 
-        let mut plan = Some(prepare_plan(profile, &ctx, true)?);
+        // Unique 0700 tempdir per exec — never a fixed shared name under TMPDIR.
+        let bind_dir = tempfile::Builder::new()
+            .prefix("alloy-sbx-binds-")
+            .tempdir()
+            .map_err(SandboxError::Io)?;
+        let mut plan = Some(prepare_plan(profile, &ctx, true, bind_dir.path())?);
         let program = ctx.program.clone();
         let argv = ctx.argv.clone();
         let cwd = ctx.cwd.clone();
@@ -64,10 +73,14 @@ impl LinuxLandlockBackend {
                     .take()
                     .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
                 apply_plan(plan)
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("{ISOLATE_ERR}: {e}")))
             })),
             after_spawn: None,
         })
         .await;
+
+        // Keep empty-dir bind sources alive until the child returns.
+        drop(bind_dir);
 
         // Probe said Available, but exec-time userns/netns/landlock failed.
         // Under network=Deny that is "cannot enforce", not "backend missing"
@@ -85,19 +98,14 @@ impl LinuxLandlockBackend {
 }
 
 fn is_isolation_io(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::PermissionDenied
-            | std::io::ErrorKind::InvalidInput
-            | std::io::ErrorKind::NotFound
-            | std::io::ErrorKind::Other
-    )
+    e.to_string().contains(ISOLATE_ERR)
 }
 
 fn prepare_plan(
     profile: &SandboxProfile,
     ctx: &IsolateContext,
     require_id_maps: bool,
+    bind_root: &Path,
 ) -> Result<LandlockPlan, SandboxError> {
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
@@ -107,9 +115,7 @@ fn prepare_plan(
     let gid_map = CString::new(format!("0 {gid} 1"))
         .map_err(|_| SandboxError::Internal("gid_map CString".into()))?;
 
-    // Broker-owned bind sources OUTSIDE the jail (not writable by sandboxed children).
-    let bind_root = broker_bind_root()?.join(uuid::Uuid::new_v4().to_string());
-    std::fs::create_dir_all(&bind_root).map_err(SandboxError::Io)?;
+    std::fs::create_dir_all(bind_root).map_err(SandboxError::Io)?;
 
     let mut binds = Vec::new();
     let mut empty_idx = 0usize;
@@ -138,7 +144,7 @@ fn prepare_plan(
         }
     }
 
-    let ruleset = build_ruleset_created(profile, ctx)?;
+    let ruleset = build_ruleset_created(profile, ctx, bind_root)?;
     Ok(LandlockPlan {
         uid_map,
         gid_map,
@@ -146,12 +152,6 @@ fn prepare_plan(
         ruleset: Some(ruleset),
         require_id_maps,
     })
-}
-
-fn broker_bind_root() -> Result<PathBuf, SandboxError> {
-    let base = std::env::temp_dir().join("alloy-sbx-binds");
-    std::fs::create_dir_all(&base).map_err(SandboxError::Io)?;
-    Ok(base)
 }
 
 fn bind_file_to_devnull(path: &Path) -> Result<(CString, CString), SandboxError> {
@@ -166,6 +166,7 @@ fn cstring_path(path: &Path) -> Result<CString, SandboxError> {
 fn build_ruleset_created(
     profile: &SandboxProfile,
     ctx: &IsolateContext,
+    bind_root: &Path,
 ) -> Result<RulesetCreated, SandboxError> {
     let abi = ABI::V2;
     let access_all = AccessFs::from_all(abi);
@@ -223,9 +224,7 @@ fn build_ruleset_created(
     ];
     ro.extend(ctx.read_only_roots.iter().cloned());
     // Allow broker bind-root (empty dirs) as RO so mounts can reference them.
-    if let Ok(br) = broker_bind_root() {
-        ro.push(br);
-    }
+    ro.push(bind_root.to_path_buf());
     for p in &ro {
         if !p.exists() {
             continue;
@@ -394,8 +393,9 @@ pub fn probe_landlock_sync() -> Result<String, String> {
     let gid = rustix::process::getgid().as_raw();
     let uid_map = CString::new(format!("0 {uid} 1")).map_err(|e| e.to_string())?;
     let gid_map = CString::new(format!("0 {gid} 1")).map_err(|e| e.to_string())?;
+    let true_bin = true_bin_path()?;
 
-    let mut cmd = Command::new("/bin/true");
+    let mut cmd = Command::new(&true_bin);
     unsafe {
         cmd.pre_exec(move || {
             unshare(UnshareFlags::NEWUSER | UnshareFlags::NEWNS | UnshareFlags::NEWNET)
@@ -453,7 +453,8 @@ pub fn probe_id_map_only() -> Result<(), String> {
     let gid = rustix::process::getgid().as_raw();
     let uid_map = CString::new(format!("0 {uid} 1")).map_err(|e| e.to_string())?;
     let gid_map = CString::new(format!("0 {gid} 1")).map_err(|e| e.to_string())?;
-    let mut cmd = Command::new("/bin/true");
+    let true_bin = true_bin_path()?;
+    let mut cmd = Command::new(&true_bin);
     unsafe {
         cmd.pre_exec(move || {
             unshare(UnshareFlags::NEWUSER | UnshareFlags::NEWNET)
@@ -467,6 +468,16 @@ pub fn probe_id_map_only() -> Result<(), String> {
         Ok(s) => Err(format!("id_map probe status={s}")),
         Err(e) => Err(e.to_string()),
     }
+}
+
+fn true_bin_path() -> Result<PathBuf, String> {
+    for p in ["/usr/bin/true", "/bin/true"] {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err("neither /usr/bin/true nor /bin/true found".into())
 }
 
 #[cfg(test)]
