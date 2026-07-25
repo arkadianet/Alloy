@@ -2,7 +2,7 @@
 **/*.rs.bk
 .DS_Store
 /.alloy/
-/.alloy-sbx/
+**/.alloy-sbx/
 # Never commit secrets; Alloy documents example.env only.
 .env
 .env.*

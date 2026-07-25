@@ -152,20 +152,44 @@ fn isolation_pipe() -> Result<(std::fs::File, std::fs::File), SandboxError> {
 }
 
 fn read_isolation_ready(ready_r: &mut std::fs::File, wait: std::time::Duration) -> bool {
+    use std::io::ErrorKind;
     use std::io::Read;
+    use std::time::Instant;
+
+    let deadline = Instant::now() + wait;
     let fd = ready_r.as_raw_fd();
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
-    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
-    if rc <= 0 {
-        return false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if rc == 0 {
+            return false;
+        }
+        let mut buf = [0u8; 1];
+        loop {
+            match ready_r.read(&mut buf) {
+                Ok(1) if buf[0] == b'x' => return true,
+                Ok(_) => return false,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return false,
+            }
+        }
     }
-    let mut buf = [0u8; 1];
-    matches!(ready_r.read(&mut buf), Ok(1) if buf[0] == b'x')
 }
 
 fn prepare_plan(
@@ -196,7 +220,26 @@ fn prepare_plan(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(SandboxError::Io(e)),
         };
-        if ft.is_symlink() || ft.is_file() {
+        if ft.is_symlink() {
+            // Resolve the target; bind /dev/null only over regular-file targets.
+            // Directory (or other) symlink targets are not supported as file binds.
+            let target = match std::fs::canonicalize(path) {
+                Ok(t) => t,
+                Err(_) => continue, // dangling — nothing to hide
+            };
+            let target_meta = match std::fs::metadata(&target) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(SandboxError::Io(e)),
+            };
+            if target_meta.is_file() {
+                // Bind over the symlink path itself so the jail name stays opaque.
+                binds.push(bind_file_to_devnull(path)?);
+            }
+            // Skip directory / special symlink targets (cannot safely bind_file).
+            continue;
+        }
+        if ft.is_file() {
             binds.push(bind_file_to_devnull(path)?);
         } else if ft.is_dir() {
             let empty = bind_root.join(format!("empty-{empty_idx}"));
@@ -469,6 +512,11 @@ pub fn probe_landlock_sync() -> Result<String, String> {
     let gid_map = CString::new(format!("0 {gid} 1")).map_err(|e| e.to_string())?;
     let true_bin = true_bin_path()?;
 
+    // Probe-owned bind target: do not depend on host /etc/hostname existing.
+    let probe_target = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    let probe_path = CString::new(probe_target.path().as_os_str().as_encoded_bytes())
+        .map_err(|e| e.to_string())?;
+
     let mut cmd = Command::new(&true_bin);
     unsafe {
         cmd.pre_exec(move || {
@@ -480,7 +528,7 @@ pub fn probe_landlock_sync() -> Result<String, String> {
                 MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
             )
             .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
-            mount_bind("/dev/null", "/etc/hostname")
+            mount_bind("/dev/null", probe_path.as_c_str())
                 .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
             let _ = bring_up_loopback();
             // Same floor + best-effort pattern as build_ruleset_created.
@@ -507,6 +555,8 @@ pub fn probe_landlock_sync() -> Result<String, String> {
         });
     }
     let out = cmd.output().map_err(|e| e.to_string())?;
+    // Keep the probe target alive until the child finishes.
+    drop(probe_target);
     if out.status.success() {
         Ok("landlock+userns+netns+idmap ABI>=2 (truncate best-effort)".into())
     } else {

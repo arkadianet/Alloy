@@ -182,7 +182,11 @@ pub async fn spawn_supervised(mut spec: SpawnSpec) -> Result<SupervisedOutcome, 
     // Direct child reaped. Drain stdio under the remaining wall-clock budget —
     // an orphan holding a pipe must not hang past `exec_timeout`. Always sweep
     // the process group before returning so no descendant survives (§6.4).
-    let drain_budget = deadline.saturating_duration_since(Instant::now());
+    // Keep a small floor so already-buffered output can still be collected when
+    // the deadline is already past (or nearly so) before returning Timeout.
+    const DRAIN_FLOOR: Duration = Duration::from_millis(100);
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let drain_budget = remaining.max(DRAIN_FLOOR);
     let drained = timeout(drain_budget, async {
         let stdout = out_task
             .await
@@ -375,14 +379,21 @@ impl Drop for ChildGuard {
                 handle.spawn(async move { kill_group_and_reap(child, group).await });
             }
             Err(_) => {
-                // Dropped off-runtime: nothing will poll a future, so kill the
-                // direct child here and escalate on a plain thread.
+                // Dropped off-runtime: nothing will poll a future, so kill and
+                // reap on a plain thread (preserve GROUP_KILL_GRACE escalation).
                 std::thread::spawn(move || {
+                    let _ = child.start_kill();
                     std::thread::sleep(GROUP_KILL_GRACE);
                     group.kill();
+                    let _ = child.start_kill();
+                    // Reap the direct child even without an ambient Tokio runtime.
+                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_io()
+                        .build()
+                    {
+                        let _ = rt.block_on(child.wait());
+                    }
                 });
-                let _ = child.start_kill();
-                drop(child);
             }
         }
     }

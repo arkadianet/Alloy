@@ -26,6 +26,7 @@ mod recording;
 mod types;
 
 pub use broker::NativeSandboxBroker;
+pub use env::OperatorHomes;
 pub use glob::default_deny_globs;
 pub use path::{PathAccess, PathPolicy};
 pub use profile::{load_sandbox_profile, SandboxProfile};
@@ -34,6 +35,3 @@ pub use types::{
     BackendStatus, DenialReason, ExecClass, NetworkPolicy, SandboxBackend, SandboxBroker,
     SandboxCapabilities, SandboxError, SandboxExecRequest, SandboxExecResult,
 };
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub use env::override_operator_homes;

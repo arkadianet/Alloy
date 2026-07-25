@@ -19,8 +19,9 @@ pub fn compute_policy_digest(profile: &SandboxProfile) -> Digest {
         crate::sandbox::types::NetworkPolicy::Allow => "allow",
     };
 
-    // serde_json::Map iterates in sorted key order for string keys?
-    // Use json! with a BTreeMap for deterministic key order.
+    // serde_json::Map is sorted by default, but may be insertion-ordered when
+    // the `preserve_order` feature is enabled. Inserting keys alphabetically
+    // keeps the digest stable under either configuration.
     let mut map = serde_json::Map::new();
     map.insert("check_backend".into(), json!(check));
     map.insert("container_image".into(), json!(profile.container_image));

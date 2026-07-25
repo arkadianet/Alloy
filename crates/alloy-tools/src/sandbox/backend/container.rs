@@ -48,14 +48,25 @@ impl Drop for CidGuard {
         if !self.armed {
             return;
         }
-        // Best-effort synchronous kill; async kill is used on the Timeout path too.
-        let _ = std::process::Command::new(&self.runtime)
-            .args(["kill", "--signal", "TERM", &self.name])
-            .status();
-        std::thread::sleep(Duration::from_millis(200));
-        let _ = std::process::Command::new(&self.runtime)
-            .args(["kill", &self.name])
-            .status();
+        let runtime = self.runtime.clone();
+        let name = self.name.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    kill_named_async(&runtime, &name).await;
+                });
+            }
+            Err(_) => {
+                // Best-effort synchronous kill outside an async runtime.
+                let _ = std::process::Command::new(&runtime)
+                    .args(["kill", "--signal", "TERM", &name])
+                    .status();
+                std::thread::sleep(Duration::from_millis(200));
+                let _ = std::process::Command::new(&runtime)
+                    .args(["kill", &name])
+                    .status();
+            }
+        }
     }
 }
 
@@ -118,7 +129,8 @@ impl ContainerBackend {
 
         let mut args: Vec<String> = vec![
             "run".into(),
-            "--rm".into(),
+            // No `--rm`: keep the named container until broker inspect confirms
+            // isolation, then remove explicitly (cidfile under jail is untrusted).
             "--init".into(),
             format!("--name={container_name}"),
             format!("--cidfile={}", cidfile.display()),
@@ -198,29 +210,30 @@ impl ContainerBackend {
         drop(bind_root);
 
         match &outcome {
-            Err(SandboxError::Timeout(_)) => {
+            Err(SandboxError::Timeout(_)) | Err(_) => {
                 kill_named_async(&runtime, &container_name).await;
-            }
-            Err(_) => {
-                // Drop guard also kills; kick TERM early for non-timeout failures.
-                kill_named_async(&runtime, &container_name).await;
+                remove_named_async(&runtime, &container_name).await;
+                cid_guard.disarm();
             }
             Ok(_) => {}
         }
 
         let outcome = outcome?;
-        // Positive confirmation the runtime created a container — never map a
-        // fabricated exit code when nothing was isolated.
-        let cid = std::fs::read_to_string(&cidfile).unwrap_or_default();
-        if cid.trim().is_empty() {
+        // Confirm isolation via broker-chosen name — never trust jail-writable
+        // cidfile contents (RFC places cidfile under exec_dir; residual risk).
+        if !container_exists_by_name(&runtime, &container_name).await {
+            kill_named_async(&runtime, &container_name).await;
+            remove_named_async(&runtime, &container_name).await;
+            cid_guard.disarm();
             return Err(SandboxError::BackendUnavailable {
                 backend: SandboxBackend::Container,
                 message: format!(
-                    "container runtime produced no cidfile (command may not have run): {}",
+                    "container runtime did not create named container (command may not have run): {}",
                     String::from_utf8_lossy(&outcome.stderr)
                 ),
             });
         }
+        remove_named_async(&runtime, &container_name).await;
         cid_guard.disarm();
         map_container_status(outcome)
     }
@@ -296,6 +309,42 @@ async fn kill_named_async(runtime: &Path, name: &str) {
     let _ = spawn_runtime_command(
         runtime,
         &["kill".into(), name.to_string()],
+        Path::new("/"),
+        &runtime_host_env(),
+        1024,
+        1024,
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+/// Confirm a container existed under the broker-chosen `--name` (not cidfile).
+async fn container_exists_by_name(runtime: &Path, name: &str) -> bool {
+    let out = spawn_runtime_command(
+        runtime,
+        &[
+            "inspect".into(),
+            "--format".into(),
+            "{{.Id}}".into(),
+            name.to_string(),
+        ],
+        Path::new("/"),
+        &runtime_host_env(),
+        4096,
+        4096,
+        Duration::from_secs(5),
+    )
+    .await;
+    match out {
+        Ok(o) => o.exit_code == Some(0) && !o.stdout.is_empty(),
+        Err(_) => false,
+    }
+}
+
+async fn remove_named_async(runtime: &Path, name: &str) {
+    let _ = spawn_runtime_command(
+        runtime,
+        &["rm".into(), "-f".into(), name.to_string()],
         Path::new("/"),
         &runtime_host_env(),
         1024,

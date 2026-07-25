@@ -4,8 +4,8 @@
 //! Without that env var, Unavailable hosts skip (local nested-userns) rather
 //! than reporting a dishonest green pass for enforcement.
 //!
-//! Built with `--features test-hooks` so operator homes can be overridden
-//! without mutating process-global `CARGO_HOME`.
+//! Operator homes are injected via `NativeSandboxBroker::with_operator_homes`
+//! (dependency injection) — no process-global CARGO_HOME mutation.
 
 #![allow(clippy::disallowed_methods)] // positive baselines may use host Command
 
@@ -21,11 +21,9 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use alloy_runtime::Timestamp;
 use alloy_runtime::{ExecAllow, Grant, PermissionToken, ProfileId, RunId};
-#[cfg(target_os = "linux")]
-use alloy_tools::override_operator_homes;
 use alloy_tools::{
     load_sandbox_profile, BackendStatus, ExecClass, NativeSandboxBroker, NetworkPolicy,
-    SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
+    OperatorHomes, SandboxBackend, SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
 };
 use tempfile::tempdir;
 
@@ -142,6 +140,70 @@ async fn broker_for_jail(jail: PathBuf) -> Result<NativeSandboxBroker, SandboxEr
     NativeSandboxBroker::new(profile).await
 }
 
+#[cfg(target_os = "linux")]
+async fn broker_for_jail_with_homes(
+    jail: PathBuf,
+    homes: OperatorHomes,
+) -> Result<NativeSandboxBroker, SandboxError> {
+    let mut profile = SandboxProfile::default_for_jail(jail)?;
+    profile.check_backend = SandboxBackend::Landlock;
+    profile.test_backend = SandboxBackend::Container;
+    profile.network = NetworkPolicy::Deny;
+    profile.exec_timeout = Duration::from_secs(30);
+    NativeSandboxBroker::with_operator_homes(profile, homes).await
+}
+
+/// Shared default image tag for container tests (matches profile fallback).
+#[cfg(target_os = "linux")]
+fn default_container_image() -> String {
+    std::env::var("ALLOY_CONTAINER_IMAGE")
+        .unwrap_or_else(|_| "docker.io/library/rust:1.97.1-bookworm".into())
+}
+
+/// Copy `tests/fixtures` into a unique tempdir so concurrent cargo-check tests
+/// do not share a writable jail.
+#[cfg(target_os = "linux")]
+fn copy_fixtures_tree() -> tempfile::TempDir {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let dir = tempdir().unwrap();
+    copy_dir_all(&src, dir.path()).expect("copy fixtures");
+    dir
+}
+
+#[cfg(target_os = "linux")]
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for ent in std::fs::read_dir(src)? {
+        let ent = ent?;
+        let ty = ent.file_type()?;
+        let to = dst.join(ent.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&ent.path(), &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(ent.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn python3_bin() -> Option<PathBuf> {
+    // Resolve via this process's PATH; sandbox PATH is scrubbed.
+    let out = Command::new("sh")
+        .args(["-c", "command -v python3"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
 fn chmod_755(path: &std::path::Path) {
     #[cfg(unix)]
     {
@@ -163,12 +225,14 @@ fn process_alive(pid: i32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn python3_ok() -> bool {
-    Command::new("python3")
-        .arg("-c")
-        .arg("1")
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    python3_bin().is_some_and(|p| {
+        Command::new(&p)
+            .arg("-c")
+            .arg("1")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 #[tokio::test]
@@ -344,7 +408,7 @@ async fn deny_walk_budget_blocks_exec() {
     );
     let err = broker.exec(req).await.unwrap_err();
     assert!(
-        matches!(err, SandboxError::Internal(ref m) if m.contains("exceeded")),
+        matches!(err, SandboxError::BackendCannotEnforce(ref m) if m.contains("exceeded")),
         "budget overrun must fail closed, got {err:?}"
     );
 }
@@ -423,10 +487,13 @@ async fn credentials_sentinel_unchanged() {
     let original = b"token = \"sentinel\"\n";
     std::fs::write(&creds, original).unwrap();
 
-    // Test-hooks override — no process-global CARGO_HOME mutation.
-    let _homes = override_operator_homes(cargo_home.clone(), rustup_home);
-
-    let broker = broker_for_jail(jail.clone()).await.unwrap();
+    // Inject operator homes — no process-global CARGO_HOME mutation.
+    let broker = broker_for_jail_with_homes(
+        jail.clone(),
+        OperatorHomes::new(cargo_home.clone(), rustup_home),
+    )
+    .await
+    .unwrap();
     let script = jail.join("try_creds.sh");
     std::fs::write(&script, format!("#!/bin/sh\ncat '{}'\n", creds.display())).unwrap();
     chmod_755(&script);
@@ -464,8 +531,10 @@ async fn landlock_ro_settings_toml_not_writable() {
     let original = b"default_toolchain = \"stable\"\n";
     std::fs::write(&settings, original).unwrap();
 
-    let _homes = override_operator_homes(cargo_home, rustup_home);
-    let broker = broker_for_jail(jail.clone()).await.unwrap();
+    let broker =
+        broker_for_jail_with_homes(jail.clone(), OperatorHomes::new(cargo_home, rustup_home))
+            .await
+            .unwrap();
 
     let script = jail.join("try_write_settings.sh");
     std::fs::write(
@@ -511,11 +580,12 @@ async fn network_deny_blocks_egress() {
         return;
     }
 
+    let py = python3_bin().expect("python3_ok ensured a path");
     // Positive baseline: host can reach a local listener (RFC §11).
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let port = addr.port();
-    let baseline = Command::new("python3")
+    let baseline = Command::new(&py)
         .arg("-c")
         .arg(format!(
             "import socket; s=socket.create_connection(('127.0.0.1', {port}), 1); s.close()"
@@ -538,7 +608,7 @@ async fn network_deny_blocks_egress() {
         &script,
         format!(
             r#"#!/bin/sh
-python3 - <<'PY'
+'{py}' - <<'PY'
 import socket,sys
 s=socket.socket()
 s.settimeout(1)
@@ -548,7 +618,9 @@ try:
 except Exception:
     sys.exit(2)
 PY
-"#
+"#,
+            py = py.display(),
+            port = port
         ),
     )
     .unwrap();
@@ -713,10 +785,28 @@ async fn child_cannot_umount_dotenv_bind() {
     let broker = broker_for_jail(jail.clone()).await.unwrap();
     let script = jail.join("umount_env.sh");
     // Attempt to undo the /dev/null bind, then read. CAP_SYS_ADMIN drop must
-    // make umount fail so the secret stays hidden.
+    // make umount fail so the secret stays hidden. Record whether umount was
+    // found and refused (do not swallow missing-command via `|| true`).
     std::fs::write(
         &script,
-        "#!/bin/sh\numount .env 2>/dev/null || umount2 .env 2>/dev/null || true\ncat .env\n",
+        r#"#!/bin/sh
+if command -v umount >/dev/null 2>&1; then
+  if umount .env 2>/dev/null; then
+    echo UMOUNT_OK
+  else
+    echo UMOUNT_DENIED
+  fi
+elif command -v umount2 >/dev/null 2>&1; then
+  if umount2 .env 2>/dev/null; then
+    echo UMOUNT_OK
+  else
+    echo UMOUNT_DENIED
+  fi
+else
+  echo UMOUNT_MISSING
+fi
+cat .env
+"#,
     )
     .unwrap();
     chmod_755(&script);
@@ -729,6 +819,10 @@ async fn child_cannot_umount_dotenv_bind() {
     );
     let result = broker.exec(req).await.unwrap();
     let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("UMOUNT_DENIED"),
+        "expected umount refusal marker; got: {stdout:?}"
+    );
     assert!(
         !stdout.contains("SUPER_SECRET"),
         "umount undid deny bind; leaked: {stdout:?}"
@@ -753,14 +847,16 @@ async fn landlock_cargo_check_fixture() {
     };
 
     // Jail must cover both the fixture crate and its path dependency.
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    // Copy into a unique tempdir so this test does not race container_cargo_check.
+    let fixtures_tmp = copy_fixtures_tree();
+    let fixtures = fixtures_tmp.path().canonicalize().expect("fixtures canon");
     let fixture_root = fixtures.join("sbx_check");
     assert!(
         fixture_root.join("Cargo.toml").is_file(),
         "missing fixture at {}",
         fixture_root.display()
     );
-    let jail = fixtures.canonicalize().expect("fixtures canonicalize");
+    let jail = fixtures.clone();
     let cwd = fixture_root.canonicalize().expect("fixture canonicalize");
 
     let broker = broker_for_jail(jail).await.unwrap();
@@ -912,16 +1008,16 @@ async fn seatbelt_denies_outside_jail_read() {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn container_cargo_check_fixture() {
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixtures_tmp = copy_fixtures_tree();
+    let fixtures = fixtures_tmp.path().canonicalize().unwrap();
     let fixture_root = fixtures.join("sbx_check");
-    let jail = fixtures.canonicalize().unwrap();
+    let jail = fixtures.clone();
     let cwd = fixture_root.canonicalize().unwrap();
 
     let mut profile = SandboxProfile::default_for_jail(jail).unwrap();
     profile.check_backend = SandboxBackend::Container;
     profile.test_backend = SandboxBackend::Container;
-    profile.container_image =
-        std::env::var("ALLOY_CONTAINER_IMAGE").unwrap_or_else(|_| "rust:1.97.1-bookworm".into());
+    profile.container_image = default_container_image();
 
     let broker = match NativeSandboxBroker::new(profile).await {
         Ok(b) => b,
@@ -988,8 +1084,7 @@ async fn container_runtime_smoke() {
     let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
     profile.check_backend = SandboxBackend::Container;
     profile.test_backend = SandboxBackend::Container;
-    profile.container_image =
-        std::env::var("ALLOY_CONTAINER_IMAGE").unwrap_or_else(|_| "rust:1.97.1-bookworm".into());
+    profile.container_image = default_container_image();
 
     let broker = match NativeSandboxBroker::new(profile).await {
         Ok(b) => b,

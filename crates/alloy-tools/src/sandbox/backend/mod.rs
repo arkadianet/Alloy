@@ -123,9 +123,10 @@ pub fn collect_deny_paths_with_budget(
         for ent in rd.flatten() {
             visited += 1;
             if visited > max_entries {
-                return Err(SandboxError::Internal(format!(
+                return Err(SandboxError::BackendCannotEnforce(format!(
                     "deny-glob walk exceeded {max_entries} entries under {}; \
-                     refusing to exec with a partial credential bind-over list",
+                     refuse to exec with a partial credential bind-over list \
+                     (reduce jail size or tighten deny globs)",
                     jail.display()
                 )));
             }
@@ -226,7 +227,7 @@ mod tests {
         let set = compile_deny_globs(&default_deny_globs()).unwrap();
         let err = collect_deny_paths_with_budget(jail, &set, 10).unwrap_err();
         assert!(
-            matches!(err, SandboxError::Internal(ref m) if m.contains("exceeded")),
+            matches!(err, SandboxError::BackendCannotEnforce(ref m) if m.contains("exceeded")),
             "got {err:?}"
         );
     }

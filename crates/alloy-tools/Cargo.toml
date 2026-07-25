@@ -9,8 +9,6 @@ rust-version.workspace = true
 
 [features]
 default = []
-# Test-only hooks (never enable in release profiles).
-test-hooks = []
 
 [dependencies]
 alloy-runtime = { workspace = true }
@@ -36,5 +34,4 @@ serde_json = { workspace = true }
 
 [[test]]
 name = "sandbox_rfc0005"
-required-features = ["test-hooks"]
 path = "tests/sandbox_rfc0005.rs"

@@ -16,10 +16,7 @@ pub mod sandbox;
 
 pub use sandbox::{
     default_deny_globs, load_sandbox_profile, BackendStatus, DenialReason, ExecClass,
-    NativeSandboxBroker, NetworkPolicy, PathAccess, PathPolicy, RecordingSandboxBroker,
-    SandboxBackend, SandboxBroker, SandboxCapabilities, SandboxError, SandboxExecRequest,
-    SandboxExecResult, SandboxProfile,
+    NativeSandboxBroker, NetworkPolicy, OperatorHomes, PathAccess, PathPolicy,
+    RecordingSandboxBroker, SandboxBackend, SandboxBroker, SandboxCapabilities, SandboxError,
+    SandboxExecRequest, SandboxExecResult, SandboxProfile,
 };
-
-#[cfg(feature = "test-hooks")]
-pub use sandbox::override_operator_homes;

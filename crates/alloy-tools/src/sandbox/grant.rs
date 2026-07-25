@@ -113,10 +113,9 @@ pub(crate) fn match_exec_grant<'a>(
     }
 
     for a in &allows {
-        if a.binary.contains("..")
-            || Path::new(&a.binary)
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
+        if Path::new(&a.binary)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
         {
             return Err(SandboxError::Invalid(
                 "ExecAllow.binary must not contain `..`".into(),
@@ -255,17 +254,23 @@ pub(crate) fn resolve_executable(
         .unwrap_or(argv0)
         .to_string();
 
+    // Canonicalize trusted roots once; reuse for membership and final checks.
+    let canon_roots: Vec<PathBuf> = trusted_path
+        .iter()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .collect();
+
     // PATH hits are always under a trusted bin dir. Absolute/relative path forms
     // are trusted for *invocation authority* only when the pre-canonicalization
     // path itself sits under a trusted root (rustup shim). A jail-writable
     // symlink named `cargo` → `/bin/sh` must not inherit the `cargo` grant.
     let (chosen, invocation_from_trusted) = if Path::new(argv0).is_absolute() {
         let chosen = PathBuf::from(argv0);
-        let trusted = path_under_trusted(&chosen, trusted_path);
+        let trusted = path_under_trusted(&chosen, &canon_roots);
         (chosen, trusted)
     } else if argv0.contains('/') {
         let chosen = cwd.join(argv0);
-        let trusted = path_under_trusted(&chosen, trusted_path);
+        let trusted = path_under_trusted(&chosen, &canon_roots);
         (chosen, trusted)
     } else {
         (find_on_trusted_path(argv0, trusted_path)?, true)
@@ -275,10 +280,7 @@ pub(crate) fn resolve_executable(
         SandboxError::Invalid(format!("canonicalize binary {}: {e}", chosen.display()))
     })?;
 
-    let under_trusted = trusted_path.iter().any(|root| {
-        let r = root.canonicalize().unwrap_or_else(|_| root.clone());
-        resolved.starts_with(&r)
-    });
+    let under_trusted = canon_roots.iter().any(|r| resolved.starts_with(r));
     if !under_trusted {
         return Err(SandboxError::Invalid(format!(
             "binary {} is outside trusted immutable roots",
@@ -301,17 +303,16 @@ pub(crate) fn resolve_executable(
     })
 }
 
-/// Whether `path` (pre-canonicalization) lives under a trusted immutable root.
-fn path_under_trusted(path: &Path, trusted_path: &[PathBuf]) -> bool {
-    trusted_path.iter().any(|root| {
-        let r = root.canonicalize().unwrap_or_else(|_| root.clone());
-        if path.starts_with(&r) {
+/// Whether `path` (pre-canonicalization) lives under already-canonical trusted roots.
+fn path_under_trusted(path: &Path, canon_roots: &[PathBuf]) -> bool {
+    canon_roots.iter().any(|r| {
+        if path.starts_with(r) {
             return true;
         }
         // Relative joins: compare the canonical parent directory.
         path.parent()
             .and_then(|p| p.canonicalize().ok())
-            .is_some_and(|parent| parent.starts_with(&r))
+            .is_some_and(|parent| parent.starts_with(r))
     })
 }
 
@@ -327,8 +328,7 @@ fn find_on_trusted_path(name: &str, trusted_path: &[PathBuf]) -> Result<PathBuf,
         }
         // Skip broad roots like /usr used only for absolute-path membership.
         let file_name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let is_bin_dir =
-            matches!(file_name, "bin" | "sbin") || dir.ends_with("bin") || dir.ends_with("sbin");
+        let is_bin_dir = matches!(file_name, "bin" | "sbin") || dir.ends_with("sbin");
         if !is_bin_dir {
             continue;
         }

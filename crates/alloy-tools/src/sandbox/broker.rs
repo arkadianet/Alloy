@@ -12,6 +12,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use alloy_runtime::{Digest, Grant, Timestamp};
 use async_trait::async_trait;
@@ -43,9 +44,11 @@ pub struct NativeSandboxBroker {
     capabilities: SandboxCapabilities,
     policy_digest: Digest,
     /// Deny globs compiled once — the profile cannot change after construction.
-    deny_set: GlobSet,
+    deny_set: Arc<GlobSet>,
     /// Jail-only policy (no RO roots, no carve-out) for pre-flight cwd checks.
     base_policy: PathPolicy,
+    /// Operator cargo/rustup homes (injected; never a process-global override).
+    homes: OperatorHomes,
 }
 
 /// Elides the compiled matchers: a `GlobSet` dump is unreadable and the
@@ -71,11 +74,19 @@ impl NativeSandboxBroker {
     /// [`SandboxError::BackendUnavailable`] for
     /// [`ExecClass::Test`](crate::sandbox::ExecClass) instead.
     pub async fn new(profile: SandboxProfile) -> Result<Self, SandboxError> {
+        Self::with_operator_homes(profile, OperatorHomes::resolve()?).await
+    }
+
+    /// Construct with explicit operator homes (tests / custom layouts).
+    pub async fn with_operator_homes(
+        profile: SandboxProfile,
+        homes: OperatorHomes,
+    ) -> Result<Self, SandboxError> {
         // Cheap and side-effect free, so it runs before the probes fork anything.
         validate_profile(&profile)?;
 
         // The profile is immutable, so everything derived from it is built once.
-        let deny_set = compile_deny_globs(&profile.deny_globs)?;
+        let deny_set = Arc::new(compile_deny_globs(&profile.deny_globs)?);
         let base_policy = PathPolicy::from_profile(&profile, Vec::new())?;
         let policy_digest = compute_policy_digest(&profile);
 
@@ -99,6 +110,7 @@ impl NativeSandboxBroker {
             policy_digest,
             deny_set,
             base_policy,
+            homes,
         })
     }
 
@@ -120,7 +132,7 @@ impl NativeSandboxBroker {
         // while the broker lives, and the test backend was never required then.
         ensure_backend_available(backend, &self.capabilities)?;
 
-        let homes = OperatorHomes::resolve()?;
+        let homes = self.homes.clone();
         // PATH search only looks inside bin directories; membership checks accept
         // the broader trusted roots, so resolution gets the union of the two.
         let path_dirs = trusted_path_dirs(Some(&homes.cargo_home), Some(&homes.rustup_home));
@@ -215,7 +227,12 @@ impl NativeSandboxBroker {
         })?;
 
         // Bind-overs are a spawn-time snapshot — see the module residual risk note.
-        let deny_paths = collect_deny_paths(policy.jail(), &self.deny_set)?;
+        // Walk off the async worker; budget exhaustion is BackendCannotEnforce.
+        let jail = policy.jail().to_path_buf();
+        let deny_set = self.deny_set.clone();
+        let deny_paths = tokio::task::spawn_blocking(move || collect_deny_paths(&jail, &deny_set))
+            .await
+            .map_err(|e| SandboxError::Internal(format!("deny-glob walk join: {e}")))??;
 
         let outcome = run_isolated(
             backend,
@@ -402,18 +419,27 @@ impl ExecDir {
 
 impl Drop for ExecDir {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.root) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(
-                    error = %e,
-                    path = %self.root.display(),
-                    "per-exec directory cleanup failed"
-                );
+        let root = self.root.clone();
+        let cleanup = move || {
+            if let Err(e) = std::fs::remove_dir_all(&root) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(
+                        error = %e,
+                        path = %root.display(),
+                        "per-exec directory cleanup failed"
+                    );
+                }
             }
-        }
-        if let Some(parent) = self.root.parent() {
-            // Succeeds only once the last concurrent execution has finished.
-            let _ = std::fs::remove_dir(parent);
+            if let Some(parent) = root.parent() {
+                // Succeeds only once the last concurrent execution has finished.
+                let _ = std::fs::remove_dir(parent);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                drop(handle.spawn_blocking(cleanup));
+            }
+            Err(_) => cleanup(),
         }
     }
 }

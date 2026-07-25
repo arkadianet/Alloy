@@ -77,7 +77,7 @@ crates/alloy-tools/src/
       container.rs       # docker/podman
 ```
 
-Plus: `docs/security/sandbox-residual-risk.md`, `.github/workflows/sandbox.yml`, `clippy.toml`, `example.env` comments only.
+Plus: `docs/security/sandbox-residual-risk.md`, `.github/workflows/sandbox.yml`, `crates/alloy-tools/clippy.toml`, `example.env` comments only.
 
 ---
 

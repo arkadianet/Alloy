@@ -131,7 +131,12 @@ impl MacosSeatbeltBackend {
         .await;
 
         let got_ready = ready_task.await.unwrap_or(false);
-        let sbpl_preview = std::fs::read_to_string(&sbpl).unwrap_or_default();
+        // Only read the SBPL preview on the failure path where it is consumed.
+        let sbpl_preview = if got_ready {
+            String::new()
+        } else {
+            std::fs::read_to_string(&sbpl).unwrap_or_default()
+        };
         // Hold SBPL/trampoline dir until after we read the preview above.
         drop(outside_dir);
 
@@ -216,19 +221,36 @@ fn clear_cloexec(fd: i32) -> Result<(), SandboxError> {
 }
 
 fn read_ready_byte(ready_r: &mut std::fs::File, wait: Duration) -> bool {
+    use std::io::ErrorKind;
+    use std::time::Instant;
+
+    let deadline = Instant::now() + wait;
     let fd = ready_r.as_raw_fd();
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
-    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
-    if rc <= 0 {
-        return false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if rc == 0 {
+            return false;
+        }
+        let mut buf = [0u8; 1];
+        return matches!(ready_r.read(&mut buf), Ok(1) if buf[0] == b'x');
     }
-    let mut buf = [0u8; 1];
-    matches!(ready_r.read(&mut buf), Ok(1) if buf[0] == b'x')
 }
 
 fn pipe_pair() -> Result<(std::fs::File, std::fs::File), SandboxError> {
@@ -236,6 +258,28 @@ fn pipe_pair() -> Result<(std::fs::File, std::fs::File), SandboxError> {
     let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
     if rc != 0 {
         return Err(SandboxError::Io(std::io::Error::last_os_error()));
+    }
+    // Set FD_CLOEXEC on both ends immediately; the write end is cleared at
+    // the child-process handoff (`clear_cloexec`) so only the intended child inherits it.
+    for fd in fds {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(SandboxError::Io(err));
+        }
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(SandboxError::Io(err));
+        }
     }
     let r = unsafe { std::fs::File::from_raw_fd(fds[0]) };
     let w = unsafe { std::fs::File::from_raw_fd(fds[1]) };
@@ -262,7 +306,8 @@ fn render_sbpl(
             ));
         } else {
             ro_clauses.push_str(&format!(
-                "(allow file-read* (subpath {}))\n",
+                "(allow file-read* (subpath {}))\n(allow process-exec (subpath {}))\n",
+                sbpl_literal(&canon),
                 sbpl_literal(&canon)
             ));
         }
@@ -273,17 +318,21 @@ fn render_sbpl(
         .into_iter()
         .chain(ctx.deny_paths.iter().cloned())
     {
-        let meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
         // Prefer resolved path for SBPL matching; fall back to the raw path
         // when canonicalize fails (dangling symlink deny targets).
         let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let matcher = if meta.is_file() || meta.file_type().is_symlink() {
-            format!("(literal {})", sbpl_literal(&canon))
-        } else {
+        // Classify using metadata of the resolved target (not the original symlink).
+        let meta = match std::fs::metadata(&canon) {
+            Ok(m) => m,
+            Err(_) => match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            },
+        };
+        let matcher = if meta.is_dir() {
             format!("(subpath {})", sbpl_literal(&canon))
+        } else {
+            format!("(literal {})", sbpl_literal(&canon))
         };
         deny_clauses.push_str(&format!("(deny file-read* file-write* {matcher})\n"));
     }
@@ -300,6 +349,8 @@ fn render_sbpl(
         .replace("{{TMP}}", &sbpl_literal(&tmp))
         .replace("{{HOME}}", &sbpl_literal(&home))
         .replace("{{BROKER_DIR}}", &sbpl_literal(&broker));
+    // SBPL uses last-matching-rule precedence: allow RO roots first, then
+    // append deny clauses last so credential/secret denies win.
     body.push('\n');
     body.push_str(&ro_clauses);
     body.push_str(&deny_clauses);

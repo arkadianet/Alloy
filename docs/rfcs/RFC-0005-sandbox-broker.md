@@ -784,7 +784,7 @@ Empty map → insert base → insert validated `env_allow` names from parent if 
 | Missing section | Error |
 | `network=allow` | Always `Invalid` in MVP |
 | `ALLOY_CONTAINER_RUNTIME` / `ALLOY_CONTAINER_IMAGE` | Process env; never write `.env` |
-| Test override | Feature `test-hooks` (never in release) may force backend; **not** `cfg(test)` alone |
+| Test override | Inject operator homes via `NativeSandboxBroker::with_operator_homes` (DI; no process-global hooks) |
 
 `profiles/default.toml` MUST contain Appendix B `[sandbox]` (already added). Commented optional in `example.env`:
 

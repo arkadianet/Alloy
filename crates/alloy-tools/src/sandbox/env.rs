@@ -67,8 +67,13 @@ pub(crate) fn is_hard_denied(name: &str) -> bool {
 }
 
 /// Homes resolved from the parent environment (RFC-0005 §5.5).
+/// Operator cargo/rustup home directories used for RO roots and env scrub.
+///
+/// Construct via [`OperatorHomes::resolve`] (production) or
+/// [`OperatorHomes::new`] (tests / custom layouts). Injected into
+/// [`crate::sandbox::NativeSandboxBroker`] — never a process-global override.
 #[derive(Debug, Clone)]
-pub(crate) struct OperatorHomes {
+pub struct OperatorHomes {
     /// Parent `HOME` (retained for credential-path derivation / tests).
     #[allow(dead_code)]
     pub op_home: PathBuf,
@@ -78,57 +83,22 @@ pub(crate) struct OperatorHomes {
     pub rustup_home: PathBuf,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-mod homes_override {
-    use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    static OVERRIDE: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
-
-    /// RAII guard that restores the previous override (usually `None`).
-    pub struct HomesOverrideGuard {
-        prev: Option<(PathBuf, PathBuf)>,
-    }
-
-    impl Drop for HomesOverrideGuard {
-        fn drop(&mut self) {
-            *OVERRIDE.lock().unwrap() = self.prev.take();
-        }
-    }
-
-    /// Override operator cargo/rustup homes for the current process (tests only).
-    pub fn override_operator_homes(
-        cargo_home: PathBuf,
-        rustup_home: PathBuf,
-    ) -> HomesOverrideGuard {
-        let mut slot = OVERRIDE.lock().unwrap();
-        let prev = slot.replace((cargo_home, rustup_home));
-        HomesOverrideGuard { prev }
-    }
-
-    pub(super) fn take_override() -> Option<(PathBuf, PathBuf)> {
-        OVERRIDE.lock().unwrap().clone()
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub use homes_override::override_operator_homes;
-
 impl OperatorHomes {
-    /// Resolve from parent env; requires `HOME` on Unix.
-    pub(crate) fn resolve() -> Result<Self, SandboxError> {
-        #[cfg(any(test, feature = "test-hooks"))]
-        if let Some((cargo_home, rustup_home)) = homes_override::take_override() {
-            let op_home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/"));
-            return Ok(Self {
-                op_home,
-                cargo_home,
-                rustup_home,
-            });
+    /// Explicit homes for tests or custom layouts (dependency injection).
+    #[must_use]
+    pub fn new(cargo_home: PathBuf, rustup_home: PathBuf) -> Self {
+        let op_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        Self {
+            op_home,
+            cargo_home,
+            rustup_home,
         }
+    }
 
+    /// Resolve from parent env; requires `HOME` on Unix.
+    pub fn resolve() -> Result<Self, SandboxError> {
         let op_home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| SandboxError::Invalid("HOME unset".into()))?;
@@ -276,29 +246,30 @@ pub(crate) fn apply_quarantine(
     let mut out = argv.to_vec();
     let sub = cargo_subcommand(&out);
 
-    match sub.as_deref() {
+    match sub.as_ref() {
         None => {
             tracing::info!(blocked = false, offline_inserted = false, "quarantine");
             Ok((out, QuarantineOutcome::OfflineEnvOnly))
         }
-        Some(s) if matches!(s, "fetch" | "update" | "install" | "publish" | "search") => {
+        Some((_, s))
+            if matches!(
+                s.as_str(),
+                "fetch" | "update" | "install" | "publish" | "search"
+            ) =>
+        {
             tracing::info!(blocked = %s, "quarantine");
             Err(SandboxError::Denied(DenialReason::QuarantineBlocked(
-                s.to_string(),
+                s.clone(),
             )))
         }
-        Some(s)
+        Some((idx, s))
             if matches!(
-                s,
+                s.as_str(),
                 "check" | "test" | "build" | "clippy" | "tree" | "metadata"
             ) =>
         {
             if !out.iter().any(|a| a == "--offline") {
-                // Insert immediately after subcommand.
-                let idx = out
-                    .iter()
-                    .position(|a| a == s)
-                    .ok_or_else(|| SandboxError::Internal("subcommand index missing".into()))?;
+                // Insert immediately after the subcommand token.
                 out.insert(idx + 1, "--offline".into());
                 tracing::info!(blocked = false, offline_inserted = true, sub = %s, "quarantine");
                 Ok((out, QuarantineOutcome::OfflineInserted))
@@ -307,30 +278,65 @@ pub(crate) fn apply_quarantine(
                 Ok((out, QuarantineOutcome::OfflineEnvOnly))
             }
         }
-        Some(s) => {
+        Some((_, s)) => {
             tracing::info!(blocked = false, offline_inserted = false, sub = %s, "quarantine");
             Ok((out, QuarantineOutcome::OfflineEnvOnly))
         }
     }
 }
 
-fn cargo_subcommand(argv: &[String]) -> Option<String> {
-    // Skip argv[0]; skip optional +<toolchain>; skip leading flags until subcommand.
+/// Returns `(index_in_argv, subcommand)` for the first real cargo subcommand.
+///
+/// Skips `+toolchain`, ordinary flags, and the separate values of known
+/// value-taking flags (`--config`, `--manifest-path`, `-Z`, …). Honours `--`.
+fn cargo_subcommand(argv: &[String]) -> Option<(usize, String)> {
+    // Flags whose next argv token is a value, not a subcommand.
+    const VALUE_FLAGS: &[&str] = &[
+        "--config",
+        "--manifest-path",
+        "--target-dir",
+        "--target",
+        "--features",
+        "--package",
+        "--bin",
+        "--example",
+        "--test",
+        "--bench",
+        "--profile",
+        "--message-format",
+        "--color",
+        "--jobs",
+        "-Z",
+        "-j",
+        "-p",
+        "-F",
+    ];
+
     let mut i = 1;
     while i < argv.len() {
         let a = &argv[i];
+        if a == "--" {
+            // Next token (if any) is the subcommand.
+            return argv.get(i + 1).map(|s| (i + 1, s.clone()));
+        }
         if a.starts_with('+') {
             i += 1;
             continue;
         }
         if a.starts_with('-') {
-            // Flag — for quarantine detection we skip flags until a non-flag token.
-            // Cargo accepts `cargo --offline check`; treat non-option as sub.
+            // `--flag=value` carries its value in-band.
+            if a.contains('=') {
+                i += 1;
+                continue;
+            }
+            let takes_value = VALUE_FLAGS.iter().any(|f| a == f);
             i += 1;
-            // If flag takes a value we don't try to be perfect; MVP scans for first non -/+ token.
+            if takes_value && i < argv.len() {
+                i += 1;
+            }
             continue;
         }
-        return Some(a.clone());
+        return Some((i, a.clone()));
     }
     None
 }
@@ -476,6 +482,47 @@ mod tests {
             err,
             SandboxError::Denied(DenialReason::QuarantineBlocked(_))
         ));
+    }
+
+    #[test]
+    fn quarantine_skips_value_taking_flags() {
+        let (out, oc) = apply_quarantine(
+            &[
+                "cargo".into(),
+                "--config".into(),
+                "fetch".into(),
+                "build".into(),
+            ],
+            Some("cargo"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec!["cargo", "--config", "fetch", "build", "--offline"]
+        );
+        assert_eq!(oc, QuarantineOutcome::OfflineInserted);
+
+        // `--config=fetch` must not be treated as a blocked subcommand.
+        let (out, _) = apply_quarantine(
+            &[
+                "cargo".into(),
+                "--config=net.git-fetch-with-cli=true".into(),
+                "check".into(),
+            ],
+            Some("cargo"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "cargo",
+                "--config=net.git-fetch-with-cli=true",
+                "check",
+                "--offline"
+            ]
+        );
     }
 
     #[test]

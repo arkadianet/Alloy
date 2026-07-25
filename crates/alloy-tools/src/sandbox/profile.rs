@@ -37,6 +37,7 @@ struct SandboxConfigToml {
     stdout_cap: usize,
     #[serde(default = "default_cap")]
     stderr_cap: usize,
+    /// Optional container image. Overridden by `ALLOY_CONTAINER_IMAGE` when set.
     #[serde(default)]
     container_image: Option<String>,
 }
@@ -130,11 +131,48 @@ pub fn load_sandbox_profile(
         ));
     }
 
-    let image = std::env::var("ALLOY_CONTAINER_IMAGE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or(cfg.container_image)
-        .unwrap_or_else(default_container_image);
+    // Positivity matches validate_profile — report with the profile path here.
+    if cfg.exec_timeout_secs == 0 {
+        return Err(SandboxError::Invalid(format!(
+            "exec_timeout_secs must be greater than zero in {}",
+            profile_toml.display()
+        )));
+    }
+    if cfg.stdout_cap == 0 {
+        return Err(SandboxError::Invalid(format!(
+            "stdout_cap must be greater than zero in {}",
+            profile_toml.display()
+        )));
+    }
+    if cfg.stderr_cap == 0 {
+        return Err(SandboxError::Invalid(format!(
+            "stderr_cap must be greater than zero in {}",
+            profile_toml.display()
+        )));
+    }
+
+    // Precedence: ALLOY_CONTAINER_IMAGE (env) > profile `container_image` >
+    // compiled default. Env wins so CI/operators can pin without editing TOML.
+    let image = if let Ok(env_image) = std::env::var("ALLOY_CONTAINER_IMAGE") {
+        if !env_image.is_empty() {
+            if cfg
+                .container_image
+                .as_ref()
+                .is_some_and(|c| c != &env_image)
+            {
+                tracing::info!(
+                    env = %env_image,
+                    profile = ?cfg.container_image,
+                    "ALLOY_CONTAINER_IMAGE overrides profile container_image"
+                );
+            }
+            env_image
+        } else {
+            cfg.container_image.unwrap_or_else(default_container_image)
+        }
+    } else {
+        cfg.container_image.unwrap_or_else(default_container_image)
+    };
 
     Ok(SandboxProfile {
         check_backend: parse_backend(&cfg.check)?,
