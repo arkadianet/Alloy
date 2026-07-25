@@ -222,17 +222,25 @@ fn env_path_boundary_after(text: &str, after: usize) -> bool {
 }
 
 fn json_key_is_sensitive(key: &str) -> bool {
+    // Match `is_secret_assignment_name` precision: exact names + secret suffixes.
+    // Do **not** use broad `contains("token")` — that falsely hits `input_tokens`,
+    // `output_tokens`, `max_tokens`, `tokenizer`, etc.
     let lower = key.to_ascii_lowercase();
-    const NEEDLES: &[&str] = &[
-        "api_key",
-        "api-key",
-        "secret",
-        "password",
-        "token",
-        "authorization",
-        "credential",
-    ];
-    NEEDLES.iter().any(|n| lower == *n || lower.contains(n))
+    matches!(
+        lower.as_str(),
+        "api_key" | "api-key" | "secret" | "password" | "token" | "authorization" | "credential"
+    ) || lower.ends_with("_api_key")
+        || lower.ends_with("_secret")
+        || lower.ends_with("_token")
+        || lower.ends_with("_password")
+        || lower.ends_with("_authorization")
+        || lower.ends_with("_credential")
+        || lower.ends_with("-api-key")
+        || lower.ends_with("-secret")
+        || lower.ends_with("-token")
+        || lower.ends_with("-password")
+        || lower.ends_with("-authorization")
+        || lower.ends_with("-credential")
 }
 
 fn match_at(text: &str, i: usize) -> Option<usize> {
@@ -506,6 +514,23 @@ mod tests {
         let out = redact_json_strings(&v);
         assert_eq!(out["api_key"], json!(REDACTED));
         assert_eq!(out["ok"], json!("fine"));
+    }
+
+    #[test]
+    fn metadata_token_counts_not_redacted() {
+        let v = json!({
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "max_tokens": 100,
+            "auth_token": "secret-value",
+            "api_key": "sk-abcdefghij"
+        });
+        let out = redact_json_strings(&v);
+        assert_eq!(out["input_tokens"], json!(10));
+        assert_eq!(out["output_tokens"], json!(5));
+        assert_eq!(out["max_tokens"], json!(100));
+        assert_eq!(out["auth_token"], json!(REDACTED));
+        assert_eq!(out["api_key"], json!(REDACTED));
     }
 
     #[test]

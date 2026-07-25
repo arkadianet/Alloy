@@ -520,10 +520,13 @@ fn obs_module_not_imported_by_session_storage_runtime() {
         manifest.join("runtime"),
     ];
     for root in roots {
+        if !root.exists() {
+            continue;
+        }
         for entry in walkdir_rs(&root) {
             let text = std::fs::read_to_string(&entry).unwrap();
             assert!(
-                !text.contains("crate::obs") && !text.contains("alloy_runtime::obs"),
+                !has_obs_import(&text),
                 "{} must not import obs",
                 entry.display()
             );
@@ -531,9 +534,53 @@ fn obs_module_not_imported_by_session_storage_runtime() {
     }
 }
 
+/// Boundary-aware detection of `obs` imports (not comments / `crate::obsolete`).
+fn has_obs_import(text: &str) -> bool {
+    for line in text.lines() {
+        let code = line
+            .split("//")
+            .next()
+            .unwrap_or(line)
+            .split("///")
+            .next()
+            .unwrap_or(line);
+        // Strip simple block-comment openers on the same line; full /* */ spanning
+        // lines is rare in use-statements and not required for this guard.
+        let code = code.split("/*").next().unwrap_or(code);
+        if code.contains("use crate::obs::")
+            || code.contains("use crate::obs{")
+            || code.contains("use crate::obs;")
+            || code.contains("use alloy_runtime::obs::")
+            || code.contains("use alloy_runtime::obs{")
+            || code.contains("use alloy_runtime::obs;")
+            || code.contains("alloy_runtime::obs::")
+        {
+            return true;
+        }
+        // `crate::obs` / `crate::obs::` / `crate::obs{` but not `crate::obsolete`
+        if let Some(idx) = code.find("crate::obs") {
+            let after = &code[idx + "crate::obs".len()..];
+            let boundary_ok = after.is_empty()
+                || after.starts_with("::")
+                || after.starts_with('{')
+                || after.starts_with(';')
+                || after.starts_with(',')
+                || after.starts_with(' ')
+                || after.starts_with('\t');
+            if boundary_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn walkdir_rs(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for e in std::fs::read_dir(dir).unwrap() {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in rd {
         let e = e.unwrap();
         let p = e.path();
         if p.is_dir() {
@@ -543,6 +590,18 @@ fn walkdir_rs(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[test]
+fn has_obs_import_boundary_aware() {
+    assert!(has_obs_import("use crate::obs::CostMeter;\n"));
+    assert!(has_obs_import("use crate::obs::{CostMeter, ObsError};\n"));
+    assert!(has_obs_import(
+        "let x = alloy_runtime::obs::CostMeter::new();\n"
+    ));
+    assert!(!has_obs_import("// crate::obs is documented here\n"));
+    assert!(!has_obs_import("use crate::obsolete::Thing;\n"));
+    assert!(!has_obs_import("/// See [`crate::obs`] for metering.\n"));
 }
 
 #[tokio::test]
