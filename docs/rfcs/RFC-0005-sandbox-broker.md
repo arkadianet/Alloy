@@ -49,7 +49,7 @@ RFC-0001 published `Grant`, `ExecAllow`, `Glob`, `HostAllow`, `PermissionToken`.
 | `RecordingSandboxBroker` | Full test-double API for 0006/0008/0013 |
 | Tests + residual-risk doc + CI workflow | Unit + platform integration + negative suite |
 | `profiles/default.toml` `[sandbox]` | In-scope deliverable |
-| Clippy `disallowed_methods` | No bare `Command::new` outside sandbox modules |
+| Clippy `disallowed_methods` | No bare `std`/`tokio` `Command::new` outside sandbox modules |
 
 ### Non-goals
 
@@ -68,7 +68,7 @@ RFC-0001 published `Grant`, `ExecAllow`, `Glob`, `HostAllow`, `PermissionToken`.
 2. `network = deny` enforced by user+netns (Landlock path), Seatbelt, or `--network none` (container) — never via Landlock FS rules alone.
 3. Default deny globs block `.env` and key material; child env never loads `.env`.
 4. Non-zero child exit → `Ok(SandboxExecResult)`; signal death encoded per §3.4; policy denials → `Err`.
-5. No bare `std::process::Command` outside sandbox modules in `alloy-tools`.
+5. No bare `std::process::Command` / `tokio::process::Command` outside sandbox modules in `alloy-tools`.
 
 ---
 
@@ -230,6 +230,7 @@ pub struct SandboxExecRequest {
     /// Extra env **names** permitted beyond the broker base set (§6).
     /// Values always come from the parent env of those names — no value injection API in MVP
     /// (RFC-0006 may extend additively).
+    /// Each name MUST pass `validate_env_allow_name` (§6.3) before lookup or `--env-file` write.
     pub env_allow: Vec<String>,
     /// Authoritative token (includes `run_id`).
     pub perms: PermissionToken,
@@ -408,7 +409,7 @@ impl PathPolicy {
 }
 ```
 
-**`PathAccess` semantics:** `Read` allows RO roots; `Write` on a path under any `read_only_roots` entry → `Denied(PathDenied)` (except `.package-cache` and `registry/src` carve-outs).
+**`PathAccess` semantics:** `Read` allows RO roots; `Write` on a path under any `read_only_roots` entry → `Denied(PathDenied)` (except the broker-owned per-execution writable cache carve-out in §5.5 — **not** persistent `cargo_home/registry/src`).
 
 **Deny-glob matching (normative):**
 
@@ -528,7 +529,7 @@ sequenceDiagram
 
 ### 5.2 Token & grant validation
 
-1. Expiry: if `expires` is `Some(t)` and `Timestamp::now().0 > t.0` → `TokenExpired`.
+1. Expiry: if `expires` is `Some(t)` and `Timestamp::now().0 >= t.0` → `TokenExpired` (reject at the equality boundary, not only after).
 2. Collect all `Grant::Exec` allows. If none → `Denied(MissingExecGrant)`.
 3. For each allow, test `exec_allow_matches` (§5.3) against **caller argv before quarantine rewrite**. First match wins. If some Exec grants exist but none match binary → `ExecNotAllowlisted`. If a binary matches but every matching binary fails args → `ArgsNotAllowlisted`.
 4. Profile `network = Deny` wins over any `Grant::Network` (MVP: Allow profiles rejected at load).
@@ -541,24 +542,21 @@ sequenceDiagram
 1. Reject empty argv, NUL bytes, `argv.len() > 256`, total argv bytes `> 64 KiB` → `Invalid`.
 2. Reject `argv[0]` containing `..` path segments → `Invalid`.
 3. Reject `ExecAllow.binary` containing `..` → `Invalid`.
-4. Let `PATH` = scrubbed base PATH (§6). **No implicit `.` entry.**
-5. **PATH hit selection** (do not canonicalize yet):
-   - If `argv[0]` is absolute: `chosen = argv[0]`.
-   - Else if `argv[0]` contains `/` (e.g. `./tool`): `chosen = cwd.join(argv[0])`.
-   - Else: search `PATH` directories in order; first existing file with execute bit → `chosen`. If none → `Invalid("binary not found")`.
-6. Let `path_hit_basename = basename(chosen)` **before** any canonicalize. This string is the **sole** basename authority for:
-   - basename-form `ExecAllow.binary` matching, and
-   - quarantine cargo detection (§5.6).
-7. Grant match:
-   - Basename grant (`allow.binary` has no `/`): `path_hit_basename == allow.binary`.
-   - Path grant (`allow.binary` contains `/`): `canonicalize(chosen)? == canonicalize(allow.binary resolved against cwd)?`.
-8. **Spawn (native):** `execve(canonicalize(chosen)?, argv_for_child, env)` where `argv_for_child[0] =` the caller’s **original** `argv[0]` string (preserves rustup/`busybox` argv0-dispatch). Do **not** replace `argv[0]` with the canonical path.
-9. If canonicalize changes the basename relative to `path_hit_basename`, still keep original argv0; do not re-run grant matching on the post-canonicalize basename.
+4. Let `PATH` = scrubbed base PATH (§6), **filtered to trusted immutable roots only** (system RO roots from the jail path set — `/usr`, `/bin`, `/sbin`, and allowlisted `cargo_home/bin` / `rustup_home/toolchains` when present). **No** cwd, jail-writable, or other untrusted directories. **No implicit `.` entry.**
+5. **PATH hit selection:**
+   - If `argv[0]` is absolute: `chosen = argv[0]` (must still fall under a trusted immutable root after canonicalize, else `Invalid` / deny).
+   - Else if `argv[0]` contains `/` (e.g. `./tool`): `chosen = cwd.join(argv[0])` — absolute/relative path forms are allowed only when the **canonical** target is under a trusted immutable root (workspace shadows are not).
+   - Else: search filtered `PATH` directories in order; first existing file with execute bit → `chosen`. If none → `Invalid("binary not found")`.
+6. **Canonicalize before security decisions:** `resolved = canonicalize(chosen)?`. Reject if `resolved` is outside trusted immutable roots. Security authority for grant matching and quarantine is derived from `resolved` (and `basename(resolved)`), **never** from the pre-canonicalization basename alone.
+7. Grant match (after canonicalize):
+   - Basename grant (`allow.binary` has no `/`): `basename(resolved) == allow.binary`.
+   - Path grant (`allow.binary` contains `/`): `resolved == canonicalize(allow.binary resolved against cwd)?`.
+8. **Spawn (native):** `execve(resolved, argv_for_child, env)` where `argv_for_child[0] =` the caller’s **original** `argv[0]` string only (preserves rustup/`busybox` argv0-dispatch semantics). Do **not** replace `argv[0]` with the canonical path, and do **not** use the original/pre-canonical basename as the security authority.
 
 **Container backend resolution (normative — distinct from native):**
 
-- Grant matching for **basename-form** `argv[0]` uses `path_hit_basename = basename(argv[0])` **without** requiring the binary to exist on the host.
-- Path-form / absolute `argv[0]` MUST still exist on the host and match grants as above; the container command then runs that path only if it is under a bind-mounted identical host path — MVP builtins MUST use basename-form `cargo` / tool names.
+- Grant matching for **basename-form** `argv[0]` uses `basename(argv[0])` **without** requiring the binary to exist on the host (image supplies the tool). Quarantine cargo detection for container uses the same basename of the **caller** `argv[0]` only when it is basename-form; path-form still follows host canonicalize rules below.
+- Path-form / absolute `argv[0]` MUST still exist on the host, canonicalize under a trusted immutable root, and match grants as above; the container command then runs that path only if it is under a bind-mounted identical host path — MVP builtins MUST use basename-form `cargo` / tool names.
 - Container command line is `req.argv` **verbatim** (argv0 preserved naturally by the runtime). Host-resolved toolchain binaries are **not** passed as the container command (avoids glibc mismatch).
 - Host `CARGO_HOME`/`RUSTUP_HOME` binds are **registry/cache only**, not the executed toolchain. The image supplies `rustc`/`cargo` matching `rust-toolchain.toml`.
 
@@ -597,7 +595,7 @@ Implementers MUST encode these examples as unit tests.
 | --- | --- |
 | `fs_jail` (canonical) | RW |
 | `/usr`, `/lib`, `/lib64`, `/lib32`, `/bin`, `/sbin`, `/etc` | RO (loader + system) |
-| Resolved rustup/cargo **allowlisted** subtrees (§ homes) | RO (+ `.package-cache` RW) |
+| Resolved rustup/cargo **allowlisted** subtrees (§ homes) | RO (+ per-exec writable cache only; see homes) |
 | Toolchain sysroot (native only; container uses image toolchain) | RO |
 | Broker tmpdir | RW |
 | `/dev/null`, `/dev/urandom`, `/dev/zero` | as needed |
@@ -610,17 +608,22 @@ Implementers MUST encode these examples as unit tests.
    - `op_home = parent HOME` (required; if unset → `Invalid("HOME unset")` on Unix).
    - `cargo_home = parent CARGO_HOME` if set, else `op_home.join(".cargo")`.
    - `rustup_home = parent RUSTUP_HOME` if set, else `op_home.join(".rustup")`.
-2. **Native backends:** child env sets `CARGO_HOME`/`RUSTUP_HOME` to those absolute paths explicitly (even if parent unset them).
-3. Child `HOME` = `fs_jail.join(".alloy-sbx-home")` (created by broker) — **never** `op_home` (all backends).
+2. **Per-execution directory (all backends):** at the start of each `exec`, the broker creates a unique directory under the jail:
+   - `exec_dir = fs_jail.join(".alloy-sbx").join(<unique_id>)` (e.g. UUID or pid+counter).
+   - Child `HOME` = `exec_dir.join("home")` — **never** `op_home`, never a fixed shared jail path.
+   - Child `TMPDIR` = `exec_dir.join("tmp")`.
+   - Container `cidfile` = `exec_dir.join("cid")`; container `--env-file` = `exec_dir.join("envfile")`.
+   - Timeout/cancel/drop cleanup MUST target only this execution’s cidfile/container identity and then remove `exec_dir` (best-effort). Concurrent execs MUST NOT share these paths.
+3. **Native backends:** child env sets `CARGO_HOME`/`RUSTUP_HOME` to the operator absolute paths explicitly (even if parent unset them).
 4. **Allowlisted RO mounts only** (do **not** mount whole `cargo_home` / `rustup_home` — blocks `credentials.toml` / credential theft):
-   - `cargo_home/registry` RO
+   - `cargo_home/registry` RO (including `registry/src` — **persistent subtree stays read-only**)
    - `cargo_home/git` RO
    - `cargo_home/bin` RO (**native** only)
    - `rustup_home/toolchains` RO (**native** only)
    - `rustup_home/settings.toml` RO if present (**native** only)
-5. **Package-cache write:** RW grant to `cargo_home.join(".package-cache")` only. Offline unpack may also need RW `cargo_home/registry/src` — grant RW to that subtree in MVP; residual-risk notes index cache caveats.
+5. **Writable cache (per execution only):** if offline unpack needs a writable location, grant RW solely to `exec_dir.join("cargo-cache")` (or equivalent under `exec_dir`) and point Cargo at it via env (`CARGO_HOME` overlay / `CARGO_TARGET_DIR`-style isolation as required). Do **not** grant RW to persistent `cargo_home/.package-cache` or `cargo_home/registry/src`. Writes under `exec_dir` MUST NOT become trusted shared state across executions (delete with `exec_dir`; never re-mount as RO input for a later exec).
 6. **Credential defence in depth:** bind `/dev/null` (file) over `cargo_home/credentials.toml` and `cargo_home/credentials` when they exist, on all backends.
-7. `PathPolicy` `read_only_roots` includes the allowlisted RO subtrees; `.package-cache` and `registry/src` are RW.
+7. `PathPolicy` `read_only_roots` includes the allowlisted RO subtrees (including persistent `registry/src`); the only RW carve-out is the current `exec_dir` writable cache.
 
 #### Container env composition (normative — distinct from native scrub)
 
@@ -629,9 +632,9 @@ Implementers MUST encode these examples as unit tests.
 | `PATH` | **Not forwarded** — image default PATH resolves `req.argv[0]` |
 | `RUSTUP_HOME` | **Not forwarded** — image `/usr/local/rustup` (or image default) |
 | `RUSTUP_TOOLCHAIN` | **Not forwarded** — image toolchain / `rust-toolchain.toml` in jail |
-| `TMPDIR` | Set to `fs_jail.join(".alloy-sbx-tmp")` (created); host `TMPDIR` not forwarded |
-| `CARGO_HOME` | Host `cargo_home` absolute path (identical bind for registry/git/cache) |
-| `HOME` | `fs_jail/.alloy-sbx-home` |
+| `TMPDIR` | Set to `exec_dir.join("tmp")` (§5.5); host `TMPDIR` not forwarded |
+| `CARGO_HOME` | Host `cargo_home` absolute path for RO registry/git binds; writable unpack uses `exec_dir` cache only (§5.5) |
+| `HOME` | `exec_dir.join("home")` |
 | `CARGO_NET_OFFLINE` | Forced `true` when quarantine |
 | `USER`, `LANG`, `LC_ALL`, `TERM` | Forwarded if present (only these names from §6.2; not overridden by the rows above) |
 
@@ -686,9 +689,9 @@ Composition: prepare ruleset FD + uid/gid map buffers + deny bind `CString` pair
 | Cargo/rustup cache | Bind RO only allowlisted subtrees (§5.5 homes); **not** host toolchain `bin` as the executed binary |
 | User | `--user <uid>:<gid>` |
 | Network | `--network none` when Deny |
-| Identity | `--cidfile <broker_tmp>/cid` (required); timeout: `kill --signal TERM` then after 2s `kill` (SIGKILL); missing container on second kill = success |
+| Identity | `--cidfile <exec_dir>/cid` (required, per-execution); timeout: `kill --signal TERM` then after 2s `kill` (SIGKILL) using **this** cidfile’s container id; missing container on second kill = success |
 | Lifecycle | `--rm`; `--init` |
-| Env | Env composed per the container env composition table, written to `broker_tmp/envfile` mode 0600 via `--env-file`; reject values containing `\n` or names starting with `#` as `Invalid`; delete after run |
+| Env | Env composed per the container env composition table, written to `<exec_dir>/envfile` mode 0600 via `--env-file` (after `validate_env_allow_name`); reject values containing `\n`; delete with `exec_dir` after run |
 | Workdir | `--workdir <canonical cwd>` |
 
 **Container status mapping (normative):**
@@ -708,7 +711,7 @@ When `true`:
 
 1. Force child env `CARGO_NET_OFFLINE=true` (**overrides** any inherited/base value).
 2. Argv rewrite **after** grant match on original argv:
-   - Detect cargo: `path_hit_basename == "cargo"` (§5.3 — **not** `basename(canonical)`).
+   - Detect cargo: native — `basename(resolved) == "cargo"` (§5.3 canonical target); container basename-form — `basename(argv[0]) == "cargo"`. Do **not** classify quarantine from an untrusted pre-canonicalization basename.
    - Let `sub` = first argv element after optional `+<toolchain>` that does not start with `-`.
    - If no subcommand (`sub == None`): allow with `CARGO_NET_OFFLINE` only (no `--offline` insert).
    - If `sub ∈ {fetch, update, install, publish, search}` → `Denied(QuarantineBlocked(sub))` before spawn.
@@ -732,13 +735,23 @@ Substring deny (ASCII case-insensitive **substring** on the env **name**, no reg
 
 ### 6.2 Base allowed from parent (if set)
 
-`PATH`, `USER`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`.  
-`HOME` → rewritten to sandbox home (§5.5).  
+`PATH`, `USER`, `LANG`, `LC_ALL`, `TERM`, `RUSTUP_TOOLCHAIN`.  
+`HOME` → rewritten to per-exec sandbox home (§5.5).  
+`TMPDIR` → rewritten to per-exec tmp (§5.5); host `TMPDIR` not forwarded as the child value.  
+`CARGO_HOME` / `RUSTUP_HOME` → set per §5.5 (native operator homes; container table).  
 `CARGO_NET_OFFLINE` → forced when quarantine.
 
 ### 6.3 Scrub algorithm
 
-Empty map → insert base → insert `env_allow` names from parent if not hard-denied → never parse `.env` files → never log values.
+**`validate_env_allow_name(name)` (normative — shared by native + container):** reject as `Invalid` if any of:
+- empty;
+- contains `=`, NUL (`\0`), CR (`\r`), or LF (`\n`);
+- starts with `#` (container `--env-file` comment syntax);
+- is otherwise not a single portable env identifier (ASCII letters, digits, `_` only; must start with letter or `_`).
+
+Invoke this validator on every `env_allow` entry **before** parent-environment lookup and **before** `--env-file` serialization. Both backends MUST use the same validated name set (no per-backend divergence).
+
+Empty map → insert base → insert validated `env_allow` names from parent if not hard-denied → never parse `.env` files → never log values.
 
 ### 6.4 Supervision
 
@@ -848,11 +861,11 @@ landlock = "0.4"
 | `path_policy_symlink_escape` / `dotdot` | Denied |
 | `path_policy_write_rejects_ro_root` | Write to CARGO_HOME → Denied |
 | `exec_allow_examples_table` | §5.3 args_glob examples |
-| `binary_resolution_path_basename_shim` | absolute / `./rel` / PATH hit; basename vs path grant; rustup shim keeps argv0; `..` rejected |
+| `binary_resolution_path_basename_shim` | trusted-root PATH; canonicalize-before-auth; basename vs path grant; rustup shim keeps argv0; workspace shadow rejected; `..` rejected |
 | `env_scrub_strips_ld_preload` | hard deny wins |
 | `env_substring_denies_registry_token` | `CARGO_REGISTRY_TOKEN` denied by substring rule |
-| `child_home_is_sandbox_home` | unit assert HOME rewrite (integration confirms) |
-| `token_expired_compares_offsetdatetime` | expiry |
+| `child_home_is_sandbox_home` | unit assert per-exec HOME under `exec_dir` (integration confirms) |
+| `token_expired_compares_offsetdatetime` | expiry; includes `now == expires` → `TokenExpired` |
 | `quarantine_rewrites_and_blocks_fetch` | `--offline` insert; `fetch` denied |
 | `profile_missing_section_errors` | Invalid |
 | `network_allow_rejected` | Invalid |
@@ -870,14 +883,14 @@ landlock = "0.4"
 | `child_cannot_read_dotenv_in_jail` | place `.env` in jail; sandboxed read fails |
 | `child_cannot_read_cargo_credentials` | sentinel `credentials.toml` unreadable inside sandbox |
 | `netns_probe_marks_unavailable` | probe-time netns failure → Landlock Unavailable / `BackendUnavailable` |
-| `network_deny_blocks_egress` | connect fails |
+| `network_deny_blocks_egress` | Positive baseline: controlled local listener reachable **before** deny; then denied connect fails (no ambient CI egress) |
 | `timeout_kills_process_group` | grandchild dead |
 | `cancel_drop_no_orphan` | drop future → no child |
 | `output_cap_truncates` | flags |
 | `dotenv_sentinel_unchanged` | host `.env` bytes unchanged |
 | `credentials_sentinel_unchanged` | host `credentials.toml` bytes unchanged after sandbox |
 | `backend_unavailable_fail_closed` | no bare exec |
-| `landlock_actually_applied` | child `open(/etc/shadow)` or out-of-jail path fails under Landlock (proves non-skip) |
+| `landlock_actually_applied` | Positive baseline: parent-owned readable sentinel readable unsandboxed; same read fails inside Landlock (no `/etc/shadow` / arbitrary out-of-jail reliance) |
 
 ### CI deliverable (yes)
 
@@ -891,7 +904,7 @@ Skip policy: individual tests may `ignore` with reason when probe says Unavailab
 
 ### Clippy
 
-`clippy.toml` disallows `std::process::Command::new` in `alloy-tools` except `sandbox::process` / `sandbox::backend`.
+`clippy.toml` `disallowed_methods` rejects **both** `std::process::Command::new` and `tokio::process::Command::new` in `alloy-tools` except `sandbox::process` / `sandbox::backend` (or both APIs are centralized behind a private broker wrapper and only that wrapper is allowed outside those modules).
 
 ---
 
@@ -907,11 +920,11 @@ Skip policy: individual tests may `ignore` with reason when probe says Unavailab
 
 | # | Criterion | Proof |
 | --- | --- | --- |
-| 1 | No bare `Command::new` outside sandbox modules | `cargo clippy -p alloy-tools -- -D warnings` + clippy.toml |
+| 1 | No bare `std`/`tokio` `Command::new` outside sandbox modules | `cargo clippy -p alloy-tools -- -D warnings` + clippy.toml |
 | 2 | Permission types match main | compile against `alloy-runtime` types; no local Grant enum |
 | 3 | `ExecClass` selects backend; no argv sniffing; §5.3 binary/args rules | `binary_resolution_path_basename_shim` + `exec_allow_examples_table` |
 | 4 | Non-zero exit `Ok`; denial `Err`; signal `Ok{signal}` | `signal_status_encoding` + integration cargo fail |
-| 5 | `network=deny` via netns/Seatbelt/`--network none`; FS-only Landlock impossible | `netns_failure_is_cannot_enforce` + `network_deny_blocks_egress` |
+| 5 | `network=deny` via netns/Seatbelt/`--network none`; probe-time netns failure → Unavailable/`BackendUnavailable`; FS-only Landlock at exec → `BackendCannotEnforce` | `netns_probe_marks_unavailable` + `network_deny_blocks_egress` |
 | 6 | Quarantine forces offline + blocks fetch/update/install | `quarantine_rewrites_and_blocks_fetch` |
 | 7 | Deny globs + in-sandbox `.env` unreadable; cargo credentials unreadable; host `.env` / credentials untouched | `child_cannot_read_dotenv_in_jail` + `child_cannot_read_cargo_credentials` + `dotenv_sentinel_unchanged` + `credentials_sentinel_unchanged` |
 | 8 | `PathPolicy` exported for 0006 | public API + path policy tests |
