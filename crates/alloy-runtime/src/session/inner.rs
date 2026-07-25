@@ -1,6 +1,7 @@
 //! Shared session-plane state.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -201,19 +202,7 @@ pub(crate) struct SessionLock {
 impl Drop for SessionLock {
     fn drop(&mut self) {
         self.guard.take();
-        if Arc::strong_count(&self.arc) == 2 {
-            let mut map = self
-                .inner
-                .session_locks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if map
-                .get(&self.id)
-                .is_some_and(|e| Arc::ptr_eq(e, &self.arc) && Arc::strong_count(e) == 2)
-            {
-                map.remove(&self.id);
-            }
-        }
+        evict_lock_map_entry(&self.inner.session_locks, &self.id, &self.arc);
     }
 }
 
@@ -271,16 +260,26 @@ impl Drop for RunLockTicket {
 }
 
 fn evict_run(inner: &SessionInner, id: RunId, arc: &Arc<Mutex<()>>) {
+    evict_lock_map_entry(&inner.run_locks, &id, arc);
+}
+
+/// Drop-path eviction shared by session and run lock maps.
+///
+/// Removes the entry only when this Arc is the last map+guard pair (`strong_count == 2`),
+/// re-validating under the map lock with [`Arc::ptr_eq`] so a concurrent re-insert is kept.
+fn evict_lock_map_entry<K>(map: &StdMutex<HashMap<K, Arc<Mutex<()>>>>, id: &K, arc: &Arc<Mutex<()>>)
+where
+    K: Eq + Hash,
+{
     if Arc::strong_count(arc) == 2 {
-        let mut map = inner
-            .run_locks
+        let mut map = map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if map
-            .get(&id)
+            .get(id)
             .is_some_and(|e| Arc::ptr_eq(e, arc) && Arc::strong_count(e) == 2)
         {
-            map.remove(&id);
+            map.remove(id);
         }
     }
 }

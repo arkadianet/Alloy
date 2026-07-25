@@ -524,6 +524,67 @@ async fn session_resume_finalizes_cancelling_with_run_completed() {
     h.close().await;
 }
 
+#[tokio::test]
+async fn session_resume_cancel_events_precede_cancelled_upsert() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let cancelling = h.submit(session).await;
+    let running = h.submit(session).await;
+    h.set_run_state(cancelling, RunControlState::Cancelling)
+        .await;
+    h.set_run_state(running, RunControlState::Running).await;
+
+    // Injected upsert failure after terminal events: row must stay `cancelling`, not
+    // `cancelled` without events. The sibling run still re-arms and resume completes.
+    h.plane.fail_next_run_upsert();
+    h.sessions().resume(session).await.unwrap();
+
+    assert_eq!(h.run_state(cancelling).await, RunControlState::Cancelling);
+    assert_eq!(h.run_state(running).await, RunControlState::Accepted);
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::RunCompleted)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(h.count_finished(cancelling).await, 1);
+    assert_eq!(h.plane.metrics().sessions_resumed, 1);
+
+    // Retry is idempotent: no duplicate terminal events, then durable Cancelled.
+    h.sessions().resume(session).await.unwrap();
+    assert_eq!(h.run_state(cancelling).await, RunControlState::Cancelled);
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::RunCompleted)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(h.count_finished(cancelling).await, 1);
+    assert_eq!(h.plane.metrics().runs_cancelled, 1);
+    assert_eq!(h.plane.metrics().sessions_resumed, 2);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn session_resume_keeps_cancelling_when_append_fails() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.set_run_state(run, RunControlState::Cancelling).await;
+
+    h.plane.fail_next_append();
+    h.sessions().resume(session).await.unwrap();
+
+    assert_eq!(h.run_state(run).await, RunControlState::Cancelling);
+    assert!(h
+        .events_of_type(session, SessionEventType::RunCompleted)
+        .await
+        .is_empty());
+    assert_eq!(h.count_finished(run).await, 0);
+    assert_eq!(h.plane.metrics().sessions_resumed, 1);
+    h.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_resume_does_not_clobber_concurrent_cancel() {
     let h = Harness::new().await;

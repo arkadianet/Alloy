@@ -19,9 +19,9 @@ use super::run_controller::{
     append_run_completed, emit_run_finished, synthetic_outcome, upsert_state,
 };
 use super::run_state::RunControlState;
-use super::traits::{clamp_events_page_limit, Session, SessionService};
+use super::traits::{clamp_events_page_limit, Session, SessionService, MAX_EVENTS_PAGE};
 use crate::error::SessionError;
-use crate::events::{NewSessionEvent, SessionEvent, SessionEventType};
+use crate::events::{NewSessionEvent, RuntimeEvent, SessionEvent, SessionEventType};
 use crate::runtime::RuntimePhase;
 use crate::scheduler::DagState;
 use crate::storage::{store_to_session, EventStore, RunRow, SessionRows};
@@ -78,6 +78,11 @@ impl SessionServiceView {
     /// A `cancelling` row is instead **finalized**: the cancel that wrote it died with the
     /// process that owned it, so resume owes the durable terminal state plus the
     /// `RunCompleted` / `RunFinished` pair that no other writer will ever produce.
+    ///
+    /// Cancel finalization writes terminal events **before** the `Cancelled` upsert so a
+    /// failed append/emit cannot leave the row permanently `Cancelled` with those events
+    /// missing. Existence checks keep a retry from duplicating events already written by a
+    /// prior attempt that failed on the upsert.
     async fn rearm_run(
         &self,
         row: &RunRow,
@@ -94,6 +99,43 @@ impl SessionServiceView {
         // `cancelling` is only reachable once a run has left `created`, so its acceptance
         // was announced before the crash.
         let accepted = self.inner.was_accepted(row.id, state);
+
+        if target == RunControlState::Cancelled {
+            if !self.has_run_completed(row.session_id, row.id).await? {
+                append_run_completed(
+                    &self.inner,
+                    row.session_id,
+                    row.id,
+                    DagState::Cancelled,
+                    Some("resume_finalized_cancel"),
+                )
+                .await
+                .map_err(run_to_session)?;
+            }
+            if let Some(dag_id) = dag_id.filter(|_| accepted) {
+                if !self.has_run_finished(row.id).await? {
+                    emit_run_finished(
+                        &self.inner,
+                        row.id,
+                        synthetic_outcome(dag_id, DagState::Cancelled),
+                    )
+                    .await
+                    .map_err(run_to_session)?;
+                }
+            }
+            upsert_state(&self.inner, row, target)
+                .await
+                .map_err(run_to_session)?;
+            self.inner.metrics.bump_runs_cancelled();
+            info!(
+                run_id = %row.id,
+                from = state.as_str(),
+                to = target.as_str(),
+                "resume finalized abandoned cancel"
+            );
+            return Ok(());
+        }
+
         upsert_state(&self.inner, row, target)
             .await
             .map_err(run_to_session)?;
@@ -103,30 +145,54 @@ impl SessionServiceView {
             to = target.as_str(),
             "resume re-armed run control state"
         );
-
-        if target != RunControlState::Cancelled {
-            return Ok(());
-        }
-        append_run_completed(
-            &self.inner,
-            row.session_id,
-            row.id,
-            DagState::Cancelled,
-            Some("resume_finalized_cancel"),
-        )
-        .await
-        .map_err(run_to_session)?;
-        if let Some(dag_id) = dag_id.filter(|_| accepted) {
-            emit_run_finished(
-                &self.inner,
-                row.id,
-                synthetic_outcome(dag_id, DagState::Cancelled),
-            )
-            .await
-            .map_err(run_to_session)?;
-        }
-        self.inner.metrics.bump_runs_cancelled();
         Ok(())
+    }
+
+    /// True if this run already has a durable `RunCompleted` (retry idempotency).
+    async fn has_run_completed(
+        &self,
+        session: SessionId,
+        run: RunId,
+    ) -> Result<bool, SessionError> {
+        let store = self.inner.storage.events();
+        let mut after = None;
+        loop {
+            let page = store
+                .list_session_events(session, after, MAX_EVENTS_PAGE)
+                .await
+                .map_err(store_to_session)?;
+            if page
+                .iter()
+                .any(|e| e.run_id == Some(run) && e.type_ == SessionEventType::RunCompleted)
+            {
+                return Ok(true);
+            }
+            match page.last() {
+                Some(last) if page.len() == MAX_EVENTS_PAGE => after = Some(last.seq),
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    /// True if this run already has a host `RunFinished` (retry idempotency).
+    async fn has_run_finished(&self, run: RunId) -> Result<bool, SessionError> {
+        let store = self.inner.storage.events();
+        let mut after = None;
+        loop {
+            let page = store
+                .list_runtime_events(after, MAX_EVENTS_PAGE)
+                .await
+                .map_err(store_to_session)?;
+            if page.iter().any(
+                |(_, ev)| matches!(ev, RuntimeEvent::RunFinished { run_id, .. } if *run_id == run),
+            ) {
+                return Ok(true);
+            }
+            match page.last() {
+                Some((rowid, _)) if page.len() == MAX_EVENTS_PAGE => after = Some(*rowid),
+                _ => return Ok(false),
+            }
+        }
     }
 }
 
@@ -244,7 +310,12 @@ impl SessionService for SessionServiceView {
             if self.inner.has_live(run) {
                 continue;
             }
-            self.rearm_run(&row, state, dag_id).await?;
+            if let Err(e) = self.rearm_run(&row, state, dag_id).await {
+                // Match corrupt-row handling: one bad re-arm must not abort the rest of
+                // the session (or the sessions_resumed metric/log path below).
+                warn!(run_id = %run, error = %e, "resume failed to re-arm run; continuing");
+                continue;
+            }
         }
 
         self.inner.metrics.bump_sessions_resumed();
