@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::codec::{parse_run_id, parse_session_id, path_to_utf8, ts_from_text, ts_to_text};
 use super::error::StoreError;
 use super::gate::StorageGate;
+use super::metrics::StorageMetrics;
 use super::open::{spawn_db, DbHandle};
 use crate::session::Session;
 use crate::types::ids::{RunId, SessionId, Timestamp};
@@ -49,12 +50,24 @@ pub trait SessionRows: Send + Sync {
 /// SQLite implementation of [`SessionRows`].
 pub struct SqliteSessionRows {
     db: Arc<DbHandle>,
+    metrics: Arc<StorageMetrics>,
     gate: Arc<StorageGate>,
 }
 
 impl SqliteSessionRows {
-    pub(crate) fn new(db: Arc<DbHandle>, gate: Arc<StorageGate>) -> Self {
-        Self { db, gate }
+    pub(crate) fn new(
+        db: Arc<DbHandle>,
+        metrics: Arc<StorageMetrics>,
+        gate: Arc<StorageGate>,
+    ) -> Self {
+        Self { db, metrics, gate }
+    }
+
+    fn map_busy(&self, err: StoreError) -> StoreError {
+        if matches!(err, StoreError::Busy) {
+            self.metrics.inc_busy_errors();
+        }
+        err
     }
 }
 
@@ -95,6 +108,7 @@ impl SessionRows for SqliteSessionRows {
             })
         })
         .await
+        .map_err(|e| self.map_busy(e))
     }
 
     async fn get_session(&self, id: SessionId) -> Result<Option<Session>, StoreError> {
@@ -137,6 +151,7 @@ impl SessionRows for SqliteSessionRows {
             })
         })
         .await
+        .map_err(|e| self.map_busy(e))
     }
 
     async fn upsert_run(&self, row: &RunRow) -> Result<(), StoreError> {
@@ -171,6 +186,7 @@ impl SessionRows for SqliteSessionRows {
             })
         })
         .await
+        .map_err(|e| self.map_busy(e))
     }
 
     async fn get_run(&self, id: RunId) -> Result<Option<RunRow>, StoreError> {
@@ -210,6 +226,7 @@ impl SessionRows for SqliteSessionRows {
             })
         })
         .await
+        .map_err(|e| self.map_busy(e))
     }
 
     async fn list_runs(&self, session: SessionId) -> Result<Vec<RunRow>, StoreError> {
@@ -248,5 +265,6 @@ impl SessionRows for SqliteSessionRows {
             })
         })
         .await
+        .map_err(|e| self.map_busy(e))
     }
 }

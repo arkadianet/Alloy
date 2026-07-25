@@ -83,7 +83,7 @@ async fn open_creates_layout() {
     assert!(dir.path().join("alloy.sqlite").is_file());
     assert!(dir.path().join("artifacts").is_dir());
     assert!(dir.path().join("graph").is_dir());
-    assert_eq!(storage.schema_version(), 1);
+    assert_eq!(storage.schema_version(), 2);
     storage.close().await.unwrap();
 }
 
@@ -99,7 +99,7 @@ async fn migrate_idempotent_and_refuse_newer() {
     let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
         .await
         .unwrap();
-    assert_eq!(storage.schema_version(), 1);
+    assert_eq!(storage.schema_version(), 2);
     storage.close().await.unwrap();
     drop(storage);
 
@@ -534,17 +534,20 @@ async fn concurrent_appends_different_sessions() {
 
 #[tokio::test]
 async fn synchronous_parse_and_open_options_env() {
-    assert_eq!(
-        SqliteSynchronous::parse("FULL").unwrap(),
-        SqliteSynchronous::Full
-    );
+    assert!(SqliteSynchronous::parse("bogus").is_err());
     let dir = tempfile::tempdir().unwrap();
-    // Safety: test process; restore not required for ephemeral keys in parallel tests —
-    // use scoped env only via from_env defaults when unset.
-    let opts = StorageOpenOptions::for_data_dir(dir.path());
-    assert!(opts.wal);
-    assert_eq!(opts.busy_timeout_ms, 5000);
-    assert_eq!(opts.synchronous, SqliteSynchronous::Normal);
+    // Safety: scoped env for this test only; restore after.
+    let prev = std::env::var("ALLOY_SQLITE_SYNCHRONOUS").ok();
+    std::env::set_var("ALLOY_SQLITE_SYNCHRONOUS", "bogus");
+    let err = StorageOpenOptions::from_env(dir.path()).unwrap_err();
+    match prev {
+        Some(v) => std::env::set_var("ALLOY_SQLITE_SYNCHRONOUS", v),
+        None => std::env::remove_var("ALLOY_SQLITE_SYNCHRONOUS"),
+    }
+    assert!(
+        matches!(err, StoreError::Io(_)),
+        "from_env must reject malformed ALLOY_SQLITE_SYNCHRONOUS: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -768,7 +771,7 @@ async fn crash_after_commit_reopen_sees_event() {
     let sid_path = dir.path().join("sid");
 
     let exe = std::env::current_exe().unwrap();
-    let status = Command::new(&exe)
+    let output = Command::new(&exe)
         .env("ALLOY_STORAGE_CRASH_DIR", &data)
         .env("RUST_BACKTRACE", "0")
         .args([
@@ -777,14 +780,25 @@ async fn crash_after_commit_reopen_sees_event() {
             "--nocapture",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .unwrap();
-    assert!(!status.success(), "child should abort");
+    let status = output.status;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!status.success(), "child should abort; stderr:\n{stderr}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        // SIGABRT == 6 on Linux/macOS.
+        assert_eq!(
+            status.signal(),
+            Some(6),
+            "child should abort with SIGABRT; status={status:?}; stderr:\n{stderr}"
+        );
+    }
 
     let sid_str = std::fs::read_to_string(&sid_path).expect("child should write session id");
-    let uuid = uuid::Uuid::parse_str(sid_str.trim()).unwrap();
-    let s: SessionId = serde_json::from_value(serde_json::json!(uuid)).unwrap();
+    let s = SessionId::parse(sid_str.trim()).expect("valid session id");
 
     let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(&data))
         .await

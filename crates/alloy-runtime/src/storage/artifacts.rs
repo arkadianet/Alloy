@@ -93,7 +93,10 @@ pub trait ArtifactStore: Send + Sync {
     async fn meta(&self, id: ArtifactId) -> Result<ArtifactMeta, StoreError>;
     /// Oldest non-deleted row for digest (`created_at ASC, id ASC`), or `None`.
     async fn get_by_digest(&self, digest: &Digest) -> Result<Option<ArtifactId>, StoreError>;
-    /// Soft-delete; CAS file retained if other rows share the digest.
+    /// Soft-delete the artifact index row only.
+    ///
+    /// CAS blobs are always retained; reference-counted reclamation / GC is
+    /// out of scope for RFC-0002.
     async fn delete(&self, id: ArtifactId) -> Result<(), StoreError>;
 }
 

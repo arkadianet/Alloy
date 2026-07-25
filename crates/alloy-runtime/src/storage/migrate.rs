@@ -4,10 +4,11 @@ use rusqlite::Connection;
 
 use super::error::StoreError;
 
-/// Schema version shipped by this crate (RFC-0002 v1).
-pub const CODE_SCHEMA_VERSION: u32 = 1;
+/// Schema version shipped by this crate (RFC-0002).
+pub const CODE_SCHEMA_VERSION: u32 = 2;
 
 // `schema_migrations` is bootstrapped in `ensure_migrations_table` before v1 runs.
+// PK (session_id, seq) already covers session_events lookups; no redundant index.
 const V1_SQL: &str = r#"
 CREATE TABLE sessions (
   id TEXT PRIMARY KEY,
@@ -43,8 +44,6 @@ CREATE TABLE session_events (
   PRIMARY KEY (session_id, seq)
 );
 
-CREATE INDEX idx_session_events_session_seq ON session_events(session_id, seq);
-
 CREATE TABLE runtime_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
@@ -77,6 +76,11 @@ CREATE TABLE dag_blobs (
 );
 "#;
 
+const V2_SQL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_runs_session_created_id
+  ON runs(session_id, created_at, id);
+"#;
+
 /// Apply pending migrations. Returns the schema version after migrate.
 ///
 /// When `refuse_newer` is true and the DB reports a version above
@@ -107,13 +111,29 @@ pub fn migrate(conn: &Connection, refuse_newer: bool) -> Result<u32, StoreError>
             .map_err(|e| StoreError::Migration(e.to_string()))?;
         tx.execute_batch(V1_SQL)
             .map_err(|e| StoreError::Migration(e.to_string()))?;
-        // schema_migrations is created empty by V1_SQL; record version 1.
+        // `schema_migrations` was bootstrapped empty by `ensure_migrations_table`.
         tx.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![1i64, now_rfc3339()],
         )
         .map_err(|e| StoreError::Migration(e.to_string()))?;
-        // `schema_migrations` was bootstrapped empty by `ensure_migrations_table`.
+        tx.commit()
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+    }
+
+    let current = current_version(conn)?;
+    if current < 2 {
+        tracing::info!(version = 2, "applying migration");
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        tx.execute_batch(V2_SQL)
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![2i64, now_rfc3339()],
+        )
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
         tx.commit()
             .map_err(|e| StoreError::Migration(e.to_string()))?;
     }
@@ -157,39 +177,40 @@ fn now_rfc3339() -> String {
 
 /// Cross-check `session_seq` against `MAX(session_events.seq)` (recovery).
 pub fn verify_seq_consistency(conn: &Connection) -> Result<(), StoreError> {
-    let mut stmt = conn.prepare("SELECT session_id, next_seq FROM session_seq")?;
-    let rows = stmt.query_map([], |row| {
+    let mut stmt = conn.prepare(
+        "SELECT s.session_id, s.next_seq, MAX(e.seq) AS max_seq
+         FROM session_seq s
+         LEFT JOIN session_events e ON e.session_id = s.session_id
+         GROUP BY s.session_id, s.next_seq
+         HAVING s.next_seq < 0
+            OR (MAX(e.seq) IS NULL AND s.next_seq != 0)
+            OR (MAX(e.seq) IS NOT NULL AND s.next_seq != MAX(e.seq) + 1)",
+    )?;
+    let mut rows = stmt.query_map([], |row| {
         let sid: String = row.get(0)?;
         let next: i64 = row.get(1)?;
-        Ok((sid, next))
+        let max_seq: Option<i64> = row.get(2)?;
+        Ok((sid, next, max_seq))
     })?;
 
-    for row in rows {
-        let (sid, next_seq) = row?;
+    // Any HAVING row is an inconsistency; report the first with session detail.
+    if let Some(row) = rows.next() {
+        let (sid, next_seq, max_seq) = row?;
         if next_seq < 0 {
             return Err(StoreError::Corrupt(format!(
                 "session_seq.next_seq < 0 for {sid}"
             )));
         }
-        let max_seq: Option<i64> = conn.query_row(
-            "SELECT MAX(seq) FROM session_events WHERE session_id = ?1",
-            [&sid],
-            |r| r.get(0),
-        )?;
         match max_seq {
             None => {
-                if next_seq != 0 {
-                    return Err(StoreError::Corrupt(format!(
-                        "session {sid}: no events but next_seq={next_seq}"
-                    )));
-                }
+                return Err(StoreError::Corrupt(format!(
+                    "session {sid}: no events but next_seq={next_seq}"
+                )));
             }
             Some(max) => {
-                if next_seq != max + 1 {
-                    return Err(StoreError::Corrupt(format!(
-                        "session {sid}: next_seq={next_seq} but MAX(seq)={max}"
-                    )));
-                }
+                return Err(StoreError::Corrupt(format!(
+                    "session {sid}: next_seq={next_seq} but MAX(seq)={max}"
+                )));
             }
         }
     }
@@ -220,9 +241,9 @@ mod tests {
     fn migrate_fresh_and_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         let v = migrate(&conn, true).unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
         let v2 = migrate(&conn, true).unwrap();
-        assert_eq!(v2, 1);
+        assert_eq!(v2, 2);
     }
 
     #[test]

@@ -22,10 +22,23 @@ macro_rules! uuid_id {
                 Self(Uuid::new_v4())
             }
 
+            /// Parse from a canonical UUID string.
+            pub fn parse(s: &str) -> Result<Self, uuid::Error> {
+                Ok(Self(Uuid::parse_str(s)?))
+            }
+
             /// Borrow the inner UUID.
             #[must_use]
             pub fn as_uuid(&self) -> &Uuid {
                 &self.0
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = uuid::Error;
+
+            fn try_from(s: &str) -> Result<Self, Self::Error> {
+                Self::parse(s)
             }
         }
 

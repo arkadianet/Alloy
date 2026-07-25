@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use artifacts::FsArtifactStore as FsArtifactStoreImpl;
 use events::SqliteEventStore as SqliteEventStoreImpl;
-use gate::StorageGate;
+use gate::{CloseClaim, StorageGate};
 use metrics::StorageMetrics;
 use open::DbHandle;
 use sessions::SqliteSessionRows as SqliteSessionRowsImpl;
@@ -81,6 +81,7 @@ impl AlloyStorage {
         ));
         let sessions = Arc::new(SqliteSessionRowsImpl::new(
             Arc::clone(&db),
+            Arc::clone(&metrics),
             Arc::clone(&gate),
         ));
 
@@ -154,50 +155,57 @@ impl AlloyStorage {
 
     /// Flush + close connections. Idempotent barrier under shared ownership.
     ///
-    /// 1. Refuse new ops (`Closed`).
+    /// 1. Atomically claim close ownership (refuse new ops).
     /// 2. Wait for in-flight ops to finish.
-    /// 3. Checkpoint (errors propagate).
-    /// 4. Close the SQLite connection.
+    /// 3. Winner: checkpoint then close the SQLite connection.
+    /// 4. Followers: drain and wait until the winner finishes teardown.
     ///
-    /// Extra `close` calls are no-ops (`Ok(())`).
+    /// Extra `close` calls return `Ok(())` after observing a finished close.
     pub async fn close(&self) -> Result<(), StoreError> {
-        if self.gate.is_closed() {
-            // Still wait for any in-flight from a concurrent first close, then ensure conn gone.
-            let gate = Arc::clone(&self.gate);
-            let db = Arc::clone(&self.db);
-            return tokio::task::spawn_blocking(move || {
-                gate.begin_close_and_drain();
-                let _ = db.take_connection();
-                Ok(())
-            })
-            .await?;
-        }
-
+        let claim = self.gate.claim_close();
         let gate = Arc::clone(&self.gate);
         let db = Arc::clone(&self.db);
         let metrics = Arc::clone(&self.metrics);
-        tokio::task::spawn_blocking(move || {
-            gate.begin_close_and_drain();
-            // Checkpoint while we still hold the connection, after in-flight finished.
-            match checkpoint::checkpoint_truncate(&db) {
-                Ok(()) => metrics.inc_checkpoints(),
-                Err(StoreError::Busy) => {
-                    metrics.inc_busy_errors();
-                    // Still close — but surface busy so callers know flush was incomplete.
-                    let _ = db.take_connection().ok().flatten().map(|c| c.close());
-                    return Err(StoreError::Busy);
-                }
-                Err(e) => {
-                    let _ = db.take_connection().ok().flatten().map(|c| c.close());
-                    return Err(e);
-                }
+
+        match claim {
+            CloseClaim::Follower => {
+                tokio::task::spawn_blocking(move || {
+                    gate.begin_close_and_drain();
+                    gate.wait_close_finished();
+                    debug_assert!(!db.connection_present().unwrap_or(true));
+                    Ok(())
+                })
+                .await?
             }
-            if let Some(conn) = db.take_connection()? {
-                conn.close().map_err(|(_c, e)| StoreError::from(e))?;
+            CloseClaim::Winner => {
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| {
+                        gate.begin_close_and_drain();
+                        // Checkpoint while we still hold the connection, after in-flight finished.
+                        match checkpoint::checkpoint_truncate(&db) {
+                            Ok(()) => metrics.inc_checkpoints(),
+                            Err(StoreError::Busy) => {
+                                metrics.inc_busy_errors();
+                                // Still close — but surface busy so callers know flush was incomplete.
+                                let _ = db.take_connection().ok().flatten().map(|c| c.close());
+                                return Err(StoreError::Busy);
+                            }
+                            Err(e) => {
+                                let _ = db.take_connection().ok().flatten().map(|c| c.close());
+                                return Err(e);
+                            }
+                        }
+                        if let Some(conn) = db.take_connection()? {
+                            conn.close().map_err(|(_c, e)| StoreError::from(e))?;
+                        }
+                        Ok(())
+                    })();
+                    gate.mark_close_finished();
+                    result
+                })
+                .await?
             }
-            Ok(())
-        })
-        .await?
+        }
     }
 }
 

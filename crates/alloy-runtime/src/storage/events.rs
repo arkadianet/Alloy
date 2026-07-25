@@ -142,9 +142,7 @@ impl EventSink for SqliteEventStore {
 
                 let seq = EventSeq(next as u64);
                 let ts = Timestamp::now();
-                let type_json = serde_json::to_string(&ev.type_)
-                    .map_err(|e| StoreError::Internal(e.to_string()))?;
-                let type_text = type_json.trim_matches('"').to_owned();
+                let type_text = event_type_to_text(ev.type_)?;
                 let payload = serde_json::to_string(&ev.payload)
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
                 let ts_text = ts_to_text(&ts)?;
@@ -336,8 +334,7 @@ fn list_session_events_sync(
     let mut out = Vec::new();
     for row in rows {
         let (seq, ts_text, run_id, type_text, payload) = row?;
-        let type_: SessionEventType = serde_json::from_str(&format!("\"{type_text}\""))
-            .map_err(|e| StoreError::Corrupt(format!("event type: {e}")))?;
+        let type_ = event_type_from_text(&type_text)?;
         let ts = ts_from_text(&ts_text)?;
         let payload: serde_json::Value = serde_json::from_str(&payload)
             .map_err(|e| StoreError::Corrupt(format!("event payload: {e}")))?;
@@ -384,9 +381,7 @@ fn import_handoff_snapshot_sync(
                     "handoff snapshot session_id mismatch".into(),
                 ));
             }
-            let type_json = serde_json::to_string(&ev.type_)
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
-            let type_text = type_json.trim_matches('"').to_owned();
+            let type_text = event_type_to_text(ev.type_)?;
             let payload = serde_json::to_string(&ev.payload)
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
             let ts_text = ts_to_text(&ev.ts)?;
@@ -447,4 +442,18 @@ fn import_handoff_snapshot_sync(
 
     tx.commit()?;
     Ok(())
+}
+
+fn event_type_to_text(ty: SessionEventType) -> Result<String, StoreError> {
+    match serde_json::to_value(ty).map_err(|e| StoreError::Internal(e.to_string()))? {
+        serde_json::Value::String(s) => Ok(s),
+        other => Err(StoreError::Internal(format!(
+            "session event type must serialize as JSON string, got {other}"
+        ))),
+    }
+}
+
+fn event_type_from_text(s: &str) -> Result<SessionEventType, StoreError> {
+    serde_json::from_value(serde_json::Value::String(s.to_owned()))
+        .map_err(|e| StoreError::Corrupt(format!("event type: {e}")))
 }

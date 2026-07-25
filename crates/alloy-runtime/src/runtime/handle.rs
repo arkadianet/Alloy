@@ -1,7 +1,7 @@
 //! [`RuntimeHandle`] — cheap cloneable process handle.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -181,25 +181,12 @@ impl RuntimeHandle {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 std::mem::take(&mut *q)
             };
-            let mut i = 0;
-            while i < pending.len() {
-                match guard.append_runtime(pending[i].clone()).await {
-                    Ok(()) => i += 1,
-                    Err(e) => {
-                        // Restore the failed event and everything behind it.
-                        let remaining = pending.split_off(i);
-                        let mut q = self
-                            .inner
-                            .pending_runtime_events
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let mut restored = remaining;
-                        restored.append(&mut *q);
-                        *q = restored;
-                        return Err(e.into());
-                    }
-                }
-            }
+            Self::drain_pending_into_sink(
+                (*guard).as_ref(),
+                &mut pending,
+                &self.inner.pending_runtime_events,
+            )
+            .await?;
         }
 
         let mem: Arc<dyn EventSink> = self.inner.memory_sink.clone();
@@ -257,22 +244,31 @@ impl RuntimeHandle {
             return Ok(());
         }
         let sink = self.inner.event_sink.read().await;
-        let mut i = 0;
-        while i < pending.len() {
-            match sink.append_runtime(pending[i].clone()).await {
-                Ok(()) => i += 1,
-                Err(e) => {
-                    let remaining = pending.split_off(i);
-                    let mut q = self
-                        .inner
-                        .pending_runtime_events
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let mut restored = remaining;
-                    restored.append(&mut *q);
-                    *q = restored;
-                    return Err(e.into());
-                }
+        Self::drain_pending_into_sink(
+            (*sink).as_ref(),
+            &mut pending,
+            &self.inner.pending_runtime_events,
+        )
+        .await
+    }
+
+    /// Append pending events from the front; on failure restore failed+remaining into `queue`.
+    async fn drain_pending_into_sink(
+        sink: &dyn EventSink,
+        pending: &mut Vec<RuntimeEvent>,
+        queue: &Mutex<Vec<RuntimeEvent>>,
+    ) -> Result<(), RuntimeError> {
+        while !pending.is_empty() {
+            let ev = pending.remove(0);
+            if let Err(e) = sink.append_runtime(ev.clone()).await {
+                pending.insert(0, ev);
+                let mut q = queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut restored = std::mem::take(pending);
+                restored.append(&mut *q);
+                *q = restored;
+                return Err(e.into());
             }
         }
         Ok(())

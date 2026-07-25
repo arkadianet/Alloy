@@ -56,6 +56,15 @@ impl DbHandle {
             .map_err(|_| StoreError::Internal("db mutex poisoned".into()))?;
         Ok(guard.take())
     }
+
+    /// Whether the SQLite connection is still held (not yet taken for close).
+    pub(crate) fn connection_present(&self) -> Result<bool, StoreError> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Internal("db mutex poisoned".into()))?;
+        Ok(guard.is_some())
+    }
 }
 
 /// Open SQLite, apply PRAGMAs, migrate, verify seq consistency.
@@ -81,8 +90,12 @@ pub fn open_db(opts: &StorageOpenOptions) -> Result<(Arc<DbHandle>, u32), StoreE
     let version = migrate::migrate(&conn, opts.refuse_newer_schema)?;
     migrate::verify_seq_consistency(&conn)?;
 
-    // Warn on orphan CAS files (file without index) — do not delete in MVP.
-    warn_orphan_blobs(&conn, &opts.layout.artifacts_dir);
+    // Optional orphan CAS scan (file without index) — do not delete in MVP.
+    warn_orphan_blobs(
+        &conn,
+        &opts.layout.artifacts_dir,
+        opts.orphan_blob_scan_limit,
+    );
 
     let handle = DbHandle::new(conn);
     debug_assert!(version >= CODE_SCHEMA_VERSION || !opts.refuse_newer_schema);
@@ -91,15 +104,16 @@ pub fn open_db(opts: &StorageOpenOptions) -> Result<(Arc<DbHandle>, u32), StoreE
 
 fn apply_pragmas(conn: &Connection, opts: &StorageOpenOptions) -> Result<(), StoreError> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    // Busy timeout before WAL so journal_mode acquisition observes it.
+    conn.busy_timeout(std::time::Duration::from_millis(u64::from(
+        opts.busy_timeout_ms,
+    )))?;
     if opts.wal {
         let mode: String = conn.query_row("PRAGMA journal_mode = WAL;", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
             tracing::warn!(%mode, "requested WAL but journal_mode is different");
         }
     }
-    conn.busy_timeout(std::time::Duration::from_millis(u64::from(
-        opts.busy_timeout_ms,
-    )))?;
     conn.execute_batch(&format!(
         "PRAGMA synchronous = {};",
         opts.synchronous.as_pragma()
@@ -107,6 +121,10 @@ fn apply_pragmas(conn: &Connection, opts: &StorageOpenOptions) -> Result<(), Sto
     Ok(())
 }
 
+/// Remove leftover CAS temp files under `artifacts/tmp/`.
+///
+/// Assumes single-process access to the storage directory. Concurrent processes
+/// writing the same data dir may lose in-flight CAS temporary files.
 fn cleanup_orphan_tmp(artifacts_dir: &std::path::Path) {
     let tmp = artifacts_dir.join("tmp");
     let Ok(entries) = std::fs::read_dir(&tmp) else {
@@ -124,12 +142,22 @@ fn cleanup_orphan_tmp(artifacts_dir: &std::path::Path) {
     }
 }
 
-fn warn_orphan_blobs(conn: &Connection, artifacts_dir: &std::path::Path) {
+/// Optionally scan for CAS files without an index row (best-effort diagnostics).
+///
+/// Disabled unless `orphan_blob_scan_limit` is set. Caps inspected files and
+/// emits a single aggregated warning.
+fn warn_orphan_blobs(conn: &Connection, artifacts_dir: &std::path::Path, scan_limit: Option<u32>) {
+    let Some(limit) = scan_limit.filter(|n| *n > 0) else {
+        return;
+    };
     let sha_root = artifacts_dir.join("sha256");
     let Ok(prefixes) = std::fs::read_dir(&sha_root) else {
         return;
     };
-    for prefix in prefixes.flatten() {
+    let mut inspected = 0u32;
+    let mut orphans = 0u64;
+    let mut check_errors = 0u64;
+    'scan: for prefix in prefixes.flatten() {
         if !prefix.path().is_dir() {
             continue;
         }
@@ -137,6 +165,9 @@ fn warn_orphan_blobs(conn: &Connection, artifacts_dir: &std::path::Path) {
             continue;
         };
         for file in files.flatten() {
+            if inspected >= limit {
+                break 'scan;
+            }
             let path = file.path();
             if !path.is_file() {
                 continue;
@@ -144,21 +175,27 @@ fn warn_orphan_blobs(conn: &Connection, artifacts_dir: &std::path::Path) {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            inspected += 1;
             let exists: Result<i64, _> = conn.query_row(
                 "SELECT COUNT(*) FROM artifacts WHERE digest = ?1 AND deleted_at IS NULL",
                 [name],
                 |r| r.get(0),
             );
             match exists {
-                Ok(0) => {
-                    tracing::warn!(path = %path.display(), "orphan artifact blob without index");
-                }
+                Ok(0) => orphans += 1,
                 Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "orphan blob index check failed");
-                }
+                Err(_) => check_errors += 1,
             }
         }
+    }
+    if orphans > 0 || check_errors > 0 {
+        tracing::warn!(
+            orphans,
+            check_errors,
+            inspected,
+            limit,
+            "orphan artifact blob scan"
+        );
     }
 }
 

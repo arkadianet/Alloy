@@ -29,20 +29,18 @@ pub async fn install_sqlite_event_sink(
     let storage = AlloyStorage::open(opts).await.map_err(store_to_runtime)?;
     let storage = Arc::new(storage);
     let events = storage.events();
+    let sink = Arc::clone(&events);
 
     let result = handle
-        .handoff_event_sink(events.clone(), {
-            let events = Arc::clone(&events);
-            move |snap| async move {
-                let runtime_n = snap.runtime.len();
-                let session_n: usize = snap.sessions.values().map(Vec::len).sum();
-                tracing::info!(
-                    runtime_events = runtime_n,
-                    session_events = session_n,
-                    "draining in-memory sink into sqlite"
-                );
-                events.import_handoff_snapshot(snap).await
-            }
+        .handoff_event_sink(sink, move |snap| async move {
+            let runtime_n = snap.runtime.len();
+            let session_n: usize = snap.sessions.values().map(Vec::len).sum();
+            tracing::info!(
+                runtime_events = runtime_n,
+                session_events = session_n,
+                "draining in-memory sink into sqlite"
+            );
+            events.import_handoff_snapshot(snap).await
         })
         .await;
 
@@ -52,7 +50,9 @@ pub async fn install_sqlite_event_sink(
             Ok(storage)
         }
         Err(e) => {
-            let _ = storage.close().await;
+            if let Err(close_err) = storage.close().await {
+                tracing::warn!(error = %close_err, "storage rollback close failed after handoff error");
+            }
             Err(e)
         }
     }

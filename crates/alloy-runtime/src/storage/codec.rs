@@ -18,22 +18,28 @@ pub fn ts_from_text(s: &str) -> Result<Timestamp, StoreError> {
     Ok(Timestamp(odt))
 }
 
-/// Parse a UUID newtype from its canonical string form.
-pub fn parse_session_id(s: &str) -> Result<SessionId, StoreError> {
+/// Parse a transparent UUID newtype via `Uuid::parse_str` + serde.
+fn parse_uuid_newtype<T>(s: &str) -> Result<T, StoreError>
+where
+    T: serde::de::DeserializeOwned,
+{
     let uuid = uuid::Uuid::parse_str(s).map_err(|e| StoreError::Corrupt(e.to_string()))?;
     serde_json::from_value(serde_json::json!(uuid)).map_err(|e| StoreError::Corrupt(e.to_string()))
+}
+
+/// Parse a session id from TEXT (uses [`SessionId::parse`]).
+pub fn parse_session_id(s: &str) -> Result<SessionId, StoreError> {
+    SessionId::parse(s).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
 
 /// Parse a run id from TEXT.
 pub fn parse_run_id(s: &str) -> Result<RunId, StoreError> {
-    let uuid = uuid::Uuid::parse_str(s).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-    serde_json::from_value(serde_json::json!(uuid)).map_err(|e| StoreError::Corrupt(e.to_string()))
+    parse_uuid_newtype(s)
 }
 
 /// Parse an artifact id from TEXT.
 pub fn parse_artifact_id(s: &str) -> Result<ArtifactId, StoreError> {
-    let uuid = uuid::Uuid::parse_str(s).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-    serde_json::from_value(serde_json::json!(uuid)).map_err(|e| StoreError::Corrupt(e.to_string()))
+    parse_uuid_newtype(s)
 }
 
 /// Require a path to be valid Unicode for durable TEXT storage.

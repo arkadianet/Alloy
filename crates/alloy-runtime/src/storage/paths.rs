@@ -46,19 +46,7 @@ impl StorageLayout {
 
     /// Content-addressed path for a digest: `artifacts/sha256/<ab>/<hex>`.
     pub fn cas_path(&self, digest_hex: &str) -> Result<PathBuf, StoreError> {
-        if digest_hex.len() != 64
-            || !digest_hex
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        {
-            return Err(StoreError::Corrupt(format!(
-                "invalid digest for CAS path: {digest_hex}"
-            )));
-        }
-        if digest_hex.contains("..") {
-            return Err(StoreError::Corrupt("path traversal in digest".into()));
-        }
-        let prefix = &digest_hex[..2];
+        let (prefix, digest_hex) = validate_digest_hex(digest_hex)?;
         Ok(self
             .artifacts_dir
             .join("sha256")
@@ -68,16 +56,7 @@ impl StorageLayout {
 
     /// Relative path stored in the artifacts index.
     pub fn cas_rel_path(digest_hex: &str) -> Result<String, StoreError> {
-        if digest_hex.len() != 64
-            || !digest_hex
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        {
-            return Err(StoreError::Corrupt(format!(
-                "invalid digest for CAS path: {digest_hex}"
-            )));
-        }
-        let prefix = &digest_hex[..2];
+        let (prefix, digest_hex) = validate_digest_hex(digest_hex)?;
         Ok(format!("sha256/{prefix}/{digest_hex}"))
     }
 
@@ -90,6 +69,20 @@ impl StorageLayout {
         }
         Ok(self.artifacts_dir.join(rel))
     }
+}
+
+/// Validate lowercase SHA-256 hex and return `(prefix2, full_hex)`.
+fn validate_digest_hex(digest_hex: &str) -> Result<(&str, &str), StoreError> {
+    if digest_hex.len() != 64
+        || !digest_hex
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(StoreError::Corrupt(format!(
+            "invalid digest for CAS path: {digest_hex}"
+        )));
+    }
+    Ok((&digest_hex[..2], digest_hex))
 }
 
 /// Maps `ALLOY_SQLITE_SYNCHRONOUS` / `PRAGMA synchronous`.
@@ -145,6 +138,8 @@ pub struct StorageOpenOptions {
     pub synchronous: SqliteSynchronous,
     /// Refuse open when DB schema_version is newer than this code (default true).
     pub refuse_newer_schema: bool,
+    /// Max CAS files to inspect for orphan warnings (`None` = skip scan).
+    pub orphan_blob_scan_limit: Option<u32>,
 }
 
 impl StorageOpenOptions {
@@ -157,12 +152,14 @@ impl StorageOpenOptions {
             busy_timeout_ms: 5000,
             synchronous: SqliteSynchronous::Normal,
             refuse_newer_schema: true,
+            orphan_blob_scan_limit: None,
         }
     }
 
     /// Build options from process env + `data_dir`.
     ///
-    /// Reads `ALLOY_SQLITE_BUSY_TIMEOUT_MS`, `ALLOY_SQLITE_SYNCHRONOUS`, `ALLOY_STORAGE_WAL`.
+    /// Reads `ALLOY_SQLITE_BUSY_TIMEOUT_MS`, `ALLOY_SQLITE_SYNCHRONOUS`, `ALLOY_STORAGE_WAL`,
+    /// and optional `ALLOY_STORAGE_ORPHAN_SCAN` / `ALLOY_STORAGE_ORPHAN_SCAN_LIMIT`.
     /// Never reads or writes `.env`.
     pub fn from_env(data_dir: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let mut opts = Self::for_data_dir(data_dir);
@@ -187,6 +184,26 @@ impl StorageOpenOptions {
                         "invalid ALLOY_STORAGE_WAL={v:?}; expected true/false/1/0 (see example.env)"
                     ))
                 })?;
+            }
+        }
+        if let Ok(v) = std::env::var("ALLOY_STORAGE_ORPHAN_SCAN") {
+            if !v.is_empty() {
+                let enabled = parse_bool_env(&v).ok_or_else(|| {
+                    StoreError::Io(format!(
+                        "invalid ALLOY_STORAGE_ORPHAN_SCAN={v:?}; expected true/false/1/0 (see example.env)"
+                    ))
+                })?;
+                if enabled {
+                    let limit = match std::env::var("ALLOY_STORAGE_ORPHAN_SCAN_LIMIT") {
+                        Ok(raw) if !raw.is_empty() => raw.parse::<u32>().map_err(|_| {
+                            StoreError::Io(format!(
+                                "invalid ALLOY_STORAGE_ORPHAN_SCAN_LIMIT={raw:?} (see example.env)"
+                            ))
+                        })?,
+                        _ => 1024,
+                    };
+                    opts.orphan_blob_scan_limit = Some(limit);
+                }
             }
         }
         Ok(opts)

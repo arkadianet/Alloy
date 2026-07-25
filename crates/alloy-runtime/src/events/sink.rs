@@ -110,15 +110,32 @@ impl InMemoryEventSink {
         }
     }
 
-    /// Restore a snapshot after failed import (handoff abort). Overwrites current buffers.
+    /// Restore a snapshot after failed import (handoff abort).
+    ///
+    /// Merges the snapshot ahead of any events appended concurrently through
+    /// [`Self`] after drain; `next_seq` becomes the max of snapshot and current.
     pub fn restore_handoff_snapshot(&self, snap: HandoffSnapshot) {
         let mut g = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        g.runtime = snap.runtime;
-        g.sessions = snap.sessions;
-        g.next_seq = snap.next_seq;
+
+        let mut runtime = snap.runtime;
+        runtime.append(&mut g.runtime);
+        g.runtime = runtime;
+
+        let mut sessions = snap.sessions;
+        for (sid, mut current) in std::mem::take(&mut g.sessions) {
+            sessions.entry(sid).or_default().append(&mut current);
+        }
+        g.sessions = sessions;
+
+        let mut next_seq = snap.next_seq;
+        for (sid, cur) in std::mem::take(&mut g.next_seq) {
+            let entry = next_seq.entry(sid).or_insert(0);
+            *entry = (*entry).max(cur);
+        }
+        g.next_seq = next_seq;
     }
 }
 

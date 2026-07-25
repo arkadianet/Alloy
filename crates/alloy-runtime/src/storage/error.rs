@@ -64,9 +64,7 @@ pub(crate) fn from_rusqlite(e: rusqlite::Error) -> StoreError {
             rusqlite::ErrorCode::ConstraintViolation => {
                 StoreError::Conflict(msg.unwrap_or_else(|| "constraint violation".into()))
             }
-            rusqlite::ErrorCode::DatabaseCorrupt
-            | rusqlite::ErrorCode::NotADatabase
-            | rusqlite::ErrorCode::SchemaChanged => {
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase => {
                 StoreError::Corrupt(msg.unwrap_or_else(|| err.to_string()))
             }
             rusqlite::ErrorCode::SystemIoFailure
