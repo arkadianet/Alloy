@@ -47,7 +47,9 @@ pub use events::{
 };
 pub use runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
 pub use scheduler::{DagOutcome, DagState, NullScheduler, Scheduler};
-pub use session::{ReplanReason, RunController, Session, SessionService};
+pub use session::{
+    clamp_events_page_limit, ReplanReason, RunController, Session, SessionService, MAX_EVENTS_PAGE,
+};
 pub use types::budget::{
     BudgetPolicy, BudgetSnapshot, Constraint, CreateSession, Goal, ModelTier, TokenBudget,
 };

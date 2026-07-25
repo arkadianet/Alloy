@@ -27,6 +27,8 @@ criterion = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
 
 [[bench]]
 name = "digest_sha256"

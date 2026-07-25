@@ -23,8 +23,8 @@ pub struct WorkerMetrics {
     pub cache_hits: u32,
     /// Wall duration in milliseconds.
     pub duration_ms: u64,
-    /// Optional model confidence.
-    pub confidence: f32,
+    /// Model confidence when the provider supplies one; `None` if unavailable.
+    pub confidence: Option<f32>,
     /// Optional error class.
     pub error_class: Option<ErrorClass>,
 }

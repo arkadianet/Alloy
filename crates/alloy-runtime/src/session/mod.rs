@@ -2,4 +2,6 @@
 
 mod traits;
 
-pub use traits::{ReplanReason, RunController, Session, SessionService};
+pub use traits::{
+    clamp_events_page_limit, ReplanReason, RunController, Session, SessionService, MAX_EVENTS_PAGE,
+};

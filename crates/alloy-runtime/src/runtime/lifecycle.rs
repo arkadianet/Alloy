@@ -90,20 +90,38 @@ impl AlloyRuntime {
     async fn start_inner(&mut self) -> Result<RuntimeHandle, RuntimeError> {
         logging::init_tracing();
         let cfg = self.handle.config()?;
+        let cancel = self.handle.cancellation();
+        if cancel.is_cancelled() {
+            return Err(RuntimeError::Internal("cancelled during start".into()));
+        }
+
         // RFC failure table: data_dir create → RuntimeError::Io; start → Failed.
-        tokio::fs::create_dir_all(&cfg.data_dir)
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "create data_dir {} (rule: {}); see {}: {e}",
-                        cfg.data_dir.display(),
-                        cfg.data_dir_rule,
-                        cfg.env_file_hint.display()
-                    ),
-                )
-            })?;
+        // Observe process cancellation during async I/O so early SIGINT/SIGTERM aborts startup.
+        let create = tokio::fs::create_dir_all(&cfg.data_dir);
+        tokio::pin!(create);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(RuntimeError::Internal("cancelled during start".into()));
+            }
+            result = &mut create => {
+                result.map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "create data_dir {} (rule: {}); see {}: {e}",
+                            cfg.data_dir.display(),
+                            cfg.data_dir_rule,
+                            cfg.env_file_hint.display()
+                        ),
+                    )
+                })?;
+            }
+        }
+
+        if cancel.is_cancelled() {
+            return Err(RuntimeError::Internal("cancelled during start".into()));
+        }
 
         let pending = self
             .handle
@@ -116,6 +134,10 @@ impl AlloyRuntime {
             self.handle
                 .emit(RuntimeEvent::Configured { data_dir: dir })
                 .await?;
+        }
+
+        if cancel.is_cancelled() {
+            return Err(RuntimeError::Internal("cancelled during start".into()));
         }
 
         self.handle.emit(RuntimeEvent::Started).await?;

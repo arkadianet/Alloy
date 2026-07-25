@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use alloy_runtime::{AlloyRuntime, ConfigPaths, RuntimeConfig};
+use alloy_runtime::{AlloyRuntime, ConfigPaths, RuntimeConfig, RuntimePhase};
 use clap::{Parser, Subcommand};
 use tracing::error;
 
@@ -50,22 +50,41 @@ async fn main() -> ExitCode {
 async fn run_host(workspace: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     alloy_runtime::logging::init_tracing();
 
-    let paths = ConfigPaths {
-        profile: workspace.join("profiles/default.toml"),
-        router: workspace.join("router.toml.example"),
-        example_env: workspace.join("example.env"),
-        data_dir: None,
-        workspace_root: Some(workspace.clone()),
-    };
+    // Active router.toml (not .example); ALLOY_PROFILE / ALLOY_ROUTER / ALLOY_DATA_DIR honored.
+    let paths = ConfigPaths::for_workspace(workspace);
     let cfg = RuntimeConfig::load(paths)?;
     let mut rt = AlloyRuntime::new();
     rt.configure(cfg)?;
-    let handle = rt.start().await?;
 
-    tracing::info!(phase = ?handle.phase(), "runtime running; Ctrl-C / SIGTERM to stop");
-    wait_for_shutdown_signal().await?;
-    graceful_shutdown(rt, Duration::from_secs(10)).await?;
-    Ok(())
+    // Arm SIGINT/SIGTERM → cancellation before start so startup I/O can abort.
+    let cancel = rt.handle().cancellation();
+    let signal_task = tokio::spawn(async move {
+        if wait_for_shutdown_signal().await.is_ok() {
+            cancel.cancel();
+        }
+    });
+
+    match rt.start().await {
+        Ok(handle) => {
+            tracing::info!(phase = ?handle.phase(), "runtime running; Ctrl-C / SIGTERM to stop");
+            // Post-start: wait until the early-armed signal cancels the token.
+            handle.cancellation().cancelled().await;
+            let _ = signal_task.await;
+            graceful_shutdown(rt, Duration::from_secs(10)).await?;
+            Ok(())
+        }
+        Err(e) if rt.handle().cancellation().is_cancelled() => {
+            tracing::info!("shutdown signal during start; draining");
+            let _ = signal_task.await;
+            graceful_shutdown(rt, Duration::from_secs(10)).await?;
+            let _ = e;
+            Ok(())
+        }
+        Err(e) => {
+            signal_task.abort();
+            Err(e.into())
+        }
+    }
 }
 
 /// Wait for SIGINT or SIGTERM (Unix). Shared so tests can call [`graceful_shutdown`] directly.
@@ -93,12 +112,14 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
     }
 }
 
-/// Drain then shutdown — production signal path and test seam.
+/// Drain (when Running) then shutdown — production signal path and test seam.
 async fn graceful_shutdown(
     rt: AlloyRuntime,
     grace: Duration,
 ) -> Result<(), alloy_runtime::RuntimeError> {
-    rt.drain(grace).await?;
+    if rt.handle().phase() == RuntimePhase::Running {
+        rt.drain(grace).await?;
+    }
     rt.shutdown().await?;
     Ok(())
 }
@@ -117,19 +138,13 @@ mod signal_path {
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("router.toml.example"),
+            dir.path().join("router.toml"),
             include_str!("../../../router.toml.example"),
         )
         .unwrap();
         std::fs::write(dir.path().join("example.env"), "ALLOY_API_KEY=\n").unwrap();
 
-        let paths = ConfigPaths {
-            profile: dir.path().join("profiles/default.toml"),
-            router: dir.path().join("router.toml.example"),
-            example_env: dir.path().join("example.env"),
-            data_dir: None,
-            workspace_root: Some(dir.path().to_path_buf()),
-        };
+        let paths = ConfigPaths::for_workspace(dir.path().to_path_buf());
         let cfg = RuntimeConfig::load(paths).unwrap();
         let mut rt = AlloyRuntime::new();
         rt.configure(cfg).unwrap();

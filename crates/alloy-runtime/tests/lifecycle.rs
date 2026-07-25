@@ -475,25 +475,16 @@ async fn core_ir_serde_round_trips() {
 
 #[tokio::test]
 async fn workspace_has_five_members() {
-    let manifest = include_str!("../../../Cargo.toml");
-    let mut in_members = false;
-    let mut count = 0usize;
-    for line in manifest.lines() {
-        let t = line.trim();
-        if t.starts_with("members") {
-            in_members = true;
-            continue;
-        }
-        if in_members {
-            if t.starts_with(']') {
-                break;
-            }
-            if t.starts_with('"') {
-                count += 1;
-            }
-        }
+    #[derive(serde::Deserialize)]
+    struct WorkspaceRoot {
+        workspace: WorkspaceTable,
     }
-    assert_eq!(count, 5);
+    #[derive(serde::Deserialize)]
+    struct WorkspaceTable {
+        members: Vec<String>,
+    }
+    let parsed: WorkspaceRoot = toml::from_str(include_str!("../../../Cargo.toml")).unwrap();
+    assert_eq!(parsed.workspace.members.len(), 5);
 }
 
 #[tokio::test]

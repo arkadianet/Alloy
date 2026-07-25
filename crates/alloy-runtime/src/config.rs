@@ -12,7 +12,7 @@ use crate::error::RuntimeError;
 pub struct ConfigPaths {
     /// Profile TOML path.
     pub profile: PathBuf,
-    /// Router TOML path.
+    /// Active router TOML path (user-owned `router.toml`, not the `.example` template).
     pub router: PathBuf,
     /// `example.env` path for error messages only.
     pub example_env: PathBuf,
@@ -20,6 +20,47 @@ pub struct ConfigPaths {
     pub data_dir: Option<PathBuf>,
     /// Optional workspace root for `.alloy` resolution.
     pub workspace_root: Option<PathBuf>,
+}
+
+impl ConfigPaths {
+    /// Build paths for a workspace, honoring `ALLOY_PROFILE` / `ALLOY_ROUTER`.
+    ///
+    /// - Profile default: `<workspace>/profiles/default.toml`
+    /// - Router default: `<workspace>/router.toml` (copy from `router.toml.example`)
+    /// - `ALLOY_DATA_DIR` is read later by [`RuntimeConfig::load`] (not stored here)
+    /// - Relative override paths resolve against `workspace_root`
+    ///
+    /// Never reads or writes a `.env` file — only process environment.
+    #[must_use]
+    pub fn for_workspace(workspace_root: PathBuf) -> Self {
+        let profile = env_path_or("ALLOY_PROFILE", || {
+            workspace_root.join("profiles/default.toml")
+        });
+        let router = env_path_or("ALLOY_ROUTER", || workspace_root.join("router.toml"));
+        Self {
+            profile: resolve_against(&workspace_root, profile),
+            router: resolve_against(&workspace_root, router),
+            example_env: workspace_root.join("example.env"),
+            data_dir: None,
+            workspace_root: Some(workspace_root),
+        }
+    }
+}
+
+fn env_path_or(key: &str, default: impl FnOnce() -> PathBuf) -> PathBuf {
+    std::env::var(key)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default)
+}
+
+fn resolve_against(workspace_root: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    }
 }
 
 /// Loaded runtime configuration.
@@ -89,7 +130,14 @@ fn default_tokens() -> u64 {
 impl RuntimeConfig {
     /// Load TOML + process env. **Never writes `.env`.**
     ///
-    /// Data dir precedence: `ALLOY_DATA_DIR` → `<workspace>/.alloy` → XDG.
+    /// Data dir precedence:
+    /// 1. `ALLOY_DATA_DIR` (process env, if set and non-empty)
+    /// 2. [`ConfigPaths::data_dir`] programmatic override
+    /// 3. `<workspace>/.alloy` when [`ConfigPaths::workspace_root`] is set
+    /// 4. XDG (`$XDG_DATA_HOME/alloy` or `~/.local/share/alloy`)
+    ///
+    /// Profile/router path overrides (`ALLOY_PROFILE`, `ALLOY_ROUTER`) are applied when
+    /// constructing paths via [`ConfigPaths::for_workspace`], not by parsing `.env` files.
     pub fn load(paths: ConfigPaths) -> Result<Self, RuntimeError> {
         if !paths.profile.is_file() {
             return Err(RuntimeError::Config(format!(
@@ -255,5 +303,14 @@ api_key_env = "ALLOY_API_KEY"
         .unwrap();
         assert_eq!(cfg.data_dir, explicit);
         assert_eq!(cfg.data_dir_rule, "ConfigPaths.data_dir");
+    }
+
+    #[test]
+    fn for_workspace_defaults_to_active_router_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::for_workspace(dir.path().to_path_buf());
+        assert_eq!(paths.router, dir.path().join("router.toml"));
+        assert_eq!(paths.profile, dir.path().join("profiles/default.toml"));
+        assert_eq!(paths.example_env, dir.path().join("example.env"));
     }
 }

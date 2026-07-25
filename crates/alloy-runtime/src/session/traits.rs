@@ -10,6 +10,15 @@ use crate::types::budget::{BudgetPolicy, CreateSession, Goal};
 use crate::types::diagnostic::FailureIr;
 use crate::types::ids::{EventSeq, GateId, LanguageId, ProfileId, RunId, SessionId, Timestamp};
 
+/// Hard cap for [`SessionService::events`] page size (impls must clamp or reject above this).
+pub const MAX_EVENTS_PAGE: usize = 1_000;
+
+/// Clamp a requested page size into `1..=MAX_EVENTS_PAGE`.
+#[must_use]
+pub fn clamp_events_page_limit(limit: usize) -> usize {
+    limit.clamp(1, MAX_EVENTS_PAGE)
+}
+
 /// Session lifecycle API (behavior in RFC-0003).
 #[async_trait]
 pub trait SessionService: Send + Sync {
@@ -19,11 +28,17 @@ pub trait SessionService: Send + Sync {
     async fn resume(&self, id: SessionId) -> Result<Session, SessionError>;
     /// Submit a goal; returns a run id.
     async fn submit_goal(&self, id: SessionId, goal: Goal) -> Result<RunId, SessionError>;
-    /// List events after a sequence cursor.
+    /// List session events with an exclusive cursor and page limit.
+    ///
+    /// - `after: None` — return from the first event (`EventSeq(0)`).
+    /// - `after: Some(seq)` — return events with `seq > after` (exclusive).
+    /// - `limit` — max events to return; impls must use [`clamp_events_page_limit`]
+    ///   (or reject `0` / values above [`MAX_EVENTS_PAGE`] with [`SessionError::Invalid`]).
     async fn events(
         &self,
         id: SessionId,
-        after: EventSeq,
+        after: Option<EventSeq>,
+        limit: usize,
     ) -> Result<Vec<SessionEvent>, SessionError>;
 }
 
