@@ -304,6 +304,16 @@ fn is_terminal_durable(state: RunControlState) -> bool {
     matches!(state, RunControlState::Succeeded | RunControlState::Failed)
 }
 
+/// True when a scheduler outcome agrees with an already-durable terminal control state.
+fn terminal_matches(durable: RunControlState, dag: DagState) -> bool {
+    matches!(
+        (durable, dag),
+        (RunControlState::Succeeded, DagState::Succeeded)
+            | (RunControlState::Failed, DagState::Failed)
+            | (RunControlState::Cancelled, DagState::Cancelled)
+    )
+}
+
 /// `Arc<dyn RunController>` view over the shared session plane.
 pub(super) struct RunControllerView {
     inner: Arc<SessionInner>,
@@ -344,13 +354,27 @@ impl RunControllerView {
         }
 
         if is_terminal_durable(durable) {
-            warn!(
-                run_id = %run,
-                state = durable.as_str(),
-                "start outcome merged: durable state already terminal"
-            );
+            // The deny handshake commits `failed` while `run_dag` is still awaited, so an
+            // outcome that agrees with the durable terminal is the expected join — not a
+            // conflicting success (§6.3 step 9b). Skip event writes; `approve` already
+            // emitted the pair.
             return match result {
-                Ok(_) => Err(RunError::InvalidPhase("state advanced during run".into())),
+                Ok(outcome) if terminal_matches(durable, outcome.state) => {
+                    info!(
+                        run_id = %run,
+                        state = durable.as_str(),
+                        "start outcome merged: agrees with durable terminal"
+                    );
+                    Ok(())
+                }
+                Ok(_) => {
+                    warn!(
+                        run_id = %run,
+                        state = durable.as_str(),
+                        "start outcome merged: durable state already terminal"
+                    );
+                    Err(RunError::InvalidPhase("state advanced during run".into()))
+                }
                 Err(RuntimeError::Scheduler(SchedError::Cancelled)) => Ok(()),
                 Err(e) => Err(runtime_to_run(e)),
             };
@@ -429,8 +453,12 @@ impl RunControllerView {
         // Terminal pair before the row write: a crash after upsert would leave a terminal
         // row that resume skips, with no other writer to emit the events.
         let state = outcome.state;
-        append_run_completed(&self.inner, session, run, state, None).await?;
-        emit_run_finished(&self.inner, run, outcome).await?;
+        if !has_run_completed(&self.inner, session, run).await? {
+            append_run_completed(&self.inner, session, run, state, None).await?;
+        }
+        if !has_run_finished(&self.inner, run).await? {
+            emit_run_finished(&self.inner, run, outcome).await?;
+        }
         upsert_state(&self.inner, row, control).await?;
         if control == RunControlState::Cancelled {
             self.inner.metrics.bump_runs_cancelled();

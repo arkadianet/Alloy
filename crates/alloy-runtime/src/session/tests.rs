@@ -1175,6 +1175,39 @@ async fn run_approve_with_waiter() {
 }
 
 #[tokio::test]
+async fn run_approve_deny_during_run_dag_joins_cleanly() {
+    let h = Harness::new().await;
+    // Scheduler blocks inside run_dag until released, then reports Failed — the shape a
+    // real gate-failed DAG returns after GateHumanAdapter observes Deny.
+    let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(DagState::Failed)]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+
+    let runs = h.runs();
+    let started = tokio::spawn(async move { runs.start(run).await });
+    sched.entered.notified().await;
+
+    let gate = GateId::new();
+    let rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
+    h.runs().approve(run, gate, Approval::Deny).await.unwrap();
+    assert_eq!(rx.await.unwrap(), Approval::Deny);
+    assert_eq!(h.run_state(run).await, RunControlState::Failed);
+
+    sched.release.notify_one();
+    // Agreeing Ok(Failed) over durable `failed` is the expected join, not InvalidPhase.
+    started.await.unwrap().unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::Failed);
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::RunCompleted)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(h.count_finished(run).await, 1);
+    h.close().await;
+}
+
+#[tokio::test]
 async fn run_approve_deny_fails_run() {
     let h = Harness::new().await;
     h.install_scheduler(MockScheduler::new([Plan::State(DagState::WaitingApproval)]));
