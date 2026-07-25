@@ -1,12 +1,14 @@
 //! Shared session-plane state.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::gates::GateWaiterRegistry;
 use super::metrics::AtomicSessionMetrics;
+use super::run_state::RunControlState;
 use crate::runtime::RuntimeHandle;
 use crate::storage::AlloyStorage;
 use crate::types::ids::{RunId, SessionId};
@@ -18,11 +20,15 @@ pub(crate) struct SessionInner {
     session_locks: StdMutex<HashMap<SessionId, Arc<Mutex<()>>>>,
     run_locks: StdMutex<HashMap<RunId, Arc<Mutex<()>>>>,
     /// Execution lease: run ids with outstanding `run_dag` awaits.
-    pub live_execution: StdMutex<HashSet<RunId>>,
-    /// Runs that emitted `RunAccepted` in this process.
-    pub accepted_emitted: StdMutex<HashSet<RunId>>,
+    live_execution: StdMutex<HashSet<RunId>>,
+    /// Runs that emitted `RunAccepted` in this process (pruned on terminal).
+    accepted_emitted: StdMutex<HashSet<RunId>>,
     pub gates: GateWaiterRegistry,
     pub metrics: AtomicSessionMetrics,
+    /// Test-only: next `upsert_run` via control plane fails once.
+    pub(crate) fail_next_run_upsert: AtomicBool,
+    /// Test-only: next session-event append via control plane fails once.
+    pub(crate) fail_next_append: AtomicBool,
 }
 
 impl SessionInner {
@@ -36,6 +42,8 @@ impl SessionInner {
             accepted_emitted: StdMutex::new(HashSet::new()),
             gates: GateWaiterRegistry::new(),
             metrics: AtomicSessionMetrics::new(),
+            fail_next_run_upsert: AtomicBool::new(false),
+            fail_next_append: AtomicBool::new(false),
         }
     }
 
@@ -84,16 +92,25 @@ impl SessionInner {
             .contains(&id)
     }
 
-    pub fn set_live(&self, id: RunId, live: bool) {
-        let mut set = self
-            .live_execution
+    /// Acquire an RAII execution lease (cleared on [`Drop`] if not released).
+    pub fn acquire_lease(self: &Arc<Self>, id: RunId) -> ExecutionLease {
+        self.live_execution
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if live {
-            set.insert(id);
-        } else {
-            set.remove(&id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
+        ExecutionLease {
+            inner: Arc::clone(self),
+            id,
+            armed: true,
         }
+    }
+
+    /// Clear a lease by id (e.g. `cancel` while `start` may still hold a guard).
+    pub fn clear_lease(&self, id: RunId) {
+        self.live_execution
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
     }
 
     pub fn mark_accepted_emitted(&self, id: RunId) {
@@ -103,11 +120,73 @@ impl SessionInner {
             .insert(id);
     }
 
-    pub fn was_accepted_emitted(&self, id: RunId) -> bool {
+    pub fn clear_accepted_emitted(&self, id: RunId) {
         self.accepted_emitted
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&id)
+            .remove(&id);
+    }
+
+    /// True if this process emitted `RunAccepted` **or** durable state has left `Created`.
+    pub fn was_accepted(&self, run: RunId, durable: RunControlState) -> bool {
+        durable != RunControlState::Created
+            || self
+                .accepted_emitted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&run)
+    }
+
+    /// Mark terminal: prune process-local accepted tracking.
+    pub fn on_terminal(&self, run: RunId) {
+        self.clear_accepted_emitted(run);
+        self.clear_lease(run);
+    }
+
+    pub(crate) fn take_fail_run_upsert(&self) -> bool {
+        self.fail_next_run_upsert.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn take_fail_append(&self) -> bool {
+        self.fail_next_append.swap(false, Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_lock_map_len(&self) -> usize {
+        self.run_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_lock_map_len(&self) -> usize {
+        self.session_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// Clears `live_execution` on drop unless [`Self::disarm`] was called after a durable transition.
+pub(crate) struct ExecutionLease {
+    inner: Arc<SessionInner>,
+    id: RunId,
+    armed: bool,
+}
+
+impl ExecutionLease {
+    /// Drop without clearing (caller already cleared via [`SessionInner::on_terminal`] / `clear_lease`).
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner.clear_lease(self.id);
+        }
     }
 }
 
@@ -122,7 +201,6 @@ pub(crate) struct SessionLock {
 impl Drop for SessionLock {
     fn drop(&mut self) {
         self.guard.take();
-        // map + self.arc => strong_count == 2 means no other holders
         if Arc::strong_count(&self.arc) == 2 {
             let mut map = self
                 .inner
@@ -175,9 +253,6 @@ pub(crate) struct RunLockTicket {
 
 impl RunLockTicket {
     /// Re-acquire the same run mutex.
-    ///
-    /// The ticket's own `Drop` cannot evict the map entry here: the returned
-    /// [`RunLock`] holds another clone of the same `Arc`.
     pub async fn relock(self) -> RunLock {
         let guard = Arc::clone(&self.arc).lock_owned().await;
         RunLock {

@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use crate::adapters::Approval;
 use crate::types::ids::{GateId, RunId};
 
-/// Onesot waiters keyed by `(RunId, GateId)`.
+/// Oneshot waiters keyed by `(RunId, GateId)`.
 #[derive(Default)]
 pub(crate) struct GateWaiterRegistry {
     waiters: Mutex<HashMap<(RunId, GateId), oneshot::Sender<Approval>>>,

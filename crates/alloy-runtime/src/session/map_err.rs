@@ -48,6 +48,19 @@ pub fn runtime_to_run(e: RuntimeError) -> RunError {
     }
 }
 
+/// Map [`RunError`] into [`SessionError`].
+///
+/// `SessionService::resume` finalizes run-control rows through the
+/// [`super::run_controller`] helpers, so their errors have to cross the trait boundary.
+#[must_use]
+pub fn run_to_session(e: RunError) -> SessionError {
+    match e {
+        RunError::NotFound(run) => SessionError::Internal(format!("run row vanished: {run}")),
+        RunError::InvalidPhase(m) => SessionError::Invalid(m),
+        other => SessionError::Internal(other.to_string()),
+    }
+}
+
 /// Map [`RuntimeError`] into [`SessionError`].
 #[must_use]
 pub fn runtime_to_session(e: RuntimeError) -> SessionError {
@@ -66,7 +79,6 @@ pub fn runtime_to_session(e: RuntimeError) -> SessionError {
 mod tests {
     use super::*;
     use crate::runtime::RuntimePhase;
-    use crate::types::ids::DagId;
 
     #[test]
     fn store_corrupt_is_internal() {
@@ -97,6 +109,5 @@ mod tests {
             op: "run",
         });
         assert!(matches!(e, RunError::InvalidPhase(_)));
-        let _ = DagId::new();
     }
 }

@@ -66,7 +66,31 @@ impl AtomicSessionMetrics {
         }
     }
 
-    pub fn inc(counter: &AtomicU64) {
-        counter.fetch_add(1, Ordering::Relaxed);
+    pub fn bump_sessions_created(&self) {
+        self.sessions_created.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn bump_sessions_resumed(&self) {
+        self.sessions_resumed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn bump_goals_submitted(&self) {
+        self.goals_submitted.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn bump_runs_started(&self) {
+        self.runs_started.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn bump_runs_start_unavailable(&self) {
+        self.runs_start_unavailable.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn bump_runs_cancelled(&self) {
+        self.runs_cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn bump_approvals_resolved(&self) {
+        self.approvals_resolved.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn bump_replans_requested(&self) {
+        self.replans_requested.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn bump_budget_warnings(&self) {
+        self.budget_warnings.fetch_add(1, Ordering::Relaxed);
     }
 }
