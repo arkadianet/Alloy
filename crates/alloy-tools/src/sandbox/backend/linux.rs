@@ -295,6 +295,38 @@ fn apply_plan(mut plan: LandlockPlan) -> std::io::Result<()> {
     if !status.no_new_privs {
         return Err(std::io::Error::from_raw_os_error(libc::EPERM));
     }
+
+    // The child is uid 0 in this userns and would otherwise keep CAP_SYS_ADMIN,
+    // which lets it umount deny-glob /dev/null binds and re-expose in-jail
+    // secrets. Drop the capability (bounding set + effective sets) and lock
+    // SECBIT_NOROOT so execve cannot regain it.
+    lock_down_userns_caps()?;
+
+    Ok(())
+}
+
+/// Prevent the sandboxed payload from undoing mount binds / remounts.
+fn lock_down_userns_caps() -> std::io::Result<()> {
+    use rustix::thread::{
+        capabilities, remove_capability_from_bounding_set, set_capabilities,
+        set_capabilities_secure_bits, CapabilitiesSecureBits, Capability, CapabilityFlags,
+    };
+
+    set_capabilities_secure_bits(
+        CapabilitiesSecureBits::NO_ROOT | CapabilitiesSecureBits::NO_ROOT_LOCKED,
+    )
+    .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+
+    // Best-effort: already-absent bounding-set entries return EPERM/EINVAL.
+    let _ = remove_capability_from_bounding_set(Capability::SystemAdmin);
+
+    let mut caps =
+        capabilities(None).map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
+    caps.effective.remove(CapabilityFlags::SYS_ADMIN);
+    caps.permitted.remove(CapabilityFlags::SYS_ADMIN);
+    caps.inheritable.remove(CapabilityFlags::SYS_ADMIN);
+    set_capabilities(None, caps)
+        .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))?;
     Ok(())
 }
 

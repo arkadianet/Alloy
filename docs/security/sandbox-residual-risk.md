@@ -73,14 +73,31 @@ arbitrary `rustup run` wrappers are out of scope for MVP quarantine rewriting.
   failure at **probe** time marks Landlock `Unavailable` (fail closed on
   `NativeSandboxBroker::new`). Nested user namespaces (some CI / cloud agent
   hosts) may refuse `uid_map` writes → Unavailable even when Landlock ABI exists.
+  After binds apply, the broker drops `CAP_SYS_ADMIN` from the bounding/effective
+  sets and locks `SECBIT_NOROOT` so the child cannot `umount` deny-glob binds
+  (verified by `child_cannot_umount_dotenv_bind`).
 - **Seatbelt** uses `/usr/bin/sandbox-exec` (Apple-deprecated). MVP uses a bash
   trampoline for the ready-byte handshake and `exec -a` argv0 preservation;
-  arguments are never re-joined into an unquoted `bash -c` string.
+  arguments are never re-joined into an unquoted `bash -c` string. The SBPL and
+  trampoline are written under a broker-owned 0700 directory **outside** the jail
+  (never under `.alloy-sbx`), so jail-writable `build.rs` cannot rewrite policy.
 - **Container** depends on docker/podman availability and a pinned image
   (`rust:1.97.1-bookworm` by default). Runtime cleanup uses a cidfile drop-guard
-  on every exit path. The cidfile lives under the jail (RFC-mandated path) and is
-  therefore visible to the container as RW — a compromised child could rewrite
-  the id the broker later signals.
+  on every exit path. The cidfile and env-file live under the jail (RFC-mandated
+  paths) and are therefore visible to the container as RW — a compromised child
+  could rewrite the id the broker later signals.
+
+---
+
+## Native `cargo check` layout
+
+Per-exec `CARGO_TARGET_DIR` points at the scratch carve-out. Operator
+`CARGO_HOME` is mounted RO for allowlisted subtrees (`registry`, `git`, `bin`,
+`config.toml`/`config`, `.package-cache`) plus rustup toolchains. Full online
+registry fetches remain blocked by quarantine + netns. The Landlock
+`landlock_cargo_check_fixture` proves offline `cargo check` against a path
+dependency; registry-dependent checks may still need the Container backend when
+operator cache layout differs.
 
 ---
 

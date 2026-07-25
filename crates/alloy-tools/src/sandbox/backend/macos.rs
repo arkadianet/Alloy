@@ -49,11 +49,15 @@ impl MacosSeatbeltBackend {
             });
         }
 
-        let sbpl = ctx.exec_dir.join("alloy-check.sb");
-        let body = render_sbpl(profile, &ctx)?;
-        std::fs::write(&sbpl, body).map_err(SandboxError::Io)?;
+        // Policy + trampoline live outside the jail: the SBPL grants write to
+        // the whole jail, so an in-jail path would be mutable by the child
+        // (policy mutable by workspace text — V2 §14.5).
+        let outside = broker_owned_dir()?;
+        let sbpl = outside.join("alloy-check.sb");
+        let body = render_sbpl(profile, &ctx, &outside)?;
+        write_mode_0600(&sbpl, body.as_bytes())?;
 
-        let trampoline = ctx.exec_dir.join("trampoline.sh");
+        let trampoline = outside.join("trampoline.sh");
         write_trampoline(&trampoline)?;
 
         let (ready_r, ready_w) = pipe_pair()?;
@@ -143,16 +147,48 @@ shift
 printf 'x' >&"$ready_fd" || exit 75
 exec -a "$argv0" "$program" "$@"
 "#;
-    std::fs::write(path, BODY).map_err(SandboxError::Io)?;
+    write_mode_0600(path, BODY.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(path)
             .map_err(SandboxError::Io)?
             .permissions();
-        perms.set_mode(0o755);
+        perms.set_mode(0o700);
         std::fs::set_permissions(path, perms).map_err(SandboxError::Io)?;
     }
+    Ok(())
+}
+
+fn broker_owned_dir() -> Result<PathBuf, SandboxError> {
+    let dir = std::env::temp_dir()
+        .join("alloy-sbx-seatbelt")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir).map_err(SandboxError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir)
+            .map_err(SandboxError::Io)?
+            .permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, perms).map_err(SandboxError::Io)?;
+    }
+    Ok(dir)
+}
+
+fn write_mode_0600(path: &Path, bytes: &[u8]) -> Result<(), SandboxError> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(path).map_err(SandboxError::Io)?;
+    f.write_all(bytes).map_err(SandboxError::Io)?;
     Ok(())
 }
 
@@ -195,7 +231,11 @@ fn pipe_pair() -> Result<(std::fs::File, std::fs::File), SandboxError> {
     Ok((r, w))
 }
 
-fn render_sbpl(profile: &SandboxProfile, ctx: &IsolateContext) -> Result<String, SandboxError> {
+fn render_sbpl(
+    profile: &SandboxProfile,
+    ctx: &IsolateContext,
+    broker_dir: &Path,
+) -> Result<String, SandboxError> {
     let cargo_registry = ctx.cargo_home.join("registry");
     let cargo_git = ctx.cargo_home.join("git");
     let cargo_bin = ctx.cargo_home.join("bin");
@@ -215,6 +255,7 @@ fn render_sbpl(profile: &SandboxProfile, ctx: &IsolateContext) -> Result<String,
         .replace("{{JAIL}}", &sbpl_literal(&profile.fs_jail))
         .replace("{{TMP}}", &sbpl_literal(&ctx.exec_dir.join("tmp")))
         .replace("{{HOME}}", &sbpl_literal(&ctx.exec_dir.join("home")))
+        .replace("{{BROKER_DIR}}", &sbpl_literal(broker_dir))
         .replace("{{CARGO_REGISTRY}}", &sbpl_literal(&cargo_registry))
         .replace("{{CARGO_GIT}}", &sbpl_literal(&cargo_git))
         .replace("{{CARGO_BIN}}", &sbpl_literal(&cargo_bin))
@@ -240,21 +281,28 @@ pub fn probe_seatbelt_sync() -> Result<String, String> {
     if !p.is_file() {
         return Err("/usr/bin/sandbox-exec missing".into());
     }
-    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let sb = dir.path().join("probe.sb");
+    // Broker-owned dir outside any jail — do not depend on the `tempfile` crate
+    // (dev-only) from library code.
+    let dir = std::env::temp_dir().join(format!("alloy-sbx-probe-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let sb = dir.join("probe.sb");
     let body = "(version 1)\n(allow default)\n";
-    std::fs::write(&sb, body).map_err(|e| e.to_string())?;
-    let out = std::process::Command::new("/usr/bin/sandbox-exec")
-        .args(["-f", &sb.display().to_string(), "--", "/usr/bin/true"])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok("sandbox-exec profile apply ok".into())
-    } else {
-        Err(format!(
-            "sandbox-exec probe failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ))
-    }
+    let result = (|| {
+        std::fs::write(&sb, body).map_err(|e| e.to_string())?;
+        let out = std::process::Command::new("/usr/bin/sandbox-exec")
+            .args(["-f", &sb.display().to_string(), "--", "/usr/bin/true"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok("sandbox-exec profile apply ok".into())
+        } else {
+            Err(format!(
+                "sandbox-exec probe failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }

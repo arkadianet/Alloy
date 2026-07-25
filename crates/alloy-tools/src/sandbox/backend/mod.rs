@@ -178,6 +178,10 @@ pub fn allowlisted_ro_subtrees(cargo_home: &Path, rustup_home: &Path) -> Vec<Pat
         cargo_home.join("registry"),
         cargo_home.join("git"),
         cargo_home.join("bin"),
+        // Offline `cargo check` needs these when CARGO_HOME itself is not RW.
+        cargo_home.join("config.toml"),
+        cargo_home.join("config"),
+        cargo_home.join(".package-cache"),
         rustup_home.join("toolchains"),
     ] {
         if p.exists() {

@@ -1,7 +1,8 @@
 ;; Alloy Seatbelt profile template (RFC-0005).
-;; Placeholders: {{JAIL}} {{TMP}} {{HOME}} {{CARGO_REGISTRY}} {{CARGO_GIT}} {{CARGO_BIN}} {{RUSTUP_TOOLCHAINS}} {{RUSTUP_SETTINGS}}
+;; Placeholders: {{JAIL}} {{TMP}} {{HOME}} {{BROKER_DIR}} {{CARGO_REGISTRY}} {{CARGO_GIT}} {{CARGO_BIN}} {{RUSTUP_TOOLCHAINS}} {{RUSTUP_SETTINGS}}
 ;; Deny clauses for credential/deny-glob paths are appended by the broker.
 ;; Whole CARGO_HOME / RUSTUP_HOME are NOT granted — allowlisted subtrees only.
+;; {{BROKER_DIR}} is outside the jail (SBPL + trampoline); never jail-writable.
 (version 1)
 (deny default)
 (allow process*)
@@ -12,11 +13,14 @@
 (allow file-read* file-write* (subpath {{JAIL}}))
 (allow file-read* file-write* (subpath {{TMP}}))
 (allow file-read* file-write* (subpath {{HOME}}))
+(allow file-read* (subpath {{BROKER_DIR}}))
 (allow file-read* (subpath "/usr"))
 (allow file-read* (subpath "/bin"))
 (allow file-read* (subpath "/sbin"))
 (allow file-read* (subpath "/System"))
 (allow file-read* (subpath "/Library"))
+(allow file-read* (subpath "/private/tmp"))
+(allow file-read* (subpath "/tmp"))
 (allow file-read* file-write* (literal "/dev/null"))
 (allow file-read* (literal "/dev/urandom"))
 (allow file-read* (literal "/dev/zero"))

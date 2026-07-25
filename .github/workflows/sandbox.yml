@@ -35,6 +35,16 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
+      - name: Enable unprivileged user namespaces
+        run: |
+          # ubuntu-24.04 defaults to apparmor_restrict_unprivileged_userns=1,
+          # which makes Landlock+userns probes Unavailable and fails the suite.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
       - name: Test alloy-tools
         run: cargo test -p alloy-tools --features test-hooks -- --nocapture
       - name: Require Landlock enforcement test ran
@@ -46,17 +56,23 @@ jobs:
         run: cargo fmt --all -- --check
 
   macos-seatbelt:
-    name: macOS Seatbelt (optional)
+    name: macOS Seatbelt (compile + test)
     runs-on: macos-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
           components: clippy
+      - name: Compile alloy-tools (required — Seatbelt must build)
+        run: cargo check -p alloy-tools --features test-hooks
       - name: Test alloy-tools
+        # Seatbelt probe/exec may still be environment-dependent; keep tests
+        # best-effort but never allow a non-compiling backend to merge.
+        continue-on-error: true
         run: cargo test -p alloy-tools --features test-hooks -- --nocapture
+      - name: Clippy
+        run: cargo clippy -p alloy-tools --all-targets --features test-hooks -- -D warnings
 
   container:
     name: Container backend (optional)

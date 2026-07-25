@@ -66,20 +66,25 @@ async fn landlock_or_skip() -> bool {
     let dir = tempdir().unwrap();
     let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
     profile.check_backend = SandboxBackend::Landlock;
-    let available = match NativeSandboxBroker::new(profile).await {
-        Ok(b) => matches!(b.capabilities().landlock, BackendStatus::Available { .. }),
-        Err(_) => false,
+    let (available, detail) = match NativeSandboxBroker::new(profile).await {
+        Ok(b) => match &b.capabilities().landlock {
+            BackendStatus::Available { detail } => (true, detail.clone()),
+            BackendStatus::Unavailable { reason } => (false, reason.clone()),
+            other => (false, format!("{other:?}")),
+        },
+        Err(e) => (false, format!("NativeSandboxBroker::new: {e}")),
     };
     if available {
         return true;
     }
     if require_landlock() {
         panic!(
-            "ALLOY_REQUIRE_LANDLOCK=1 but Landlock is Unavailable \
-             (need unprivileged userns identity maps + Landlock ABI >= 2)"
+            "ALLOY_REQUIRE_LANDLOCK=1 but Landlock is Unavailable: {detail} \
+             (need unprivileged userns identity maps + Landlock ABI >= 2; \
+             on ubuntu-24.04 set kernel.apparmor_restrict_unprivileged_userns=0)"
         );
     }
-    eprintln!("skip: landlock unavailable (set ALLOY_REQUIRE_LANDLOCK=1 to fail)");
+    eprintln!("skip: landlock unavailable ({detail}); set ALLOY_REQUIRE_LANDLOCK=1 to fail");
     false
 }
 
@@ -522,6 +527,92 @@ async fn token_expired_via_exec() {
     let req = SandboxExecRequest::new(vec![true_bin().into()], jail, perms, ExecClass::Check);
     let err = broker.exec(req).await.unwrap_err();
     assert!(matches!(err, SandboxError::TokenExpired), "got {err:?}");
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn child_cannot_umount_dotenv_bind() {
+    if !landlock_or_skip().await {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let jail = dir.path().canonicalize().unwrap();
+    let dotenv = jail.join(".env");
+    std::fs::write(&dotenv, b"SUPER_SECRET=1\n").unwrap();
+
+    let broker = broker_for_jail(jail.clone()).await.unwrap();
+    let script = jail.join("umount_env.sh");
+    // Attempt to undo the /dev/null bind, then read. CAP_SYS_ADMIN drop must
+    // make umount fail so the secret stays hidden.
+    std::fs::write(
+        &script,
+        "#!/bin/sh\numount .env 2>/dev/null || umount2 .env 2>/dev/null || true\ncat .env\n",
+    )
+    .unwrap();
+    chmod_755(&script);
+
+    let req = SandboxExecRequest::new(
+        vec![sh_bin().into(), script.display().to_string()],
+        jail,
+        token(sh_bin(), None),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        !stdout.contains("SUPER_SECRET"),
+        "umount undid deny bind; leaked: {stdout:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn landlock_cargo_check_fixture() {
+    if !landlock_or_skip().await {
+        return;
+    }
+    let cargo = match which_cargo() {
+        Some(c) => c,
+        None => {
+            if require_landlock() {
+                panic!("cargo required for landlock_cargo_check_fixture");
+            }
+            eprintln!("skip: cargo not on PATH");
+            return;
+        }
+    };
+
+    // Jail must cover both the fixture crate and its path dependency.
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixture_root = fixtures.join("sbx_check");
+    assert!(
+        fixture_root.join("Cargo.toml").is_file(),
+        "missing fixture at {}",
+        fixture_root.display()
+    );
+    let jail = fixtures.canonicalize().expect("fixtures canonicalize");
+    let cwd = fixture_root.canonicalize().expect("fixture canonicalize");
+
+    let broker = broker_for_jail(jail).await.unwrap();
+    let req = SandboxExecRequest::new(
+        vec![
+            cargo.clone(),
+            "check".into(),
+            "--offline".into(),
+            "--quiet".into(),
+        ],
+        cwd,
+        token(&cargo, Some("check*")),
+        ExecClass::Check,
+    );
+    let result = broker.exec(req).await.unwrap();
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "sandboxed cargo check --offline failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 #[tokio::test]
