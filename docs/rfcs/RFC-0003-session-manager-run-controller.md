@@ -233,6 +233,7 @@ pub enum RunError {
 
 - MUST NOT remove or redefine existing variants.
 - `#[non_exhaustive]` on `RunError` is REQUIRED (pre-1.0 additive safety for exhaustive matches).
+- **Public API impact:** adding `#[non_exhaustive]` is an intentional source break for downstream `match` expressions that exhaust every variant. Downstream crates MUST add a wildcard arm (`_ => …`) or equivalent; existing variants and their meanings are preserved. This is required so later additive variants do not break dependents before 1.0.
 - `store_to_session` (0002) remains unchanged and MUST NOT invent `SessionError::NotFound` from store misses — SessionService maps missing **session rows** itself (see §7 / §11).
 - Full `RuntimeError` / `StoreError` mapping is normative in §7 and §11.
 
@@ -549,10 +550,10 @@ Corrupt `goal_json` on `start` / `request_replan` ⇒ `RunError::Internal`. On `
 3. Return `Session` snapshot as stored.
 4. MUST NOT invent missing events.
 5. MUST NOT auto-start runs.
-6. Rebuild **process-local** run→dag bindings by scanning `list_runs` and deserializing `RunGoalRecord` from `goal_json`.
+6. Rebuild **process-local** run→dag bindings by scanning `list_runs` and deserializing `RunGoalRecord` from `goal_json`. On per-run deser failure: `tracing::warn`, skip that run’s binding, continue. The corrupt row remains persisted and listable, is not dispatched, is not entered into `live_execution`, and MUST NOT block resume of the session or restoration of other valid runs.
 7. Gate waiters start empty (0010 re-registers).
 8. `live_execution` starts empty.
-9. **Re-arm after restart:** rows in `accepted` or `running` or `waiting_approval` with no live execution are **re-dispatchable** via `start` (see §6.3) or await 0010 re-entering gates. Rows in `cancelling` MUST be finalized to `cancelled` on resume (best-effort `cancel_dag` skipped if no live scheduler work). Do not invent DAG progress.
+9. **Re-arm after restart (explicit recovery only):** for rows in `running` or `waiting_approval`, upsert durable state to `accepted` (crash recovery), then they follow the `Accepted` re-dispatch path in §6.3. Rows already `accepted` stay re-dispatchable. Rows in `cancelling` MUST be finalized to `cancelled` on resume (best-effort `cancel_dag` skipped if no live scheduler work). Do not invent DAG progress. In-process non-terminal outcomes MUST NOT be treated as crash recovery (see §6.3).
 
 ### 5.4 `submit_goal`
 
@@ -646,7 +647,7 @@ sequenceDiagram
   Proc->>SP: resume(session_id)
   SP->>SR: get_session
   SR-->>SP: Session
-  Note over SP: live_execution empty; accepted/running re-dispatchable
+  Note over SP: live_execution empty; running/waiting_approval rewritten to accepted
   SP-->>Proc: Session
   Proc->>SP: events(None, n)
   SP->>ES: list_session_events
@@ -692,33 +693,34 @@ sequenceDiagram
 | --- | --- | --- |
 | `Created` | false | First dispatch — continue |
 | `Accepted` | false | Re-dispatch — continue; **do not** emit a second `RunAccepted` |
-| `Accepted` \| `Running` \| `WaitingApproval` | true | `AlreadyStarted(run)` |
+| `Created` \| `Accepted` | true | `AlreadyStarted(run)` |
+| `Running` \| `WaitingApproval` | * | `AlreadyStarted(run)` — not re-dispatchable in-process; crash recovery rewrites these to `accepted` in §5.3 before `start` |
 | `Cancelling` | * | `InvalidPhase("cancelling")` |
 | `Cancelled` \| `Succeeded` \| `Failed` | * | `InvalidPhase("terminal")` |
 | `ReplanRequested` | * | `InvalidPhase("replan pending")` |
-| `Running` \| `WaitingApproval` | false (after crash/resume) | Treat as re-dispatchable like `Accepted` (continue; no second `RunAccepted` if a prior `RunAccepted` exists for this `run_id` in-process cache OR state was not `Created` — **pin:** if state ≠ `Created`, skip `RunAccepted` emit) |
 
 5. If state == `Created` (first dispatch only):
    - Upsert `state = "accepted"`, bump `updated_at` (**row first**).
    - `handle.emit(RunAccepted { run_id, dag_id })` (**event second**).
-6. Insert `run` into `live_execution`.
+6. Insert `run` into `live_execution` (execution lease). The lease is the sole in-process liveness indicator that `run_dag` is outstanding for this run.
 7. **Release per-run mutex** before any host await.
 8. `result = handle.run_dag(dag_id).await`.
-9. Re-acquire per-run mutex; remove `run` from `live_execution` (unless step 10 keeps a non-terminal live wait — MVP: always clear here; 0010 gate waits happen inside `run_dag` and use the waiter registry, not `live_execution` spanning approve).
-10. Map `result` while holding the lock:
+9. Re-acquire per-run mutex. Clear the execution lease (`live_execution`) **only after** applying step 10’s durable state transition for this result (still under the same lock acquisition). Order under the lock: (a) if durable state is already `replan_requested`, `cancelling`, `cancelled`, `succeeded`, or `failed`, **reject/merge** the outcome — do not overwrite those states; clear lease; return `Ok(())` if terminal cancel/replan already recorded, else `InvalidPhase("state advanced during run")` for conflicting success; (b) otherwise apply the step 10 row; (c) then clear lease. This prevents a late `run_dag` completion from clobbering `request_replan` / `cancel` and prevents a second `start` from admitting duplicate execution while the lease is held.
+10. Map `result` while holding the lock (when step 9(a) does not suppress):
 
 | Host result | RunController result | Required side effects |
 | --- | --- | --- |
 | `Ok(outcome)` with **terminal** `DagState` (`Succeeded` / `Failed` / `Cancelled`) | `Ok(())` | Upsert matching `RunControlState`; emit `RunFinished { run_id, outcome }`; append `RunCompleted` with `{ "dag_state": "…" }` (including cancel/failure terminals — **not** `SessionEventType::Error` for user/host cancel) |
-| `Ok(outcome)` with `DagState::WaitingApproval` | `Ok(())` | Upsert `waiting_approval`; **do not** emit `RunFinished` |
-| `Ok(outcome)` with `DagState::Running` | `Ok(())` | Upsert `running`; **do not** emit `RunFinished` |
-| `Ok(outcome)` with `DagState::Pending` \| `ReplanRequired` | `Ok(())` for `ReplanRequired` → upsert `replan_requested`; `Pending` → `Internal("unexpected pending outcome")` leave `accepted` |
+| `Ok(outcome)` with `DagState::WaitingApproval` | `Ok(())` | Upsert `waiting_approval`; **do not** emit `RunFinished`; lease cleared after upsert — further `start` rejected until §5.3 recovery rewrites to `accepted` |
+| `Ok(outcome)` with `DagState::Running` | `Ok(())` | Upsert `running`; **do not** emit `RunFinished`; same re-dispatch rule as `WaitingApproval` |
+| `Ok(outcome)` with `DagState::ReplanRequired` | `Ok(())` | Upsert `replan_requested`; **do not** emit `RunFinished` |
+| `Ok(outcome)` with `DagState::Pending` | `Err(Internal("unexpected pending outcome"))` | Leave durable state `accepted`; **do not** emit `RunFinished` |
 | `Err(SchedulerUnavailable)` | `Err(SchedulerUnavailable)` | Keep `accepted`; append `Error` `{ "class": "scheduler_unavailable" }`; **no** `RunFinished`; run remains re-dispatchable |
 | `Err(SchedulerBusy)` | `Err(InvalidPhase("scheduler busy"))` | Keep prior durable state (`accepted` if first dispatch completed step 5); **no** `RunFinished`; re-dispatchable when busy clears |
 | `Err(InvalidPhase { .. })` | `Err(InvalidPhase(..))` | Keep prior durable state; no `RunFinished` |
-| `Err(Scheduler(SchedError::Cancelled))` | `Ok(())` after upsert `cancelled` | Emit `RunFinished` with cancelled outcome; append `RunCompleted` `{ "dag_state": "cancelled" }` |
+| `Err(Scheduler(SchedError::Cancelled))` | `Ok(())` | Upsert `cancelled`; emit `RunFinished` with cancelled outcome; append `RunCompleted` `{ "dag_state": "cancelled" }`. **Do not** call `runtime_to_run` for this arm |
 | `Err(Scheduler(SchedError::DagNotFound(_)))` | `Err(InvalidPhase("dag not found"))` | Keep `accepted`; append `Error` `{ "class": "dag_not_found" }` |
-| `Err(EventSinkBusy)` \| `Err(EventSink(_))` | `Err(Internal(..))` | Keep prior state; log |
+| `Err(EventSinkBusy)` or `Err(EventSink(_))` | `Err(Internal(..))` | Keep prior state; log |
 | Other `RuntimeError` | `Err(Internal(..))` | Keep prior state; append `Error` `{ "class": "internal", "message": "…" }` when session append still possible |
 
 **NullScheduler MVP:** first `start` performs step 5, then step 8 returns `SchedulerUnavailable`, step 10 returns that error with `accepted` retained. A later `start` (or after RFC-0010 installs a real scheduler) re-dispatches from `Accepted` without a second `RunAccepted`.
@@ -728,40 +730,41 @@ sequenceDiagram
 ### 6.4 `cancel`
 
 1. Acquire per-run mutex.
-2. Load run → `NotFound` if missing. Read `session_id`; try parse `dag_id` from `RunGoalRecord`.
+2. Load run → `NotFound` if missing. Read `session_id`. Attempt `RunGoalRecord` parse from `goal_json`; retain `goal_ok: bool` and `dag_id: Option<DagId>` (`goal_ok == false` ⇒ `dag_id == None`, `tracing::warn`).
 3. If `Cancelled` \| `Succeeded` \| `Failed` ⇒ `Ok(())` (idempotent).
 4. If `Cancelling` ⇒ proceed to finish cancel (idempotent completion).
 5. Upsert `cancelling`. Drop **all** gate waiters for this `run` (senders dropped).
 6. Release per-run mutex.
-7. If `dag_id` known: `handle.cancel_dag(dag_id).await` (map errors via §7; NullScheduler `Ok(())`).
+7. If `goal_ok`: `handle.cancel_dag(dag_id).await` (map errors via §7; NullScheduler `Ok(())`). If `!goal_ok`, skip `cancel_dag`.
 8. Re-acquire per-run mutex.
 9. Upsert `cancelled`; clear `live_execution` for run.
 10. Append `RunCompleted` with `{ "dag_state": "cancelled" }` using `session_id` / `run_id`.
-11. If a `RunAccepted` was previously emitted for this run in this process **or** durable state had left `Created`: emit `RunFinished` with `DagOutcome { state: Cancelled, … }` (synthetic generation `0` / empty failure when no scheduler outcome).
+11. Emit `RunFinished` **only when** `goal_ok` is true **and** (a `RunAccepted` was previously emitted for this run in this process **or** durable state had left `Created`). Synthetic `DagOutcome { state: Cancelled, … }` (generation `0` / empty failure) when no scheduler outcome. If `!goal_ok`, skip `RunFinished` (permitted cancellation updates in steps 5–10 still apply).
 12. Return `Ok(())`.
 
 ### 6.5 `approve`
 
-**Allowed states:** `WaitingApproval` only. All others:
+**State validation (before any waiter lookup):**
 
 | State | Result |
 | --- | --- |
-| `WaitingApproval` | continue |
 | missing run | `NotFound` |
+| `WaitingApproval` | continue to waiter lookup |
 | `Cancelled` \| `Succeeded` \| `Failed` | `InvalidPhase("terminal")` |
 | `Cancelling` | `InvalidPhase("cancelling")` |
-| `Created` \| `Accepted` \| `Running` \| `ReplanRequested` | `UnknownGate(gate)` if no waiter; if waiter somehow present still require `WaitingApproval` — **pin:** non-`WaitingApproval` ⇒ `InvalidPhase("not waiting approval")` |
+| `Created` \| `Accepted` \| `Running` \| `ReplanRequested` | `InvalidPhase("not waiting approval")` |
 
 **Algorithm:**
 
 1. Acquire per-run mutex.
-2. Load run; apply state table above.
-3. Remove waiter for `(run, gate)` from registry (take sender). None ⇒ `UnknownGate(gate)`.
-4. `sender.send(decision)` — if receiver dropped ⇒ `Internal("gate waiter dropped")`.
-5. Append `ApprovalResolved` with `{ "gate_id": "…", "decision": "allow"|"deny"|"allow_once" }` using `RunRow.session_id`.
-6. On `Deny`: upsert `failed`; clear any remaining waiters for run; emit `RunFinished` with failed outcome if run had been accepted; append `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`.
-7. On `Allow` / `AllowOnce`: upsert `running`.
-8. Release lock. Return `Ok(())`.
+2. Load run; apply state table above (every existing non-`WaitingApproval` run returns its `InvalidPhase` **regardless of waiter presence**).
+3. Only if `WaitingApproval`: take waiter for `(run, gate)` from registry. None ⇒ `UnknownGate(gate)`.
+4. Persist before notify (row/event first):
+   - On `Deny`: upsert `failed`; clear any remaining waiters for run; append `ApprovalResolved`; append `RunCompleted` `{ "dag_state": "failed", "reason": "approval_denied" }`; emit `RunFinished` with failed outcome if run had been accepted.
+   - On `Allow` / `AllowOnce`: upsert `running`; append `ApprovalResolved` with `{ "gate_id": "…", "decision": "allow"|"deny"|"allow_once" }` using `RunRow.session_id`.
+   - On any persistence / emit failure: map via §7, **do not** call `sender.send` (waiter remains registered only if take was reverted — **pin:** on persist failure after take, put sender back or drop without send and return error so the gate is not consumed as approved).
+5. Only after durable persistence succeeds: `sender.send(decision)` — if receiver dropped ⇒ `Internal("gate waiter dropped")` (decision is already durable).
+6. Release lock. Return `Ok(())`.
 
 A second `approve` for the same gate finds no waiter ⇒ `UnknownGate`.
 
@@ -783,10 +786,11 @@ A second `approve` for the same gate finds no waiter ⇒ `UnknownGate`.
 
 1. Acquire per-run mutex.
 2. Load run; apply table.
-3. Upsert `replan_requested`.
-4. Append `ReplanRequested` with `{ "reason": /* serde ReplanReason */ }` using `RunRow.session_id`.
-5. MUST NOT mutate DAG topology, nodes, or edges.
-6. Return `Ok(())`.
+3. Drop **all** gate waiters for this `run` (invalidate outstanding approvals).
+4. Upsert `replan_requested` (**row first**).
+5. Append `ReplanRequested` with `{ "reason": /* serde ReplanReason */ }` using `RunRow.session_id`.
+6. MUST NOT mutate DAG topology, nodes, or edges.
+7. Return `Ok(())` (release lock). A concurrent `start` still awaiting `run_dag` MUST observe `replan_requested` in §6.3 step 9(a) and MUST NOT overwrite it with a later success/failure transition; merge by preserving `replan_requested` and skipping clobbering side effects while still clearing the execution lease.
 
 ### 6.7 `register_gate_waiter` (SessionPlane)
 
@@ -808,6 +812,8 @@ stateDiagram-v2
   Accepted --> Running: run_dag Ok Running
   Accepted --> WaitingApproval: register_gate_waiter / run_dag WaitingApproval
   Running --> WaitingApproval: register_gate_waiter
+  Running --> Accepted: resume crash recovery (§5.3)
+  WaitingApproval --> Accepted: resume crash recovery (§5.3)
   WaitingApproval --> Running: approve Allow/AllowOnce
   WaitingApproval --> Failed: approve Deny
   Running --> Cancelling: cancel
@@ -862,8 +868,13 @@ stateDiagram-v2
 
 fn store_to_run(e: StoreError) -> RunError {
     match e {
-        StoreError::Conflict(s) | StoreError::Corrupt(s) | StoreError::Migration(s)
-        | StoreError::NotFound(s) => RunError::InvalidPhase(s),
+        // Typed NotFound requires a RunId; callers map `get_run` → Ok(None) →
+        // RunError::NotFound(id) themselves. StoreError::NotFound is a stringly miss.
+        StoreError::NotFound(s) => RunError::Internal(format!("store not found: {s}")),
+        StoreError::Conflict(s) => RunError::InvalidPhase(s),
+        StoreError::Corrupt(s) | StoreError::Migration(s) => {
+            RunError::Internal(s)
+        }
         StoreError::Busy => RunError::Internal("store busy".into()),
         StoreError::Closed => RunError::Internal("store closed".into()),
         StoreError::DigestMismatch => RunError::Internal("digest mismatch".into()),
@@ -878,9 +889,12 @@ fn runtime_to_run(e: RuntimeError) -> RunError {
         RuntimeError::InvalidPhase { current, op } => {
             RunError::InvalidPhase(format!("{op} in phase {current:?}"))
         }
-        RuntimeError::Scheduler(SchedError::Cancelled) => {
-            RunError::InvalidPhase("scheduler cancelled".into())
-        }
+        // `run_dag` → SchedError::Cancelled is a **success** path in §6.3 step 10
+        // (RunFinished + RunCompleted). Callers MUST match that arm before invoking
+        // this helper. Reaching here is a programming error.
+        RuntimeError::Scheduler(SchedError::Cancelled) => RunError::Internal(
+            "bug: SchedError::Cancelled must be handled by start success path (§6.3)".into(),
+        ),
         RuntimeError::Scheduler(SchedError::DagNotFound(id)) => {
             RunError::InvalidPhase(format!("dag not found: {id}"))
         }
@@ -1058,18 +1072,26 @@ Profile **catalog files** (`profiles/default.toml`, etc.) remain 0015/0001 confi
 | `session_events_allowed_while_draining` | resume/events ok in `Draining` |
 | `run_start_null_scheduler_unavailable` | `RunAccepted` once + `SchedulerUnavailable` + state `accepted` |
 | `run_start_redispatch_after_unavailable` | second `start` no second `RunAccepted`; still Unavailable |
+| `run_start_scheduler_cancelled_emits_finished` | `SchedError::Cancelled` → `Ok(())` + `RunFinished` + `RunCompleted`; not `InvalidPhase` |
+| `runtime_to_run_cancelled_is_bug_internal` | bare `runtime_to_run(Scheduler(Cancelled))` → `Internal` (start must special-case) |
 | `run_double_start_while_live_already_started` | `AlreadyStarted` when `live_execution` set |
-| `run_approve_unknown_gate` | `UnknownGate` |
-| `run_approve_requires_waiting_approval` | `InvalidPhase` if not waiting |
+| `run_running_outcome_not_redispatchable` | after `Ok(Running)`, second `start` → `AlreadyStarted` |
+| `run_approve_unknown_gate` | `UnknownGate` only when `WaitingApproval` and no waiter |
+| `run_approve_requires_waiting_approval` | `InvalidPhase` if not waiting (even if waiter present) |
+| `run_approve_persists_before_notify` | fail append → waiter not notified |
 | `run_approve_with_waiter` | oneshot resolves + `ApprovalResolved`; second approve `UnknownGate` |
 | `run_cancel_clears_waiters` | approve after cancel → `UnknownGate` |
+| `run_cancel_corrupt_goal_skips_run_finished` | `goal_ok == false` → cancelled row, no `RunFinished` |
 | `run_cancel_idempotent` | second cancel `Ok(())`; uses `RunCompleted` not `Error` |
 | `run_request_replan_rejects_terminal` | `InvalidPhase` |
-| `run_request_replan_records_event` | state + `ReplanRequested` |
+| `run_request_replan_records_event` | state + `ReplanRequested`; waiters cleared |
+| `run_request_replan_not_overwritten_by_late_start` | concurrent `run_dag` Ok does not clobber `replan_requested` |
 | `budget_warning_hook_appends_event` | `BudgetWarning` |
 | `store_miss_session_maps_to_not_found` | not `Invalid` via `store_to_session` |
+| `store_to_run_corrupt_is_internal` | `Corrupt`/`Migration` → `Internal`; `Conflict` → `InvalidPhase` |
 | `runtime_error_invalid_phase_maps` | `runtime_to_run` preserves `InvalidPhase` |
 | `start_lock_not_held_across_run_dag` | with a mock scheduler that blocks until approve, approve succeeds |
+| `session_resume_skips_corrupt_goal_json` | warn + skip binding; other runs restored |
 
 ### Integration tests
 
@@ -1128,11 +1150,16 @@ Merge only when all items hold:
 - [ ] Persistence uses RFC-0002 `SessionRows` / `EventStore` / `RuntimeHandle` append — no dual-write, no sixth crate
 - [ ] Row-then-event ordering for start acceptance; locks not held across `run_dag` / `cancel_dag`
 - [ ] `accepted` remains re-dispatchable when `live_execution` is false (Unavailable path does not poison runs)
+- [ ] `Running`/`WaitingApproval` not in-process re-dispatchable; resume rewrites to `accepted`
+- [ ] Execution lease cleared only after durable transition; late outcomes cannot clobber `replan_requested`/`cancelled`
 - [ ] `approve` / `request_replan` / `cancel` state guards and waiter lifecycle defined and tested
-- [ ] `RuntimeError` → `RunError` / `SessionError` mapping table implemented
+- [ ] Approve persists before waiter notify
+- [ ] `RuntimeError` → `RunError` / `SessionError` mapping table implemented; `SchedError::Cancelled` handled as start success
+- [ ] `store_to_run`: Corrupt/Migration → Internal; Conflict → InvalidPhase
 - [ ] `BudgetPolicy` attached on create; `signal_budget_warning` hook defined and tested
 - [ ] Restart recovery: `resume` + `events` + re-dispatch rules defined and integration-tested
-- [ ] `RunError::SchedulerUnavailable` / `AlreadyStarted` / `UnknownGate`; `RunError` is `#[non_exhaustive]`
+- [ ] Corrupt `goal_json` on resume skipped with warn; cancel skips `RunFinished` when `!goal_ok`
+- [ ] `RunError::SchedulerUnavailable` / `AlreadyStarted` / `UnknownGate`; `RunError` is `#[non_exhaustive]` with downstream catch-all guidance
 - [ ] `RunRow.state` vocabulary pinned (`RunControlState::parse` → `Option`); not a second DAG state machine
 - [ ] `RunGoalRecord` stored in `goal_json` with minted `DagId`; unknown fields tolerated
 - [ ] `RuntimeHandle::run_dag` / `cancel_dag` additive seams share `AlloyRuntime::run` admit semantics
@@ -1179,8 +1206,12 @@ Only genuine implementation spikes — settled V2/0001/0002 decisions are not re
 - Budget **metering** belongs to 0004; this RFC only attaches policy + warning hooks
 - Per-run locks MUST NOT span `run_dag` / `cancel_dag`
 - `accepted` + `!live_execution` is re-dispatchable (Unavailable does not poison)
+- `Running` / `WaitingApproval` are not in-process re-dispatchable; crash recovery rewrites them to `accepted`
 - Row then event for acceptance; `RunFinished` only for terminal outcomes
 - User/host cancel recorded as `RunCompleted`, not `SessionEventType::Error`
+- `SchedError::Cancelled` from `run_dag` is handled as success in §6.3, not via `runtime_to_run` → `InvalidPhase`
+- Approve persists before notifying the gate waiter
+- `#[non_exhaustive]` on `RunError` requires downstream catch-all match arms
 
 ---
 
