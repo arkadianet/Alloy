@@ -57,6 +57,10 @@ fn sleep_bin() -> &'static str {
     }
 }
 
+fn require_landlock() -> bool {
+    std::env::var_os("ALLOY_REQUIRE_LANDLOCK").is_some()
+}
+
 fn require_seatbelt() -> bool {
     std::env::var_os("ALLOY_REQUIRE_SEATBELT").is_some()
 }
