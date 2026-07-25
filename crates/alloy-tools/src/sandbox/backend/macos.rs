@@ -119,10 +119,13 @@ impl MacosSeatbeltBackend {
             Ok(out) if got_ready => Ok(out),
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
+                let sbpl_preview = std::fs::read_to_string(&sbpl).unwrap_or_default();
                 Err(SandboxError::BackendCannotEnforce(format!(
                     "sandbox-exec/trampoline exited before ready-byte \
-                     (exit={:?} signal={:?}): {stderr}",
-                    out.exit_code, out.signal
+                     (exit={:?} signal={:?}): {stderr}; sbpl={sbpl} preview:\n{sbpl_preview}",
+                    out.exit_code,
+                    out.signal,
+                    sbpl = sbpl.display(),
                 )))
             }
             Err(e) => Err(e),
@@ -306,18 +309,40 @@ fn sbpl_literal(path: &Path) -> String {
     format!("\"{s}\"")
 }
 
-/// Probe Seatbelt by applying a minimal profile (not just statting the binary).
+/// Probe Seatbelt by applying a representative deny-default profile (not
+/// `(allow default)`, which would hide real SBPL failures).
 pub fn probe_seatbelt_sync() -> Result<String, String> {
     let p = Path::new("/usr/bin/sandbox-exec");
     if !p.is_file() {
         return Err("/usr/bin/sandbox-exec missing".into());
     }
-    // Broker-owned dir outside any jail — do not depend on the `tempfile` crate
-    // (dev-only) from library code.
     let dir = std::env::temp_dir().join(format!("alloy-sbx-probe-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
     let sb = dir.join("probe.sb");
-    let body = "(version 1)\n(allow default)\n";
+    // Mirror the production shape: deny default, allow pipes + process + /usr,
+    // then exec /usr/bin/true. If this aborts, Seatbelt is Unavailable.
+    let body = format!(
+        r#"(version 1)
+(deny default)
+(allow process*)
+(allow process-exec*)
+(allow signal)
+(allow sysctl-read)
+(allow mach-lookup)
+(allow file-read-metadata)
+(allow file-write* (vnode-type PIPE))
+(allow file-write* (vnode-type SOCKET))
+(allow file-ioctl (vnode-type PIPE))
+(allow file-read* (subpath "/usr"))
+(allow file-read* (subpath "/bin"))
+(allow file-read* (subpath "/System"))
+(allow file-read* (subpath "/dev"))
+(allow file-read* file-write* (literal "/dev/null"))
+(allow process-exec (literal "/usr/bin/true"))
+(deny network*)
+"#
+    );
     let result = (|| {
         std::fs::write(&sb, body).map_err(|e| e.to_string())?;
         let out = std::process::Command::new("/usr/bin/sandbox-exec")
@@ -326,10 +351,11 @@ pub fn probe_seatbelt_sync() -> Result<String, String> {
             .output()
             .map_err(|e| e.to_string())?;
         if out.status.success() {
-            Ok("sandbox-exec profile apply ok".into())
+            Ok("sandbox-exec deny-default probe ok".into())
         } else {
             Err(format!(
-                "sandbox-exec probe failed: {}",
+                "sandbox-exec probe failed: status={} stderr={}",
+                out.status,
                 String::from_utf8_lossy(&out.stderr)
             ))
         }

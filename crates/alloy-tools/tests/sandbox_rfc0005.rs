@@ -133,9 +133,11 @@ fn python3_ok() -> bool {
 }
 
 #[tokio::test]
+#[cfg(not(target_os = "macos"))]
 async fn backend_unavailable_fail_closed() {
     let dir = tempdir().unwrap();
     let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
+    // Force Seatbelt off-macOS → UnsupportedOs / Unavailable at construction.
     profile.check_backend = SandboxBackend::Seatbelt;
     let err = NativeSandboxBroker::new(profile).await.unwrap_err();
     assert!(
@@ -144,6 +146,27 @@ async fn backend_unavailable_fail_closed() {
             SandboxError::UnsupportedOs
                 | SandboxError::BackendUnavailable {
                     backend: SandboxBackend::Seatbelt,
+                    ..
+                }
+        ),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(target_os = "macos")]
+async fn backend_unavailable_fail_closed() {
+    let dir = tempdir().unwrap();
+    let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
+    // Force Landlock on macOS → Unavailable / UnsupportedOs.
+    profile.check_backend = SandboxBackend::Landlock;
+    let err = NativeSandboxBroker::new(profile).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SandboxError::UnsupportedOs
+                | SandboxError::BackendUnavailable {
+                    backend: SandboxBackend::Landlock,
                     ..
                 }
         ),
