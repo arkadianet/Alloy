@@ -26,7 +26,7 @@ jobs:
     name: fmt · clippy · test · doc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Keep in sync with rust-toolchain.toml (MSRV 1.97.1) — CI builds at MSRV
       # so a too-new language feature fails here rather than for a user.
