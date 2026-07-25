@@ -61,11 +61,13 @@ fn require_landlock() -> bool {
     std::env::var_os("ALLOY_REQUIRE_LANDLOCK").is_some()
 }
 
+#[cfg(target_os = "macos")]
 fn require_seatbelt() -> bool {
     std::env::var_os("ALLOY_REQUIRE_SEATBELT").is_some()
 }
 
 /// Returns `true` when Seatbelt is Available. When required by CI, panics if not.
+#[cfg(target_os = "macos")]
 async fn seatbelt_or_skip() -> bool {
     let dir = tempdir().unwrap();
     let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).unwrap();
