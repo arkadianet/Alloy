@@ -15,7 +15,9 @@ use super::goal_record::RunGoalRecord;
 use super::inner::SessionInner;
 use super::map_err::{run_to_session, runtime_to_session};
 use super::profiles::validate_mvp_profile;
-use super::run_controller::{finalize_cancelled, has_run_accepted, upsert_state};
+use super::run_controller::{
+    finalize_cancelled, has_run_accepted, repair_failed_approval_events, upsert_state,
+};
 use super::run_state::RunControlState;
 use super::traits::{clamp_events_page_limit, Session, SessionService};
 use crate::error::SessionError;
@@ -82,12 +84,27 @@ impl SessionServiceView {
     /// prior attempt that failed on the upsert. `RunFinished` is gated on a durable
     /// `RunAccepted` (not on `cancelling` alone), because `created → cancelling` never
     /// announced acceptance.
+    ///
+    /// A `failed` row without its Deny terminal events (crash after the Failed upsert in
+    /// `approve`) is repaired in place: missing `ApprovalResolved` / `RunCompleted` /
+    /// conditional `RunFinished` are written; the row stays `failed`.
     async fn rearm_run(
         &self,
         row: &RunRow,
         state: RunControlState,
         dag_id: Option<DagId>,
     ) -> Result<(), SessionError> {
+        if state == RunControlState::Failed {
+            repair_failed_approval_events(&self.inner, row, dag_id)
+                .await
+                .map_err(run_to_session)?;
+            info!(
+                run_id = %row.id,
+                "resume repaired failed-approval terminal events"
+            );
+            return Ok(());
+        }
+
         let target = match state {
             RunControlState::Running | RunControlState::WaitingApproval => {
                 RunControlState::Accepted

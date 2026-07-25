@@ -1315,6 +1315,52 @@ async fn run_approve_deny_drops_waiter_when_append_fails() {
 }
 
 #[tokio::test]
+async fn session_resume_repairs_failed_approval_without_terminal_events() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    // Acceptance is durable so resume owes RunFinished after repairing the Deny window.
+    assert!(matches!(
+        h.runs().start(run).await.unwrap_err(),
+        RunError::SchedulerUnavailable
+    ));
+    assert_eq!(h.count_accepted(run).await, 1);
+    // Crash after Failed upsert, before ApprovalResolved / RunCompleted / RunFinished.
+    h.set_run_state(run, RunControlState::Failed).await;
+
+    h.sessions().resume(session).await.unwrap();
+
+    assert_eq!(h.run_state(run).await, RunControlState::Failed);
+    let resolved = h
+        .events_of_type(session, SessionEventType::ApprovalResolved)
+        .await;
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].payload["decision"], json!("deny"));
+    assert_eq!(
+        resolved[0].payload["reason"],
+        json!("resume_finalized_approval_denied")
+    );
+    let completed = h
+        .events_of_type(session, SessionEventType::RunCompleted)
+        .await;
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].payload["dag_state"], json!("failed"));
+    assert_eq!(completed[0].payload["reason"], json!("approval_denied"));
+    assert_eq!(h.count_finished(run).await, 1);
+
+    // Second resume is idempotent.
+    h.sessions().resume(session).await.unwrap();
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::RunCompleted)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(h.count_finished(run).await, 1);
+    h.close().await;
+}
+
+#[tokio::test]
 async fn run_approve_deny_emits_run_finished_after_redispatch() {
     let h = Harness::new().await;
     let session = h.create_session().await;

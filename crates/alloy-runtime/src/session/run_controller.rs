@@ -16,7 +16,7 @@ use super::goal_record::RunGoalRecord;
 use super::inner::SessionInner;
 use super::map_err::{runtime_to_run, store_to_run};
 use super::run_state::RunControlState;
-use super::traits::{ReplanReason, RunController, MAX_EVENTS_PAGE};
+use super::traits::{ReplanReason, RunController};
 use crate::adapters::Approval;
 use crate::error::{RunError, RuntimeError, SchedError};
 use crate::events::{NewSessionEvent, RuntimeEvent, SessionEventType};
@@ -175,34 +175,36 @@ pub(super) async fn has_run_completed(
     session: SessionId,
     run: RunId,
 ) -> Result<bool, RunError> {
-    let store = inner.storage.events();
-    let mut after = None;
-    loop {
-        let page = store
-            .list_session_events(session, after, MAX_EVENTS_PAGE)
-            .await
-            .map_err(store_to_run)?;
-        if page
-            .iter()
-            .any(|e| e.run_id == Some(run) && e.type_ == SessionEventType::RunCompleted)
-        {
-            return Ok(true);
-        }
-        match page.last() {
-            Some(last) if page.len() == MAX_EVENTS_PAGE => after = Some(last.seq),
-            _ => return Ok(false),
-        }
-    }
+    inner
+        .storage
+        .events()
+        .has_session_event_for_run(session, run, SessionEventType::RunCompleted)
+        .await
+        .map_err(store_to_run)
+}
+
+/// True if this run already has a durable `ApprovalResolved` (retry idempotency).
+async fn has_approval_resolved(
+    inner: &SessionInner,
+    session: SessionId,
+    run: RunId,
+) -> Result<bool, RunError> {
+    inner
+        .storage
+        .events()
+        .has_session_event_for_run(session, run, SessionEventType::ApprovalResolved)
+        .await
+        .map_err(store_to_run)
 }
 
 /// True if this run already has a host `RunFinished` (retry idempotency).
 pub(super) async fn has_run_finished(inner: &SessionInner, run: RunId) -> Result<bool, RunError> {
-    runtime_event_for_run(
-        inner,
-        run,
-        |ev| matches!(ev, RuntimeEvent::RunFinished { run_id, .. } if *run_id == run),
-    )
-    .await
+    inner
+        .storage
+        .events()
+        .has_run_finished_event(run)
+        .await
+        .map_err(store_to_run)
 }
 
 /// True if this run already has a host `RunAccepted`.
@@ -213,34 +215,12 @@ pub(super) async fn has_run_accepted(inner: &SessionInner, run: RunId) -> Result
     if inner.was_accepted(run, RunControlState::Created) {
         return Ok(true);
     }
-    runtime_event_for_run(
-        inner,
-        run,
-        |ev| matches!(ev, RuntimeEvent::RunAccepted { run_id, .. } if *run_id == run),
-    )
-    .await
-}
-
-async fn runtime_event_for_run(
-    inner: &SessionInner,
-    _run: RunId,
-    mut pred: impl FnMut(&RuntimeEvent) -> bool,
-) -> Result<bool, RunError> {
-    let store = inner.storage.events();
-    let mut after = None;
-    loop {
-        let page = store
-            .list_runtime_events(after, MAX_EVENTS_PAGE)
-            .await
-            .map_err(store_to_run)?;
-        if page.iter().any(|(_, ev)| pred(ev)) {
-            return Ok(true);
-        }
-        match page.last() {
-            Some((rowid, _)) if page.len() == MAX_EVENTS_PAGE => after = Some(*rowid),
-            _ => return Ok(false),
-        }
-    }
+    inner
+        .storage
+        .events()
+        .has_run_accepted_event(run)
+        .await
+        .map_err(store_to_run)
 }
 
 /// Write cancel terminal events, then the `Cancelled` row (events-before-upsert).
@@ -263,6 +243,51 @@ pub(super) async fn finalize_cancelled(
     }
     upsert_state(inner, row, RunControlState::Cancelled).await?;
     inner.metrics.bump_runs_cancelled();
+    Ok(())
+}
+
+/// Repair a `failed` row left by `approve(Deny)` after the state write but before its
+/// terminal events. Idempotent: missing events are appended; existing ones are left alone.
+///
+/// Only the Deny path writes `failed` before events. A `failed` row that already has
+/// `RunCompleted` is treated as complete for session events (scheduler terminal writes
+/// events before the row); we still fill a missing `RunFinished` when acceptance is known.
+pub(super) async fn repair_failed_approval_events(
+    inner: &SessionInner,
+    row: &RunRow,
+    dag_id: Option<DagId>,
+) -> Result<(), RunError> {
+    let session = row.session_id;
+    let run = row.id;
+    if !has_run_completed(inner, session, run).await? {
+        if !has_approval_resolved(inner, session, run).await? {
+            append_run_event(
+                inner,
+                session,
+                run,
+                SessionEventType::ApprovalResolved,
+                json!({
+                    "decision": "deny",
+                    "reason": "resume_finalized_approval_denied",
+                }),
+            )
+            .await?;
+        }
+        append_run_completed(
+            inner,
+            session,
+            run,
+            DagState::Failed,
+            Some("approval_denied"),
+        )
+        .await?;
+    }
+    let accepted = has_run_accepted(inner, run).await?;
+    if let Some(dag_id) = dag_id.filter(|_| accepted) {
+        if !has_run_finished(inner, run).await? {
+            emit_run_finished(inner, run, synthetic_outcome(dag_id, DagState::Failed)).await?;
+        }
+    }
     Ok(())
 }
 
@@ -473,22 +498,17 @@ impl RunControllerView {
         row: &RunRow,
         gate: GateId,
         decision: Approval,
+        durable: RunControlState,
     ) -> Result<(), PersistApprovalError> {
         let session = row.session_id;
         let run = row.id;
         let resolved = json!({ "gate_id": gate, "decision": decision });
 
         if decision == Approval::Deny {
-            // `row` is still `waiting_approval`, so acceptance is implied even when the
+            // `durable` is still `waiting_approval`, so acceptance is implied even when the
             // `RunAccepted` emission happened in an earlier process. Sample it before the
             // terminal write prunes the process-local marker.
-            let accepted = self.inner.was_accepted(
-                run,
-                parse_state(row).map_err(|err| PersistApprovalError {
-                    err,
-                    row_committed: false,
-                })?,
-            );
+            let accepted = self.inner.was_accepted(run, durable);
             if let Err(err) = upsert_state(&self.inner, row, RunControlState::Failed).await {
                 return Err(PersistApprovalError {
                     err,
@@ -704,7 +724,8 @@ impl RunController for RunControllerView {
         let _lock = self.inner.lock_run(run).await;
 
         let row = load_run(&self.inner, run).await?;
-        match parse_state(&row)? {
+        let state = parse_state(&row)?;
+        match state {
             RunControlState::WaitingApproval => {}
             RunControlState::Cancelled | RunControlState::Succeeded | RunControlState::Failed => {
                 return Err(RunError::InvalidPhase("terminal".into()));
@@ -726,7 +747,7 @@ impl RunController for RunControllerView {
             .take(run, gate)
             .ok_or(RunError::UnknownGate(gate))?;
 
-        if let Err(e) = self.persist_approval(&row, gate, decision).await {
+        if let Err(e) = self.persist_approval(&row, gate, decision, state).await {
             // Restore only when the row write itself failed. If the state already left
             // `waiting_approval`, putting the sender back permanently strands Deny waiters
             // (terminal guards block every release path) — drop it so they observe closure.
