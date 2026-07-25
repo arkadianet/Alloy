@@ -9,6 +9,19 @@ use super::{NewSessionEvent, SessionEvent};
 use crate::events::RuntimeEvent;
 use crate::types::ids::{EventSeq, SessionId, Timestamp};
 
+/// Buffered state drained from [`InMemoryEventSink`] for lossless SQLite handoff.
+///
+/// Exact `seq` / `ts` must be preserved by [`crate::storage::EventStore::import_handoff_snapshot`].
+#[derive(Debug, Clone, Default)]
+pub struct HandoffSnapshot {
+    /// Buffered host runtime events (FIFO).
+    pub runtime: Vec<RuntimeEvent>,
+    /// Buffered session events keyed by session (seq order within each vec).
+    pub sessions: HashMap<SessionId, Vec<SessionEvent>>,
+    /// Per-session next seq after drain (same maps [`InMemoryEventSink`] used).
+    pub next_seq: HashMap<SessionId, u64>,
+}
+
 /// Errors from an [`EventSink`].
 #[derive(Debug, thiserror::Error)]
 pub enum EventSinkError {
@@ -82,6 +95,47 @@ impl InMemoryEventSink {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session_n: usize = g.sessions.values().map(Vec::len).sum();
         g.runtime.len() + session_n
+    }
+
+    /// Take buffered state for lossless SQLite handoff (leaves sink empty).
+    pub fn drain_for_handoff(&self) -> HandoffSnapshot {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HandoffSnapshot {
+            runtime: std::mem::take(&mut g.runtime),
+            sessions: std::mem::take(&mut g.sessions),
+            next_seq: std::mem::take(&mut g.next_seq),
+        }
+    }
+
+    /// Restore a snapshot after failed import (handoff abort).
+    ///
+    /// Merges the snapshot ahead of any events appended concurrently through
+    /// [`Self`] after drain; `next_seq` becomes the max of snapshot and current.
+    pub fn restore_handoff_snapshot(&self, snap: HandoffSnapshot) {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut runtime = snap.runtime;
+        runtime.append(&mut g.runtime);
+        g.runtime = runtime;
+
+        let mut sessions = snap.sessions;
+        for (sid, mut current) in std::mem::take(&mut g.sessions) {
+            sessions.entry(sid).or_default().append(&mut current);
+        }
+        g.sessions = sessions;
+
+        let mut next_seq = snap.next_seq;
+        for (sid, cur) in std::mem::take(&mut g.next_seq) {
+            let entry = next_seq.entry(sid).or_insert(0);
+            *entry = (*entry).max(cur);
+        }
+        g.next_seq = next_seq;
     }
 }
 
