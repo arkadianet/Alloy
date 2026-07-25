@@ -3,7 +3,7 @@
 use thiserror::Error;
 
 use crate::events::EventSinkError;
-use crate::types::ids::{DagId, RunId, SessionId};
+use crate::types::ids::{DagId, GateId, RunId, SessionId};
 
 /// Host-level runtime errors.
 #[derive(Debug, Error)]
@@ -78,6 +78,7 @@ pub enum SessionError {
 
 /// Run controller errors (behavior in RFC-0003).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RunError {
     /// Run missing.
     #[error("not found: {0}")]
@@ -88,6 +89,15 @@ pub enum RunError {
     /// Internal error.
     #[error("internal: {0}")]
     Internal(String),
+    /// No executable scheduler / NullScheduler / SchedError::Unavailable.
+    #[error("scheduler unavailable")]
+    SchedulerUnavailable,
+    /// `start` called while an in-process live execution is already registered.
+    #[error("already started: {0}")]
+    AlreadyStarted(RunId),
+    /// `approve` for a gate with no pending waiter.
+    #[error("unknown gate: {0}")]
+    UnknownGate(GateId),
 }
 
 /// Runtime adapter errors (impl in RFC-0010 / 0006).

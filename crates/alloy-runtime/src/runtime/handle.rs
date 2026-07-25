@@ -9,11 +9,11 @@ use tokio_util::sync::CancellationToken;
 use super::inner::RuntimeInner;
 use super::RuntimePhase;
 use crate::config::RuntimeConfig;
-use crate::error::RuntimeError;
+use crate::error::{RuntimeError, SchedError};
 use crate::events::{EventSink, HandoffSnapshot, InMemoryEventSink, NewSessionEvent, RuntimeEvent};
-use crate::scheduler::Scheduler;
+use crate::scheduler::{DagOutcome, Scheduler};
 use crate::storage::StoreError;
-use crate::types::ids::EventSeq;
+use crate::types::ids::{DagId, EventSeq};
 use crate::types::metrics::RuntimeMetrics;
 
 /// Process-wide handle injected into Session / Scheduler / workers.
@@ -228,6 +228,62 @@ impl RuntimeHandle {
         self.flush_pending_runtime_events().await?;
         let sink = self.inner.event_sink.read().await;
         Ok(sink.append_session(ev).await?)
+    }
+
+    /// Thin DAG forwarder shared with [`crate::AlloyRuntime::run`].
+    ///
+    /// Single-flight admit; maps [`SchedError::Unavailable`] →
+    /// [`RuntimeError::SchedulerUnavailable`]. Does **not** emit
+    /// `RunAccepted` / `RunFinished`.
+    pub async fn run_dag(&self, dag_id: DagId) -> Result<DagOutcome, RuntimeError> {
+        self.flush_pending_runtime_events().await?;
+        let permit = self.inner.try_admit_run(dag_id)?;
+        let sched = self.scheduler();
+        let result = sched.run(dag_id).await;
+        drop(permit);
+
+        match result {
+            Ok(outcome) => {
+                self.inner
+                    .metrics
+                    .runs_completed
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(outcome)
+            }
+            Err(SchedError::Unavailable) => {
+                self.inner
+                    .metrics
+                    .runs_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(RuntimeError::SchedulerUnavailable)
+            }
+            Err(e) => {
+                self.inner
+                    .metrics
+                    .runs_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(RuntimeError::Scheduler(e))
+            }
+        }
+    }
+
+    /// Cancel via the current [`Scheduler`] (NullScheduler: `Ok(())`).
+    ///
+    /// Phase: `Running` | `Draining`. Does not emit session events.
+    pub async fn cancel_dag(&self, dag_id: DagId) -> Result<(), RuntimeError> {
+        match self.phase() {
+            RuntimePhase::Running | RuntimePhase::Draining => {}
+            other => {
+                return Err(RuntimeError::InvalidPhase {
+                    current: other,
+                    op: "cancel_dag",
+                });
+            }
+        }
+        self.scheduler()
+            .cancel(dag_id)
+            .await
+            .map_err(RuntimeError::Scheduler)
     }
 
     /// Drain sync-queued host events into the sink in FIFO order.
