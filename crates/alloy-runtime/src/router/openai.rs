@@ -21,6 +21,7 @@ use super::types::{
     redact_and_truncate, scrub_exact_secret, scrub_redact_and_truncate, ChatMessage,
     CompletionRequest, Health, ModelEndpoint, ModelResponse, ResponseFormat, Usage,
 };
+use crate::obs::truncate_utf8_bytes;
 
 const RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
 
@@ -324,9 +325,15 @@ fn map_status(status: u16, body: &[u8], api_key: &str) -> ProviderError {
             // longer than any display prefix cannot leak via truncation.
             let body = String::from_utf8_lossy(body);
             let scrubbed = scrub_exact_secret(&body, api_key);
+            // Bound pattern-redaction work after the exact-key pass.
+            let bounded = if scrubbed.len() > 4 * 1024 {
+                truncate_utf8_bytes(&scrubbed, 4 * 1024)
+            } else {
+                scrubbed
+            };
             ProviderError::HttpStatus {
                 status,
-                message: redact_and_truncate(&scrubbed, 512),
+                message: redact_and_truncate(&bounded, 512),
             }
         }
     }
@@ -586,8 +593,9 @@ mod tests {
         let ProviderError::HttpStatus { message, .. } = error else {
             panic!("unexpected status mapping");
         };
-        assert!(!message.contains('k') || !message.contains(&"k".repeat(32)));
-        assert!(message.contains("[REDACTED]"));
+        assert!(message.starts_with("prefix-[REDACTED]"));
+        assert!(!message.contains(&"k".repeat(64)));
+        assert!(message.len() <= 512);
     }
 
     #[test]

@@ -351,6 +351,7 @@ pub(crate) fn redact_and_truncate(value: &str, max_bytes: usize) -> String {
 }
 
 /// Replace an exact API-key substring before pattern redaction / truncation.
+#[cfg(feature = "http-provider")]
 pub(crate) fn scrub_exact_secret(value: &str, secret: &str) -> String {
     if secret.is_empty() {
         value.to_owned()
@@ -359,6 +360,7 @@ pub(crate) fn scrub_exact_secret(value: &str, secret: &str) -> String {
     }
 }
 
+#[cfg(feature = "http-provider")]
 pub(crate) fn scrub_redact_and_truncate(value: &str, secret: &str, max_bytes: usize) -> String {
     redact_and_truncate(&scrub_exact_secret(value, secret), max_bytes)
 }

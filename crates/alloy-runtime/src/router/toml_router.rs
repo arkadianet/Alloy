@@ -157,6 +157,7 @@ impl TomlModelRouter {
             .ok_or_else(|| RouterError::Config("at least one provider is required".into()))?;
         let api_key = std::env::var(&provider_config.api_key_env)
             .ok()
+            .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 tracing::error!(
