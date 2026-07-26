@@ -1,6 +1,7 @@
 # router.toml.example — Author: arkadianet
 # Copy to router.toml (active config). Alloy never writes .env.
 # Set `model` and `base_url` for your openai-compatible provider (BYOM).
+# Public providers must use https; http is allowed only for loopback local servers.
 # api_key_env names a process env var (see example.env); Alloy never invents keys.
 #
 # Schema owned by RFC-0007 (Architecture V2 §11.2).
@@ -10,6 +11,7 @@ default_tier = "standard"
 connect_timeout_ms = 10000
 request_timeout_ms = 120000
 shutdown_grace_ms = 5000
+max_in_flight = 32
 
 # Stubbed unused in MVP (ADR F-20). Parsed if present; MUST NOT affect routing.
 [policy.scoring]
@@ -38,7 +40,7 @@ max_context = 200000
 # output_usd_per_mtok = 0.0
 
 [capability_tiers]
-Repair = "standard"
-Edit = "standard"
-Review = "economy"
-Planning = "standard"
+repair = "standard"
+edit = "standard"
+review = "economy"
+planning = "standard"

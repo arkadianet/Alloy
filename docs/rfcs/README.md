@@ -46,7 +46,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | [RFC-0004](./RFC-0004-observability-cost-metering.md) | Observability & Cost Metering | Implemented | 2–4 pd | 0001, 0002 | **Yes** |
 | [RFC-0005](./RFC-0005-sandbox-broker.md) | Sandbox Broker | Implemented | 5–8 pd | 0001 | **Yes** |
 | [RFC-0006](./RFC-0006-mcp-host-builtins.md) | MCP Host & In-Process Builtins | Implemented | 8–9.5 pd | 0001, 0005 | **Yes** |
-| [RFC-0007](./RFC-0007-model-router-provider.md) | Model Router & Provider | Draft | 4–6 pd | 0001, 0004 | **Yes** |
+| [RFC-0007](./RFC-0007-model-router-provider.md) | Model Router & Provider | Draft | 7–9 pd | 0001, 0004 | **Yes** |
 | [RFC-0008](./RFC-0008-edit-engine.md) | EditEngine (TextPatch + Git Checkpoint) | Draft | 4–6 pd | 0001, 0005, 0006 | **Yes** |
 | [RFC-0009](./RFC-0009-task-dag-templates-planner.md) | Task DAG, Templates & Planner | Draft | 4–6 pd | 0001, 0002 | **Yes** |
 | [RFC-0010](./RFC-0010-scheduler-runtime-adapters.md) | Scheduler & Runtime Adapters | Draft | 5–8 pd | 0003, 0004, 0006, 0009 | **Yes** |
@@ -182,8 +182,8 @@ Tracked under each RFC’s **Future extensions** (RenameType / gated LLM Planner
 
 | Scope | Person-days | Person-weeks (approx.) |
 | --- | --- | --- |
-| All RFCs (sum of ranges) | **69–111 pd** | **~14–22 pw** |
-| Critical path alone (no parallel) | ~47–73 pd | ~9–15 pw |
+| All RFCs (sum of ranges) | **72–114 pd** | **~14–23 pw** |
+| Critical path alone (no parallel) | ~50–76 pd | ~10–15 pw |
 | With Wave A–C parallelization (solo switching) | calendar ~8–12 weeks | matches V2 M1 |
 
 ## Coverage vs V2 MVP (§0.5)
