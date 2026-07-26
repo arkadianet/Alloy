@@ -41,16 +41,14 @@ repair = "standard"
         ProviderId::new("provider").expect("provider id"),
     ));
     let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
-    let router = TomlModelRouter::from_parts(TomlModelRouterParts {
+    let router = TomlModelRouter::from_parts(TomlModelRouterParts::new(
         config,
         provider,
-        budget_policy: BudgetPolicy::default(),
-        decision_log: Some(log),
-        cost_meter: Some(SharedCostMeter::new()),
-        bound_run: Some(run),
-        allow_unmetered: false,
-        shutdown_token: None,
-    })
+        BudgetPolicy::default(),
+        Some(log),
+        Some(SharedCostMeter::new()),
+        Some(run),
+    ))
     .expect("benchmark router");
     (router, run)
 }

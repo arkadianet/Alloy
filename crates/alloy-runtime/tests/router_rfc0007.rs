@@ -122,16 +122,14 @@ fn router(
     meter: SharedCostMeter,
     run: RunId,
 ) -> TomlModelRouter {
-    TomlModelRouter::from_parts(TomlModelRouterParts {
+    TomlModelRouter::from_parts(TomlModelRouterParts::new(
         config,
         provider,
-        budget_policy: policy,
-        decision_log: Some(log),
-        cost_meter: Some(meter),
-        bound_run: Some(run),
-        allow_unmetered: false,
-        shutdown_token: None,
-    })
+        policy,
+        Some(log),
+        Some(meter),
+        Some(run),
+    ))
     .expect("router")
 }
 

@@ -45,6 +45,7 @@ const POST_CANCEL_MAX: Duration = Duration::from_secs(1);
 static NEXT_ROUTER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Dependencies and validated inputs for [`TomlModelRouter::from_parts`].
+#[non_exhaustive]
 pub struct TomlModelRouterParts {
     /// Router configuration; all invariants are revalidated.
     pub config: RouterConfig,
@@ -59,6 +60,7 @@ pub struct TomlModelRouterParts {
     /// Run to which this router is bound.
     pub bound_run: Option<RunId>,
     /// Test-only escape hatch for isolated router unit tests.
+    #[cfg(test)]
     pub allow_unmetered: bool,
     /// Optional host cancellation token.
     pub shutdown_token: Option<CancellationToken>,
@@ -81,6 +83,7 @@ impl TomlModelRouterParts {
             decision_log,
             cost_meter,
             bound_run,
+            #[cfg(test)]
             allow_unmetered: false,
             shutdown_token: None,
         }

@@ -86,6 +86,7 @@ const fn budget_check(tokens_exhausted: bool, usd_exhausted: bool) -> BudgetChec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obs::SharedCostMeter;
     use crate::router::RouterConfig;
 
     fn config() -> RouterConfig {
@@ -182,6 +183,28 @@ repair = "standard"
         };
         assert_eq!(
             apply_usd_ceiling_overlay(BudgetCheck::Ok, &zero_usd),
+            BudgetCheck::UsdExhausted
+        );
+    }
+
+    #[test]
+    fn check_budget_snapshot_zero_usd_diff() {
+        let policy = BudgetPolicy {
+            max_usd_per_run: 0.0,
+            ..BudgetPolicy::default()
+        };
+        let meter = SharedCostMeter::new();
+        assert_eq!(meter.snapshot().usd_spent, None);
+        assert_eq!(meter.check_budget(&policy), BudgetCheck::Ok);
+        assert_eq!(
+            check_budget_snapshot(
+                &BudgetSnapshot {
+                    usd_spent: 0.0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                },
+                &policy,
+            ),
             BudgetCheck::UsdExhausted
         );
     }

@@ -4,16 +4,17 @@ use std::future::pending;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use alloy_runtime::{
     classify_provider_error, classify_router_error, parse_model_call_event, BudgetCheck,
     BudgetPolicy, BudgetSnapshot, CapabilityId, ChatMessage, ChatRole, CompletionRequest,
-    DecisionLog, DecisionRecord, ErrorClass, EventSeq, FailureIr, Health, ModelCallRecord,
-    ModelEndpoint, ModelProvider, ModelResponse, ModelRouter, ModelUsdSource, NodeId, ObsError,
-    PromptPack, ProviderError, ProviderId, RecordingDecisionLog, RecordingModelProvider,
-    ResponseFormat, RetentionPolicy, RetryDisposition, RouterConfig, RouterError, RoutingRequest,
-    RunId, SessionEvent, SessionEventType, SessionId, SharedCostMeter, Timestamp, TomlModelRouter,
-    TomlModelRouterParts, ToolCallRecord, ToolChoice, Usage,
+    DecisionKind, DecisionLog, DecisionRecord, EndpointId, ErrorClass, EventSeq, FailureIr, Health,
+    ModelCallRecord, ModelEndpoint, ModelProvider, ModelResponse, ModelRouter, ModelTier,
+    ModelUsdSource, NodeId, ObsError, PromptPack, ProviderError, ProviderId, RecordingDecisionLog,
+    RecordingModelProvider, RetentionPolicy, RetryDisposition, RouterConfig, RouterError,
+    RoutingRequest, RunId, SessionEvent, SessionEventType, SessionId, SharedCostMeter, Timestamp,
+    TomlModelRouter, TomlModelRouterParts, ToolCallRecord, Usage,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -102,16 +103,14 @@ fn build_router(
     meter: SharedCostMeter,
     run: RunId,
 ) -> TomlModelRouter {
-    TomlModelRouter::from_parts(TomlModelRouterParts {
+    TomlModelRouter::from_parts(TomlModelRouterParts::new(
         config,
         provider,
-        budget_policy: policy,
-        decision_log: Some(log),
-        cost_meter: Some(meter),
-        bound_run: Some(run),
-        allow_unmetered: false,
-        shutdown_token: None,
-    })
+        policy,
+        Some(log),
+        Some(meter),
+        Some(run),
+    ))
     .expect("router")
 }
 
@@ -147,13 +146,153 @@ async fn budget_denial_no_provider_call() {
         max_tokens_per_run: 0,
         ..BudgetPolicy::default()
     };
-    let (provider, _, _, run, router) = recording_dependencies(policy);
+    let (provider, log, _, run, router) = recording_dependencies(policy);
 
     assert!(matches!(
         router.route(route_request(run)).await,
         Err(RouterError::BudgetDenied(BudgetCheck::TokensExhausted))
     ));
     assert!(provider.recorded().is_empty());
+    let decisions = log.recorded_decisions();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].kind, DecisionKind::Budget);
+    assert_eq!(decisions[0].metadata["budget_check"], "tokens_exhausted");
+    assert_eq!(decisions[0].metadata["budget_source"], "meter");
+    assert!(decisions[0].metadata.get("in_flight_at_route").is_some());
+    let metrics = router.metrics();
+    assert_eq!(metrics.routes_budget_denied, 1);
+    assert_eq!(metrics.completes_err, 0);
+}
+
+#[tokio::test]
+async fn complete_budget_recheck_denies() {
+    let policy = BudgetPolicy {
+        max_tokens_per_run: 10,
+        ..BudgetPolicy::default()
+    };
+    let (provider, log, meter, run, router) = recording_dependencies(policy);
+    let routed = router.route(route_request(run)).await.expect("route");
+    let duplicate = routed.clone();
+    meter.add_model_usage(ModelTier::Standard, Some(10), Some(0), None);
+
+    assert!(matches!(
+        router.complete(&routed, prompt()).await,
+        Err(RouterError::BudgetDenied(BudgetCheck::TokensExhausted))
+    ));
+    assert!(matches!(
+        router.complete(&duplicate, prompt()).await,
+        Err(RouterError::AlreadyCompleted)
+    ));
+    assert!(provider.recorded().is_empty());
+    let decisions = log.recorded_decisions();
+    let budget = decisions.last().expect("completion budget decision");
+    assert_eq!(budget.kind, DecisionKind::Budget);
+    assert_eq!(budget.metadata["budget_check"], "tokens_exhausted");
+    assert!(budget.metadata.get("in_flight_at_complete").is_some());
+    assert!(budget.metadata.get("in_flight_at_route").is_none());
+    let metrics = router.metrics();
+    assert_eq!(metrics.routes_ok, 1);
+    assert_eq!(metrics.completes_err, 0);
+    assert_eq!(metrics.in_flight, 0);
+}
+
+#[tokio::test]
+async fn route_uses_meter_before_snapshot() {
+    let policy = BudgetPolicy {
+        max_tokens_per_run: 5,
+        ..BudgetPolicy::default()
+    };
+    let (provider, _, meter, run, router) = recording_dependencies(policy);
+    meter.add_model_usage(ModelTier::Standard, Some(5), Some(0), None);
+    let request = route_request(run);
+    assert_eq!(request.budget_remaining.tokens_in, 0);
+
+    assert!(matches!(
+        router.route(request).await,
+        Err(RouterError::BudgetDenied(BudgetCheck::TokensExhausted))
+    ));
+    assert!(provider.recorded().is_empty());
+}
+
+#[tokio::test]
+async fn budget_denied_no_escalation() {
+    let mut router_config = config("https://example.com");
+    router_config
+        .capability_tiers
+        .insert("repair".into(), ModelTier::Premium);
+    router_config.providers[0].endpoints[0].tiers = vec![ModelTier::Premium];
+    let mut economy = router_config.providers[0].endpoints[0].clone();
+    economy.id = EndpointId::new("economy-endpoint").expect("endpoint");
+    economy.model = "operator-economy".into();
+    economy.tiers = vec![ModelTier::Economy];
+    router_config.providers[0].endpoints.push(economy);
+    let provider = Arc::new(RecordingModelProvider::new(
+        ProviderId::new("provider").expect("provider"),
+    ));
+    let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+    let run = RunId::new();
+    let router = build_router(
+        router_config,
+        provider.clone(),
+        BudgetPolicy {
+            max_tokens_per_run: 0,
+            ..BudgetPolicy::default()
+        },
+        log.clone(),
+        SharedCostMeter::new(),
+        run,
+    );
+
+    assert!(matches!(
+        router.route(route_request(run)).await,
+        Err(RouterError::BudgetDenied(BudgetCheck::TokensExhausted))
+    ));
+    assert!(provider.recorded().is_empty());
+    let decision = log.recorded_decisions().pop().expect("budget decision");
+    assert_eq!(decision.metadata["tier"], "premium");
+}
+
+#[tokio::test]
+async fn route_decision_metadata_is_normative() {
+    let (_, log, _, run, router) = recording_dependencies(BudgetPolicy::default());
+    router.route(route_request(run)).await.expect("route");
+
+    let decision = log.recorded_decisions().pop().expect("route decision");
+    assert_eq!(decision.kind, DecisionKind::ModelRoute);
+    assert_eq!(decision.metadata["capability"], "repair");
+    assert_eq!(decision.metadata["capability_mapped"], true);
+    assert_eq!(decision.metadata["tier"], "standard");
+    assert_eq!(decision.metadata["tier_source"], "capability_map");
+    assert_eq!(decision.metadata["provider_id"], "provider");
+    assert_eq!(decision.metadata["endpoint_id"], "endpoint");
+    assert_eq!(decision.metadata["model"], "operator-configured");
+    assert_eq!(decision.metadata["requires_tools"], false);
+    assert_eq!(decision.metadata["requires_structured_output"], true);
+    assert!(decision.metadata.get("in_flight_at_route").is_some());
+}
+
+#[tokio::test]
+async fn no_endpoint_records_model_route() {
+    let (provider, log, _, run, router) = recording_dependencies(BudgetPolicy::default());
+    let mut request = route_request(run);
+    request.requires_tools = true;
+
+    assert!(matches!(
+        router.route(request).await,
+        Err(RouterError::NoEndpoint {
+            requires_tools: true,
+            ..
+        })
+    ));
+    assert!(provider.recorded().is_empty());
+    let decision = log
+        .recorded_decisions()
+        .pop()
+        .expect("no endpoint decision");
+    assert_eq!(decision.kind, DecisionKind::ModelRoute);
+    assert_eq!(decision.metadata["error"], "no_endpoint");
+    assert!(decision.metadata.get("endpoint_id").is_none());
+    assert_eq!(router.metrics().routes_no_endpoint, 1);
 }
 
 #[tokio::test]
@@ -216,6 +355,98 @@ impl ModelProvider for PendingProvider {
 }
 
 #[tokio::test]
+async fn concurrent_completes() {
+    const COMPLETIONS: usize = 8;
+    let (provider, log, _, run, router) = recording_dependencies(BudgetPolicy::default());
+    for _ in 0..COMPLETIONS {
+        provider.push(Ok(response(Usage {
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+        })));
+    }
+    let router = Arc::new(router);
+    let mut completions = Vec::new();
+    for _ in 0..COMPLETIONS {
+        let routed = router.route(route_request(run)).await.expect("route");
+        let router = Arc::clone(&router);
+        completions.push(tokio::spawn(async move {
+            router.complete(&routed, prompt()).await
+        }));
+    }
+    for completion in completions {
+        completion
+            .await
+            .expect("completion task")
+            .expect("successful completion");
+    }
+
+    assert_eq!(provider.recorded().len(), COMPLETIONS);
+    assert_eq!(log.recorded_model_calls().len(), COMPLETIONS);
+    let metrics = router.metrics();
+    assert_eq!(metrics.routes_ok, COMPLETIONS as u64);
+    assert_eq!(metrics.completes_ok, COMPLETIONS as u64);
+    assert_eq!(metrics.completes_err, 0);
+    assert_eq!(metrics.in_flight, 0);
+}
+
+#[tokio::test]
+async fn max_in_flight_bounds_admission() {
+    let provider = Arc::new(PendingProvider {
+        calls: AtomicUsize::new(0),
+        started: Notify::new(),
+    });
+    let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+    let run = RunId::new();
+    let mut router_config = config("https://example.com");
+    router_config.policy.max_in_flight = 1;
+    let router = Arc::new(build_router(
+        router_config,
+        provider.clone(),
+        BudgetPolicy::default(),
+        log,
+        SharedCostMeter::new(),
+        run,
+    ));
+    let routed = router.route(route_request(run)).await.expect("route");
+    let started = provider.started.notified();
+    tokio::pin!(started);
+    let first = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.complete(&routed, prompt()).await })
+    };
+    started.await;
+
+    let waiting_route = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.route(route_request(run)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!waiting_route.is_finished());
+
+    let shutdown = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.shutdown().await })
+    };
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), waiting_route)
+            .await
+            .expect("waiting route released")
+            .expect("route task"),
+        Err(RouterError::ShuttingDown)
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first completion cancelled")
+            .expect("completion task"),
+        Err(RouterError::Cancelled)
+    ));
+    let report = shutdown.await.expect("shutdown task");
+    assert!(report.cancelled_in_flight);
+    assert_eq!(report.remaining_in_flight, 0);
+}
+
+#[tokio::test]
 async fn host_cancel_returns_cancelled() {
     let provider = Arc::new(PendingProvider {
         calls: AtomicUsize::new(0),
@@ -225,22 +456,63 @@ async fn host_cancel_returns_cancelled() {
     let meter = SharedCostMeter::new();
     let run = RunId::new();
     let cancellation = CancellationToken::new();
-    let router = TomlModelRouter::from_parts(TomlModelRouterParts {
-        config: config("https://example.com"),
-        provider: provider.clone(),
-        budget_policy: BudgetPolicy::default(),
-        decision_log: Some(log),
-        cost_meter: Some(meter),
-        bound_run: Some(run),
-        allow_unmetered: false,
-        shutdown_token: Some(cancellation.clone()),
-    })
+    let router = TomlModelRouter::from_parts(
+        TomlModelRouterParts::new(
+            config("https://example.com"),
+            provider.clone(),
+            BudgetPolicy::default(),
+            Some(log),
+            Some(meter),
+            Some(run),
+        )
+        .shutdown_token(cancellation.clone()),
+    )
     .expect("router");
     let routed = router.route(route_request(run)).await.expect("route");
 
     cancellation.cancel();
     assert!(matches!(
         router.complete(&routed, prompt()).await,
+        Err(RouterError::Cancelled)
+    ));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn mid_flight_host_cancel_returns_cancelled() {
+    let provider = Arc::new(PendingProvider {
+        calls: AtomicUsize::new(0),
+        started: Notify::new(),
+    });
+    let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+    let run = RunId::new();
+    let cancellation = CancellationToken::new();
+    let router = Arc::new(
+        TomlModelRouter::from_parts(
+            TomlModelRouterParts::new(
+                config("https://example.com"),
+                provider.clone(),
+                BudgetPolicy::default(),
+                Some(log),
+                Some(SharedCostMeter::new()),
+                Some(run),
+            )
+            .shutdown_token(cancellation.clone()),
+        )
+        .expect("router"),
+    );
+    let routed = router.route(route_request(run)).await.expect("route");
+    let started = provider.started.notified();
+    tokio::pin!(started);
+    let completion = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.complete(&routed, prompt()).await })
+    };
+    started.await;
+    cancellation.cancel();
+
+    assert!(matches!(
+        completion.await.expect("completion task"),
         Err(RouterError::Cancelled)
     ));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
@@ -339,16 +611,14 @@ async fn drop_complete_after_provider_keeps_obs() {
     let meter = SharedCostMeter::new();
     let run = RunId::new();
     let router = Arc::new(
-        TomlModelRouter::from_parts(TomlModelRouterParts {
-            config: config("https://example.com"),
+        TomlModelRouter::from_parts(TomlModelRouterParts::new(
+            config("https://example.com"),
             provider,
-            budget_policy: BudgetPolicy::default(),
-            decision_log: Some(log.clone()),
-            cost_meter: Some(meter.clone()),
-            bound_run: Some(run),
-            allow_unmetered: false,
-            shutdown_token: None,
-        })
+            BudgetPolicy::default(),
+            Some(log.clone()),
+            Some(meter.clone()),
+            Some(run),
+        ))
         .expect("router"),
     );
     let routed = router.route(route_request(run)).await.expect("route");
@@ -375,6 +645,135 @@ async fn drop_complete_after_provider_keeps_obs() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].input_tokens, Some(3));
     assert_eq!(calls[0].output_tokens, Some(2));
+}
+
+#[tokio::test]
+async fn shutdown_drains_appends() {
+    let provider = Arc::new(RecordingModelProvider::new(
+        ProviderId::new("provider").expect("provider"),
+    ));
+    provider.push(Ok(response(Usage {
+        input_tokens: Some(3),
+        output_tokens: Some(2),
+    })));
+    let log = Arc::new(BlockingDecisionLog::new());
+    let run = RunId::new();
+    let router = Arc::new(
+        TomlModelRouter::from_parts(TomlModelRouterParts::new(
+            config("https://example.com"),
+            provider,
+            BudgetPolicy::default(),
+            Some(log.clone()),
+            Some(SharedCostMeter::new()),
+            Some(run),
+        ))
+        .expect("router"),
+    );
+    let routed = router.route(route_request(run)).await.expect("route");
+    let append_started = log.model_started.notified();
+    tokio::pin!(append_started);
+    let completion = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.complete(&routed, prompt()).await })
+    };
+    append_started.await;
+
+    let first_shutdown = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.shutdown().await })
+    };
+    let second_shutdown = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.shutdown().await })
+    };
+    log.release_model.notify_one();
+
+    completion
+        .await
+        .expect("completion task")
+        .expect("completion");
+    let first_report = first_shutdown.await.expect("first shutdown");
+    let second_report = second_shutdown.await.expect("second shutdown");
+    assert_eq!(first_report, second_report);
+    assert_eq!(first_report.remaining_appends, 0);
+    assert_eq!(log.recorded_model_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn shutdown_idempotent_concurrent() {
+    let (_, _, _, _, router) = recording_dependencies(BudgetPolicy::default());
+    let router = Arc::new(router);
+    let first = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.shutdown().await })
+    };
+    let second = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.shutdown().await })
+    };
+    let first_report = first.await.expect("first shutdown");
+    let second_report = second.await.expect("second shutdown");
+    assert_eq!(first_report, second_report);
+    assert_eq!(router.shutdown().await, first_report);
+}
+
+#[tokio::test]
+async fn shutdown_leadership_is_cancel_safe() {
+    let provider = Arc::new(RecordingModelProvider::new(
+        ProviderId::new("provider").expect("provider"),
+    ));
+    provider.push(Ok(response(Usage {
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+    })));
+    let log = Arc::new(BlockingDecisionLog::new());
+    let run = RunId::new();
+    let router = Arc::new(
+        TomlModelRouter::from_parts(TomlModelRouterParts::new(
+            config("https://example.com"),
+            provider,
+            BudgetPolicy::default(),
+            Some(log.clone()),
+            Some(SharedCostMeter::new()),
+            Some(run),
+        ))
+        .expect("router"),
+    );
+    let routed = router.route(route_request(run)).await.expect("route");
+    let append_started = log.model_started.notified();
+    tokio::pin!(append_started);
+    let completion = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.complete(&routed, prompt()).await })
+    };
+    append_started.await;
+
+    let leader = {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move { router.shutdown().await })
+    };
+    loop {
+        match router.route(route_request(run)).await {
+            Err(RouterError::ShuttingDown) => break,
+            Ok(_) => tokio::task::yield_now().await,
+            Err(error) => panic!("unexpected route result: {error}"),
+        }
+    }
+    leader.abort();
+    assert!(leader
+        .await
+        .expect_err("shutdown caller aborted")
+        .is_cancelled());
+    log.release_model.notify_one();
+    completion
+        .await
+        .expect("completion task")
+        .expect("completion");
+
+    let report = tokio::time::timeout(Duration::from_secs(1), router.shutdown())
+        .await
+        .expect("runtime-owned shutdown completed");
+    assert_eq!(report.remaining_appends, 0);
 }
 
 #[tokio::test]
@@ -410,16 +809,14 @@ fn from_parts_requires_meter() {
             None,
         ),
     ] {
-        let result = TomlModelRouter::from_parts(TomlModelRouterParts {
-            config: config("https://example.com"),
-            provider: provider.clone(),
-            budget_policy: BudgetPolicy::default(),
+        let result = TomlModelRouter::from_parts(TomlModelRouterParts::new(
+            config("https://example.com"),
+            provider.clone(),
+            BudgetPolicy::default(),
             decision_log,
             cost_meter,
             bound_run,
-            allow_unmetered: false,
-            shutdown_token: None,
-        });
+        ));
         assert!(matches!(result, Err(RouterError::Config(_))));
     }
 }
@@ -432,18 +829,16 @@ fn usd_budget_requires_prices() {
         ProviderId::new("provider").expect("provider"),
     ));
 
-    let result = TomlModelRouter::from_parts(TomlModelRouterParts {
-        config: without_prices,
+    let result = TomlModelRouter::from_parts(TomlModelRouterParts::new(
+        without_prices,
         provider,
-        budget_policy: BudgetPolicy::default(),
-        decision_log: Some(Arc::new(RecordingDecisionLog::new(
+        BudgetPolicy::default(),
+        Some(Arc::new(RecordingDecisionLog::new(
             RetentionPolicy::defaults(),
         ))),
-        cost_meter: Some(SharedCostMeter::new()),
-        bound_run: Some(RunId::new()),
-        allow_unmetered: false,
-        shutdown_token: None,
-    });
+        Some(SharedCostMeter::new()),
+        Some(RunId::new()),
+    ));
     assert!(matches!(result, Err(RouterError::Config(_))));
 }
 
@@ -555,6 +950,87 @@ async fn model_call_has_endpoint_model_route_seq() {
         calls[0].usd_source,
         Some(ModelUsdSource::OperatorPriceTable)
     );
+}
+
+#[tokio::test]
+async fn oversize_prompt_body_hash_only() {
+    let provider = Arc::new(RecordingModelProvider::new(
+        ProviderId::new("provider").expect("provider"),
+    ));
+    provider.push(Ok(response(Usage {
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+    })));
+    let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy {
+        retain_full_prompts: true,
+        retain_tool_bodies: false,
+    }));
+    let run = RunId::new();
+    let router = build_router(
+        config("https://example.com"),
+        provider,
+        BudgetPolicy::default(),
+        log.clone(),
+        SharedCostMeter::new(),
+        run,
+    );
+    let routed = router.route(route_request(run)).await.expect("route");
+    let oversized = PromptPack {
+        messages: vec![ChatMessage {
+            role: ChatRole::User,
+            content: "x".repeat(300 * 1024),
+        }],
+        citations: vec![],
+        domains: None,
+    };
+
+    router
+        .complete(&routed, oversized)
+        .await
+        .expect("completion");
+    let call = log.recorded_model_calls().pop().expect("model call");
+    assert!(call.content_hash.is_some());
+    assert!(call.prompt_body.is_none());
+    assert_eq!(router.metrics().model_call_prompt_body_oversize, 1);
+}
+
+#[tokio::test]
+async fn metrics_public_api_counters() {
+    let (provider, _, _, run, router) = recording_dependencies(BudgetPolicy::default());
+    provider.push(Ok(response(Usage {
+        input_tokens: Some(1),
+        output_tokens: Some(1),
+    })));
+    provider.push(Err(ProviderError::RateLimit));
+
+    let first = router.route(route_request(run)).await.expect("first route");
+    router
+        .complete(&first, prompt())
+        .await
+        .expect("first completion");
+
+    let mut default_request = route_request(run);
+    default_request.capability = CapabilityId::new("unmapped").expect("capability");
+    let second = router.route(default_request).await.expect("second route");
+    assert!(matches!(
+        router.complete(&second, prompt()).await,
+        Err(RouterError::Provider(ProviderError::RateLimit))
+    ));
+
+    let mut no_endpoint = route_request(run);
+    no_endpoint.requires_tools = true;
+    assert!(matches!(
+        router.route(no_endpoint).await,
+        Err(RouterError::NoEndpoint { .. })
+    ));
+
+    let metrics = router.metrics();
+    assert_eq!(metrics.routes_ok, 2);
+    assert_eq!(metrics.routes_no_endpoint, 1);
+    assert_eq!(metrics.routes_default_tier, 1);
+    assert_eq!(metrics.completes_ok, 1);
+    assert_eq!(metrics.completes_err, 1);
+    assert_eq!(metrics.in_flight, 0);
 }
 
 #[test]
@@ -741,37 +1217,6 @@ async fn scoring_weights_ignored() {
 }
 
 #[test]
-fn completion_request_defaults_remain_non_streaming_surface() {
-    let request = CompletionRequest {
-        messages: vec![],
-        tools: vec![],
-        tool_choice: ToolChoice::None,
-        response_format: ResponseFormat::Text,
-        temperature: None,
-        max_output_tokens: None,
-    };
-    assert!(request.tools.is_empty());
-}
-
-#[test]
-fn production_rejects_unmetered_escape_hatch() {
-    let provider = Arc::new(RecordingModelProvider::new(
-        ProviderId::new("provider").expect("provider"),
-    ));
-    let result = TomlModelRouter::from_parts(TomlModelRouterParts {
-        config: config("https://example.com"),
-        provider,
-        budget_policy: BudgetPolicy::default(),
-        decision_log: None,
-        cost_meter: None,
-        bound_run: None,
-        allow_unmetered: true,
-        shutdown_token: None,
-    });
-    assert!(matches!(result, Err(RouterError::Config(_))));
-}
-
-#[test]
 fn router_core_contains_no_hardcoded_vendor_model_ids() {
     let router_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/router");
     let denied = [
@@ -783,24 +1228,29 @@ fn router_core_contains_no_hardcoded_vendor_model_ids() {
         "o1-",
         "o3-",
     ];
-    for entry in std::fs::read_dir(router_dir).expect("router source directory") {
-        let path = entry.expect("directory entry").path();
-        if path.extension().and_then(|value| value.to_str()) != Some("rs")
-            || path.file_name().and_then(|value| value.to_str()) == Some("recording.rs")
-        {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("router source");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map_or(source.as_str(), |(prefix, _)| prefix)
-            .to_ascii_lowercase();
-        for pattern in denied {
-            assert!(
-                !production.contains(pattern),
-                "{} contains forbidden model-id pattern {pattern}",
-                path.display()
-            );
+    let mut directories = vec![router_dir];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).expect("router source directory") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("router source");
+            let production = source
+                .split_once("#[cfg(test)]")
+                .map_or(source.as_str(), |(prefix, _)| prefix)
+                .to_ascii_lowercase();
+            for pattern in denied {
+                assert!(
+                    !production.contains(pattern),
+                    "{} contains forbidden model-id pattern {pattern}",
+                    path.display()
+                );
+            }
         }
     }
 }

@@ -576,6 +576,7 @@ impl TomlModelRouter {
 ```
 
 ```rust
+#[non_exhaustive]
 pub struct TomlModelRouterParts {
     pub config: RouterConfig,
     pub provider: Arc<dyn ModelProvider>,
@@ -586,15 +587,32 @@ pub struct TomlModelRouterParts {
     pub cost_meter: Option<SharedCostMeter>,
     /// When set, `route`/`complete` require `RoutingRequest.run == Some(bound_run)`.
     pub bound_run: Option<RunId>,
-    /// Test-only escape hatch. Production MUST leave this `false`.
+    /// Test-only escape hatch; absent from production artifacts.
+    #[cfg(test)]
     pub allow_unmetered: bool,
     pub shutdown_token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl TomlModelRouterParts {
+    pub fn new(
+        config: RouterConfig,
+        provider: Arc<dyn ModelProvider>,
+        budget_policy: BudgetPolicy,
+        decision_log: Option<Arc<dyn DecisionLog>>,
+        cost_meter: Option<SharedCostMeter>,
+        bound_run: Option<RunId>,
+    ) -> Self;
+
+    pub fn shutdown_token(self, token: CancellationToken) -> Self;
+
+    #[cfg(test)]
+    pub fn allow_unmetered(self) -> Self;
 }
 ```
 
 **Construction ownership:** `from_paths` owns parsing + building `OpenAiCompatibleProvider` with a crate-private validated HTTP client (§3.14). `from_parts` is the injection point for `RecordingModelProvider` / RFC-0016 scripts.
 
-`from_paths` MUST reject `allow_unmetered` semantics: meter + decision log + `bound_run` are always required. `from_parts` MUST return `RouterError::Config` if `allow_unmetered == false` and either meter or decision log is missing, or if `bound_run` is missing when metered. `from_parts` MUST return `Config` if `allow_unmetered == true` outside `#[cfg(test)]` builds of `alloy-runtime` (gate the field setter / constructor path with `cfg(test)` so production artifacts cannot set it).
+`from_paths` MUST reject unmetered semantics: meter + decision log + `bound_run` are always required. `from_parts` MUST return `RouterError::Config` if the test-only escape hatch is disabled and either meter or decision log is missing, or if `bound_run` is missing when metered. The `allow_unmetered` field and builder MUST be compiled only in `#[cfg(test)]` builds of `alloy-runtime`, so production artifacts cannot set it.
 
 `from_paths`, `OpenAiCompatibleProvider`, `OpenAiCompatibleSpec`, and `http_client` are gated behind `http-provider`. `from_parts`, traits, config DTOs, `RecordingModelProvider`, and all shared types compile without default features.
 
