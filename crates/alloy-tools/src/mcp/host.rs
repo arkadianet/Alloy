@@ -24,7 +24,7 @@ use tracing::Instrument;
 
 use crate::mcp::authz;
 use crate::mcp::builtins::{self, BuiltinCtx};
-use crate::mcp::disclose::disclose;
+use crate::mcp::disclose::{disclose, discloses_name};
 use crate::mcp::error::McpError;
 use crate::mcp::metrics::{McpMetrics, McpMetricsSnapshot};
 use crate::mcp::patch::PatchApplyBackend;
@@ -392,7 +392,12 @@ impl InProcessMcpHost {
         self.state.registry.names()
     }
 
-    /// Admission: phase check, permit, then a phase re-check (StorageGate pattern).
+    /// Admission: permit, then **increment then recheck phase** (RFC-0006 §5.1).
+    ///
+    /// Incrementing before the recheck makes drain's `in_flight == 0` observation
+    /// sound: a drain that sees zero must have CAS'd before this call's phase
+    /// load, so the call is rejected rather than racing past an "already idle"
+    /// drain path that never cancels.
     async fn admit(state: &Arc<HostState>) -> Result<Admission, McpError> {
         if state.phase() != PHASE_RUNNING {
             return Err(McpError::ShuttingDown);
@@ -401,15 +406,18 @@ impl InProcessMcpHost {
             .acquire_owned()
             .await
             .map_err(|_| McpError::ShuttingDown)?;
-        // A drain may have started while this call waited for a permit.
-        if state.phase() != PHASE_RUNNING {
-            return Err(McpError::ShuttingDown);
-        }
+        // Count before the phase recheck so drain cannot observe idle mid-admit.
         state.in_flight.fetch_add(1, Ordering::SeqCst);
-        Ok(Admission {
+        let admission = Admission {
             state: Arc::clone(state),
             _permit: permit,
-        })
+        };
+        if admission.state.phase() != PHASE_RUNNING {
+            // Drop decrements in_flight and notifies drain waiters.
+            drop(admission);
+            return Err(McpError::ShuttingDown);
+        }
+        Ok(admission)
     }
 
     async fn run_call(
@@ -427,18 +435,14 @@ impl InProcessMcpHost {
             .ok_or_else(|| McpError::UnknownTool(call.name.to_string()))?;
 
         let ctx = BuiltinCtx {
-            broker: &state.broker,
+            broker: state.broker.as_ref(),
             path_policy: &state.path_policy,
             trusted_path: &state.trusted_path,
-            patch_backend: &state.patch_backend,
+            patch_backend: state.patch_backend.as_ref(),
         };
 
         // Parse + derive + grant, all before any spawn or file open.
-        let prepared = builtins::prepare(id, &ctx, call, &perms).inspect_err(|err| {
-            if let McpError::PermissionDenied(reason) = err {
-                tracing::warn!(tool = %call.name, %reason, "mcp permission denied");
-            }
-        })?;
+        let prepared = builtins::prepare(id, &ctx, call, &perms)?;
 
         let dispatch = builtins::execute(&ctx, prepared, perms);
         let outcome = tokio::select! {
@@ -449,7 +453,11 @@ impl InProcessMcpHost {
             },
         };
 
+        // §9.1: warn on every PermissionDenied, including broker-mapped denials.
         match &outcome {
+            Err(McpError::PermissionDenied(reason)) => {
+                tracing::warn!(tool = %call.name, %reason, "mcp permission denied");
+            }
             Err(McpError::Cancelled) => tracing::info!(tool = %call.name, "mcp call cancelled"),
             Err(McpError::Timeout(_)) => tracing::info!(tool = %call.name, "mcp call timed out"),
             _ => {}
@@ -558,6 +566,17 @@ impl McpPlatform for InProcessMcpHost {
         }
         tracing::debug!(returned = views.len(), truncated, "mcp disclosure");
         Ok(views)
+    }
+
+    async fn discloses(
+        &self,
+        selectors: &[ToolSelector],
+        name: &ToolName,
+    ) -> Result<bool, McpError> {
+        if self.state.phase() != PHASE_RUNNING {
+            return Err(McpError::ShuttingDown);
+        }
+        Ok(discloses_name(self.state.registry.views(), selectors, name))
     }
 
     async fn call(&self, call: ToolCall, perms: PermissionToken) -> Result<ToolResult, McpError> {
