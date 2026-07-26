@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use alloy_runtime::{
-    CapabilityId, ChatMessage, ChatRole, CompletionRequest, EndpointId, ModelEndpoint, ModelTier,
-    NodeId, ProviderId, ResponseFormat, ToolChoice, Usage,
+    CapabilityId, ChatMessage, ChatRole, CompletionRequest, EndpointId, ModelEndpoint,
+    ModelResponse, ModelTier, NodeId, ProviderId, ResponseFormat, ToolChoice, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +132,7 @@ pub struct FixtureManifest {
 
 /// Captured Rust and Cargo toolchain identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolchainRecord {
     /// Toolchain channel, e.g. `1.97.1`.
     pub channel: String,
@@ -214,6 +215,28 @@ pub enum ScriptTurnOutcome {
         /// Error returned by the scripted provider.
         error: ScriptedProviderError,
     },
+}
+
+impl From<ScriptTurnOutcome> for ScriptOutcome {
+    fn from(value: ScriptTurnOutcome) -> Self {
+        match value {
+            ScriptTurnOutcome::Response {
+                text,
+                structured,
+                usage,
+                provider_request_id,
+                finish_reason,
+            } => Self::Response(ModelResponse {
+                text,
+                structured,
+                tool_calls: vec![],
+                usage,
+                provider_request_id,
+                finish_reason,
+            }),
+            ScriptTurnOutcome::Error { error } => Self::Error(error),
+        }
+    }
 }
 
 /// Cargo recording manifest references.
@@ -300,9 +323,9 @@ pub(crate) struct FixturePaths {
 
 /// Parse and validate a manifest TOML document that has no filesystem fields.
 ///
-/// This is primarily useful for tests and tools. Full fixture loading should
-/// use the crate-private loader so path, license, and recording checks also run.
-pub fn parse_manifest_toml(toml_src: &str) -> Result<FixtureManifest, EvalError> {
+/// This is crate-internal because full fixture loading must also enforce path,
+/// license, and recording checks.
+pub(crate) fn parse_manifest_toml(toml_src: &str) -> Result<FixtureManifest, EvalError> {
     let wire: ManifestWire = toml::from_str(toml_src)
         .map_err(|err| EvalError::Manifest(format!("manifest toml: {err}")))?;
     validate_and_convert_manifest(wire)
@@ -329,6 +352,16 @@ pub(crate) fn load_fixture(
         Err(err) => return Err(EvalError::Io(err)),
     }
 
+    let canonical_fixture_root = fixture_root
+        .canonicalize()
+        .map_err(|_| path_error(fixture_root))?;
+    let canonical_fixture_dir = fixture_dir
+        .canonicalize()
+        .map_err(|_| path_error(&fixture_dir))?;
+    if !canonical_fixture_dir.starts_with(&canonical_fixture_root) {
+        return Err(path_error(&fixture_dir));
+    }
+
     let manifest_path = fixture_dir.join("manifest.toml");
     let toml_src = match std::fs::read_to_string(&manifest_path) {
         Ok(src) => src,
@@ -339,7 +372,7 @@ pub(crate) fn load_fixture(
     };
     let manifest = parse_manifest_toml(&toml_src)?;
     validate_physical_identity(&fixture_dir, set, id, &manifest)?;
-    let root = fixture_dir.canonicalize()?;
+    let root = canonical_fixture_dir;
     validate_license(&root, &manifest.license)?;
     let paths = validate_manifest_paths(&root, &manifest)?;
     let (pre_repair, post_repair) =
@@ -358,31 +391,50 @@ pub(crate) fn load_fixture(
 }
 
 fn validate_and_convert_manifest(wire: ManifestWire) -> Result<FixtureManifest, EvalError> {
-    if wire.manifest_version != FIXTURE_MANIFEST_VERSION {
+    let ManifestWire {
+        manifest_version,
+        id,
+        set,
+        license,
+        toolchain,
+        workspace,
+        naive_target_path,
+        naive_patch_mode,
+        endpoint_prices,
+        expected_diagnostics,
+        turns: wire_turns,
+        cargo_recordings,
+        success_criteria,
+        require_consume_all,
+        driver,
+    } = wire;
+
+    if manifest_version != FIXTURE_MANIFEST_VERSION {
         return Err(EvalError::Manifest(format!(
             "manifest_version must be {FIXTURE_MANIFEST_VERSION}"
         )));
     }
-    if wire.turns.is_empty() {
+    if wire_turns.is_empty() {
         return Err(EvalError::Manifest("turns must be non-empty".into()));
     }
-    if wire.expected_diagnostics.is_empty() {
+    if expected_diagnostics.is_empty() {
         return Err(EvalError::Manifest(
             "expected_diagnostics must be non-empty".into(),
         ));
     }
-    for expected in &wire.expected_diagnostics {
+    for expected in &expected_diagnostics {
         if expected.code.is_empty() || expected.message_contains.is_empty() {
             return Err(EvalError::Manifest(
                 "expected diagnostics must have non-empty code and message_contains".into(),
             ));
         }
     }
-    validate_endpoint_prices(wire.endpoint_prices.as_ref())?;
-    validate_criteria(&wire.success_criteria)?;
+    let endpoint_prices = endpoint_prices.map(EndpointPrices::from);
+    validate_endpoint_prices(endpoint_prices.as_ref())?;
+    validate_criteria(&success_criteria)?;
 
-    let mut turns = Vec::with_capacity(wire.turns.len());
-    for turn in wire.turns {
+    let mut turns = Vec::with_capacity(wire_turns.len());
+    for turn in wire_turns {
         let request = turn.request.into_request();
         if !request.tools.is_empty() {
             return Err(EvalError::Manifest(
@@ -408,7 +460,7 @@ fn validate_and_convert_manifest(wire: ManifestWire) -> Result<FixtureManifest, 
             }
         }
         turns.push(ScriptTurn {
-            turn_id: turn.turn_id,
+            turn_id: turn.turn_id.into_turn_id()?,
             request,
             request_fingerprint: turn.request_fingerprint,
             outcome: turn.outcome.into_outcome(),
@@ -418,21 +470,24 @@ fn validate_and_convert_manifest(wire: ManifestWire) -> Result<FixtureManifest, 
     validate_naive_selector(&turns)?;
 
     Ok(FixtureManifest {
-        manifest_version: wire.manifest_version,
-        id: wire.id,
-        set: wire.set,
-        license: wire.license,
-        toolchain: wire.toolchain,
-        workspace: wire.workspace,
-        naive_target_path: wire.naive_target_path,
-        naive_patch_mode: wire.naive_patch_mode,
-        endpoint_prices: wire.endpoint_prices,
-        expected_diagnostics: wire.expected_diagnostics,
+        manifest_version,
+        id,
+        set,
+        license: license.into(),
+        toolchain: toolchain.into(),
+        workspace: workspace.into(),
+        naive_target_path,
+        naive_patch_mode,
+        endpoint_prices,
+        expected_diagnostics: expected_diagnostics
+            .into_iter()
+            .map(ExpectedDiagnostic::from)
+            .collect(),
         turns,
-        cargo_recordings: wire.cargo_recordings,
-        success_criteria: wire.success_criteria,
-        require_consume_all: wire.require_consume_all,
-        driver: wire.driver,
+        cargo_recordings: cargo_recordings.into(),
+        success_criteria,
+        require_consume_all,
+        driver,
     })
 }
 
@@ -715,16 +770,16 @@ struct ManifestWire {
     manifest_version: u32,
     id: FixtureId,
     set: FixtureSet,
-    license: LicenseMeta,
-    toolchain: ToolchainRecord,
-    workspace: WorkspaceRef,
+    license: ManifestLicenseWire,
+    toolchain: ManifestToolchainWire,
+    workspace: ManifestWorkspaceWire,
     naive_target_path: String,
     naive_patch_mode: NaivePatchMode,
     #[serde(default)]
-    endpoint_prices: Option<EndpointPrices>,
-    expected_diagnostics: Vec<ExpectedDiagnostic>,
+    endpoint_prices: Option<ManifestEndpointPricesWire>,
+    expected_diagnostics: Vec<ManifestExpectedDiagnosticWire>,
     turns: Vec<ScriptTurnWire>,
-    cargo_recordings: CargoRecordingRefs,
+    cargo_recordings: ManifestCargoRecordingRefsWire,
     success_criteria: Vec<SuccessCriterion>,
     #[serde(default = "default_require_consume_all")]
     require_consume_all: bool,
@@ -733,12 +788,144 @@ struct ManifestWire {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ManifestLicenseWire {
+    class: LicenseClass,
+    spdx: String,
+    source_note: String,
+}
+
+impl From<ManifestLicenseWire> for LicenseMeta {
+    fn from(value: ManifestLicenseWire) -> Self {
+        Self {
+            class: value.class,
+            spdx: value.spdx,
+            source_note: value.source_note,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestToolchainWire {
+    channel: String,
+    rustc_version: String,
+    cargo_version: String,
+}
+
+impl From<ManifestToolchainWire> for ToolchainRecord {
+    fn from(value: ManifestToolchainWire) -> Self {
+        Self {
+            channel: value.channel,
+            rustc_version: value.rustc_version,
+            cargo_version: value.cargo_version,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestWorkspaceWire {
+    path: String,
+    package: String,
+}
+
+impl From<ManifestWorkspaceWire> for WorkspaceRef {
+    fn from(value: ManifestWorkspaceWire) -> Self {
+        Self {
+            path: value.path,
+            package: value.package,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestEndpointPricesWire {
+    #[serde(default)]
+    input_usd_per_mtok: Option<f64>,
+    #[serde(default)]
+    output_usd_per_mtok: Option<f64>,
+}
+
+impl From<ManifestEndpointPricesWire> for EndpointPrices {
+    fn from(value: ManifestEndpointPricesWire) -> Self {
+        Self {
+            input_usd_per_mtok: value.input_usd_per_mtok,
+            output_usd_per_mtok: value.output_usd_per_mtok,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestExpectedDiagnosticWire {
+    code: String,
+    message_contains: String,
+}
+
+impl From<ManifestExpectedDiagnosticWire> for ExpectedDiagnostic {
+    fn from(value: ManifestExpectedDiagnosticWire) -> Self {
+        Self {
+            code: value.code,
+            message_contains: value.message_contains,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestCargoRecordingRefsWire {
+    pre_repair: String,
+    post_repair: String,
+    recording_format_version: u32,
+}
+
+impl From<ManifestCargoRecordingRefsWire> for CargoRecordingRefs {
+    fn from(value: ManifestCargoRecordingRefsWire) -> Self {
+        Self {
+            pre_repair: value.pre_repair,
+            post_repair: value.post_repair,
+            recording_format_version: value.recording_format_version,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScriptTurnWire {
-    turn_id: FixtureTurnId,
+    turn_id: ManifestFixtureTurnIdWire,
     request: ManifestCompletionRequest,
     #[serde(default)]
     request_fingerprint: Option<String>,
     outcome: ScriptTurnOutcomeWire,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestFixtureTurnIdWire {
+    capability: String,
+    #[serde(default)]
+    node: Option<String>,
+    ordinal: u32,
+}
+
+impl ManifestFixtureTurnIdWire {
+    fn into_turn_id(self) -> Result<FixtureTurnId, EvalError> {
+        let capability = CapabilityId::new(self.capability)
+            .map_err(|err| EvalError::Manifest(format!("turn_id capability: {err}")))?;
+        let node = self
+            .node
+            .map(|node| {
+                NodeId::parse(&node)
+                    .map_err(|err| EvalError::Manifest(format!("turn_id node: {err}")))
+            })
+            .transpose()?;
+        Ok(FixtureTurnId {
+            capability,
+            node,
+            ordinal: self.ordinal,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -818,7 +1005,7 @@ enum ScriptTurnOutcomeWire {
         finish_reason: Option<String>,
     },
     Error {
-        error: ScriptedProviderError,
+        error: ManifestScriptedProviderError,
     },
 }
 
@@ -838,7 +1025,43 @@ impl ScriptTurnOutcomeWire {
                 provider_request_id,
                 finish_reason,
             },
-            Self::Error { error } => ScriptTurnOutcome::Error { error },
+            Self::Error { error } => ScriptTurnOutcome::Error {
+                error: error.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ManifestScriptedProviderError {
+    Auth,
+    RateLimit,
+    ContextLength,
+    Timeout,
+    MalformedResponse { message: String },
+    HttpStatus { status: u16, message: String },
+    Tls { message: String },
+    Transport { message: String },
+    Internal { message: String },
+}
+
+impl From<ManifestScriptedProviderError> for ScriptedProviderError {
+    fn from(value: ManifestScriptedProviderError) -> Self {
+        match value {
+            ManifestScriptedProviderError::Auth => Self::Auth,
+            ManifestScriptedProviderError::RateLimit => Self::RateLimit,
+            ManifestScriptedProviderError::ContextLength => Self::ContextLength,
+            ManifestScriptedProviderError::Timeout => Self::Timeout,
+            ManifestScriptedProviderError::MalformedResponse { message } => {
+                Self::MalformedResponse { message }
+            }
+            ManifestScriptedProviderError::HttpStatus { status, message } => {
+                Self::HttpStatus { status, message }
+            }
+            ManifestScriptedProviderError::Tls { message } => Self::Tls { message },
+            ManifestScriptedProviderError::Transport { message } => Self::Transport { message },
+            ManifestScriptedProviderError::Internal { message } => Self::Internal { message },
         }
     }
 }
@@ -1055,11 +1278,7 @@ output_tokens = 2
     #[test]
     fn manifest_request_usage_dtos_deny_unknown() {
         let base = manifest_toml("strict", FixtureSet::Train);
-        assert!(parse_manifest_toml(&base.replace(
-            "max_output_tokens = 1",
-            "max_output_tokens = 1\nunknown = true"
-        ))
-        .is_ok());
+        assert!(parse_manifest_toml(&base).is_ok());
 
         let request_unknown = base.replace(
             "messages = [{ role = \"user\", content = \"hello\" }]",
@@ -1084,6 +1303,61 @@ output_tokens = 2
             parse_manifest_toml(&usage_unknown),
             Err(EvalError::Manifest(_))
         ));
+
+        let nested_unknowns = [
+            (
+                "license",
+                base.replace(
+                    "source_note = \"test provenance\"",
+                    "source_note = \"test provenance\"\nextra = true",
+                ),
+            ),
+            (
+                "toolchain",
+                base.replace(
+                    "cargo_version = \"cargo 1.97.1\"",
+                    "cargo_version = \"cargo 1.97.1\"\nextra = true",
+                ),
+            ),
+            (
+                "workspace",
+                base.replace(
+                    "package = \"fixture\"",
+                    "package = \"fixture\"\nextra = true",
+                ),
+            ),
+            (
+                "endpoint_prices",
+                base.replace(
+                    "[workspace]",
+                    "[endpoint_prices]\ninput_usd_per_mtok = 1.0\nextra = true\n\n[workspace]",
+                ),
+            ),
+            (
+                "expected_diagnostics",
+                base.replace(
+                    "message_contains = \"borrow\"",
+                    "message_contains = \"borrow\"\nextra = true",
+                ),
+            ),
+            (
+                "cargo_recordings",
+                base.replace(
+                    "recording_format_version = 1",
+                    "recording_format_version = 1\nextra = true",
+                ),
+            ),
+            (
+                "turn_id",
+                base.replace("ordinal = 0", "ordinal = 0\nextra = true"),
+            ),
+        ];
+        for (table, manifest) in nested_unknowns {
+            assert!(
+                matches!(parse_manifest_toml(&manifest), Err(EvalError::Manifest(_))),
+                "{table} accepted an unknown key"
+            );
+        }
     }
 
     #[test]
@@ -1117,6 +1391,35 @@ type = "response"
         assert!(matches!(
             parse_manifest_toml(&duplicate),
             Err(EvalError::Manifest(_))
+        ));
+    }
+
+    #[test]
+    fn script_turn_outcome_conversion() {
+        let outcome = ScriptTurnOutcome::Response {
+            text: Some("t".into()),
+            structured: None,
+            usage: Usage {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+            },
+            provider_request_id: None,
+            finish_reason: None,
+        };
+        match ScriptOutcome::from(outcome) {
+            ScriptOutcome::Response(response) => {
+                assert!(response.tool_calls.is_empty());
+                assert_eq!(response.text.as_deref(), Some("t"));
+            }
+            ScriptOutcome::Error(_) => panic!("expected response"),
+        }
+
+        let error = ScriptTurnOutcome::Error {
+            error: ScriptedProviderError::RateLimit,
+        };
+        assert!(matches!(
+            ScriptOutcome::from(error),
+            ScriptOutcome::Error(ScriptedProviderError::RateLimit)
         ));
     }
 
@@ -1180,6 +1483,14 @@ type = "response"
             assert!(matches!(
                 canonicalize_contained(&root_canon, &root.path().join("link")),
                 Err(EvalError::Manifest(_))
+            ));
+
+            let escaped_fixture = create_fixture(outside.path(), FixtureSet::Train, "escaped");
+            fs::create_dir_all(root.path().join("train")).unwrap();
+            symlink(&escaped_fixture, root.path().join("train/escaped")).unwrap();
+            assert!(matches!(
+                load(root.path(), FixtureSet::Train, "escaped"),
+                Err(EvalError::Manifest(message)) if message.starts_with("path: ")
             ));
         }
     }

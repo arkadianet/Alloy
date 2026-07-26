@@ -13,6 +13,7 @@ pub const CARGO_RECORDING_FORMAT_VERSION: u32 = 1;
 
 /// Recorded `cargo check --message-format=json` stream and capture metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CargoJsonRecording {
     /// Recording file format version; must be [`CARGO_RECORDING_FORMAT_VERSION`].
     pub recording_format_version: u32,
@@ -225,6 +226,42 @@ mod tests {
             CargoJsonRecording::load(&path),
             Err(EvalError::RecordingInvalid(_))
         ));
+    }
+
+    #[test]
+    fn recording_rejects_unknown_fields() {
+        let rec = recording(0, vec![json!({ "reason": "build-finished" }).to_string()]);
+        let base = serde_json::to_value(&rec).unwrap();
+        let cases = [
+            {
+                let mut value = base.clone();
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("extra".into(), json!(true));
+                ("recording", value)
+            },
+            {
+                let mut value = base;
+                value["toolchain"]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("extra".into(), json!(true));
+                ("recording toolchain", value)
+            },
+        ];
+        for (field, value) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("recording.json");
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(
+                matches!(
+                    CargoJsonRecording::load(&path),
+                    Err(EvalError::RecordingInvalid(_))
+                ),
+                "{field} accepted an unknown key"
+            );
+        }
     }
 
     #[test]

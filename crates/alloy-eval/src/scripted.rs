@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::EvalError;
 use crate::fingerprint::RequestFingerprint;
-use crate::manifest::ScriptTurnOutcome;
+
+pub(crate) const SCRIPTED_WRONG_ENDPOINT: &str = "scripted wrong endpoint";
+pub(crate) const SCRIPTED_MISS_PREFIX: &str = "scripted miss:";
 
 /// Keyed scripted [`ModelProvider`] for offline eval. Performs no network I/O.
 ///
@@ -38,28 +40,6 @@ pub enum ScriptOutcome {
     Response(ModelResponse),
     /// Provider-level failure returned to the caller.
     Error(ScriptedProviderError),
-}
-
-impl From<ScriptTurnOutcome> for ScriptOutcome {
-    fn from(value: ScriptTurnOutcome) -> Self {
-        match value {
-            ScriptTurnOutcome::Response {
-                text,
-                structured,
-                usage,
-                provider_request_id,
-                finish_reason,
-            } => Self::Response(ModelResponse {
-                text,
-                structured,
-                tool_calls: vec![],
-                usage,
-                provider_request_id,
-                finish_reason,
-            }),
-            ScriptTurnOutcome::Error { error } => Self::Error(error),
-        }
-    }
 }
 
 /// Cloneable subset of [`ProviderError`] for fixture manifests.
@@ -248,7 +228,7 @@ impl ModelProvider for ScriptedProvider {
         .entered();
 
         if endpoint.id != self.endpoint.id {
-            return Err(ProviderError::Internal("scripted wrong endpoint".into()));
+            return Err(ProviderError::Internal(SCRIPTED_WRONG_ENDPOINT.into()));
         }
 
         let fp = RequestFingerprint::of(&request);
@@ -284,7 +264,7 @@ impl ModelProvider for ScriptedProvider {
             None => {
                 _span.record("hit", false);
                 Err(ProviderError::Internal(format!(
-                    "scripted miss: {}",
+                    "{SCRIPTED_MISS_PREFIX} {}",
                     fp.as_hex()
                 )))
             }
@@ -367,7 +347,9 @@ mod tests {
         );
         assert!(provider.is_exhausted());
         let err = provider.complete(&endpoint(id), req).await.unwrap_err();
-        assert!(matches!(err, ProviderError::Internal(msg) if msg.starts_with("scripted miss:")));
+        assert!(
+            matches!(err, ProviderError::Internal(msg) if msg.starts_with(SCRIPTED_MISS_PREFIX))
+        );
         assert_eq!(provider.recorded().len(), 2);
     }
 
@@ -462,7 +444,10 @@ mod tests {
         let mut other = endpoint(id.clone());
         other.id = alloy_runtime::EndpointId::new("other").unwrap();
         let err = provider.complete(&other, req).await.unwrap_err();
-        assert!(matches!(err, ProviderError::Internal(msg) if msg == "scripted wrong endpoint"));
+        assert!(matches!(
+            err,
+            ProviderError::Internal(msg) if msg == SCRIPTED_WRONG_ENDPOINT
+        ));
         assert!(provider.recorded().is_empty());
         assert_eq!(provider.remaining_outcomes(), 1);
     }
@@ -494,34 +479,6 @@ mod tests {
         assert_eq!(recorded[0].endpoint, ep);
         assert_eq!(recorded[0].request, req);
         assert_eq!(recorded[0].fingerprint, RequestFingerprint::of(&req));
-    }
-
-    #[test]
-    fn script_turn_outcome_conversion() {
-        let outcome = ScriptTurnOutcome::Response {
-            text: Some("t".into()),
-            structured: None,
-            usage: Usage {
-                input_tokens: Some(1),
-                output_tokens: Some(2),
-            },
-            provider_request_id: None,
-            finish_reason: None,
-        };
-        match ScriptOutcome::from(outcome) {
-            ScriptOutcome::Response(r) => {
-                assert!(r.tool_calls.is_empty());
-                assert_eq!(r.text.as_deref(), Some("t"));
-            }
-            ScriptOutcome::Error(_) => panic!("expected response"),
-        }
-        let err = ScriptTurnOutcome::Error {
-            error: ScriptedProviderError::RateLimit,
-        };
-        match ScriptOutcome::from(err) {
-            ScriptOutcome::Error(ScriptedProviderError::RateLimit) => {}
-            _ => panic!("expected rate limit"),
-        }
     }
 
     #[tokio::test]
