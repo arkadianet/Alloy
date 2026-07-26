@@ -101,6 +101,7 @@ pub(crate) fn budget_decision_for_complete(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn budget_decision(
     session: crate::SessionId,
     run: Option<crate::RunId>,
