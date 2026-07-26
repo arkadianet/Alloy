@@ -29,6 +29,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 scopeguard = { workspace = true }
+zeroize = { workspace = true }
 reqwest = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 

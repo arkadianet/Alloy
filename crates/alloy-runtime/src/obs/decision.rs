@@ -10,7 +10,8 @@ use crate::error::SessionError;
 use crate::events::{NewSessionEvent, SessionEventType};
 use crate::obs::error::ObsError;
 use crate::obs::redact::{
-    apply_body_retention, redact_json_strings, RetentionPolicy, BODY_MAX_BYTES, METADATA_MAX_BYTES,
+    apply_body_retention, redact_json_strings, redact_secrets, truncate_utf8_bytes,
+    RetentionPolicy, BODY_MAX_BYTES, METADATA_MAX_BYTES,
 };
 use crate::runtime::RuntimeHandle;
 use crate::storage::{AlloyStorage, SessionRows};
@@ -481,6 +482,16 @@ pub(crate) fn prepare_model_call(
     }
     rec.content_hash = resolve_hash(session, caller_hash, raw_owned.as_deref(), outcome.hash);
     rec.prompt_body = outcome.body;
+    rec.finish_reason = rec
+        .finish_reason
+        .as_deref()
+        .map(redact_secrets)
+        .map(|value| truncate_utf8_bytes(&value, 128));
+    rec.provider_request_id = rec
+        .provider_request_id
+        .as_deref()
+        .map(redact_secrets)
+        .map(|value| truncate_utf8_bytes(&value, 256));
     Ok(rec)
 }
 
@@ -775,6 +786,29 @@ mod tests {
         .usd(Some(f64::NAN));
         let err = prepare_model_call(rec, RetentionPolicy::defaults()).unwrap_err();
         assert!(matches!(err, ObsError::Invalid(msg) if msg.contains("usd")));
+    }
+
+    #[test]
+    fn model_call_provider_metadata_is_redacted_and_bounded_on_prepare() {
+        let rec = ModelCallRecord::new(
+            SessionId::new(),
+            ProviderId::new("p").unwrap(),
+            ModelTier::Standard,
+        )
+        .finish_reason(Some(format!("api_key=sk-abcdefghij {}", "é".repeat(100))))
+        .provider_request_id(Some(format!(
+            "Authorization: Bearer secret-token {}",
+            "é".repeat(200)
+        )));
+        let prepared = prepare_model_call(rec, RetentionPolicy::defaults()).unwrap();
+        let finish = prepared.finish_reason.unwrap();
+        let request_id = prepared.provider_request_id.unwrap();
+        assert!(finish.len() <= 128);
+        assert!(request_id.len() <= 256);
+        assert!(!finish.contains("sk-"));
+        assert!(!request_id.contains("secret-token"));
+        assert!(finish.is_char_boundary(finish.len()));
+        assert!(request_id.is_char_boundary(request_id.len()));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! Non-formatting API-key wrapper.
 
+use zeroize::Zeroize;
+
 /// API-key material used only to construct an authorization header.
 ///
 /// This type intentionally implements neither `Display`, serialization, nor
@@ -27,6 +29,12 @@ impl SecretString {
 impl std::fmt::Debug for SecretString {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SecretString([REDACTED])")
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.value.zeroize();
     }
 }
 
