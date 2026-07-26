@@ -1094,58 +1094,55 @@ If `cost_meter` is `None`, skip metering (tests without meter). Decision log rem
 
 **Cancellation-safe ordering and durable append (normative):**
 
-`JoinSet::join_next` cannot await a specific task, and dropping a `JoinSet` aborts members — so MVP MUST NOT use bare `JoinSet` as the sole supervisor. Use this exact design:
+Do **not** store `JoinHandle`s in a `Vec` for both reaping and shutdown — a handle cannot be moved into a reaper and retained for drain. Do **not** use bare `JoinSet` as the sole supervisor (`join_next` is not per-task; dropping aborts members). Use this exact ownership-safe design:
 
 ```rust
 struct DurableAppendSupervisor {
-    /// Tracked so shutdown can drain; NOT aborted on caller drop.
-    handles: Mutex<Vec<JoinHandle<()>>>,
+    pending: AtomicUsize,
+    done_notify: Notify,
     obs_record_errors: Arc<AtomicU64>,
 }
 
 type AppendNotify = Result<(), ObsError>; // oneshot payload
 
 // inside complete, after provider returns Ok or ANY ProviderError:
-// 0. If host cancel and provider result race: once the provider future has
-//    resolved (Ok or Err), the no-await meter+spawn critical section MUST run;
-//    Cancelled MUST NOT win after the provider result is in hand.
-// 1. Normalize/redact ModelResponse or ProviderError at the router boundary (§5.9.5).
-// 2. Build ModelCallRecord (always for ProviderError, including Internal).
+// 0. Once provider future resolved, meter+spawn MUST run (cancel loses).
+// 1. Normalize/redact at router boundary (§5.9.5).
+// 2. Build ModelCallRecord (every ProviderError, including Internal).
 // 3. If meter present: add_model_usage synchronously (no .await before this).
 // 4. let (tx, rx) = oneshot::channel::<AppendNotify>();
-// 5. let handle: JoinHandle<()> = tokio::spawn(async move {
+// 5. supervisor.pending.fetch_add(1, SeqCst);
+// 6. tokio::spawn({
 //        let res = decision_log.record_model_call(rec).await;
 //        if res.is_err() { obs_record_errors.fetch_add(1, Relaxed); }
-//        let _ = tx.send(res.map(|_| ())); // receiver may be gone; do not use res after move
+//        let _ = tx.send(res.map(|_| ()));
+//        supervisor.pending.fetch_sub(1, SeqCst);
+//        supervisor.done_notify.notify_waiters();
 //    });
-// 6. supervisor.track(handle): push into Vec AND spawn a reaper that
-//    awaits the handle then removes it (completed handles MUST be reaped
-//    continuously — do not retain one entry per historical completion).
+//    // Runtime owns the task; supervisor does NOT hold JoinHandle.
 // 7. Host-level cancellation MUST NOT be selected between steps 3–6.
-// 8. Await `rx` only to surface completion to the caller:
-//      - Ok(Ok(())) / Ok(Err(obs)) → continue (obs errors already counted)
-//      - Err(RecvError) → append task ended without send (panic/cancel of the
-//        append task). This is NOT "caller dropped". Caller drop drops `rx`
-//        while the task continues; `let _ = tx.send(...)` then fails silently.
-// 9. shutdown drain under ONE aggregate deadline:
-//      deadline = now + drain_budget;
-//      while let Some(handle) = supervisor.pop_any() {
-//          left = deadline.saturating_duration_since(now);
-//          if left.is_zero() { remaining_appends = 1 + supervisor.len(); break; }
-//          match timeout(left, handle).await {
-//              Ok(_) => {}
-//              Err(_) => { remaining_appends += 1 + supervisor.len(); break; }
-//          }
+// 8. Await `rx` for caller visibility only:
+//      - Ok(_) → continue
+//      - Err(RecvError) → append task ended without send (panic)
+//      Caller drop drops `rx` only; spawn continues; tx.send may fail silently.
+// 9. shutdown drain_aggregate(budget) under ONE deadline:
+//      deadline = now + budget;
+//      loop {
+//          let wait = done_notify.notified(); pin!(wait); // enable-before-check
+//          let left = pending.load(SeqCst);
+//          if left == 0 { return 0; }
+//          let rem = deadline.saturating_duration_since(now);
+//          if rem.is_zero() { warn!; return left; }
+//          let _ = timeout(rem, wait).await;
 //      }
 ```
 
 Rules:
 
-1. Dropping the caller `complete` future after step 3 MUST NOT abort the spawned append (`JoinHandle` is held by the supervisor, not tied to the caller future).
-2. The supervisor MUST reap completed handles continuously so the Vec does not grow without bound.
-3. `shutdown()` MUST drain remaining handles under **one** aggregate deadline (`post_cancel_or_grace`), not `N × grace`. Timed-out remainder becomes `remaining_appends`. Do not abort mid-write; detach and `warn`.
-4. The last `Arc<TomlModelRouter>` drop MUST NOT abort outstanding appends: keep the supervisor in an `Arc` shared with spawned tasks. Preferred: `shutdown` is REQUIRED before process exit.
-5. `obs_record_errors` MUST count returned obs failures for both route decisions and model-call records (task-owned increment, not only caller-awaited errors).
+1. Dropping the caller `complete` future after step 3 MUST NOT abort the spawned append (runtime-owned task; not tied to caller future or a supervisor `JoinHandle`).
+2. `shutdown()` waits on `pending` via enable-before-check `Notify` under **one** aggregate deadline. Timed-out remainder is `remaining_appends = pending.load()`; tasks are not aborted (detach + `warn`).
+3. Keep `DurableAppendSupervisor` in an `Arc` shared with spawned tasks and the router. Preferred: call `shutdown` before process exit so the runtime is not torn down with `pending > 0`.
+4. `obs_record_errors` MUST count returned obs failures for both route decisions and model-call records (task-owned increment).
 
 This preserves RFC-0004 §7.5's durable-metering invariant after a provider attempt has occurred. Run-level post-call warnings remain RFC-0010 (`maybe_signal_budget_warning`).
 
