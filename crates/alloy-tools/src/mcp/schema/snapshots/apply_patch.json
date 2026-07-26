@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "patch": {},
+    "dry_run": { "type": "boolean", "default": false }
+  },
+  "required": ["patch"],
+  "additionalProperties": false
+}

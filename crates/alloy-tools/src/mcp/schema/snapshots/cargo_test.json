@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "workspace_root": { "type": "string" },
+    "package": { "type": ["string", "null"] },
+    "test_name_filter": { "type": ["string", "null"] },
+    "jobs": { "type": ["integer", "null"], "minimum": 1 }
+  },
+  "required": ["workspace_root"],
+  "additionalProperties": false
+}
