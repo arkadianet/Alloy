@@ -43,7 +43,7 @@ pub use adapters::{
     UnavailableVerifyCompile, UnavailableVerifyTest, VerifyCompileAdapter, VerifyOutcome,
     VerifyTestAdapter,
 };
-pub use config::{ConfigPaths, RuntimeConfig};
+pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
 pub use dag::{
     ApprovalSpec, Backoff, CacheKey, DependencyEdge, EdgeKind, NodeKind, NodeState, RetryPolicy,
     TaskDag, TaskNode,

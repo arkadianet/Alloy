@@ -143,12 +143,13 @@ impl CostMeter {
 
     /// Feed a completed [`WorkerMetrics`].
     ///
-    /// Treats token fields as known. Increments calls even when `error_class` is set.
+    /// Passes token fields through honestly (`None` stays unknown). Increments
+    /// calls even when `error_class` is set.
     pub fn add_worker_metrics(&mut self, metrics: &WorkerMetrics, usd: Option<f64>) {
         self.add_model_usage(
             metrics.model_tier_used,
-            Some(metrics.input_tokens),
-            Some(metrics.output_tokens),
+            metrics.input_tokens,
+            metrics.output_tokens,
             usd,
         );
     }
@@ -398,8 +399,8 @@ mod tests {
         let metrics = WorkerMetrics {
             model_tier_used: ModelTier::Economy,
             provider_id: ProviderId::new("p").unwrap(),
-            input_tokens: 4,
-            output_tokens: 2,
+            input_tokens: Some(4),
+            output_tokens: Some(2),
             tool_calls: 0,
             cache_hits: 0,
             duration_ms: 10,
@@ -413,6 +414,28 @@ mod tests {
         assert_eq!(s.tokens_out, 2);
         assert_eq!(s.unknown_token_events, 0);
         assert_eq!(s.by_tier.economy.calls, 1);
+    }
+
+    #[test]
+    fn add_worker_metrics_unknown_tokens_are_not_zeros() {
+        let mut m = CostMeter::new();
+        let metrics = WorkerMetrics {
+            model_tier_used: ModelTier::Standard,
+            provider_id: ProviderId::new("p").unwrap(),
+            input_tokens: None,
+            output_tokens: None,
+            tool_calls: 0,
+            cache_hits: 0,
+            duration_ms: 1,
+            confidence: None,
+            error_class: None,
+        };
+        m.add_worker_metrics(&metrics, None);
+        let s = m.snapshot();
+        assert_eq!(s.model_calls, 1);
+        assert_eq!(s.tokens_in, 0);
+        assert_eq!(s.tokens_out, 0);
+        assert_eq!(s.unknown_token_events, 1);
     }
 
     #[test]

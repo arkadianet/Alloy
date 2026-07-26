@@ -797,8 +797,8 @@ pub struct ApprovalSpec {
 pub struct WorkerMetrics {
     pub model_tier_used: ModelTier,
     pub provider_id: ProviderId,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: Option<u64>,  // None = not reported / unknown
+    pub output_tokens: Option<u64>, // None = not reported / unknown
     pub tool_calls: u32,
     pub cache_hits: u32,
     pub duration_ms: u64,

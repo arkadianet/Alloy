@@ -217,6 +217,36 @@ fn dirs_fallback_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Shared minimal valid `router.toml` body for tests.
+///
+/// Public so integration tests (separate crates) can reuse the same fixture as
+/// unit tests without duplicating the TOML literal.
+#[must_use]
+pub fn default_router_toml() -> &'static str {
+    r#"
+[policy]
+default_tier = "standard"
+
+[[providers]]
+id = "openai-compatible-main"
+kind = "openai_compatible"
+base_url = "https://api.example.com/v1/"
+api_key_env = "ALLOY_API_KEY"
+
+[[providers.endpoints]]
+id = "team-workhorse"
+display_name = "Workhorse"
+model = "REPLACE_ME"
+tiers = ["standard"]
+max_context = 200000
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
+
+[capability_tiers]
+repair = "standard"
+"#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,32 +270,7 @@ retain_tool_bodies = false
         )
         .unwrap();
         let router = dir.join("router.toml");
-        fs::write(
-            &router,
-            r#"
-[policy]
-default_tier = "standard"
-
-[[providers]]
-id = "openai-compatible-main"
-kind = "openai_compatible"
-base_url = "https://api.example.com/v1/"
-api_key_env = "ALLOY_API_KEY"
-
-[[providers.endpoints]]
-id = "team-workhorse"
-display_name = "Workhorse"
-model = "REPLACE_ME"
-tiers = ["standard"]
-max_context = 200000
-input_usd_per_mtok = 0.0
-output_usd_per_mtok = 0.0
-
-[capability_tiers]
-repair = "standard"
-"#,
-        )
-        .unwrap();
+        fs::write(&router, default_router_toml()).unwrap();
         let example = dir.join("example.env");
         fs::write(&example, "ALLOY_API_KEY=\n").unwrap();
         (profile, router, example)

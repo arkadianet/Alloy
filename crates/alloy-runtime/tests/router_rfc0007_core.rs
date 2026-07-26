@@ -535,8 +535,13 @@ async fn mid_flight_host_cancel_returns_cancelled() {
         Err(RouterError::Cancelled)
     ));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(meter.snapshot().model_calls, 0);
-    assert!(log.recorded_model_calls().is_empty());
+    assert_eq!(meter.snapshot().model_calls, 1);
+    assert_eq!(meter.snapshot().unknown_token_events, 1);
+    let calls = log.recorded_model_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].error_class, Some(ErrorClass::Cancelled));
+    assert!(calls[0].input_tokens.is_none());
+    assert!(calls[0].output_tokens.is_none());
     // Host token remains cancelled → §5.4.1 Cancelled precedes AlreadyCompleted.
     assert!(matches!(
         router.complete(&routed, prompt()).await,
@@ -793,13 +798,17 @@ async fn shutdown_leadership_is_cancel_safe() {
         let router = Arc::clone(&router);
         tokio::spawn(async move { router.shutdown().await })
     };
-    loop {
-        match router.route(route_request(run)).await {
-            Err(RouterError::ShuttingDown) => break,
-            Ok(_) => tokio::task::yield_now().await,
-            Err(error) => panic!("unexpected route result: {error}"),
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match router.route(route_request(run)).await {
+                Err(RouterError::ShuttingDown) => break,
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected route result: {error}"),
+            }
         }
-    }
+    })
+    .await
+    .expect("route loop observed ShuttingDown before timeout");
     leader.abort();
     assert!(leader
         .await

@@ -100,28 +100,7 @@ retain_tool_bodies = {retain_tools}
     .unwrap();
     std::fs::write(
         dir.join("router.toml"),
-        r#"
-[policy]
-default_tier = "standard"
-
-[[providers]]
-id = "openai-compatible-main"
-kind = "openai_compatible"
-base_url = "https://api.example.com/v1/"
-api_key_env = "ALLOY_API_KEY"
-
-[[providers.endpoints]]
-id = "team-workhorse"
-display_name = "Workhorse"
-model = "REPLACE_ME"
-tiers = ["standard"]
-max_context = 200000
-input_usd_per_mtok = 0.0
-output_usd_per_mtok = 0.0
-
-[capability_tiers]
-repair = "standard"
-"#,
+        alloy_runtime::default_router_toml(),
     )
     .unwrap();
     std::fs::write(dir.join("example.env"), "ALLOY_API_KEY=\n").unwrap();

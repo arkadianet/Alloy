@@ -13,10 +13,10 @@ pub struct WorkerMetrics {
     pub model_tier_used: ModelTier,
     /// Provider id.
     pub provider_id: ProviderId,
-    /// Input tokens.
-    pub input_tokens: u64,
-    /// Output tokens.
-    pub output_tokens: u64,
+    /// Input tokens when reported; `None` means unknown / not reported.
+    pub input_tokens: Option<u64>,
+    /// Output tokens when reported; `None` means unknown / not reported.
+    pub output_tokens: Option<u64>,
     /// Tool call count.
     pub tool_calls: u32,
     /// Cache hit count.

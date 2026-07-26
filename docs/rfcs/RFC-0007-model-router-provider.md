@@ -626,7 +626,7 @@ impl TomlModelRouterParts {
 - Concurrent runs MUST each own a distinct router instance (distinct `router_instance_id`) and MUST NOT share one meter through a process-global router.
 - The router is the **sole** producer of `SessionEventType::ModelCall` (`DecisionLog::record_model_call`) and `SharedCostMeter::add_model_usage` for each LLM `complete`. Workers MUST NOT also call `add_model_usage` / `record_model_call` for the same provider completion.
 - **`add_worker_metrics` trap:** on `main`, `CostMeter::add_worker_metrics` forwards into `add_model_usage`. Therefore workers MUST NOT call `add_worker_metrics` with token counts that duplicate a router completion. Until RFC-0004 splits worker-non-model metrics from model usage, LLM nodes that used the router MUST leave model tokens to the router only.
-- **`WorkerMetrics` vs unknown provider usage (RFC-0013 amendment):** merged `WorkerMetrics` uses `u64` token fields, but provider usage may be `None`. Workers MUST NOT invent provider tokens as real zeros (RFC-0004). Preferred: amend `WorkerMetrics.input_tokens` / `output_tokens` to `Option<u64>` in the RFC-0013 implementation series and pass through `None` when the provider omitted usage. Interim MVP without that amendment: LLM workers MAY set `0` on `CapabilityOutput.metrics` **only** as “not reported on this struct”, MUST NOT call `add_worker_metrics` with those zeros, and schedulers MUST prefer `ModelCall` / meter snapshots for model spend.
+- **`WorkerMetrics` vs unknown provider usage (RFC-0001 / RFC-0013 amendment):** `WorkerMetrics.input_tokens` / `output_tokens` are `Option<u64>`. When the provider omitted usage, workers MUST pass `None` (never invent `Some(0)` to mean unknown). Schedulers MUST prefer `ModelCall` / meter snapshots for model spend on router-owned completions; workers MUST NOT call `add_worker_metrics` for those completions.
 - **RFC-0004 amendment note:** any merged guidance that workers record model calls / feed model usage for LLM completions is superseded by this RFC for completions owned by `TomlModelRouter`; update RFC-0004 in the same implementation series.
 - **RFC-0013 amendment (normative for binding):** `CapabilityContext` MUST gain `pub run: RunId` (and SHOULD expose the same `session` already present) so workers can build `RoutingRequest { session, run: Some(ctx.run), node: Some(ctx.node), ... }`. Until that lands, host composition MUST inject run id by wrapping the router rather than leaving workers unable to satisfy `bound_run`.
 - RFC-0010 does **not** depend on RFC-0007; it creates the meter. Binding the meter to the router is host/RFC-0013 composition.
@@ -1244,7 +1244,8 @@ On successful route-decision append, the returned `EventSeq` MUST be copied into
 | TLS failure | `Err(Provider(Tls))` | ModelCall + Model | unknown |
 | Transport (non-TLS I/O) | `Err(Provider(Transport))` | ModelCall + Model | unknown |
 | Malformed | `Err(Provider(Malformed…))` | ModelCall + Model | unknown |
-| Host cancellation before provider returns | `Err(Cancelled)` | no ModelCall | no |
+| Host cancellation before provider HTTP starts | `Err(Cancelled)` | no ModelCall | no |
+| Host cancellation after provider attempt starts, before provider returns | `Err(Cancelled)` | ModelCall + error_class Cancelled | unknown usage |
 | Caller drops before provider result | no return value | no ModelCall | no |
 | Caller drops after provider success, before/during durable append | no return value (lost oneshot) | ModelCall still appended via DurableAppendSupervisor (§5.9.3) | yes (sync before spawn) |
 | Wrong router instance | `Err(WrongRouter)` | no | no |
@@ -1326,7 +1327,8 @@ Implementation MUST use an `AtomicU8` phase (`Ready = 0`, `Draining = 1`, `Stopp
 | Drop of `route` future | No durable write required beyond best-effort; in_flight dec |
 | Drop of `complete` future **before** provider returns | In-flight HTTP aborted (reqwest cancel-on-drop); in_flight dec; **no** ModelCall / meter update; ticket already consumed → later `complete` → `AlreadyCompleted` |
 | Drop of `complete` future **after** provider success (during oneshot await) | Meter already updated; durable `ModelCall` **continues** on DurableAppendSupervisor (§5.9.3); caller may lose the oneshot |
-| Host-level cancellation token fires before provider returns | `Err(Cancelled)`; no ModelCall unless the provider attempt already returned — once returned, meter+spawn MUST run (cancel loses) |
+| Host-level cancellation token fires before provider HTTP starts | `Err(Cancelled)`; no ModelCall; ticket not consumed |
+| Host-level cancellation token fires after provider attempt starts, before provider returns | `Err(Cancelled)` after durable ModelCall with unknown spend + `error_class=Cancelled`; once the provider future has already returned, meter+spawn MUST run (cancel loses) |
 | Shutdown grace expires | router calls `shutdown_token.cancel()`; still-polled in-flight provider calls observe `Err(Cancelled)`; supervised appends drain per §6.6 |
 
 No per-call `CancellationToken` field is added to V2 trait signatures. The cancellation token is router-owned / injected through `TomlModelRouterParts`, matching the RFC-0006 host-level pattern.
@@ -1656,7 +1658,7 @@ Callers MUST pass `RuntimeConfig::budget_policy` into `TomlModelRouter::from_pat
 | `AlreadyCompleted` | complete §5.4.1 | ticket already consumed | no | no | yes |
 | `WrongRouter` | complete §5.4.1 | routed handle from another instance | no | no | yes |
 | `Provider` | complete | wrapped provider failure | see §8.2 | ModelCall | yes |
-| `Cancelled` | host-level cancellation token | cancelled before provider result | no | no | yes |
+| `Cancelled` | host-level cancellation token | cancelled before provider result | no | ModelCall when attempt started (unknown spend); else no | yes |
 | `ShuttingDown` | lifecycle | drain/stop | no | no | yes |
 | `Internal` | invariant | bug | no | optional | yes |
 
@@ -2114,7 +2116,7 @@ Every criterion is independently testable.
 | 17 | Missing/empty API key fail closed | `missing_api_key_fail_closed` |
 | 18 | Secrets redacted in Debug / errors / events; Authorization header sensitive; invalid auth header fails at construct | secret + redact + header + construct tests |
 | 19 | `RecordingModelProvider` satisfies `ModelProvider` | contract test |
-| 20 | Drop before provider → no ModelCall; drop after provider → durable ModelCall retained; host cancel → `Cancelled` | `drop_complete_before_provider_no_obs`, `drop_complete_after_provider_keeps_obs`, `host_cancel_returns_cancelled` |
+| 20 | Drop before provider → no ModelCall; drop after provider → durable ModelCall retained; pre-start host cancel → `Cancelled` without ModelCall; mid-flight host cancel → `Cancelled` after unknown-spend ModelCall | `drop_complete_before_provider_no_obs`, `drop_complete_after_provider_keeps_obs`, `host_cancel_returns_cancelled`, `mid_flight_host_cancel_returns_cancelled` |
 | 21 | `RuntimeConfig::load` no longer parses `[provider.*]` and exposes profile `budget_policy` | config unit tests updated |
 | 22 | `#![forbid(unsafe_code)]` preserved; reqwest version/features/TLS backend justified | crate attrs + Cargo.toml |
 | 23 | Retry loop absent; TLS classified separately from Transport | code review + `openai_tls_classified` |
@@ -2146,7 +2148,7 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 - [x] Clippy: **clean**
 - [x] Formatting: **clean**
 - [x] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
-- [x] Code review: **approved**
+- [ ] Code review: **approved**
 
 ---
 

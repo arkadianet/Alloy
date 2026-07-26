@@ -723,16 +723,16 @@ pub fn parse_tool_call_event(ev: &SessionEvent) -> Result<ToolCallRecord, ObsErr
 
 | Producer (later RFC) | Contract |
 | --- | --- |
-| RFC-0013 workers | Populate `WorkerMetrics` on `CapabilityOutput`; MUST NOT duplicate model-call metering or recording for router-owned completions |
+| RFC-0013 workers | Populate `WorkerMetrics` on `CapabilityOutput` with honest `Option` tokens (`None` = not reported); MUST NOT duplicate model-call metering or recording for router-owned completions |
 | RFC-0007 `TomlModelRouter` | Sole producer of `ModelCall` / `add_model_usage` for LLM `complete` attempts |
 | RFC-0010 scheduler | MAY aggregate `SharedCostMeter` per run and call `maybe_signal_budget_warning` |
 
-**RFC-0007 amendment:** `TomlModelRouter` owns both `DecisionLog::record_model_call` and `SharedCostMeter::add_model_usage` for every LLM completion it executes. Workers may report their broader `WorkerMetrics`, but MUST NOT call `add_worker_metrics`, `add_model_usage`, or `record_model_call` for that same routed completion; doing so would double-count usage. This supersedes the earlier worker-producer guidance wherever the completion is router-owned.
+**RFC-0007 amendment:** `TomlModelRouter` owns both `DecisionLog::record_model_call` and `SharedCostMeter::add_model_usage` for every LLM completion it executes (including mid-flight host cancel after the provider attempt started). Workers may report their broader `WorkerMetrics`, but MUST NOT call `add_worker_metrics`, `add_model_usage`, or `record_model_call` for that same routed completion; doing so would double-count usage. This supersedes the earlier worker-producer guidance wherever the completion is router-owned.
 
 **Field rules:**
 
 - `confidence: Option<f32>` — copy through to `ModelCallRecord.confidence`; `None` when unavailable.
-- `input_tokens` / `output_tokens` on `WorkerMetrics` are `u64`. When usage is unknown, producers MUST NOT mint a fake `WorkerMetrics` with zeros to mean “unknown”; they MUST call `add_model_usage` with `None`s.
+- `input_tokens` / `output_tokens` on `WorkerMetrics` are `Option<u64>`. Unknown / not-reported MUST be `None`. Producers MUST NOT use `Some(0)` to mean “unknown”, and MUST NOT call `add_worker_metrics` / `add_model_usage` with invented zeros for omitted provider usage.
 - `provider_id` / `model_tier_used` MUST be the actual provider/tier used (attribution owned by 0007; shape reused here).
 
 ### 3.16 `RuntimeMetrics` relationship

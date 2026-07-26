@@ -22,8 +22,8 @@ use super::config::RouterConfig;
 use super::decision_bridge::{
     budget_decision_for_complete, budget_decision_for_route, route_decision, BudgetCounters,
 };
-use super::error::{normalize_provider_error, RouterError};
-use super::meter_bridge::build_model_call_record;
+use super::error::{normalize_provider_error, ProviderError, RouterError};
+use super::meter_bridge::{build_cancelled_model_call_record, build_model_call_record};
 use super::metrics::{RouterMetrics, RouterMetricsSnapshot};
 #[cfg(feature = "http-provider")]
 use super::openai::{OpenAiCompatibleProvider, OpenAiCompatibleSpec};
@@ -450,7 +450,7 @@ impl TomlModelRouter {
         prompt: PromptPack,
         span: &tracing::Span,
     ) -> Result<ModelResponse, RouterError> {
-        let (normalized, receiver) = {
+        let (result, receiver) = {
             let _admission = self.admit().await?;
             if routed.router_instance_id() != self.router_instance_id {
                 return Err(RouterError::WrongRouter);
@@ -497,10 +497,14 @@ impl TomlModelRouter {
             let started = tokio::time::Instant::now();
             let provider_call = self.provider.complete(routed.endpoint(), request);
             tokio::pin!(provider_call);
-            let provider_result = tokio::select! {
+            enum ProviderAttempt {
+                Done(Result<ModelResponse, ProviderError>),
+                Cancelled,
+            }
+            let attempt = tokio::select! {
                 biased;
-                result = &mut provider_call => result,
-                () = self.shutdown_token.cancelled() => return Err(RouterError::Cancelled),
+                result = &mut provider_call => ProviderAttempt::Done(result),
+                () = self.shutdown_token.cancelled() => ProviderAttempt::Cancelled,
             };
             let duration = started.elapsed();
             span.record(
@@ -508,8 +512,8 @@ impl TomlModelRouter {
                 u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             );
 
-            let normalized = match provider_result {
-                Ok(mut response) => {
+            let (result, built) = match attempt {
+                ProviderAttempt::Done(Ok(mut response)) => {
                     response.finish_reason = response
                         .finish_reason
                         .as_deref()
@@ -518,12 +522,38 @@ impl TomlModelRouter {
                         .provider_request_id
                         .as_deref()
                         .map(|value| redact_and_truncate(value, 256));
-                    Ok(response)
+                    let normalized = Ok(response);
+                    let built = build_model_call_record(
+                        routed,
+                        self.provider.id(),
+                        &prompt,
+                        duration,
+                        &normalized,
+                    );
+                    (normalized.map_err(RouterError::Provider), built)
                 }
-                Err(error) => Err(normalize_provider_error(error)),
+                ProviderAttempt::Done(Err(error)) => {
+                    let normalized = Err(normalize_provider_error(error));
+                    let built = build_model_call_record(
+                        routed,
+                        self.provider.id(),
+                        &prompt,
+                        duration,
+                        &normalized,
+                    );
+                    (normalized.map_err(RouterError::Provider), built)
+                }
+                ProviderAttempt::Cancelled => {
+                    // Provider attempt started; ledger unknown spend then Cancelled.
+                    let built = build_cancelled_model_call_record(
+                        routed,
+                        self.provider.id(),
+                        &prompt,
+                        duration,
+                    );
+                    (Err(RouterError::Cancelled), built)
+                }
             };
-            let built =
-                build_model_call_record(routed, self.provider.id(), &prompt, duration, &normalized);
             if built.prompt_body_oversize {
                 self.metrics
                     .model_call_prompt_body_oversize
@@ -547,7 +577,7 @@ impl TomlModelRouter {
                 .decision_log
                 .as_ref()
                 .map(|log| self.append_supervisor.spawn(Arc::clone(log), built.record));
-            (normalized, receiver)
+            (result, receiver)
         };
 
         if let Some(receiver) = receiver {
@@ -565,7 +595,7 @@ impl TomlModelRouter {
             }
         }
 
-        normalized.map_err(RouterError::Provider)
+        result
     }
 
     fn route_budget(

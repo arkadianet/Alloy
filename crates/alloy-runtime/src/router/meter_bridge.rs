@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::obs::{hash_prompt, ModelCallRecord, ModelUsdSource, MODEL_PROMPT_BODY_MAX_BYTES};
+use crate::types::diagnostic::ErrorClass;
 use crate::types::ids::ProviderId;
 
 use super::error::{classify_provider_error, ProviderError};
@@ -83,6 +84,54 @@ pub(crate) fn build_model_call_record(
         input_tokens,
         output_tokens,
         usd,
+        prompt_body_oversize,
+        canonical_len,
+    }
+}
+
+/// Mid-flight host cancel: durable attempt with unknown spend and `Cancelled`.
+pub(crate) fn build_cancelled_model_call_record(
+    routed: &RoutedModel,
+    provider_id: ProviderId,
+    prompt: &PromptPack,
+    duration: Duration,
+) -> ModelCallBuild {
+    let canonical = serde_json::to_string(&prompt.messages).unwrap_or_else(|error| {
+        tracing::error!(%error, "canonical prompt serialization unexpectedly failed");
+        "[]".to_owned()
+    });
+    let canonical_len = canonical.len();
+    let prompt_body_oversize = canonical_len > MODEL_PROMPT_BODY_MAX_BYTES;
+    let content_hash = Some(hash_prompt(&canonical));
+    let prompt_body = (!prompt_body_oversize).then_some(canonical);
+    let duration_ms = Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+
+    let mut record = ModelCallRecord::new(routed.session(), provider_id, routed.tier())
+        .tokens(None, None)
+        .usd(None)
+        .duration_ms(duration_ms)
+        .confidence(None)
+        .error_class(Some(ErrorClass::Cancelled))
+        .content_hash(content_hash)
+        .prompt_body(prompt_body)
+        .endpoint_id(Some(routed.endpoint().id.clone()))
+        .model(Some(routed.endpoint().model.clone()))
+        .route_event_seq(routed.route_event_seq())
+        .usd_source(None)
+        .finish_reason(None)
+        .provider_request_id(None);
+    if let Some(run) = routed.run() {
+        record = record.run(run);
+    }
+    if let Some(node) = routed.node() {
+        record = record.node(node);
+    }
+
+    ModelCallBuild {
+        record,
+        input_tokens: None,
+        output_tokens: None,
+        usd: None,
         prompt_body_oversize,
         canonical_len,
     }
@@ -182,5 +231,30 @@ mod tests {
         assert_eq!(built.input_tokens, None);
         assert_eq!(built.output_tokens, None);
         assert_eq!(built.record.error_class, Some(crate::ErrorClass::Timeout));
+    }
+
+    #[test]
+    fn maps_cancelled_attempt_to_unknown_usage() {
+        let prompt = PromptPack {
+            messages: vec![],
+            citations: vec![],
+            domains: None,
+        };
+        let built = build_cancelled_model_call_record(
+            &routed(),
+            ProviderId::new("provider").unwrap(),
+            &prompt,
+            Duration::from_millis(3),
+        );
+        assert_eq!(built.input_tokens, None);
+        assert_eq!(built.output_tokens, None);
+        assert_eq!(built.usd, None);
+        assert_eq!(built.record.error_class, Some(crate::ErrorClass::Cancelled));
+        assert_eq!(built.record.duration_ms, Some(3));
+        assert_eq!(
+            built.record.endpoint_id.as_ref().map(|id| id.as_str()),
+            Some("endpoint")
+        );
+        assert_eq!(built.record.model.as_deref(), Some("configured"));
     }
 }
