@@ -189,7 +189,7 @@ pub use obs::{
     apply_prompt_retention, apply_tool_retention,
     BudgetCheck, CostByTier, CostMeter, CostSnapshot, DecisionPage, SharedCostMeter, TierCost,
     DecisionKind, DecisionLog, DecisionRecord, EventDecisionLog, RecordingDecisionLog,
-    ModelCallRecord, ObsError, RetentionPolicy, ToolCallRecord,
+    ModelCallRecord, ModelUsdSource, ObsError, RetentionPolicy, ToolCallRecord,
     maybe_signal_budget_warning,
 };
 ```
@@ -307,7 +307,15 @@ pub struct DecisionRecord {
 ### 3.5 `ModelCallRecord` / `ToolCallRecord` (in-memory API)
 
 ```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelUsdSource {
+    ProviderReported,
+    OperatorPriceTable,
+}
+
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ModelCallRecord {
     pub session: SessionId,
     pub run: Option<RunId>,
@@ -322,6 +330,12 @@ pub struct ModelCallRecord {
     pub error_class: Option<ErrorClass>,
     pub content_hash: Option<Digest>,
     pub prompt_body: Option<String>,
+    pub endpoint_id: Option<EndpointId>,
+    pub model: Option<String>,
+    pub route_event_seq: Option<EventSeq>,
+    pub usd_source: Option<ModelUsdSource>,
+    pub finish_reason: Option<String>,
+    pub provider_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,7 +352,7 @@ pub struct ToolCallRecord {
 }
 ```
 
-Same rule: wire payloads are private structs in §5.4–5.5; `usage_unknown` exists only on the wire.
+`ModelCallRecord` is non-exhaustive after the RFC-0007 amendment. External callers construct it with `ModelCallRecord::new(session, provider_id, model_tier)` and the builder methods (`run`, `node`, `tokens`, `usd`, `endpoint_id`, `model`, `route_event_seq`, `usd_source`, `finish_reason`, and `provider_request_id`) rather than struct literals. Same rule: wire payloads are private structs in §5.4–5.5; `usage_unknown` exists only on the wire.
 
 ### 3.6 `DecisionLog` trait
 
@@ -709,9 +723,11 @@ pub fn parse_tool_call_event(ev: &SessionEvent) -> Result<ToolCallRecord, ObsErr
 
 | Producer (later RFC) | Contract |
 | --- | --- |
-| RFC-0013 workers | Populate `WorkerMetrics` on `CapabilityOutput`; pass to `CostMeter::add_worker_metrics` / `record_model_call` |
-| RFC-0007 router | On `complete`, supply provider usage into `add_model_usage` / `record_model_call` |
+| RFC-0013 workers | Populate `WorkerMetrics` on `CapabilityOutput`; MUST NOT duplicate model-call metering or recording for router-owned completions |
+| RFC-0007 `TomlModelRouter` | Sole producer of `ModelCall` / `add_model_usage` for LLM `complete` attempts |
 | RFC-0010 scheduler | MAY aggregate `SharedCostMeter` per run and call `maybe_signal_budget_warning` |
+
+**RFC-0007 amendment:** `TomlModelRouter` owns both `DecisionLog::record_model_call` and `SharedCostMeter::add_model_usage` for every LLM completion it executes. Workers may report their broader `WorkerMetrics`, but MUST NOT call `add_worker_metrics`, `add_model_usage`, or `record_model_call` for that same routed completion; doing so would double-count usage. This supersedes the earlier worker-producer guidance wherever the completion is router-owned.
 
 **Field rules:**
 
@@ -875,6 +891,18 @@ struct ModelCallPayload {
     error_class: Option<ErrorClass>,
     content_hash: Option<Digest>,
     prompt_body: Option<String>,
+    #[serde(default)]
+    endpoint_id: Option<EndpointId>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    route_event_seq: Option<EventSeq>,
+    #[serde(default)]
+    usd_source: Option<ModelUsdSource>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+    #[serde(default)]
+    provider_request_id: Option<String>,
 }
 ```
 
@@ -883,6 +911,7 @@ struct ModelCallPayload {
 | `usage_unknown` | `true` iff `input_tokens.is_none() \|\| output_tokens.is_none()` at append time |
 | `usd` | JSON `null` when unknown; MUST NOT write non-finite (reject before append as `Invalid`) |
 | `prompt_body` | subject to `retain_full_prompts` + size cap |
+| RFC-0007 attribution fields | Nullable and `#[serde(default)]`; pre-amendment events parse with `None` |
 
 ### 5.5 `ToolCall` wire payload (private `ToolCallPayload`)
 
@@ -1077,9 +1106,9 @@ Repeated calls while still exhausted will append multiple `BudgetWarning` events
 
 | RFC | MUST |
 | --- | --- |
-| **0007** | Log every route via `DecisionLog::record(kind=ModelRoute, …)`; on complete, `record_model_call` + `CostMeter` update with provider usage; never hardcode savings |
+| **0007** | `TomlModelRouter` is the sole LLM-completion producer: log every route via `DecisionLog::record(kind=ModelRoute, …)`; on complete, `record_model_call` + `CostMeter` update with provider usage; never hardcode savings |
 | **0010** | Own per-run `SharedCostMeter` lifecycle; call `maybe_signal_budget_warning` after usage updates that can cross ceilings; emit `NodeState` itself (not via DecisionLog) |
-| **0013** | Fill `WorkerMetrics` honestly; feed meter; `confidence` remains `Option<f32>` |
+| **0013** | Fill `WorkerMetrics` honestly; do not duplicate router-owned `ModelCall` / meter updates; `confidence` remains `Option<f32>` |
 | **0015** | Use `list_decision_events` / snapshots for `alloy events` display; print budget warnings; no OTLP |
 | **0016** | Only publish calibrated cost bands from holdout — MUST NOT read fabricated RFC-0004 estimates |
 
@@ -1135,7 +1164,7 @@ Behaviour:
 5. Ignore non-`ModelCall` events.
 6. Return rebuilt `CostMeter`.
 
-**Invariant:** rebuild is complete only for usage that was recorded via `record_model_call`. Meter-only updates without a durable `ModelCall` are **lossy** on restart. Producers that need durable metering MUST call `record_model_call` (RFC-0007/0013 contract). Document this in residual comments / this section — not best-effort silent.
+**Invariant:** rebuild is complete only for usage that was recorded via `record_model_call`. Meter-only updates without a durable `ModelCall` are **lossy** on restart. `TomlModelRouter` MUST pair router-owned completion metering with `record_model_call`; workers MUST NOT duplicate that pair. Document this in residual comments / this section — not best-effort silent.
 
 ---
 

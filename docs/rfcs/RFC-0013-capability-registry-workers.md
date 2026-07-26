@@ -42,6 +42,8 @@ Capabilities are contracts, not personas. Registry resolves ≤4 LLM capabilitie
 
 From V2 §9.2:
 
+**RFC-0007 binding amendment:** `CapabilityContext` MUST carry `run: RunId` so a worker can create a run-bound `RoutingRequest` and satisfy `TomlModelRouter` attribution checks.
+
 ```rust
 #[async_trait]
 pub trait Capability: Send + Sync {
@@ -55,6 +57,7 @@ pub trait Capability: Send + Sync {
 
 pub struct CapabilityContext {
     pub session: SessionId,
+    pub run: RunId,
     pub node: NodeId,
     pub input: serde_json::Value,
     pub prompt_pack: PromptPack,
