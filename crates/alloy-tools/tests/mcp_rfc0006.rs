@@ -69,30 +69,30 @@ fn ensure_permissive_global_tracing_default() {
         // and its `event()` is a no-op, so this only widens the cached
         // interest -- it never observes or alters what any test's own
         // subscriber sees.
-        let Err(already_set) =
-            tracing::subscriber::set_global_default(tracing_subscriber::registry())
-        else {
-            return;
-        };
-
-        // Something installed a global default before this suite could. That
-        // is only harmless if it is permissive: a filtering default (for
-        // example the `alloy_runtime=info,alloy=info` filter that
-        // `AlloyRuntime::start` installs, which excludes `alloy_tools`
-        // entirely) would let the deny-warn callsite latch to
-        // `Interest::never()` and silently reintroduce the flake this
-        // function exists to prevent. Fail loudly here rather than let a
-        // future test reopen it as a mystery.
+        // Failing to install means something else got there first and this
+        // suite can no longer guarantee the invariant it depends on.
         //
-        // Note this checks the max-level hint only; it cannot see
-        // target-based filtering. It catches the coarse regression, not
-        // every possible one.
-        let level = tracing::level_filters::LevelFilter::current();
-        assert!(
-            level >= tracing::level_filters::LevelFilter::WARN,
-            "a global tracing default was already installed ({already_set}) and its max level \
-             is {level:?}, which will not dispatch the WARN events this suite captures; \
-             permission_deny_warns_prepare_and_broker would regress to the flake in issue #20"
+        // Deliberately unconditional. The tempting cheaper check — tolerate an
+        // existing default whose max level still permits WARN — is worse than
+        // nothing: the realistic offender is the `alloy_runtime=info,alloy=info`
+        // filter `AlloyRuntime::start` installs, and `LevelFilter::current()`
+        // reports `INFO` for it, which compares as *more* permissive than
+        // `WARN` and passes. That filter still excludes `alloy_tools` by
+        // target, so the deny-warn callsite would latch to `Interest::never()`
+        // and issue #20 would silently reopen. A level check passes in exactly
+        // the case worth catching.
+        //
+        // Telling a benign permissive default from a target-filtering one needs
+        // `enabled()` probing with synthesised metadata — more machinery than a
+        // test guard earns, for a benign case that does not occur in this
+        // binary. Failing on the ambiguity is the honest trade: the panic tells
+        // a future author precisely what they broke and how to proceed.
+        tracing::subscriber::set_global_default(tracing_subscriber::registry()).expect(
+            "a global tracing subscriber was installed before this suite's fixtures ran. This \
+             suite needs a permissive global default so the shared `mcp permission denied` \
+             callsite does not latch to Interest::never() (issue #20). If a test here now builds \
+             an AlloyRuntime — which installs a filtering default via init_tracing — build it \
+             after the first Fixture, or make this suite own the global default explicitly.",
         );
     });
 }
