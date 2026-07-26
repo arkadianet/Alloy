@@ -374,19 +374,18 @@ fn map_success(
             512,
         ))
     })?;
-    let Some(root_object) = root_value.as_object() else {
+    if !root_value.is_object() {
         return Err(ProviderError::MalformedResponse(
             "response root must be a JSON object".into(),
         ));
-    };
-    let root: WireResponse =
-        serde_json::from_value(Value::Object(root_object.clone())).map_err(|error| {
-            ProviderError::MalformedResponse(scrub_redact_and_truncate(
-                &error.to_string(),
-                api_key,
-                512,
-            ))
-        })?;
+    }
+    let root: WireResponse = serde_json::from_value(root_value).map_err(|error| {
+        ProviderError::MalformedResponse(scrub_redact_and_truncate(
+            &error.to_string(),
+            api_key,
+            512,
+        ))
+    })?;
     if root.error.is_some_and(|value| value.is_object()) {
         return Err(ProviderError::MalformedResponse(
             "successful response contains an error object".into(),
