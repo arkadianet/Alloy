@@ -30,7 +30,9 @@ impl RequestFingerprint {
 
     /// Parse a 64-char lowercase hex digest; reject otherwise.
     ///
-    /// Failure: [`EvalError::Manifest`] for wrong length, uppercase, or non-hex.
+    /// # Errors
+    ///
+    /// Returns [`EvalError::Manifest`] for wrong length, uppercase, or non-hex.
     pub fn from_hex(s: impl AsRef<str>) -> Result<Self, EvalError> {
         let s = s.as_ref();
         Digest::try_from_hex(s)

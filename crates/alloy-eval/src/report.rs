@@ -299,6 +299,34 @@ cost_disclaimer=internal-only";
     }
 
     #[test]
+    fn report_serde_round_trip() {
+        let report = EvalReport {
+            schema_version: 1,
+            run_id: "00000000-0000-4000-8000-000000000000".to_owned(),
+            offline: true,
+            toolchain: ToolchainRecord {
+                channel: "1.97.1".to_owned(),
+                rustc_version: "rustc 1.97.1".to_owned(),
+                cargo_version: "cargo 1.97.1".to_owned(),
+            },
+            fixtures: vec![outcome("round-trip", FixtureStatus::Pass)],
+            trajectories: vec![],
+            naive_fixtures: None,
+            naive_trajectories: None,
+            metrics: metrics(),
+            cost_claim: CostClaimEnvelope::uncalibrated(MetricField::Unmeasured {
+                reason: UnmeasuredReason::CostInputsIncomplete,
+            }),
+            gate: None,
+            naive_comparison: None,
+        };
+
+        let json = serde_json::to_vec(&report).unwrap();
+        let decoded: EvalReport = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded, report);
+    }
+
+    #[test]
     fn report_toolchain_assembly() {
         let toolchain = ToolchainRecord {
             channel: "manifest".to_owned(),

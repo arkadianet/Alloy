@@ -88,6 +88,26 @@ async fn determinism_concurrent_batch() {
 }
 
 #[tokio::test]
+async fn trajectory_duration_is_scrubbed() {
+    let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
+    let report = harness.run_holdout_with_naive().await.unwrap();
+    assert!(!report.trajectories.is_empty());
+    assert!(report
+        .naive_trajectories
+        .as_ref()
+        .is_some_and(|rows| !rows.is_empty()));
+
+    let scrubbed = scrub(&report);
+    for field in ["trajectories", "naive_trajectories"] {
+        let rows = scrubbed[field].as_array().unwrap();
+        assert!(
+            rows.iter().all(|row| row["duration_ms"].is_null()),
+            "{field} retained a duration"
+        );
+    }
+}
+
+#[tokio::test]
 async fn day1_public_cost_is_always_uncalibrated() {
     let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
     let report = harness.run_holdout_with_naive().await.unwrap();

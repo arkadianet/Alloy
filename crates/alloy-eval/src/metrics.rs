@@ -98,7 +98,7 @@ pub(crate) struct MetricsAggregator;
 impl MetricsAggregator {
     /// Aggregate one logical run of fixture outcomes.
     #[must_use]
-    pub fn aggregate(outcomes: &[FixtureOutcome]) -> EvalMetrics {
+    pub(crate) fn aggregate(outcomes: &[FixtureOutcome]) -> EvalMetrics {
         let non_error: Vec<&FixtureOutcome> = outcomes
             .iter()
             .filter(|outcome| outcome.status != FixtureStatus::Error)
@@ -136,7 +136,7 @@ impl MetricsAggregator {
 
     /// Compute the internal uncalibrated cost p50 population for the cost envelope.
     #[must_use]
-    pub fn internal_cost_usd_p50(outcomes: &[FixtureOutcome]) -> MetricField<f64> {
+    pub(crate) fn internal_cost_usd_p50(outcomes: &[FixtureOutcome]) -> MetricField<f64> {
         if outcomes.is_empty() {
             return unmeasured(UnmeasuredReason::CostInputsIncomplete);
         }
@@ -301,6 +301,52 @@ mod tests {
         assert_eq!(
             empty.token_efficiency,
             unmeasured(UnmeasuredReason::EmptySample)
+        );
+    }
+
+    #[test]
+    fn token_sums_saturate() {
+        let metrics = MetricsAggregator::aggregate(&[outcome(
+            "saturated",
+            FixtureStatus::Pass,
+            Some((u64::MAX, u64::MAX)),
+            Some(false),
+        )]);
+        assert_eq!(
+            metrics.token_efficiency,
+            MetricField::Measured(1.0 / u64::MAX as f64)
+        );
+    }
+
+    #[test]
+    fn internal_cost_p50_requires_complete_finite_inputs() {
+        let mut outcomes = vec![
+            outcome("a", FixtureStatus::Pass, Some((1, 1)), Some(false)),
+            outcome("b", FixtureStatus::Pass, Some((1, 1)), Some(false)),
+            outcome("c", FixtureStatus::Pass, Some((1, 1)), Some(false)),
+        ];
+        for (outcome, cost) in outcomes.iter_mut().zip([1.0, 2.0, 100.0]) {
+            outcome.cost_usd = Some(cost);
+        }
+        assert_eq!(
+            MetricsAggregator::internal_cost_usd_p50(&outcomes),
+            MetricField::Measured(2.0)
+        );
+
+        outcomes[1].cost_usd = None;
+        assert_eq!(
+            MetricsAggregator::internal_cost_usd_p50(&outcomes),
+            unmeasured(UnmeasuredReason::CostInputsIncomplete)
+        );
+        outcomes[1].cost_usd = Some(f64::NAN);
+        assert_eq!(
+            MetricsAggregator::internal_cost_usd_p50(&outcomes),
+            unmeasured(UnmeasuredReason::CostInputsIncomplete)
+        );
+        outcomes[1].cost_usd = Some(f64::INFINITY);
+        assert_eq!(
+            MetricsAggregator::internal_cost_usd_p50(&outcomes),
+            unmeasured(UnmeasuredReason::CostInputsIncomplete)
         );
     }
 

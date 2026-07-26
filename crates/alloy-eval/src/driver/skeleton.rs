@@ -14,15 +14,10 @@ use crate::fingerprint::RequestFingerprint;
 use crate::harness::{FixtureRunOutput, LoadedFixture};
 use crate::manifest::{FixtureTurnId, ScriptTurn, SuccessCriterion};
 use crate::report::{CriterionResult, FixtureOutcome, FixtureStatus};
-use crate::scripted::{ScriptOutcome, ScriptedProvider};
+use crate::scripted::{
+    ScriptOutcome, ScriptedProvider, SCRIPTED_MISS_PREFIX, SCRIPTED_WRONG_ENDPOINT,
+};
 use crate::trajectory::EvalTrajectoryRecord;
-
-// TODO(RFC-0016): replace with `crate::scripted::SCRIPTED_MISS_PREFIX` and
-// `crate::scripted::SCRIPTED_WRONG_ENDPOINT` once `scripted` exports them.
-// These must stay byte-identical to the strings `ScriptedProvider::complete`
-// produces (§5.3.2 steps 5-6).
-const SCRIPTED_MISS_PREFIX: &str = "scripted miss:";
-const SCRIPTED_WRONG_ENDPOINT: &str = "scripted wrong endpoint";
 
 /// §5.3.1 carrier detail; conformance tests match it byte-for-byte.
 const SCRIPT_MISS_DETAIL: &str = "script miss";
@@ -328,6 +323,10 @@ async fn dispatch_turn(
                     FixtureStatus::Error,
                     None,
                 ));
+                #[cfg(test)]
+                if fixture.panic_after_dispatch {
+                    panic!("eval test panic");
+                }
                 return None;
             }
             result = complete => result,
@@ -361,6 +360,10 @@ async fn dispatch_turn(
             None,
         ),
     });
+    #[cfg(test)]
+    if fixture.panic_after_dispatch {
+        panic!("eval test panic");
+    }
     Some(result)
 }
 
@@ -843,6 +846,76 @@ mod tests {
         assert_eq!(output.outcome.criteria[0].detail, "missing repair text");
         assert_eq!(output.outcome.compile_clean, Some(false));
         assert!(output.outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn criteria_exactly_manifest_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&golden, "fixed").unwrap();
+        let mut fixture =
+            loaded_fixture_for_tests("criteria-list", FixtureDriverKind::SkeletonReplay);
+        fixture.paths.golden = golden;
+        fixture.manifest.success_criteria = vec![
+            SuccessCriterion::CompileClean,
+            SuccessCriterion::ScriptTurnsConsumed,
+        ];
+        let expected = fixture.manifest.success_criteria.clone();
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+
+        let output = run(&fixture, provider, None).await;
+
+        let actual: Vec<_> = output
+            .outcome
+            .criteria
+            .iter()
+            .map(|criterion| criterion.name)
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn script_turns_consumed_skeleton() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&golden, "fixed").unwrap();
+        let mut fixture =
+            loaded_fixture_for_tests("turns-consumed", FixtureDriverKind::SkeletonReplay);
+        fixture.paths.golden = golden;
+        fixture.manifest.success_criteria = vec![SuccessCriterion::ScriptTurnsConsumed];
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+
+        let output = run(&fixture, Arc::clone(&provider), None).await;
+
+        assert_eq!(output.outcome.status, FixtureStatus::Pass);
+        assert_eq!(output.outcome.criteria.len(), 1);
+        assert_eq!(
+            output.outcome.criteria[0].name,
+            SuccessCriterion::ScriptTurnsConsumed
+        );
+        assert!(output.outcome.criteria[0].passed);
+        assert!(provider.is_exhausted());
+    }
+
+    #[test]
+    fn naive_selects_unique_repair_zero() {
+        let mut fixture = loaded_fixture_for_tests("naive-plan", FixtureDriverKind::NaiveBaseline);
+        let selected = fixture.manifest.turns[0].clone();
+        let mut ignored = selected.clone();
+        ignored.turn_id.capability = alloy_runtime::CapabilityId::new("review").unwrap();
+        ignored.turn_id.ordinal = 1;
+        fixture.manifest.turns.push(ignored);
+
+        let plan = execution_plan(&fixture, ScriptedDriverMode::NaiveBaseline).unwrap();
+        assert_eq!(plan.turns, vec![selected.clone()]);
+        assert_eq!(plan.entries.len(), 1);
+
+        fixture.manifest.turns.push(selected);
+        assert!(matches!(
+            execution_plan(&fixture, ScriptedDriverMode::NaiveBaseline),
+            Err(EvalError::Manifest(message))
+                if message == "exactly one repair ordinal 0 turn is required"
+        ));
     }
 
     #[tokio::test]

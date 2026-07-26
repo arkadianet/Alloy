@@ -62,7 +62,7 @@ impl EvalTrajectoryRecord {
     /// Construct a trajectory row for a successful provider response.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn from_response(
+    pub(crate) fn from_response(
         fixture_id: FixtureId,
         set: FixtureSet,
         turn_id: FixtureTurnId,
@@ -94,7 +94,7 @@ impl EvalTrajectoryRecord {
     /// Construct a trajectory row for a provider error.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn from_provider_error(
+    pub(crate) fn from_provider_error(
         fixture_id: FixtureId,
         set: FixtureSet,
         turn_id: FixtureTurnId,
@@ -122,7 +122,7 @@ impl EvalTrajectoryRecord {
     /// Construct a trajectory row for cancellation after dispatch.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn cancelled(
+    pub(crate) fn cancelled(
         fixture_id: FixtureId,
         set: FixtureSet,
         turn_id: FixtureTurnId,

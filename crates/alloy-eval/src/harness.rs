@@ -102,6 +102,8 @@ pub struct LoadedFixture {
         crate::scripted::ScriptOutcome,
     )>,
     pub(crate) scripts: Option<Arc<ScriptedProvider>>,
+    #[cfg(test)]
+    pub(crate) panic_after_dispatch: bool,
 }
 
 impl LoadedFixture {
@@ -202,6 +204,11 @@ enum TaskOutcome<T> {
 
 impl EvalHarness {
     /// Construct and validate a harness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when thresholds or configuration bounds are invalid,
+    /// or when the fixture root is missing or is not a directory.
     pub fn new(config: EvalHarnessConfig) -> Result<Self, EvalError> {
         config.thresholds.validate()?;
         if config.max_concurrency == 0 {
@@ -242,6 +249,10 @@ impl EvalHarness {
     }
 
     /// Load one manifest and its validated fixture artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture cannot be found, parsed, or validated.
     pub fn load_fixture(
         &self,
         set: FixtureSet,
@@ -256,6 +267,11 @@ impl EvalHarness {
     }
 
     /// Run all fixtures in `set` and attach gate and optional artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture set cannot be enumerated, report
+    /// assembly fails, or configured trajectory artifacts cannot be written.
     pub async fn run_batch(&self, set: FixtureSet) -> Result<EvalReport, EvalError> {
         let entries = self.enumerate_fixture_entries(set).await?;
         let span = batch_span(set, entries.len());
@@ -298,6 +314,11 @@ impl EvalHarness {
     }
 
     /// Run holdout control and forced naive baseline, then compare and gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-holdout gate profile, fixture-set mismatch,
+    /// report assembly failure, or trajectory artifact write failure.
     pub async fn run_holdout_with_naive(&self) -> Result<EvalReport, EvalError> {
         if self.config.thresholds.set != FixtureSet::Holdout {
             return Err(EvalError::Manifest(
@@ -375,6 +396,11 @@ impl EvalHarness {
     }
 
     /// Write and rotate the configured trajectory artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report run id is invalid or artifact
+    /// directories and files cannot be safely created, written, or rotated.
     pub fn write_trajectory_artifacts(&self, report: &EvalReport) -> Result<(), EvalError> {
         write_trajectory_artifacts(
             report,
@@ -699,6 +725,8 @@ impl LoadedFixture {
             endpoint: parts.endpoint,
             script_entries: parts.script_entries,
             scripts: Some(provider),
+            #[cfg(test)]
+            panic_after_dispatch: false,
         })
     }
 }
@@ -1315,6 +1343,52 @@ pub(crate) mod tests {
         assert!(batch.non_error_toolchains.is_empty());
     }
 
+    #[tokio::test]
+    async fn enumeration_reports_invalid_fixture_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("train/Bad Name")).unwrap();
+        let harness = EvalHarness::new(EvalHarnessConfig::skeleton(dir.path())).unwrap();
+
+        let report = harness.run_batch(FixtureSet::Train).await.unwrap();
+
+        assert_eq!(report.fixtures.len(), 1);
+        let outcome = &report.fixtures[0];
+        assert_eq!(outcome.status, FixtureStatus::Error);
+        assert_eq!(outcome.model_calls, 0);
+        assert_eq!(outcome.error.as_ref().unwrap().kind, "invalid_fixture_id");
+        assert!(report.trajectories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn panic_drops_fixture_trajectory_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = EvalHarness::new(EvalHarnessConfig::skeleton(dir.path())).unwrap();
+        let mut fixture =
+            loaded_fixture_for_tests("panic-buffer", FixtureDriverKind::SkeletonReplay);
+        fixture.panic_after_dispatch = true;
+        let entry = LoadedEntry {
+            id: fixture.manifest.id.clone(),
+            toolchain: fixture.manifest.toolchain.clone(),
+            fixture,
+        };
+
+        let phase = harness
+            .run_loaded_entries(
+                FixtureSet::Train,
+                vec![entry],
+                BatchDriverMode::Manifest,
+                &harness.new_semaphore(),
+            )
+            .await;
+
+        assert_eq!(phase.outcomes.len(), 1);
+        let outcome = &phase.outcomes[0];
+        assert_eq!(outcome.status, FixtureStatus::Error);
+        assert_eq!(outcome.model_calls, 0);
+        assert_eq!(outcome.error.as_ref().unwrap().kind, "join_failed");
+        assert!(phase.trajectories.is_empty());
+    }
+
     /// Write a complete, loadable fixture tree under `root`.
     fn write_test_fixture(
         root: &Path,
@@ -1525,6 +1599,7 @@ output_tokens = 5
                 ScriptOutcome::from(turn_outcome),
             )],
             scripts: Some(provider),
+            panic_after_dispatch: false,
         }
     }
 

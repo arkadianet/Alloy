@@ -31,6 +31,10 @@ impl FixtureId {
     ///
     /// Valid ids are non-empty, at most 128 UTF-8 bytes, use only
     /// `[a-z0-9_.-]`, and are never `.` or `..`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvalError::Manifest`] when the id violates those constraints.
     pub fn new(s: impl Into<String>) -> Result<Self, EvalError> {
         let s = s.into();
         if s.is_empty()
@@ -1356,6 +1360,46 @@ output_tokens = 2
             assert!(
                 matches!(parse_manifest_toml(&manifest), Err(EvalError::Manifest(_))),
                 "{table} accepted an unknown key"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_types_expose_no_deserialize() {
+        fn assert_serialize<T: Serialize>(value: &T) {
+            serde_json::to_value(value).unwrap();
+        }
+
+        let manifest = parse_manifest_toml(&manifest_toml("serialize-only", FixtureSet::Train))
+            .expect("wire parser constructs validated manifest types");
+        assert_serialize(&manifest);
+        assert_serialize(&manifest.turns[0]);
+        assert_serialize(&manifest.turns[0].outcome);
+
+        // Rust has no stable negative trait bound. Guard the public derive
+        // surface directly so adding `Deserialize` to any validated manifest
+        // type fails this acceptance test.
+        let source = include_str!("manifest.rs");
+        for declaration in [
+            "pub struct FixtureManifest",
+            "pub struct ScriptTurn",
+            "pub enum ScriptTurnOutcome",
+        ] {
+            let prefix = source
+                .split_once(declaration)
+                .unwrap_or_else(|| panic!("missing declaration: {declaration}"))
+                .0;
+            let derive = prefix
+                .rsplit_once("#[derive(")
+                .unwrap_or_else(|| panic!("missing derive: {declaration}"))
+                .1
+                .lines()
+                .next()
+                .unwrap();
+            assert!(derive.contains("Serialize"), "{declaration}: {derive}");
+            assert!(
+                !derive.contains("Deserialize"),
+                "{declaration} must remain serialize-only: {derive}"
             );
         }
     }

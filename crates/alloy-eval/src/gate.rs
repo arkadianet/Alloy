@@ -53,6 +53,11 @@ impl GateThresholds {
     }
 
     /// Reject unusable thresholds before a run starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvalError::Manifest`] when a rate is non-finite or outside
+    /// its accepted range.
     pub fn validate(&self) -> Result<(), EvalError> {
         validate_thresholds(self).map_err(EvalError::Manifest)
     }
@@ -579,6 +584,59 @@ unknown = true
                 },
             ]
         );
+    }
+
+    #[test]
+    fn gate_invalid_measured_rates_fail() {
+        for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            let report = report(metrics(
+                MetricField::Measured(invalid),
+                MetricField::Measured(1.0),
+                MetricField::Measured(0.0),
+            ));
+            let result = evaluate_gate(&GateThresholds::skeleton_defaults(), &report);
+            assert!(!result.passed);
+            assert!(result.failures.iter().any(|failure| matches!(
+                failure,
+                GateFailure::InvalidMeasuredMetric { field, .. }
+                    if field == "compile_success_rate"
+            )));
+        }
+    }
+
+    #[test]
+    fn gate_rejects_fixture_set_mismatch() {
+        let mut report = report(metrics(
+            MetricField::Measured(1.0),
+            MetricField::Measured(1.0),
+            MetricField::Measured(0.0),
+        ));
+        report.fixtures.push(FixtureOutcome {
+            fixture_id: FixtureId::new("wrong-set").unwrap(),
+            set: FixtureSet::Holdout,
+            status: FixtureStatus::Pass,
+            criteria: vec![],
+            wall_ms: 0,
+            model_calls: 0,
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            retry_count: None,
+            human_interventions: None,
+            unsafe_introduced: None,
+            compile_clean: Some(true),
+            error: None,
+        });
+
+        let result = evaluate_gate(&GateThresholds::skeleton_defaults(), &report);
+
+        assert!(!result.passed);
+        assert!(result.failures.contains(&GateFailure::SetMismatch {
+            source: "control".to_owned(),
+            fixture_id: FixtureId::new("wrong-set").unwrap(),
+            expected: FixtureSet::Train,
+            actual: FixtureSet::Holdout,
+        }));
     }
 
     #[test]

@@ -46,8 +46,10 @@ pub struct RecordedDiagnostic {
 impl CargoJsonRecording {
     /// Load a recording JSON file and validate its format version and digest.
     ///
-    /// Failure: I/O errors are [`EvalError::Io`]; JSON, version, and digest
-    /// integrity failures are [`EvalError::RecordingInvalid`].
+    /// # Errors
+    ///
+    /// Returns [`EvalError::Io`] for read failures and
+    /// [`EvalError::RecordingInvalid`] for JSON, version, or digest failures.
     pub fn load(path: &Path) -> Result<Self, EvalError> {
         let bytes = std::fs::read(path)?;
         let recording: Self = serde_json::from_slice(&bytes)

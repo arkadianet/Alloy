@@ -120,7 +120,9 @@ pub struct ScriptedInvocation {
 impl ScriptedProvider {
     /// Empty provider bound to exactly one endpoint.
     ///
-    /// Failure: [`EvalError::Manifest`] when `endpoint.provider != id`.
+    /// # Errors
+    ///
+    /// Returns [`EvalError::Manifest`] when `endpoint.provider != id`.
     pub fn new(id: ProviderId, endpoint: ModelEndpoint) -> Result<Self, EvalError> {
         if endpoint.provider != id {
             return Err(EvalError::Manifest(
