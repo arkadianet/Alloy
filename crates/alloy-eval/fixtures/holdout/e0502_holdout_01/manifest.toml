@@ -1,0 +1,61 @@
+manifest_version = 1
+id = "e0502_holdout_01"
+set = "holdout"
+naive_target_path = "src/lib.rs"
+naive_patch_mode = "full_file_replace"
+success_criteria = ["compile_clean", "expected_diagnostics_cleared", "script_turns_consumed", "no_new_unsafe"]
+require_consume_all = true
+driver = "skeleton_replay"
+
+[license]
+class = "permitted"
+spdx = "Alloy-Original"
+source_note = "Alloy-original RFC-0016 E0502 holdout fixture by arkadianet."
+
+[toolchain]
+channel = "1.97.1"
+rustc_version = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+cargo_version = "cargo 1.97.1 (c980f4866 2026-06-30)"
+
+[workspace]
+path = "workspace"
+package = "e0502_holdout_01"
+
+[endpoint_prices]
+input_usd_per_mtok = 2.0
+output_usd_per_mtok = 4.0
+
+[[expected_diagnostics]]
+code = "E0502"
+message_contains = "cannot borrow"
+
+[cargo_recordings]
+pre_repair = "recordings/pre_repair.json"
+post_repair = "recordings/post_repair.json"
+recording_format_version = 1
+
+[[turns]]
+request_fingerprint = "e793da47f7869175a731283d679b8fb64175f154ccdc4258f80d403b31c1d0e6"
+
+[turns.turn_id]
+capability = "repair"
+ordinal = 0
+
+[turns.request]
+messages = [{ role = "user", content = "Repair workspace/src/lib.rs so it compiles cleanly. Return only the complete fixed Rust source file." }]
+tools = []
+
+[turns.outcome]
+type = "response"
+text = '''
+pub fn broken_total() -> i32 {
+    let mut total = 10;
+    let snapshot = total;
+    total += 5;
+    snapshot + total
+}
+'''
+
+[turns.outcome.usage]
+input_tokens = 37
+output_tokens = 35

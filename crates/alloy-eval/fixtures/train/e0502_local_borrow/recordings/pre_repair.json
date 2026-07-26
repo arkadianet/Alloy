@@ -1,0 +1,22 @@
+{
+  "recording_format_version": 1,
+  "toolchain": {
+    "channel": "1.97.1",
+    "rustc_version": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo_version": "cargo 1.97.1 (c980f4866 2026-06-30)"
+  },
+  "argv": [
+    "cargo",
+    "check",
+    "--message-format=json",
+    "-p",
+    "e0502_local_borrow"
+  ],
+  "exit_code": 101,
+  "stdout_lines": [
+    "{\"reason\":\"compiler-message\",\"message\":{\"code\":{\"code\":\"E0502\"},\"level\":\"error\",\"message\":\"cannot borrow `x` as immutable because it is also borrowed as mutable\"}}",
+    "{\"reason\":\"build-finished\",\"success\":false}"
+  ],
+  "stderr": "",
+  "content_digest": "e00d8fd312c9ad8be539eb3763ec1cabb57f69d2435b9a44fa2dda58bc88e374"
+}
