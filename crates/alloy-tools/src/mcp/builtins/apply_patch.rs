@@ -200,7 +200,7 @@ fn sanitize_msg(msg: &str) -> Option<String> {
     while !rest.is_empty() {
         if !prev_pathish && rest.starts_with('/') {
             out.push_str("<path>");
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let end = path_span_end(rest);
             rest = &rest[end..];
             prev_pathish = false;
             continue;
@@ -225,8 +225,22 @@ fn is_path_continuation(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')
 }
 
+/// End index of an absolute-path span starting at `s` (which begins with `/`
+/// or a drive path). Stops before whitespace and before message delimiters so
+/// closing quotes/parens are not swallowed into the redaction.
+fn path_span_end(s: &str) -> usize {
+    s.char_indices()
+        .find(|&(_, ch)| ch.is_whitespace() || is_path_terminator(ch))
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
+fn is_path_terminator(ch: char) -> bool {
+    matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | ';' | '<' | '>')
+}
+
 /// If `s` begins with a Windows drive path (`X:\` or `X:/`), return the
-/// remainder after the non-whitespace path span.
+/// remainder after the path span.
 fn strip_drive_path_prefix(s: &str) -> Option<&str> {
     let mut chars = s.chars();
     let drive = chars.next()?;
@@ -240,8 +254,7 @@ fn strip_drive_path_prefix(s: &str) -> Option<&str> {
         Some('\\' | '/') => {}
         _ => return None,
     }
-    let end = s.find(char::is_whitespace).unwrap_or(s.len());
-    Some(&s[end..])
+    Some(&s[path_span_end(s)..])
 }
 
 #[cfg(test)]
