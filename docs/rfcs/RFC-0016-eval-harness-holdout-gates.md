@@ -73,6 +73,10 @@ RFC-0001 created the five-crate workspace including `alloy-eval` as an empty stu
 7. Cost fields MAY be computed internally as uncalibrated operator-price-table estimates. Reports MUST carry `CostClaimGrade::UncalibratedInternal` and MUST NOT emit marketing-grade cost claims (§3.8 / §9.3).
 8. CI MUST run `cargo test -p alloy-eval` with no `ALLOY_API_KEY` and with `alloy-runtime` consumed at `default-features = false` (§10).
 9. Alloy MUST NEVER write `.env`.
+10. The harness MUST retain one eval-local trajectory record for every
+    attempted `ModelProvider::complete` call, grouped per fixture and turn,
+    alongside aggregate metrics (§3.16). Trajectory retention is Day-1
+    behaviour, not part of the `ControlPlane` Stub.
 
 ---
 
@@ -107,6 +111,18 @@ Authoritative for: `CostMeter`, `SharedCostMeter`, `CostSnapshot`, `ModelCallRec
 
 Eval MAY construct a process-local `CostMeter` when aggregating scripted usage for internal `cost_usd_p50`. Eval MUST honour `CostSnapshot.usd_spent: Option<f64>` semantics: `None` is not measured zero. Eval MUST NOT publish calibrated marketing bands from uncalibrated meter data (RFC-0004 related note; ADR F-08).
 
+The shipped `router/meter_bridge.rs` and `router/decision_bridge.rs` construct
+`ModelCallRecord` / `DecisionRecord` only inside the `TomlModelRouter` routed
+path. Day-1 `SkeletonReplay` and `NaiveBaseline` instead call
+`ScriptedProvider::complete` directly through `ModelProvider`; they bypass
+both bridges and therefore emit **zero** `ModelCallRecord`s through the
+RFC-0004 `DecisionLog`.
+
+Eval MUST consequently synthesize the eval-local records in §3.16 itself.
+They are analysis inputs parallel to aggregates, not a second `DecisionLog`,
+not RFC-0002 session events, and not a prompt/response corpus. Their redaction
+posture MUST match `RetentionPolicy::defaults()`: metadata plus hashes only.
+
 ### 2.4 Relationship to RFC-0007
 
 Authoritative for: `ModelProvider`, `ModelRouter`, `CompletionRequest`, `ModelResponse`, `Usage`, `ModelEndpoint`, `PromptPack`, `ChatMessage`, `Health`, `ProviderError`, `RouterError`, `RecordingModelProvider`, `TomlModelRouter::from_parts`, price table → USD via operator prices, `http-provider` feature gate.
@@ -122,7 +138,7 @@ This RFC **exercises that MAY as MUST** for the eval harness (keyed mode is requ
 | Category | Contents |
 | --- | --- |
 | **Already implemented** | `ModelProvider` / `ModelRouter`; `RecordingModelProvider` (FIFO); router types; `CostMeter` / `CostSnapshot`; `Digest` / `hash_prompt`; `DiagnosticEvent`; MCP `cargo_check` with `--message-format=json` (RFC-0006); sandbox broker (RFC-0005); empty `alloy-eval` stub; toolchain pin `1.97.1` |
-| **Added by RFC-0016** | `ScriptedProvider`; TOML fixture manifest schema + set-aware loader; recorded cargo JSON types + replay; `EvalMetrics` / `MetricField` / serializable report envelope; batch runner; pure gate function + naive baseline types; holdout directory discipline + CI lint; offline-by-construction harness; ≥1 train + ≥1 holdout golden fixture; crate deps with `default-features = false` on `alloy-runtime` |
+| **Added by RFC-0016** | `ScriptedProvider`; TOML fixture manifest schema + set-aware loader; recorded cargo JSON types + replay; `EvalMetrics` / `MetricField` / serializable report envelope; eval-local trajectory types + optional bounded JSONL artifacts; batch runner; pure gate function + naive baseline types; holdout directory discipline + CI lint; offline-by-construction harness; ≥1 train + ≥1 holdout golden fixture; crate deps with `default-features = false` on `alloy-runtime` |
 | **Deferred / Stub** | Full control-plane fixture driver through scheduler/CLI (0008–0015); any live-provider eval API; calibrated cost grade emission; public leaderboard; lifetime-heavy fixtures; Alloy-on-Alloy dogfood |
 
 ### 2.6 Dependency boundaries
@@ -172,8 +188,8 @@ NOT appear in `alloy-eval` imports.
 | `CompletionRequest`, `ModelResponse`, `Usage` | `alloy_runtime::{CompletionRequest, ModelResponse, Usage}` | Script I/O |
 | `ModelEndpoint`, `Health`, `PromptPack`, `ChatMessage`, `ChatRole`, `ToolChoice`, `ResponseFormat` | `alloy_runtime::{...}` | Unchanged; also reachable as `alloy_runtime::router::{...}` |
 | `ProviderId`, `CapabilityId`, `NodeId`, `EndpointId`, `Digest` | `alloy_runtime::{ProviderId, CapabilityId, NodeId, EndpointId, Digest}` | Fingerprints / attribution |
-| `ProviderError`, `RouterError` | `alloy_runtime::{ProviderError, RouterError}` | Scripted error outcomes |
-| `CostMeter`, `CostSnapshot`, `ModelCallRecord` | `alloy_runtime::{CostMeter, CostSnapshot, ModelCallRecord}` | Internal cost aggregation |
+| `ProviderError`, `RouterError`, `classify_provider_error` | `alloy_runtime::{ProviderError, RouterError, classify_provider_error}` | Scripted error outcomes and trajectory classification |
+| `CostMeter`, `CostSnapshot`, `ModelCallRecord`, `ModelUsdSource`, `RetentionPolicy` | `alloy_runtime::{CostMeter, CostSnapshot, ModelCallRecord, ModelUsdSource, RetentionPolicy}` | Internal cost aggregation and RFC-0004-shaped trajectory metadata |
 | `ModelTier` | `alloy_runtime::ModelTier` | Optional attribution in reports |
 | `DiagnosticEvent`, `ErrorClass` | `alloy_runtime::{DiagnosticEvent, ErrorClass}` | Outcome classification helpers |
 | `hash_prompt`, `Digest::sha256` | `alloy_runtime::hash_prompt`, `alloy_runtime::Digest` | Fingerprint construction |
@@ -647,9 +663,14 @@ pub struct EvalReport {
     pub toolchain: ToolchainRecord,
     /// Control or sole-run fixture outcomes.
     pub fixtures: Vec<FixtureOutcome>,
+    /// Control or sole-run per-complete trajectory records.
+    pub trajectories: Vec<EvalTrajectoryRecord>,
     /// Naive outcomes when `run_holdout_with_naive` was used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub naive_fixtures: Option<Vec<FixtureOutcome>>,
+    /// Naive per-complete records when comparison execution was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub naive_trajectories: Option<Vec<EvalTrajectoryRecord>>,
     pub metrics: EvalMetrics,
     /// Cost claim for the **control** (or sole) run. During
     /// `run_holdout_with_naive`, this envelope is derived from `fixtures` /
@@ -1433,6 +1454,10 @@ pub struct EvalHarnessConfig {
     pub max_concurrency: usize, // MUST be in 1..=1024; default 4
     pub pin_toolchain_channel: String, // default "1.97.1"
     pub cancel: Option<tokio_util::sync::CancellationToken>,
+    /// None keeps trajectories in the report only.
+    pub artifact_dir: Option<PathBuf>,
+    /// Maximum immediate child run directories retained on disk; default 32.
+    pub max_retained_runs: u32,
 }
 
 impl EvalHarnessConfig {
@@ -1467,6 +1492,14 @@ impl EvalHarness {
 
     /// Run control batch + naive batch on holdout and compare (§5.8).
     pub async fn run_holdout_with_naive(&self) -> Result<EvalReport, EvalError>;
+
+    /// Write and rotate the configured trajectory artifact (§7.7).
+    ///
+    /// This is a no-op when `artifact_dir` is `None`.
+    pub fn write_trajectory_artifacts(
+        &self,
+        report: &EvalReport,
+    ) -> Result<(), EvalError>;
 }
 
 pub struct LoadedFixture {
@@ -1495,10 +1528,11 @@ impl LoadedFixture {
 
 `EvalHarnessConfig` MUST NOT implement `Default` because `fixture_root` is
 required. Both constructors set `max_concurrency = 4`,
-`pin_toolchain_channel = "1.97.1"`, and `cancel = None`; they differ only in
-their threshold constructors. Numeric defaults therefore live in explicit
-root-taking constructors. `EvalHarness::new` MUST reject
-`max_concurrency == 0`, an empty pin, or invalid thresholds with
+`pin_toolchain_channel = "1.97.1"`, `cancel = None`, `artifact_dir = None`,
+and `max_retained_runs = 32`; they differ only in their threshold
+constructors. Numeric defaults therefore live in explicit root-taking
+constructors. `EvalHarness::new` MUST reject `max_concurrency == 0`,
+`max_retained_runs == 0`, an empty pin, or invalid thresholds with
 `EvalError::Manifest`.
 
 **Concurrency bound (normative):** `EvalHarness::new` MUST also reject
@@ -1540,11 +1574,15 @@ it MUST NOT panic, reinstall, or reuse consumed queues.
 to `gate::evaluate_gate(&self.config.thresholds, report)`.
 
 `run_batch` MUST first assemble the complete report with `gate = None`, then
-set `gate = Some(evaluate_gate(&config.thresholds, &report_without_gate))`
-before returning `Ok`, including for empty and all-Error batches.
-`run_holdout_with_naive` MUST do the same after attaching both fixture vectors
-and `naive_comparison`; it also always returns `gate = Some(...)` on a
-successfully assembled report.
+set `gate = Some(evaluate_gate(&config.thresholds, &report_without_gate))`,
+including for empty and all-Error batches. `run_holdout_with_naive` MUST do
+the same after attaching both fixture and trajectory vectors plus
+`naive_comparison`; it also always attaches `gate = Some(...)` to a
+successfully assembled report. After complete assembly, each method MUST call
+`write_trajectory_artifacts` when `artifact_dir` is `Some`. The method returns
+`Ok(report)` only after that write and rotation succeed; an artifact I/O
+failure returns `Err(EvalError::Io(...))` and does not silently return an
+unpersisted report (§7.7 / §8.5).
 
 **Async boundary:** All `run_*` methods are `async` and MUST be `.await`ed on a Tokio runtime. Fingerprint / load / gate evaluation MAY be sync. `ScriptedProvider::complete` is async to match `ModelProvider` but MUST NOT perform I/O.
 
@@ -1599,7 +1637,8 @@ list is:
 - recording: `CargoJsonRecording` and `RecordedDiagnostic`;
 - outcomes/reporting: `FixtureStatus`, `FixtureOutcome`, `CriterionResult`,
   `ReportError`, `EvalMetrics`, `MetricField`, `UnmeasuredReason`,
-  `EvalReport`, `CostClaimGrade`, and `CostClaimEnvelope`;
+  `EvalTrajectoryRecord`, `EvalReport`, `CostClaimGrade`, and
+  `CostClaimEnvelope`;
 - harness/gate/error: `LoadedFixture`, `EvalHarness`, `EvalHarnessConfig`,
   `GateThresholds`, `GateResult`, `GateFailure`, `NaiveComparisonResult`,
   `EvalError`, and the function `evaluate_gate`;
@@ -1622,6 +1661,111 @@ types MUST NOT be re-exported.
 | `gate::evaluate_gate` | `pub` pure function | no stateful evaluator type |
 | Internal modules (`driver`, `aggregate`, …) | `pub(crate)` | — |
 
+### 3.16 Trajectory retention
+
+Day-1 scripted execution does not pass through `TomlModelRouter`, so it MUST
+create this eval-local record after every attempted `complete`, including an
+`Err`. This type intentionally resembles the analysis fields of an RFC-0004
+`ModelCallRecord`, but it is report data and MUST NOT be appended to a
+`DecisionLog` or the RFC-0002 SQLite session event log.
+
+```rust
+/// One retained decision tuple for later offline grouping. No prompt/response bodies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvalTrajectoryRecord {
+    pub fixture_id: FixtureId,
+    pub set: FixtureSet,
+    pub turn_id: FixtureTurnId,
+    pub request_fingerprint: RequestFingerprint,
+    /// Same digest as fingerprint; retained for RFC-0004-shaped analysis joins.
+    pub request_content_hash: Digest,
+    pub endpoint_id: EndpointId,
+    pub provider_id: ProviderId,
+    /// Always `ModelTier::Standard` for the Day-1 scripted path.
+    pub model_tier: ModelTier,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    /// Uncalibrated operator-price estimate; analysis only.
+    pub usd: Option<f64>,
+    /// `OperatorPriceTable` exactly when `usd` is `Some`; otherwise `None`.
+    pub usd_source: Option<ModelUsdSource>,
+    /// Observed wall time for this complete attempt.
+    pub duration_ms: Option<u64>,
+    /// Always `None` in the Day-1 scripted path.
+    pub confidence: Option<f32>,
+    /// Classified provider error, or cancellation after dispatch; `None` on `Ok`.
+    pub error_class: Option<ErrorClass>,
+    pub complete_ok: bool,
+    /// Fixture final status, stamped before the record enters a report.
+    pub fixture_status: FixtureStatus,
+    /// Fixture final compile observation, stamped before report assembly.
+    pub compile_clean: Option<bool>,
+}
+
+impl EvalReport {
+    /// Group retained control trajectories by an exact key extractor.
+    pub fn group_trajectories_by<K, F>(
+        &self,
+        key: F,
+    ) -> BTreeMap<K, Vec<&EvalTrajectoryRecord>>
+    where
+        K: Ord,
+        F: Fn(&EvalTrajectoryRecord) -> K;
+}
+```
+
+The fixture-local pending representation MAY defer `fixture_status` and
+`compile_clean`, but every public record MUST carry the terminal fixture
+values. `request_content_hash` MUST equal
+`request_fingerprint.as_digest().clone()` — the SHA-256 of the exact canonical
+`CompletionRequest` JSON from §3.3 — and MUST NOT be recomputed from a
+different message-only encoding. `duration_ms` MUST contain the observed
+elapsed wall time for the attempt (saturating at `u64::MAX` when converting
+from a wider duration).
+
+Eval-local ownership is mandatory because Day-1 offline CI MUST NOT require
+session/storage bring-up, synthetic eval sessions must not pollute production
+event stores, and report embedding plus optional JSONL provides re-readable
+grouping without either dependency.
+
+The retention posture is the RFC-0004 `RetentionPolicy::defaults()` posture:
+
+- `EvalTrajectoryRecord` MUST NOT have a `prompt_body` field. Prompt and
+  request bodies MUST NOT appear under another field name.
+- Response text and structured response bodies MUST NOT be retained. On
+  success, only status, usage, duration, and a finite derived USD value are
+  eligible.
+- On provider `Err`, token and USD fields are `None`, `complete_ok = false`,
+  and `error_class = Some(classify_provider_error(&error).class)`. On `Ok`,
+  `complete_ok = true` and `error_class = None`. If cancellation wins after
+  dispatch but before a result, the attempted call is retained with
+  `complete_ok = false`, unknown token/USD fields, and
+  `error_class = Some(ErrorClass::Cancelled)`.
+- `usd_source` MUST be `Some(ModelUsdSource::OperatorPriceTable)` exactly when
+  `usd` is `Some`, otherwise `None`. Trajectory USD is uncalibrated analysis
+  input and MUST NOT be published as a claim; ADR F-08 and §3.8 still apply.
+- Day-1 MUST set `model_tier = ModelTier::Standard` and `confidence = None`.
+  It MUST NOT infer routing policy from endpoint tier lists.
+
+`EvalReport.trajectories` and `naive_trajectories` are intentionally unbounded
+relative to the current batch. This is acceptable for the MVP corpus of
+dozens of fixtures with a few turns each; no record from the current batch may
+be dropped while computing aggregates. Optional cross-run disk retention is
+bounded separately by §7.7.
+
+`group_trajectories_by` groups only `self.trajectories` (the control or sole
+run), uses exact `Ord` keys returned by the caller, and preserves report order
+inside each group. Callers group the optional naive vector directly when
+needed; this RFC adds no second grouping abstraction.
+
+When M7 later drives model calls through `TomlModelRouter::from_parts`, its
+router-emitted `ModelCallRecord`s MAY be mapped into this same eval-local type.
+That mapping is deferred and is not part of Day-1.
+
+**Non-goals:** Trajectories MUST NOT introduce learned or scored routing (ADR
+F-20), multi-implementation scoring, holdout-based prompt/policy tuning (R15),
+or any feedback that changes harness behaviour.
+
 ---
 
 ## 4. Internal Module Design
@@ -1640,6 +1784,7 @@ crates/alloy-eval/
     recording.rs        # CargoJsonRecording load/validate/diagnostics
     metrics.rs          # EvalMetrics, MetricField, aggregator
     cost_claim.rs       # CostClaimEnvelope rules
+    trajectory.rs       # eval-local trajectory records + JSONL retention
     gate.rs             # GateThresholds, evaluate, naive compare
     driver/
       mod.rs
@@ -1707,6 +1852,7 @@ re-exported (§3.14).
 | `recording` | Cargo JSON durability + diagnostic extract |
 | `metrics` | Aggregation; percentile; unmeasured rules |
 | `cost_claim` | ADR F-08 emission guard |
+| `trajectory` | Redacted eval-local record construction, grouping data, JSONL write + rotation |
 | `gate` | Thresholds + naive comparison |
 | `driver::*` | Per-kind execution |
 | `report` | `EvalReport` assembly, toolchain record, CI summary rendering |
@@ -1724,11 +1870,12 @@ recording    → error
 manifest     → fingerprint, license, recording, error
 metrics      → error
 cost_claim   → metrics, error
-report       → metrics, cost_claim, manifest, recording, error
+trajectory   → fingerprint, manifest, error
+report       → metrics, cost_claim, trajectory, manifest, recording, error
              → gate (TYPES ONLY: Option<GateResult>, Option<NaiveComparisonResult>)
 gate         → metrics, report, error
-driver::*    → scripted, recording, manifest, metrics, error
-harness      → manifest, driver::*, metrics, cost_claim, report, gate, error
+driver::*    → scripted, recording, manifest, metrics, trajectory, error
+harness      → manifest, driver::*, metrics, cost_claim, trajectory, report, gate, error
 
 driver   ↛ gate      (drivers never evaluate thresholds)
 driver   ↛ harness   (no upward call)
@@ -2017,7 +2164,9 @@ normally and receive their own results.
    patch oracle MUST NOT run and execution continues through the missing
    repair text and criterion paths.
 3. The driver MUST call `provider.complete(&bound_endpoint, request).await`.
-   The exact bound endpoint id is mandatory.
+   The exact bound endpoint id is mandatory. It MUST start an observational
+   timer immediately before dispatch and append one fixture-local
+   `EvalTrajectoryRecord` after the attempt resolves, including `Err`.
 4. Every `ProviderError` returned by `complete` is that turn’s `Err`; it MUST
    not be silently converted into an empty response.
 5. A `ProviderError::Internal` whose message (before §5.2.3 bounding of any
@@ -2067,6 +2216,15 @@ text MUST NOT panic or be classified as a harness `Error`.
 provider error before repair, missing repair text, wrong repair text, patch
 mismatch, or criterion miss is `Fail`. All criteria passing without a harness
 fault is `Pass`.
+
+Every invocation counted by `FixtureOutcome.model_calls` MUST have exactly one
+fixture-local trajectory row; a pre-call request mismatch has neither. A
+cancellation that wins after dispatch is still an attempted invocation and
+MUST retain the cancelled row described in §3.16. The driver buffers these
+rows until the fixture reaches `Pass | Fail | Error`, then stamps that final
+`fixture_status` and `compile_clean` onto every row for the fixture. Response
+text MUST be discarded after the existing repair candidate logic consumes it;
+it MUST NOT enter the trajectory buffer.
 
 ### 5.4 Recorded diagnostic replay
 
@@ -2366,6 +2524,13 @@ details. Criteria are finalized only by the selected driver, and every
 non-Error outcome contains exactly the manifest-listed criteria in manifest
 order.
 
+Aggregation MUST also concatenate, not discard, the finalized fixture-local
+trajectory buffers. `EvalReport.trajectories` is sorted by `fixture_id` and
+then `turn_id.ordinal`; ties preserve validated manifest order.
+`run_holdout_with_naive` applies the same rule independently to
+`naive_trajectories`. Aggregate metric computation MUST NOT consume, filter,
+or mutate either trajectory vector.
+
 #### 5.7.1 Observational fields and deterministic equality
 
 `FixtureOutcome.wall_ms` is wall-clock observational data. Measured
@@ -2376,6 +2541,7 @@ The normative determinism comparison MUST deep-clone reports and scrub:
 
 - `run_id`;
 - every control and naive fixture’s `wall_ms`;
+- every control and naive trajectory’s `duration_ms`;
 - `metrics.latency_p50_ms` and `metrics.latency_p95_ms`;
 - the same two fields inside both sides of `naive_comparison`.
 
@@ -2415,15 +2581,19 @@ sequenceDiagram
 4. Construct a fresh endpoint-bound provider for naive execution and install
    only that selected turn’s one `ScriptTurnOutcome`. Do not install other
    turns, even if they share its request fingerprint.
-5. Call complete exactly once. Apply full-file byte equality, compile, unsafe,
-   expected-diagnostic, and installed-key consumption algorithms from §5.5.
-6. Produce a sorted control outcome vector and sorted naive outcome vector.
+5. Call complete exactly once and retain its naive trajectory under §3.16.
+   Apply full-file byte equality, compile, unsafe, expected-diagnostic, and
+   installed-key consumption algorithms from §5.5.
+6. Produce sorted control and naive outcome vectors plus independently sorted
+   control and naive trajectory vectors.
    Their fixture-id sets MUST be identical. Any missing, extra, or duplicate id
    on either side is a batch-level
    `Err(EvalError::Internal("control/naive fixture id mismatch".into()))`;
    a partial comparison report MUST NOT be emitted.
-7. Store control outcomes in `EvalReport.fixtures` and naive outcomes in
-   `EvalReport.naive_fixtures = Some(...)`.
+7. Store control outcomes and trajectories in `EvalReport.fixtures` and
+   `EvalReport.trajectories`; store naive outcomes and trajectories in
+   `EvalReport.naive_fixtures = Some(...)` and
+   `EvalReport.naive_trajectories = Some(...)`.
 8. Aggregate control and naive metrics separately. Store both in
    `NaiveComparisonResult`, setting `EvalReport.metrics` to the control
    aggregate and `NaiveComparisonResult.control` to its exact clone (never a
@@ -2434,8 +2604,9 @@ sequenceDiagram
    thresholds, checks both outcome vectors for errors, and applies the
    comparison when `require_beat_naive`.
 
-An ordinary `run_batch` report MUST set `naive_fixtures = None` and
-`naive_comparison = None`. `run_holdout_with_naive` MUST set both to `Some`.
+An ordinary `run_batch` report MUST set `naive_fixtures = None`,
+`naive_trajectories = None`, and `naive_comparison = None`.
+`run_holdout_with_naive` MUST set all three to `Some`.
 
 **Threshold-set precondition (error pinned):** before enumerating anything,
 `run_holdout_with_naive` MUST check `self.config.thresholds.set`. If it is not
@@ -2470,7 +2641,7 @@ It MUST NOT silently skip.
 | Isolation | One mutable, one-shot `LoadedFixture` + one `ScriptedProvider` + one outcome per task |
 | Concurrency | `tokio::spawn` up to `max_concurrency` via a semaphore |
 | Shared state | Harness config is read-only/`Clone`; no shared provider across fixtures |
-| Ordering | Report `fixtures` sorted by `fixture_id.as_str()` ascending for determinism |
+| Ordering | Report `fixtures` sorted by `fixture_id.as_str()`; trajectories sorted by fixture id then turn ordinal (§5.7) |
 | Cancellation | If config has a token, `tokio::select!` observes it at every checkpoint below. A cancelled fixture is `Error` with `ReportError { kind: "cancelled", message: "fixture cancelled" }`, never Fail. |
 | Join/panic | Every `JoinError`, including a task panic, becomes that fixture’s `Error` with `ReportError.kind == "join_failed"` and a bounded message. Batch siblings continue. |
 | Empty set | Successful enumeration with zero fixtures returns `Ok(EvalReport)` with empty vectors, report toolchain versions `"none"`, rate metrics `Unmeasured(EmptySample)`, and `gate = Some(failed result)`. |
@@ -2675,6 +2846,45 @@ If `toolchain.channel != pin`, `validate_against_pin` returns
 `RecordingStale`. Offline CI MUST fail the fixture as `Error`, not skip.
 Generating new recordings is outside the harness execution path (§12.2).
 
+### 7.7 Trajectory artifact configuration and rotation
+
+`EvalHarnessConfig.artifact_dir` controls only the optional trajectory JSONL
+artifact. `None` means report-only retention and performs no disk write;
+`skeleton` and `milestone_holdout` both use this CI-safe default. Callers that
+want artifacts set an explicit `PathBuf` (the conventional sibling location
+may be `fixture_root.join("../eval_artifacts")`, but it is never selected
+implicitly).
+
+When configured, the layout is:
+
+```text
+<artifact_dir>/<run_id>/trajectories.jsonl
+```
+
+`<run_id>` is the report's internally generated UUID v4 string. The JSONL file
+contains `report.trajectories` in report order, one serialized
+`EvalTrajectoryRecord` JSON object per line. Comparison-run
+`naive_trajectories` remain separately embedded in `EvalReport`; the single
+artifact file does not flatten the two sides and thereby lose side identity.
+No prompt or response body may appear in the file.
+
+`max_retained_runs` is a `u32`, defaults to `32`, and MUST be at least `1`
+even when `artifact_dir` is `None`. After successfully writing the current
+run, the writer MUST inspect immediate sibling run directories under
+`artifact_dir` and delete the oldest by directory modification time until no
+more than `max_retained_runs` remain. Modification-time ties MUST break by
+directory name for deterministic deletion. It MUST never delete the
+just-written run and MUST NOT count or delete non-directory entries.
+
+`write_trajectory_artifacts` exposes this same write-and-rotate step for
+testability and is a no-op under report-only configuration. `run_batch` and
+`run_holdout_with_naive` MUST invoke it after report assembly whenever
+`artifact_dir` is `Some`. Directory creation, write, enumeration, metadata, or
+rotation deletion failure is `EvalError::Io`; persistence MUST NOT be silently
+skipped. Day-1 does not open SQLite, start a session store, or require
+RFC-0002 storage bring-up: offline CI needs no storage service, and synthetic
+eval sessions must not pollute production event stores.
+
 ---
 
 ## 8. Error Handling
@@ -2689,7 +2899,7 @@ Generating new recordings is outside the harness execution path (§12.2).
 | `RecordingInvalid` | recording | Bad NDJSON/digest | no | pub | fixture `Error` |
 | `NetworkRequired` | harness | Offline violation | no | pub | fixture/batch `Error` |
 | `FixtureNotFound` | harness | Missing `<set>/<id>` directory or its `manifest.toml` | no | pub | `load_fixture` / batch `Err` |
-| `Io` | fs | OS I/O | no | pub | `Error` |
+| `Io` | fs / trajectory artifact writer | OS I/O | no | pub | fixture `Error` or batch `Err` |
 | `Json` | serde | Parse | no | pub | `Error` |
 | `Stub` | control_plane driver | Deferred surface invoked | no | pub | fixture `Error` |
 | `Internal` | miscellaneous | Invariant | no | pub | `Error` |
@@ -2774,6 +2984,12 @@ Eval does **not** invent retries. Retry loops are RFC-0010’s concern and appea
 only in full-gate control-plane runs when that stack exists. Day-1 fixtures MAY
 declare repeated identical requests so tests can prove per-fingerprint FIFO
 semantics. Fail closed, record the outcome, and continue batch siblings.
+
+Trajectory retention does not change fixture recovery or gate semantics. If
+`artifact_dir` is configured, artifact write or rotation failure occurs after
+report assembly and makes `run_batch` / `run_holdout_with_naive` return
+`Err(EvalError::Io(...))`; the assembled in-memory report is not returned.
+With `artifact_dir = None`, no persistence I/O is attempted.
 
 ---
 
@@ -3010,7 +3226,7 @@ non-hex input specifically with `EvalError::Manifest`.
 
 | Test | Asserts |
 | --- | --- |
-| `report_serde_round_trip` | Full report with `ReportError`, naive fixtures, metrics, gate, and cost envelope round-trips and is equal |
+| `report_serde_round_trip` | Full report with `ReportError`, both trajectory vectors, naive fixtures, metrics, gate, and cost envelope round-trips and is equal |
 | `report_error_io_mapping` | Io maps to kind `"io"` and inner `io::Error::to_string()` |
 | `report_ci_summary_exact` | Exact eight lines, six-place rates, Display delegation, no trailing newline or numeric USD |
 | `public_reexports_complete` | Every item listed in §3.14, including constants and function, compiles from crate root |
@@ -3032,6 +3248,10 @@ non-hex input specifically with `EvalError::Manifest`.
 | `determinism_same_input_same_output` | Two serial runs equal after full §5.7.1 scrub |
 | `determinism_concurrent_batch` | Eight concurrent iterations equal after full scrub |
 | `wall_latency_remain_observational` | Unscrubbed wall/latency may differ and are still populated for operators |
+| `trajectories_survive_batch_and_group` | Golden batch retains one control row per attempted model call; `group_trajectories_by` works for fixture id and model tier; row count matches the sum of `model_calls` |
+| `trajectories_omit_prompt_and_response_bodies` | Serialized trajectories contain no `prompt_body` or response-body key and no sentinel prompt/response text; the struct exposes no `prompt_body` field |
+| `trajectory_disk_rotation` | With `artifact_dir = Some(tempdir)` and `max_retained_runs = 2`, a third successful run deletes the oldest sibling by mtime, retains the new run, and writes valid one-row-per-line JSONL |
+| `trajectory_duration_is_scrubbed` | Full determinism scrub clears `duration_ms` in both control and naive trajectory vectors |
 
 ### 11.5 Gate and naive comparison
 
@@ -3069,8 +3289,8 @@ non-hex input specifically with `EvalError::Manifest`.
 | `cancel_before_batch_marks_all` | Every enumerated fixture Error kind cancelled; no model calls |
 | `cancel_during_batch_marks_pending` | Pending work cancelled; completed work retained per select order |
 | `join_failure_is_reported` | Task panic/join error becomes fixture Error kind join_failed |
-| `config_requires_root_constructor` | No Default impl; skeleton/milestone constructors set numeric defaults |
-| `config_validation_is_complete` | `new` rejects zero concurrency, invalid thresholds, empty pin, non-directory root, and propagates root metadata I/O |
+| `config_requires_root_constructor` | No Default impl; skeleton/milestone constructors set `artifact_dir = None`, `max_retained_runs = 32`, and the other numeric defaults |
+| `config_validation_is_complete` | `new` rejects zero concurrency, zero retained runs, invalid thresholds, empty pin, non-directory root, and propagates root metadata I/O |
 | `config_rejects_excess_concurrency` | `max_concurrency = EVAL_MAX_CONCURRENCY` constructs; `EVAL_MAX_CONCURRENCY + 1` and `usize::MAX` return `EvalError::Manifest` and no harness is built or silently clamped |
 | `run_holdout_with_naive_requires_holdout_thresholds` | A `Train` threshold set returns the exact `EvalError::Manifest` message before any enumeration, load, or model call, and produces no partial report |
 | `loaded_fixture_is_one_shot` | Immutable getters expose validated data; second mutable run returns `fixture_already_run` Error |
@@ -3105,6 +3325,7 @@ CI script fails when diff intersects holdout fixtures and prompt/template paths 
 - TOML-only manifest schema + set-qualified loader + train/holdout goldens
 - Recorded cargo JSON replay
 - `EvalMetrics` + unmeasured semantics + cost claim envelope
+- Per-attempt eval-local trajectories in reports + optional bounded JSONL
 - Batch runner + determinism
 - Single pure gate function + naive comparison accounting
 - Offline-by-construction CI + exact license checks + holdout hygiene lint
@@ -3221,6 +3442,11 @@ Every criterion is independently testable.
 | 77 | The §4.3 dependency graph covers `report`, `license`, `error`, and `fingerprint`; the `gate` ↔ `report` type reference is documented as allowed with no runtime cycle | §4.3 review; module-graph review |
 | 78 | Dogfood unlock additionally requires every control fixture in the green holdout run to use `FixtureDriverKind::ControlPlane`; Day-1 cannot satisfy it because the Stub `Error` fires `FixtureErrorsPresent` | Appendix B; §5.9 Stub test |
 | 79 | The Day-1 naive comparison is documented as gate-arithmetic verification only and is not citable as thesis evidence | §12.1 review |
+| 80 | Direct scripted execution is documented as bypassing the router meter/decision bridges and therefore producing no automatic `DecisionLog` model-call records | §2.3 review; source-path review |
+| 81 | Every attempted Day-1 complete, including provider Err and post-dispatch cancellation, survives as one finalized eval-local trajectory; control and naive vectors remain separate and groupable | `trajectories_survive_batch_and_group`; cancellation tests |
+| 82 | Trajectory report and JSONL serialization retain only metadata, request digest, and outcome measurements; prompt and response bodies are structurally absent | `trajectories_omit_prompt_and_response_bodies`; public API review |
+| 83 | `artifact_dir = None` is report-only; configured artifact failures return `EvalError::Io`; successful writes retain at most `max_retained_runs >= 1` by mtime without deleting the current run | `trajectory_disk_rotation`; config validation tests |
+| 84 | Trajectory durations are observational and both control and naive values are included in the normative determinism scrub | `trajectory_duration_is_scrubbed`; determinism tests |
 
 ---
 
