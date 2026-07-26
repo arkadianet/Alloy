@@ -6,7 +6,7 @@
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0005](./RFC-0005-sandbox-broker.md) (merged) |
-| **Effort** | 6–9 person-days |
+| **Effort** | 8–9.5 person-days |
 | **Related RFCs** | [0004](./RFC-0004-observability-cost-metering.md) optional `DecisionLog` injection · [0008](./RFC-0008-edit-engine.md) real `PatchApplyBackend` · [0010](./RFC-0010-scheduler-runtime-adapters.md) consumes `ToolError` / `cargo_check` · [0013](./RFC-0013-capability-registry-workers.md) `ToolHandle` / selectors · [0015](./RFC-0015-cli-profiles-config.md) profile UX |
 | **Product** | Alloy — AI Engineering Runtime |
 | **Supersedes** | Draft outline of this filename (expanded to implementation grade) |
@@ -298,13 +298,13 @@ impl ToolView {
 }
 
 /// Successful or tool-level-failed invocation payload.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct ToolResult {
     pub name: ToolName,
     pub call_id: Option<String>,
     pub content: Value,
-    /// MUST equal `error.is_some()`.
+    /// MUST equal `error.is_some()` — enforced by constructors and `Deserialize`.
     pub is_error: bool,
     pub error: Option<ToolError>,
     pub duration_ms: u64,
@@ -321,6 +321,37 @@ impl ToolResult {
     pub fn with_call_id(mut self, id: Option<String>) -> Self {
         self.call_id = id;
         self
+    }
+}
+
+#[derive(Deserialize)]
+struct ToolResultDe {
+    name: ToolName,
+    #[serde(default)]
+    call_id: Option<String>,
+    content: Value,
+    is_error: bool,
+    #[serde(default)]
+    error: Option<ToolError>,
+    duration_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for ToolResult {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = ToolResultDe::deserialize(d)?;
+        if raw.is_error != raw.error.is_some() {
+            return Err(serde::de::Error::custom(
+                "ToolResult invariant violated: is_error must equal error.is_some()",
+            ));
+        }
+        Ok(Self {
+            name: raw.name,
+            call_id: raw.call_id,
+            content: raw.content,
+            is_error: raw.is_error,
+            error: raw.error,
+            duration_ms: raw.duration_ms,
+        })
     }
 }
 
@@ -687,8 +718,10 @@ pub struct ApplyPatchArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyPatchOutcome {
     pub dry_run: bool,
+    /// Jail-relative paths only (`/`-separated, no leading `/`, no `..`). Host re-validates.
     pub files_touched: Vec<String>,
     pub transaction_id: Option<TransactionId>,
+    /// Operator/model-safe summary — MUST NOT contain raw patch bodies or absolute paths.
     pub message: String,
 }
 
@@ -770,14 +803,15 @@ Ok(ToolResult {
 | --- | --- |
 | Trait stability | RFC-0008 MUST implement `PatchApplyBackend` (adapter over `EditEngine`) OR provide `Arc<dyn PatchApplyBackend>` preserving these signatures |
 | Host change | Host MUST NOT require code changes beyond injecting a different `Arc<dyn PatchApplyBackend>` |
-| Success mapping | `Ok(ApplyPatchOutcome)` → `Ok(ToolResult{is_error:false, content: serialize(outcome)})` |
-| `Unsupported(msg)` | → `ToolError::Permanent { code: "unsupported", message: msg }` except the stub string in §3.7.1 which uses code `edit_engine_unwired` |
-| `InvalidPatch` | → `ToolError::InvalidArgs` |
-| `Conflict` | → `ToolError::Permanent { code: "conflict", … }` |
-| `Io` | → `ToolError::Transient { code: "io", … }` |
-| `Internal` | → `ToolError::Permanent { code: "internal", … }` |
+| Success mapping | `Ok(outcome)` → host runs §5.9 sanitize → `Ok(ToolResult{is_error:false, content: serialize(sanitized)})` |
+| `Unsupported(msg)` | → `ToolError::Permanent { code: "unsupported", message: sanitize_msg(msg) }` except the stub string in §3.7.1 which uses code `edit_engine_unwired` and the fixed message (already safe) |
+| `InvalidPatch` | → `ToolError::InvalidArgs { message: sanitize_msg(...) }` |
+| `Conflict` | → `ToolError::Permanent { code: "conflict", message: sanitize_msg(...) }` |
+| `Io` | → `ToolError::Transient { code: "io", message: "apply_patch io error" }` (fixed; drop backend detail) |
+| `Internal` | → `ToolError::Permanent { code: "internal", message: "apply_patch internal error" }` (fixed) |
 | Permissions | Still enforced by host **before** backend call |
 | Second write stack | Forbidden |
+| Output boundary | Host MUST apply §5.9 sanitization on **every** success and error mapping from the backend |
 
 ### 3.8 `ToolHandle`
 
@@ -1169,19 +1203,19 @@ Description: `Apply a unified diff / TextPatch via EditEngine`.
 
 **Host wrapper `tools_for`:**
 1. If host phase ≠ `Running` → `Err(ShuttingDown)`.
-2. Let `views = disclose(&registry_views, selectors)` (pure helper below).
-3. If helper truncated: increment `disclose_truncated`; tracing `warn` with `truncated=true`, `returned=32`.
+2. Let `(views, truncated) = disclose(&registry_views, selectors)` (pure helper below).
+3. If `truncated`: increment `disclose_truncated`; tracing `warn` with `truncated=true`, `returned=32`.
 4. Return `Ok(views)`.
 
-**Pure helper `disclose(views, selectors) -> Vec<ToolView>`:**
-1. If `selectors.is_empty()` → return `vec![]` (**MUST NOT** return the catalogue).
+**Pure helper `disclose(views, selectors) -> (Vec<ToolView>, bool /* truncated */)`:**
+1. If `selectors.is_empty()` → return `(vec![], false)` (**MUST NOT** return the catalogue).
 2. Let `out: BTreeMap<ToolName, ToolView> = {}`.
 3. For each selector in **input order**:
    - `Name { name }`: if a view with that name exists in `views`, insert it.
    - `Tag { tag }`: insert every view whose `tags` contains an exact match.
    - Unknown names / tags that match nothing: **silently ignored**.
 4. Build `Vec` from map values sorted by `ToolName` ascending.
-5. If `len > MAX_TOOLS_PER_DISCLOSURE` (32): truncate to first 32 (caller detects truncation by comparing pre/post length or a returned flag — **normative MVP:** helper returns `(Vec<ToolView>, truncated: bool)`).
+5. If `len > MAX_TOOLS_PER_DISCLOSURE` (32): truncate to first 32 and return `(vec, true)`; else return `(vec, false)`.
 
 #### Why the full catalogue is never exposed
 
@@ -1221,7 +1255,7 @@ After argument parse (pure) and path/argv derivation; before any filesystem open
 1. Resolve input path: if relative, join with jail; if absolute, use as-is.
 2. `let canon = path_policy.authorize(&path, PathAccess::Read)?` via `map_sandbox_error`.
 3. **MVP:** if `canon` is not under `path_policy.jail()`, return `PermissionDenied(PathNotCovered("outside jail".into()))` — out-of-jail RO-root reads are **not** supported for `fs_read` in MVP (keeps content `path` jail-relative well-defined).
-4. Let `rel = jail_relative(&canon, path_policy.jail())?` (`/`-separated, no leading `/`; map Err via `map_sandbox_error`).
+4. Let `rel = relative_for_matching(&canon, path_policy.jail())?` (`/`-separated, no leading `/`; map Err via `map_sandbox_error`).
 5. Require ≥1 `Grant::FsRead(Glob)` matching `rel` under the dialect below. Zero FsRead grants → `MissingGrant("fs_read")`. Some grants but none match → `PathNotCovered(rel)` (rel is jail-relative — safe to return).
 
 **`FsRead` glob dialect (normative):**
@@ -1267,12 +1301,13 @@ MVP MUST NOT add a schema crate. Validators MUST enforce:
 | Root | JSON object; unknown keys → `InvalidArguments("additional property: …")` |
 | Any string field | ≤ `MAX_ARG_STRING_BYTES` (4096); NUL bytes forbidden |
 | `cargo_check.features` | ≤ `MAX_FEATURES` (64) entries |
-| `cargo_check` | `workspace_root` non-empty; `package` string/null/absent; `features` string array; `all_features` bool; `message_format` absent/`"json"` only |
-| `cargo_test` | `workspace_root` non-empty; `package` string/null/absent; `test_name_filter` string/null/absent; `jobs` integer ≥1 or null/absent |
+| `cargo_check` | `workspace_root` non-empty; `package` non-empty string **or** null/absent (**reject** `""`); `features` string array with **no empty entries** (reject `""`); `all_features` bool; `message_format` absent/`"json"` only |
+| `cargo_test` | `workspace_root` non-empty; `package` non-empty string **or** null/absent (**reject** `""`); `test_name_filter` non-empty string **or** null/absent (**reject** `""`); `jobs` integer ≥1 or null/absent |
 | `fs_read` | `path` non-empty; `max_bytes` in `1..=1048576` (default 262144) |
 | `apply_patch` | `patch` present; `dry_run` bool (default false) |
 
 Type mismatches → `InvalidArguments` with prefix `type error: <field>`.
+Explicitly empty optional strings (`""` for `package` / `test_name_filter`, or `""` inside `features`) → `InvalidArguments("empty string: <field>")`. Absent or JSON `null` remains omission (no argv flag).
 
 Host MUST reject oversized args **before** grant check so broker argv caps are not the first line of defence for model input. Relationship: host caps ensure intended argv stays within RFC-0005 argv limits (256 elems / 64 KiB) for legal cargo feature lists.
 
@@ -1296,9 +1331,9 @@ On any permission error: no sandbox spawn, no file read, no backend apply, no pa
 
 ```text
 argv = ["cargo", "check"]
-+ optional ["-p", package] if package is Some(non-empty)
++ optional ["-p", package] if package is Some  // empty already rejected at validation
 + if all_features { ["--all-features"] }
-  else for f in features { ["--features", f] }  // input order
+  else for f in features { ["--features", f] }  // entries non-empty by validation
 + ["--message-format", "json"]
 ```
 
@@ -1346,10 +1381,10 @@ Messages are not re-parsed in MVP. Lossy UTF-8 REQUIRED.
 
 ```text
 argv = ["cargo", "test"]
-+ optional ["-p", package] if package is Some(non-empty)
++ optional ["-p", package] if package is Some  // empty already rejected at validation
 + optional ["--jobs", jobs.to_string()] if jobs is Some
 + ["--", "--nocapture"]
-+ optional [test_name_filter] if test_name_filter is Some(non-empty)
++ optional [test_name_filter] if test_name_filter is Some  // empty rejected at validation
   // filter AFTER `--` so it is a test-name filter, not a cargo option
 ```
 
@@ -1378,10 +1413,15 @@ args_glob subject (argv[1..], space-joined) =
 | Open/read `NotFound` | `Permanent { code: "not_found", … }` |
 | Open/read `PermissionDenied` (EACCES) | `Permanent { code: "io_denied", … }` |
 | Other IO | `Transient { code: "io", message: "fs_read io error" }` (no raw OS strings) |
-| Bytes not valid UTF-8 **after** trim | `Permanent { code: "not_utf8", … }` with no body |
+| Invalid UTF-8 interior to the returned buffer (see step 6) | `Permanent { code: "not_utf8", … }` with no body |
 
-5. Read at most `min(max_bytes, 1_048_576)` bytes via `tokio::fs`.
-6. **UTF-8 trim (normative):** interpret read bytes with `str::from_utf8`. If `Err(e)`, keep only `bytes[..e.valid_up_to()]` as the text; if `valid_up_to() == 0` and bytes non-empty → `not_utf8`. Truncation that splits a codepoint MUST NOT surface as `not_utf8`.
+5. Let `cap = min(max_bytes, 1_048_576)`. Read at most `cap` bytes via `tokio::fs`. Let `raw` be the bytes read. Let `capped = metadata().len() as usize > raw.len()` (same metadata call as the regular-file check) **or** equivalently `raw.len() == cap && file longer` — normative: `capped = (meta.len() as u64) > (raw.len() as u64)`.
+6. **UTF-8 decode (normative):**
+   1. Match `str::from_utf8(&raw)`:
+   2. `Ok(text)` → success with that text; `truncated = capped`.
+   3. `Err(e)` let `v = e.valid_up_to()`:
+      - **Cap-induced incomplete suffix only:** if `capped` **and** the invalid sequence reaches the buffer end (`e.error_len().is_none()`, i.e. unexpected end / incomplete code point at end) **and** `v > 0`: keep `text = &raw[..v]` (lossy-trim trailing incomplete code point only); `truncated = true`.
+      - **Otherwise** (interior invalid bytes, or invalid at end when not capped, or `v == 0` with non-empty `raw`): `Permanent { code: "not_utf8", … }` with no body — do **not** silently trim interior corruption.
 7. Success content:
 
 ```json
@@ -1393,7 +1433,7 @@ args_glob subject (argv[1..], space-joined) =
 }
 ```
 
-`bytes` = length of returned UTF-8 text in bytes. `truncated: true` iff `metadata().len() > bytes_read` (from the same metadata call used for the regular-file check) **or** UTF-8 trim shortened the buffer.
+`bytes` = length of returned UTF-8 text in bytes. `truncated` as computed in step 6.
 
 **No sandbox exec** for reads.
 
@@ -1401,7 +1441,15 @@ args_glob subject (argv[1..], space-joined) =
 
 1. Permission gate (§5.5).
 2. `patch_backend.apply(args)`.
-3. Map per §3.7 / §8.4.
+3. **Host output boundary (normative)** before returning `ToolResult`:
+
+| Field / error text | Rule |
+| --- | --- |
+| `files_touched` | Each entry MUST be jail-relative: non-empty, `/`-separated, no leading `/`, no `\`, no `.` or `..` path segments, ≤ `MAX_ARG_STRING_BYTES`. On violation → replace entire `files_touched` with `vec![]` and append `" (files_touched redacted)"` to sanitized message **or** map to `ToolError::Permanent { code: "unsafe_backend_output", message: "files_touched failed validation" }` with empty content files list — **normative MVP:** reject the outcome as `Permanent { code: "unsafe_backend_output", … }` (fail closed; do not forward bad paths). |
+| `message` | Run `sanitize_msg`: strip absolute path prefixes (`/`, drive letters), reject if length > 512 or contains NUL; on reject use fixed `"apply_patch completed"`. MUST NOT forward raw patch bodies. |
+| Backend error strings | `Io`/`Internal` use fixed messages (§3.7.2). `Unsupported`/`InvalidPatch`/`Conflict` pass through `sanitize_msg` (max 512, no abs paths, no NUL); on reject use the fixed code-only message for that variant. |
+
+4. Map sanitized success/error per §3.7 / §8.4.
 
 ### 5.10 Sequence — successful `cargo_check`
 
@@ -1485,7 +1533,19 @@ stateDiagram-v2
 | Draining | `Err(ShuttingDown)` | `Err(ShuttingDown)` | finish until grace; then cancel |
 | Stopped | `Err(ShuttingDown)` | `Err(ShuttingDown)` | none |
 
-Observable via `phase()`. Dropping the last `Arc` cancels outstanding work via token; there is **no** `Running → Stopped` transition observed after destruction.
+Observable via `phase()`.
+
+**`Drop` for `InProcessMcpHost` (normative):** `cancel.cancel()` MUST run when the host value is dropped (including when the last `Arc<InProcessMcpHost>` is dropped if the host is stored as `Arc` — implement by wrapping inner state so `Drop` on the allocation fires, e.g. store `Arc<Inner>` where `Inner: Drop` calls `cancel.cancel()`, **or** document that callers hold `InProcessMcpHost` by value / the outer type’s `Drop` cancels). Normative MVP shape:
+
+```rust
+struct Inner { cancel: CancellationToken, /* … */ }
+impl Drop for Inner {
+    fn drop(&mut self) { self.cancel.cancel(); }
+}
+// InProcessMcpHost holds Arc<Inner> (and optionally other handles)
+```
+
+This ensures outstanding `select!` waiters on `cancel` receive cancellation when the host is destroyed. There is **no** `Running → Stopped` phase transition observed after destruction (phase atomics die with the allocation). Drain-step cancellation (§6.4 step 3) is unchanged.
 
 ### 6.2 Startup
 
@@ -1620,14 +1680,15 @@ Sole conversion: `map_sandbox_error` (§3.3).
 
 | PatchApplyError | ToolError |
 | --- | --- |
-| Stub `Unsupported` with exact §3.7.1 string | `Permanent { code: "edit_engine_unwired", … }` |
-| Other `Unsupported` | `Permanent { code: "unsupported", … }` |
-| `InvalidPatch` | `InvalidArgs` |
-| `Conflict` | `Permanent { code: "conflict", … }` |
-| `Io` | `Transient { code: "io", … }` |
-| `Internal` | `Permanent { code: "internal", … }` |
+| Stub `Unsupported` with exact §3.7.1 string | `Permanent { code: "edit_engine_unwired", … }` (fixed safe message) |
+| Other `Unsupported` | `Permanent { code: "unsupported", message: sanitize_msg(...) }` |
+| `InvalidPatch` | `InvalidArgs { message: sanitize_msg(...) }` |
+| `Conflict` | `Permanent { code: "conflict", message: sanitize_msg(...) }` |
+| `Io` | `Transient { code: "io", message: "apply_patch io error" }` |
+| `Internal` | `Permanent { code: "internal", message: "apply_patch internal error" }` |
+| Success with invalid `files_touched` | `Permanent { code: "unsafe_backend_output", … }` per §5.9 |
 
-Always `Ok(ToolResult{is_error:true})` except permission failures before backend.
+Always `Ok(ToolResult{is_error:true})` for errors above except permission failures before backend. Success path serializes **sanitized** outcome only.
 
 ### 8.5 Recovery semantics
 
@@ -1761,6 +1822,8 @@ Hand-rolled validators only — **no** `jsonschema` crate.
 | `apply_patch_stub_deterministic` | §3.7.1 |
 | `apply_patch_requires_fs_write` | MissingGrant |
 | `apply_patch_error_map_all_variants` | test backend returns each `PatchApplyError` → §8.4 |
+| `apply_patch_rejects_abs_files_touched` | abs/`..` paths → unsafe_backend_output |
+| `cargo_rejects_empty_optional_strings` | `package=""` / `features=[""]` / `test_name_filter=""` → InvalidArguments |
 | `no_graph_query_registered` | `registered_names()` exact set |
 | `no_bash_registered` | UnknownTool |
 | `schema_snapshots` | committed JSON |
@@ -1770,12 +1833,13 @@ Hand-rolled validators only — **no** `jsonschema` crate.
 | `recording_platform_fifo` | push/pop/exhausted |
 | `map_sandbox_error_table` | §8.3 rows including default |
 | `arguments_too_large` | InvalidArguments |
-| `tool_result_invariant` | `is_error == error.is_some()` |
+| `tool_result_invariant` | constructors keep invariant; deserialize rejects both inconsistent combos |
 | `construction_rejects_zero_in_flight` | Internal |
 | `construction_call_timeout_default_ok` | `None` timeout succeeds even if exec_timeout > 1860 |
 | `construction_explicit_timeout_too_small` | Internal |
 | `signal_execution_failed` | `ExecutionFailed { signal: Some(_), … }` |
-| `fs_read_utf8_trim_on_truncate` | split codepoint → truncated text, not not_utf8 |
+| `fs_read_utf8_trim_on_truncate` | capped read ending mid-codepoint → trim suffix, truncated=true |
+| `fs_read_utf8_interior_invalid` | uncapped/interior bad bytes → Permanent not_utf8 |
 | `fs_read_not_found_code` | Permanent not_found |
 | `no_abs_paths_in_mcp_errors` | Sandbox/PermissionDenied Display has no `/home` style paths |
 | `denied_flag_on_quarantine` | QuarantineBlocked → PermissionDenied → denied=true in obs |
@@ -1873,7 +1937,7 @@ Tool IR; `McpPlatform` + host; four builtins; lazy disclosure; permission gate w
 | 24 | Construction rejects `max_in_flight == 0`; rejects explicit `call_timeout < exec_timeout`; defaults `None` → exec+60s | unit |
 | 25 | PathPolicy built from broker profile (no injectable divergent policy); `OperatorHomes` injected | API + unit |
 | 26 | `map_sandbox_error` maps all `DenialReason` to `PermissionDenied`; redacts host paths in `Sandbox` | `map_sandbox_error_table` + `no_abs_paths_in_mcp_errors` |
-| 27 | `fs_read` UTF-8 trim on truncation; open/read error codes | unit |
+| 27 | `fs_read` cap-suffix UTF-8 trim vs interior not_utf8; open/read error codes | unit |
 | 28 | `McpServerSpec::new` constructible; `start_server` Unsupported | unit |
 | 29 | Drain CAS+Notify; follower wait; 5s post-cancel bound | `drain_grace_then_cancel` |
 | 30 | Series Definition of Done below | checklist |
@@ -1908,7 +1972,7 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 
 ## 16. Estimated Implementation Effort
 
-**6–9 person-days.**
+**8–9.5 person-days.**
 
 | Slice | Effort | Depends on |
 | --- | --- | --- |
