@@ -1050,9 +1050,15 @@ async fn drain_grace_then_cancel() {
             .await
     });
 
-    // Let the call reach the backend before draining.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(host.metrics().in_flight, 1);
+    // Wait until the call is admitted and parked on the pending backend.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while host.metrics().in_flight != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "in-flight call was never admitted"
+        );
+        tokio::task::yield_now().await;
+    }
 
     host.drain(Duration::from_millis(50)).await.unwrap();
     assert_eq!(host.phase(), McpHostPhase::Stopped);

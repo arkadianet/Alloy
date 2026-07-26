@@ -135,10 +135,14 @@ tokens.
 ## MCP `fs_read` (RFC-0006)
 
 `fs_read` authorizes a path with `PathPolicy::authorize(.., Read)` and then opens
-the **canonical** `PathBuf` that authorize returned — never the raw argument — so
-deny-globs and jail membership cannot be dodged by a symlink or a `..` segment.
-MVP additionally refuses any path that resolves outside the jail, even a readable
-RO root, so the reported `path` is always jail-relative.
+the **canonical** `PathBuf` that authorize returned — never the raw argument.
+When that open races with concurrent filesystem replacement, deny-glob and jail
+membership protection are only as strong as the authorize snapshot: a symlink
+swap in the TOCTOU window can still redirect the read (see Residual below).
+Absent concurrent replacement, `..` segments and pre-existing symlinks cannot
+bypass deny-globs or jail membership, because authorize resolves them before
+open. MVP additionally refuses any path that resolves outside the jail, even a
+readable RO root, so the reported `path` is always jail-relative.
 
 **Residual:** a TOCTOU window remains between authorize and open. An attacker who
 can replace the canonical path with a symlink to a denied file in that window

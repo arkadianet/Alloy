@@ -1162,9 +1162,13 @@ Error exits also pass through DecisionLog rules in §9.2 (not shown as success).
 {
   "type": "object",
   "properties": {
-    "workspace_root": { "type": "string" },
-    "package": { "type": ["string", "null"] },
-    "features": { "type": "array", "items": { "type": "string" } },
+    "workspace_root": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "package": { "type": ["string", "null"], "minLength": 1, "maxLength": 4096 },
+    "features": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    },
     "all_features": { "type": "boolean", "default": false },
     "message_format": { "type": "string", "enum": ["json"], "default": "json" }
   },
@@ -1181,9 +1185,9 @@ Description (exact): `Run cargo check and return structured rustc messages`.
 {
   "type": "object",
   "properties": {
-    "workspace_root": { "type": "string" },
-    "package": { "type": ["string", "null"] },
-    "test_name_filter": { "type": ["string", "null"] },
+    "workspace_root": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "package": { "type": ["string", "null"], "minLength": 1, "maxLength": 4096 },
+    "test_name_filter": { "type": ["string", "null"], "minLength": 1, "maxLength": 4096 },
     "jobs": { "type": ["integer", "null"], "minimum": 1 }
   },
   "required": ["workspace_root"],
@@ -1194,6 +1198,7 @@ Description (exact): `Run cargo check and return structured rustc messages`.
 Description: `Run cargo test and return structured results`.
 
 **No `timeout_secs` field** — host `call_timeout` + broker `exec_timeout` own deadlines (avoids a schema knob that does nothing).
+`test_name_filter` values that begin with `-` are rejected at parse time (`InvalidArguments`) so libtest options cannot be smuggled after `--`.
 
 #### 5.3.3 `fs_read`
 
@@ -1201,7 +1206,7 @@ Description: `Run cargo test and return structured results`.
 {
   "type": "object",
   "properties": {
-    "path": { "type": "string" },
+    "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
     "max_bytes": { "type": "integer", "default": 262144, "minimum": 1, "maximum": 1048576 }
   },
   "required": ["path"],
@@ -1334,7 +1339,7 @@ MVP MUST NOT add a schema crate. Validators MUST enforce:
 | Any string field | ≤ `MAX_ARG_STRING_BYTES` (4096); NUL bytes forbidden |
 | `cargo_check.features` | ≤ `MAX_FEATURES` (64) entries |
 | `cargo_check` | `workspace_root` non-empty; `package` non-empty string **or** null/absent (**reject** `""`); `features` string array with **no empty entries** (reject `""`); `all_features` bool; `message_format` absent/`"json"` only |
-| `cargo_test` | `workspace_root` non-empty; `package` non-empty string **or** null/absent (**reject** `""`); `test_name_filter` non-empty string **or** null/absent (**reject** `""`); `jobs` integer ≥1 or null/absent |
+| `cargo_test` | `workspace_root` non-empty; `package` non-empty string **or** null/absent (**reject** `""`); `test_name_filter` non-empty string **or** null/absent (**reject** `""`); `test_name_filter` MUST NOT begin with `-`; `jobs` integer ≥1 or null/absent |
 | `fs_read` | `path` non-empty; `max_bytes` in `1..=1048576` (default 262144) |
 | `apply_patch` | `patch` present; `dry_run` bool (default false) |
 

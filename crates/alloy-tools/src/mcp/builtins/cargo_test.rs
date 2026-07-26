@@ -39,10 +39,20 @@ pub(crate) fn parse(arguments: &Value) -> Result<CargoTestArgs, McpError> {
     let obj = object_args(arguments, ALLOWED_KEYS)?;
     let jobs = optional_integer(obj, "jobs", 1, u64::from(u32::MAX))?
         .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+    let test_name_filter = optional_string(obj, "test_name_filter")?;
+    if let Some(filter) = &test_name_filter {
+        // After `--`, a leading `-` is still a libtest option (`--ignored`, …),
+        // not a test-name filter. Reject before argv derivation.
+        if filter.starts_with('-') {
+            return Err(McpError::InvalidArguments(
+                "test_name_filter must not start with '-'".into(),
+            ));
+        }
+    }
     Ok(CargoTestArgs {
         workspace_root: required_string(obj, "workspace_root")?,
         package: optional_string(obj, "package")?,
-        test_name_filter: optional_string(obj, "test_name_filter")?,
+        test_name_filter,
         jobs,
     })
 }
@@ -147,14 +157,17 @@ mod tests {
     }
 
     #[test]
-    fn cargo_test_rejects_zero_jobs() {
+    fn cargo_test_rejects_option_like_filter() {
         assert!(matches!(
-            parse(&json!({ "workspace_root": ".", "jobs": 0 })),
-            Err(McpError::InvalidArguments(ref m)) if m.starts_with("out of range")
+            parse(&json!({ "workspace_root": ".", "test_name_filter": "--ignored" })),
+            Err(McpError::InvalidArguments(ref m))
+                if m == "test_name_filter must not start with '-'"
         ));
-        assert!(parse(&json!({ "workspace_root": ".", "jobs": null }))
-            .unwrap()
-            .jobs
-            .is_none());
+        assert!(matches!(
+            parse(&json!({ "workspace_root": ".", "test_name_filter": "-q" })),
+            Err(McpError::InvalidArguments(ref m))
+                if m == "test_name_filter must not start with '-'"
+        ));
+        assert!(parse(&json!({ "workspace_root": ".", "test_name_filter": "foo" })).is_ok());
     }
 }

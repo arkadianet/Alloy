@@ -2,8 +2,10 @@
 //!
 //! Reads go through `PathPolicy::authorize(.., Read)` and then open the
 //! **canonical** path that authorize returned — never the raw argument — so
-//! deny globs (`.env`, keys, SSH/AWS material) cannot be dodged by a symlink or
-//! a `..` segment. No sandbox exec is involved.
+//! deny globs (`.env`, keys, SSH/AWS material) and jail membership hold for the
+//! authorize snapshot. A concurrent symlink swap between authorize and open
+//! remains a documented residual (see `docs/security/sandbox-residual-risk.md`).
+//! No sandbox exec is involved.
 //!
 //! Author: arkadianet
 

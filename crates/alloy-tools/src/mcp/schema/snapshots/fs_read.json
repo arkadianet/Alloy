@@ -1,8 +1,17 @@
 {
   "type": "object",
   "properties": {
-    "path": { "type": "string" },
-    "max_bytes": { "type": "integer", "default": 262144, "minimum": 1, "maximum": 1048576 }
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "max_bytes": {
+      "type": "integer",
+      "default": 262144,
+      "minimum": 1,
+      "maximum": 1048576
+    }
   },
   "required": ["path"],
   "additionalProperties": false

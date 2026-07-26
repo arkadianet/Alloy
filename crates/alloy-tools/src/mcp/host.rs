@@ -133,8 +133,6 @@ struct HostState {
     patch_backend: Arc<dyn PatchApplyBackend>,
     registry: Registry,
     call_timeout: Duration,
-    /// Same token as the host's `cancel_guard`, not a second one.
-    cancel: CancellationToken,
     phase: AtomicU8,
     in_flight: AtomicUsize,
     permits: Arc<Semaphore>,
@@ -233,7 +231,6 @@ impl InProcessMcpHost {
             patch_backend,
             registry: Registry::builtins(),
             call_timeout,
-            cancel: config.cancel.clone(),
             phase: AtomicU8::new(PHASE_RUNNING),
             in_flight: AtomicUsize::new(0),
             permits: Arc::new(Semaphore::new(config.max_in_flight)),
@@ -303,7 +300,7 @@ impl InProcessMcpHost {
         // 3. Still busy — cancel so still-polled calls observe it.
         let mut drained = state.in_flight.load(Ordering::SeqCst) == 0;
         if !drained {
-            state.cancel.cancel();
+            self.cancel_guard.0.cancel();
             // 4. Bounded wait for the cancelled calls to unwind.
             self.wait_for_idle(Some(DRAIN_CANCEL_GRACE)).await;
             drained = state.in_flight.load(Ordering::SeqCst) == 0;
@@ -447,7 +444,7 @@ impl InProcessMcpHost {
             Ok(prepared) => {
                 let dispatch = builtins::execute(&ctx, prepared, perms);
                 tokio::select! {
-                    () = state.cancel.cancelled() => Err(McpError::Cancelled),
+                    () = self.cancel_guard.0.cancelled() => Err(McpError::Cancelled),
                     result = tokio::time::timeout(state.call_timeout, dispatch) => match result {
                         Ok(inner) => inner,
                         Err(_) => Err(McpError::Timeout(state.call_timeout)),

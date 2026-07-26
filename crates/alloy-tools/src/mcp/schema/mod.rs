@@ -8,7 +8,8 @@
 
 use serde_json::{json, Value};
 
-use crate::mcp::builtins::BuiltinToolId;
+use crate::mcp::builtins::fs_read::{FS_READ_DEFAULT_MAX, FS_READ_HARD_MAX};
+use crate::mcp::builtins::{BuiltinToolId, MAX_ARG_STRING_BYTES, MAX_FEATURES};
 
 /// Committed snapshot for `cargo_check`.
 #[cfg(test)]
@@ -29,9 +30,25 @@ pub(crate) fn input_schema(id: BuiltinToolId) -> Value {
         BuiltinToolId::CargoCheck => json!({
             "type": "object",
             "properties": {
-                "workspace_root": { "type": "string" },
-                "package": { "type": ["string", "null"] },
-                "features": { "type": "array", "items": { "type": "string" } },
+                "workspace_root": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_ARG_STRING_BYTES
+                },
+                "package": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": MAX_ARG_STRING_BYTES
+                },
+                "features": {
+                    "type": "array",
+                    "maxItems": MAX_FEATURES,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_ARG_STRING_BYTES
+                    }
+                },
                 "all_features": { "type": "boolean", "default": false },
                 "message_format": { "type": "string", "enum": ["json"], "default": "json" }
             },
@@ -41,9 +58,21 @@ pub(crate) fn input_schema(id: BuiltinToolId) -> Value {
         BuiltinToolId::CargoTest => json!({
             "type": "object",
             "properties": {
-                "workspace_root": { "type": "string" },
-                "package": { "type": ["string", "null"] },
-                "test_name_filter": { "type": ["string", "null"] },
+                "workspace_root": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_ARG_STRING_BYTES
+                },
+                "package": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": MAX_ARG_STRING_BYTES
+                },
+                "test_name_filter": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": MAX_ARG_STRING_BYTES
+                },
                 "jobs": { "type": ["integer", "null"], "minimum": 1 }
             },
             "required": ["workspace_root"],
@@ -52,12 +81,16 @@ pub(crate) fn input_schema(id: BuiltinToolId) -> Value {
         BuiltinToolId::FsRead => json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_ARG_STRING_BYTES
+                },
                 "max_bytes": {
                     "type": "integer",
-                    "default": 262_144,
+                    "default": FS_READ_DEFAULT_MAX,
                     "minimum": 1,
-                    "maximum": 1_048_576
+                    "maximum": FS_READ_HARD_MAX
                 }
             },
             "required": ["path"],
