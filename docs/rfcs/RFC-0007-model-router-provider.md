@@ -1490,6 +1490,7 @@ planning = "standard"
 | `base_url` uses `http` and host is not loopback (`localhost`, `127.0.0.0/8`, `::1`) | Config |
 | `base_url` contains a query string or fragment | Config |
 | `api_key_env` empty | Config |
+| `api_key_env` contains `=` or NUL (would panic in `std::env::var`) | Config |
 | Env var unset/empty at construct | Config with `example.env` hint |
 | No endpoints under the provider | Config |
 | Endpoint `tiers` empty | Config |

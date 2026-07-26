@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::Instrument;
 use url::Url;
+use zeroize::Zeroize;
 
 use crate::types::ids::ProviderId;
 
@@ -56,8 +57,12 @@ impl OpenAiCompatibleProvider {
             base_url.set_path(&normalized);
         }
 
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", spec.api_key.expose()))
-            .map_err(|_| ProviderError::Internal("invalid authorization header".into()))?;
+        let mut bearer = format!("Bearer {}", spec.api_key.expose());
+        let mut authorization = HeaderValue::from_str(&bearer).map_err(|_| {
+            bearer.zeroize();
+            ProviderError::Internal("invalid authorization header".into())
+        })?;
+        bearer.zeroize();
         authorization.set_sensitive(true);
 
         let client = ValidatedHttpClient::build(spec.connect_timeout, spec.request_timeout)?;
@@ -320,7 +325,15 @@ fn context_length_signal(body: &[u8]) -> bool {
 }
 
 fn map_success(body: &[u8], format: &ResponseFormat) -> Result<ModelResponse, ProviderError> {
-    let root: WireResponse = serde_json::from_slice(body).map_err(|error| {
+    let root_value: Value = serde_json::from_slice(body).map_err(|error| {
+        ProviderError::MalformedResponse(redact_and_truncate(&error.to_string(), 512))
+    })?;
+    if !root_value.is_object() {
+        return Err(ProviderError::MalformedResponse(
+            "response root must be a JSON object".into(),
+        ));
+    }
+    let root: WireResponse = serde_json::from_value(root_value).map_err(|error| {
         ProviderError::MalformedResponse(redact_and_truncate(&error.to_string(), 512))
     })?;
     if root.error.is_some_and(|value| value.is_object()) {
@@ -471,6 +484,13 @@ mod tests {
             br#"{"choices":[{"message":{"content":123},"finish_reason":"stop"}]}"#;
         assert!(matches!(
             map_success(invalid_content, &ResponseFormat::Text),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+
+        let array_root =
+            br#"[null,[{"message":{"content":"x"},"finish_reason":"stop"}],null,null]"#;
+        assert!(matches!(
+            map_success(array_root, &ResponseFormat::Text),
             Err(ProviderError::MalformedResponse(_))
         ));
     }

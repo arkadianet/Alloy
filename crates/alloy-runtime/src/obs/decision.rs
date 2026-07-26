@@ -492,6 +492,11 @@ pub(crate) fn prepare_model_call(
         .as_deref()
         .map(redact_secrets)
         .map(|value| truncate_utf8_bytes(&value, 256));
+    rec.model = rec
+        .model
+        .as_deref()
+        .map(redact_secrets)
+        .map(|value| truncate_utf8_bytes(&value, 512));
     Ok(rec)
 }
 
@@ -799,16 +804,21 @@ mod tests {
         .provider_request_id(Some(format!(
             "Authorization: Bearer secret-token {}",
             "é".repeat(200)
-        )));
+        )))
+        .model(Some("api_key=sk-modelsecret".into()));
         let prepared = prepare_model_call(rec, RetentionPolicy::defaults()).unwrap();
         let finish = prepared.finish_reason.unwrap();
         let request_id = prepared.provider_request_id.unwrap();
+        let model = prepared.model.unwrap();
         assert!(finish.len() <= 128);
         assert!(request_id.len() <= 256);
+        assert!(model.len() <= 512);
         assert!(!finish.contains("sk-"));
         assert!(!request_id.contains("secret-token"));
+        assert!(!model.contains("sk-"));
         assert!(finish.is_char_boundary(finish.len()));
         assert!(request_id.is_char_boundary(request_id.len()));
+        assert!(model.is_char_boundary(model.len()));
     }
 
     #[test]

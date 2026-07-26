@@ -362,10 +362,20 @@ fn validate_provider(provider: &ProviderConfig) -> Result<(), RouterError> {
     if provider.api_key_env.trim().is_empty() {
         return Err(config_error("api_key_env must not be empty"));
     }
+    if !is_valid_env_var_name(&provider.api_key_env) {
+        return Err(config_error(
+            "api_key_env must not contain '=' or NUL (std::env::var would panic)",
+        ));
+    }
     if provider.endpoints.is_empty() {
         return Err(config_error("provider must declare at least one endpoint"));
     }
     Ok(())
+}
+
+/// Reject names that panic inside `std::env::var` on Unix (`=` or NUL bytes).
+fn is_valid_env_var_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('=') && !name.contains('\0')
 }
 
 fn validate_endpoint(endpoint: &EndpointConfig) -> Result<(), RouterError> {
@@ -502,6 +512,10 @@ Repair = "standard"
             sample("https://example.com")
         );
         assert!(RouterConfig::from_str("test", &two).is_err());
+
+        let bad_key = sample("https://example.com")
+            .replace("api_key_env = \"MODEL_KEY\"", "api_key_env = \"BAD=NAME\"");
+        assert!(RouterConfig::from_str("test", &bad_key).is_err());
 
         let zero = sample("https://example.com").replace(
             "default_tier = \"standard\"",

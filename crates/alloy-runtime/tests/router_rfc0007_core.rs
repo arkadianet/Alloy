@@ -520,11 +520,12 @@ async fn mid_flight_host_cancel_returns_cancelled() {
         .expect("router"),
     );
     let routed = router.route(route_request(run)).await.expect("route");
+    let routed_for_complete = routed.clone();
     let started = provider.started.notified();
     tokio::pin!(started);
     let completion = {
         let router = Arc::clone(&router);
-        tokio::spawn(async move { router.complete(&routed, prompt()).await })
+        tokio::spawn(async move { router.complete(&routed_for_complete, prompt()).await })
     };
     started.await;
     cancellation.cancel();
@@ -536,6 +537,12 @@ async fn mid_flight_host_cancel_returns_cancelled() {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(meter.snapshot().model_calls, 0);
     assert!(log.recorded_model_calls().is_empty());
+    // Host token remains cancelled → §5.4.1 Cancelled precedes AlreadyCompleted.
+    assert!(matches!(
+        router.complete(&routed, prompt()).await,
+        Err(RouterError::Cancelled)
+    ));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1026,6 +1033,34 @@ async fn oversize_prompt_body_hash_only() {
     assert!(call.content_hash.is_some());
     assert!(call.prompt_body.is_none());
     assert_eq!(router.metrics().model_call_prompt_body_oversize, 1);
+}
+
+#[tokio::test]
+async fn provider_error_records_unknown_usage_and_model_call() {
+    let (provider, log, meter, run, router) = recording_dependencies(BudgetPolicy::default());
+    provider.push(Err(ProviderError::RateLimit));
+    let routed = router.route(route_request(run)).await.expect("route");
+
+    assert!(matches!(
+        router.complete(&routed, prompt()).await,
+        Err(RouterError::Provider(ProviderError::RateLimit))
+    ));
+
+    let snap = meter.snapshot();
+    assert_eq!(snap.model_calls, 1);
+    assert_eq!(snap.unknown_token_events, 1);
+    assert_eq!(snap.tokens_in, 0);
+    assert_eq!(snap.tokens_out, 0);
+    assert_eq!(snap.usd_spent, None);
+
+    let calls = log.recorded_model_calls();
+    assert_eq!(calls.len(), 1);
+    let call = &calls[0];
+    assert_eq!(call.input_tokens, None);
+    assert_eq!(call.output_tokens, None);
+    assert_eq!(call.usd, None);
+    assert_eq!(call.error_class, Some(ErrorClass::Model));
+    assert_eq!(router.metrics().completes_err, 1);
 }
 
 #[tokio::test]
