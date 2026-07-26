@@ -719,7 +719,7 @@ pub fn parse_tool_call_event(ev: &SessionEvent) -> Result<ToolCallRecord, ObsErr
 
 ### 3.15 `WorkerMetrics` relationship (usage contract)
 
-`WorkerMetrics` remains defined solely in `types::metrics` (RFC-0001). RFC-0004 MUST NOT redefine it.
+`WorkerMetrics` remains defined solely in `types::metrics` (RFC-0001). RFC-0004 MUST NOT fork a second shape; the RFC-0007 series amends token fields to `Option<u64>` on that shared type.
 
 | Producer (later RFC) | Contract |
 | --- | --- |
