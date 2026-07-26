@@ -22,8 +22,8 @@ use alloy_tools::mcp::{
     McpPlatform, PatchApplyBackend, PatchApplyError, PermissionDenial, StubPatchApplyBackend,
 };
 use alloy_tools::{
-    ExecClass, OperatorHomes, RecordingSandboxBroker, SandboxBackend, SandboxError,
-    SandboxExecResult, SandboxProfile,
+    BackendStatus, ExecClass, OperatorHomes, RecordingSandboxBroker, SandboxBackend, SandboxBroker,
+    SandboxCapabilities, SandboxError, SandboxExecRequest, SandboxExecResult, SandboxProfile,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -81,7 +81,7 @@ impl Fixture {
 
     fn host_with(
         &self,
-        broker: Arc<RecordingSandboxBroker>,
+        broker: Arc<dyn SandboxBroker>,
         patch: Arc<dyn PatchApplyBackend>,
         config: McpHostConfig,
     ) -> InProcessMcpHost {
@@ -164,6 +164,45 @@ struct PendingPatchBackend;
 impl PatchApplyBackend for PendingPatchBackend {
     async fn apply(&self, _args: ApplyPatchArgs) -> Result<ApplyPatchOutcome, PatchApplyError> {
         std::future::pending().await
+    }
+}
+
+/// Broker whose `exec` future never resolves; Drop of the future sets `dropped`.
+struct PendingExecBroker {
+    profile: SandboxProfile,
+    capabilities: SandboxCapabilities,
+    entered: std::sync::atomic::AtomicBool,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PendingExecGuard {
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for PendingExecGuard {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl SandboxBroker for PendingExecBroker {
+    async fn exec(&self, _req: SandboxExecRequest) -> Result<SandboxExecResult, SandboxError> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _guard = PendingExecGuard {
+            dropped: Arc::clone(&self.dropped),
+        };
+        std::future::pending().await
+    }
+
+    fn profile(&self) -> &SandboxProfile {
+        &self.profile
+    }
+
+    fn capabilities(&self) -> &SandboxCapabilities {
+        &self.capabilities
     }
 }
 
@@ -1089,34 +1128,62 @@ async fn host_timeout_apply_patch() {
 async fn cancel_by_drop_no_orphan() {
     let fx = Fixture::new();
     let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let broker = Arc::new(PendingExecBroker {
+        profile: fx.profile.clone(),
+        capabilities: SandboxCapabilities {
+            landlock: BackendStatus::Available {
+                detail: "pending".into(),
+            },
+            seatbelt: BackendStatus::Available {
+                detail: "pending".into(),
+            },
+            container: BackendStatus::Available {
+                detail: "pending".into(),
+            },
+        },
+        entered: std::sync::atomic::AtomicBool::new(false),
+        dropped: Arc::clone(&dropped),
+    });
     let host = fx
         .host_with(
-            fx.broker(),
-            Arc::new(PendingPatchBackend),
+            Arc::clone(&broker) as Arc<dyn SandboxBroker>,
+            Arc::new(StubPatchApplyBackend),
             McpHostConfig::new(),
         )
         .with_decision_log(log.clone());
 
     let mut pending = Box::pin(host.call(
-        call("apply_patch", json!({ "patch": "diff" })).with_attribution(
+        call("cargo_check", json!({ "workspace_root": "." })).with_attribution(
             Some(SessionId::new()),
             None,
             None,
         ),
-        token(vec![Grant::FsWrite(Glob("**".into()))]),
+        token(vec![cargo_grant(None)]),
     ));
-    // Drive the future far enough to be admitted, then drop it.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut pending)
-            .await
-            .is_err()
-    );
+    // Drive until the broker exec future is polled, then drop the call.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !broker.entered.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "exec future was never entered"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                .await
+                .is_err(),
+            "call completed before exec was cancelled"
+        );
+    }
     drop(pending);
 
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "dropping the call must drop the nested SandboxBroker::exec future"
+    );
     assert_eq!(host.metrics().in_flight, 0);
     assert_eq!(host.metrics().calls_mcp_error, 0);
     assert!(log.recorded_tool_calls().is_empty());
-    // The host still admits new work.
     assert_eq!(host.phase(), McpHostPhase::Running);
 }
 
