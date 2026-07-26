@@ -22,7 +22,7 @@ max_in_flight = 32
 [[providers]]
 id = "openai-compatible-main"
 kind = "openai_compatible"
-base_url = "https://api.example.com/v1"
+base_url = "https://api.example.com/v1/"
 api_key_env = "ALLOY_API_KEY"
 
 [[providers.endpoints]]

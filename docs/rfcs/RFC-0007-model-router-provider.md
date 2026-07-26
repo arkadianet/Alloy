@@ -637,7 +637,9 @@ impl OpenAiCompatibleProvider {
 
 pub struct OpenAiCompatibleSpec {
     pub id: ProviderId,
-    pub base_url: String,       // no trailing slash required; normalized at construct
+    /// Operator string; construct stores a `url::Url` with a trailing slash so
+    /// `Url::join("chat/completions")` keeps the API prefix (e.g. `/v1` → `/v1/`).
+    pub base_url: String,
     pub api_key: SecretString,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
@@ -649,13 +651,15 @@ pub(crate) struct ValidatedHttpClient {
 }
 ```
 
-Implements `ModelProvider`. Performs `POST {base_url}/chat/completions` using path join on a stored `url::Url` (not string concatenation after a single slash trim).
+Implements `ModelProvider`. Performs `POST` to the joined chat-completions URL using a stored `url::Url` (not string concatenation).
 
 `OpenAiCompatibleProvider::new` MUST:
 1. Re-validate `base_url` (§7.2).
-2. Validate `Authorization` `HeaderValue` construction (§10.2.1).
-3. Build `ValidatedHttpClient` via `http_client::build` with §10.1 policy (no redirects, platform verifier, timeouts, AWS-LC rustls).
-4. Return `ProviderError` on failure when called directly.
+2. Parse into `url::Url` and **ensure a trailing `/` on the path** before storing (if the path does not end in `/`, append one). Example: `https://api.example.com/v1` normalizes to `https://api.example.com/v1/`.
+3. Validate `Authorization` `HeaderValue` construction (§10.2.1).
+4. Build `ValidatedHttpClient` via `http_client::build` with §10.1 policy (no redirects, platform verifier, timeouts, AWS-LC rustls).
+5. On each `complete`, request URL = `base.join("chat/completions")` (yields `…/v1/chat/completions`). Without the trailing-slash normalize, `Url::join` would replace the final path segment (`/v1` → `/chat/completions`).
+6. Return `ProviderError` on construct failure when called directly.
 
 `TomlModelRouter::from_paths` MUST catch construct-time `ProviderError` and return `RouterError::Config(redacted_message)`; `RouterError::Provider` is reserved for `complete` failures.
 
@@ -943,7 +947,7 @@ Production routers always have a meter (§3.13). Algorithm:
 6. **MUST NOT** escalate or downgrade tier to satisfy budget in MVP.
 7. Successful `route` returns a sealed `RoutedModel` stamped with `router_instance_id` and a fresh ticket (`used = false`).
 
-**USD price fail-closed:** when `budget_policy.max_usd_per_run.is_finite() && budget_policy.max_usd_per_run > 0.0`, every endpoint MUST declare both `input_usd_per_mtok` and `output_usd_per_mtok` (finite, `>= 0`) at config validation (§7.2). Otherwise a finite USD ceiling could never advance on known-token completions.
+**USD price fail-closed:** when `budget_policy.max_usd_per_run.is_finite() && budget_policy.max_usd_per_run > 0.0`, every endpoint MUST declare both `input_usd_per_mtok` and `output_usd_per_mtok` (finite, `>= 0`). This check runs only in `TomlModelRouter::from_paths` / `from_parts` (which hold `BudgetPolicy`), not in `RouterConfig::load` / `from_str`. Otherwise a finite USD ceiling could never advance on known-token completions.
 
 **Zero / non-finite USD ceiling (normative router overlay):** RFC-0004 `CostMeter::check_budget` does **not** treat `max_usd_per_run == 0.0` as exhausted while `usd_spent` is still `None`. The router MUST NOT inherit that hole. Before accepting a route or complete, if `!max_usd_per_run.is_finite() || max_usd_per_run <= 0.0`, the router MUST deny with `BudgetDenied(UsdExhausted)` (or `TokensAndUsdExhausted` if tokens are also exhausted) **even when** `meter.check_budget` returns `Ok`. Price fields MAY be omitted when this overlay applies. Unit test: `zero_usd_ceiling_denies_with_unknown_spend`.
 
@@ -1410,7 +1414,7 @@ max_in_flight = 32                 # u32; default 32; MUST be > 0
 [[providers]]
 id = "openai-compatible-main"      # ProviderId; REQUIRED
 kind = "openai_compatible"         # ONLY supported kind in MVP
-base_url = "https://api.example.com/v1"  # REQUIRED; https or loopback http
+base_url = "https://api.example.com/v1/"  # REQUIRED; https or loopback http; trailing slash kept/normalized for Url::join
 api_key_env = "ALLOY_API_KEY"      # REQUIRED for openai_compatible
 
 [[providers.endpoints]]
@@ -1421,7 +1425,7 @@ tiers = ["standard"]               # non-empty Vec<ModelTier>; REQUIRED
 supports_tools = true              # bool; default false
 supports_structured_output = true  # bool; default false
 max_context = 200000               # u32; REQUIRED; MUST be > 0
-# Required when profile max_usd_per_run is finite and > 0 (§5.4 / §7.2).
+# Required when profile max_usd_per_run is finite and > 0 (§5.4 / from_paths|from_parts).
 # A literal 0.0 means measured/declared free, not unknown.
 input_usd_per_mtok = 0.0
 output_usd_per_mtok = 0.0
@@ -1473,10 +1477,10 @@ planning = "standard"
 | capability keys collide after ASCII-lowercase normalization | Config |
 | capability key empty or >128 UTF-8 bytes after trim | Config |
 | `max_in_flight > 1024` (MVP hard cap; MUST also be `<= tokio::sync::Semaphore::MAX_PERMITS`) | Config |
-| finite `max_usd_per_run > 0` but an endpoint omits either price field | Config |
+| finite `max_usd_per_run > 0` but an endpoint omits either price field | Config — **only** at `TomlModelRouter::from_paths` / `from_parts` (not `RouterConfig::load`) |
 | serde unknown fields on fixed-schema DTOs including the **root** private parse DTO (`RouterFile` / equivalent), `RouterPolicy`, `ProviderConfig`, `EndpointConfig`, `ScoringWeights` | Config (`deny_unknown_fields`) |
 
-**Trailing slash / path join:** parse `base_url` into `url::Url` at construct; join `chat/completions` via `Url::join`. Do not string-concatenate after trimming a single slash.
+**Trailing slash / path join:** parse `base_url` into `url::Url` at construct and ensure the path ends with `/` before storing (so `https://api.example.com/v1` becomes `https://api.example.com/v1/`). Join with `base.join("chat/completions")` → `https://api.example.com/v1/chat/completions`. Do not string-concatenate. Operators MAY write either form in TOML; construct normalizes.
 
 `max_context` is advisory in MVP. RFC-0007 validates it is present and non-zero but does not enforce a tokenizer-based pre-flight check; context overflow is surfaced through `ProviderError::ContextLength`.
 
@@ -1564,11 +1568,11 @@ impl RouterConfig {
 }
 ```
 
-`RouterConfig::load` / `from_str` own TOML parse (`deny_unknown_fields` on fixed DTOs), capability-key normalization, duplicate detection, URL scheme/loopback/userinfo/query/fragment validation, endpoint validation, price fail-closed when the caller-supplied `BudgetPolicy` requires it (see below), and timeout/max-in-flight validation. They are ungated so `--no-default-features` still verifies router config semantics.
+`RouterConfig::load` / `from_str` own TOML parse (`deny_unknown_fields` on fixed DTOs), capability-key normalization, duplicate detection, URL scheme/loopback/userinfo/query/fragment validation, endpoint structural validation (including non-finite/negative prices when present), and timeout/max-in-flight validation. They are ungated so `--no-default-features` still verifies router config semantics. They MUST NOT take a `BudgetPolicy` and MUST NOT enforce budget-dependent price completeness.
 
-Price fail-closed needs the run `BudgetPolicy`: `RouterConfig::load` validates structural rules; `TomlModelRouter::from_paths` / `from_parts` MUST additionally reject configs that omit prices when `budget_policy.max_usd_per_run.is_finite() && budget_policy.max_usd_per_run > 0.0`.
+Budget-dependent missing-price rejection is performed only by `TomlModelRouter::from_paths` / `from_parts` when `budget_policy.max_usd_per_run.is_finite() && budget_policy.max_usd_per_run > 0.0` (both `input_usd_per_mtok` and `output_usd_per_mtok` required on every endpoint).
 
-`TomlModelRouter::from_paths` calls `RouterConfig::load`, then resolves `api_key_env` and builds the HTTP provider behind `http-provider`. `from_parts` MUST re-run the same invariants and require `provider.id() == config.providers[0].id`.
+`TomlModelRouter::from_paths` calls `RouterConfig::load`, then resolves `api_key_env`, applies the budget-dependent price check above, and builds the HTTP provider behind `http-provider`. `from_parts` MUST re-run the same invariants (including the budget-dependent price check) and require `provider.id() == config.providers[0].id`.
 
 `EndpointConfig` converts to `ModelEndpoint` by copying every same-named field and setting `ModelEndpoint.provider = ProviderConfig.id` from the owning provider. There is no endpoint-level provider override in TOML.
 
@@ -1912,6 +1916,7 @@ RFC-0007 MUST NOT sleep-and-retry inside `OpenAiCompatibleProvider::complete` or
 | `toml_accepts_loopback_http_base_url` | `http://127.0.0.1` / `http://localhost` accepted for local CI/provider use |
 | `toml_rejects_base_url_userinfo` | `https://user@example.com` rejected |
 | `toml_rejects_base_url_query_or_fragment` | `?x=1` / `#frag` rejected |
+| `base_url_join_preserves_prefix` | `…/v1` and `…/v1/` both join to `…/v1/chat/completions` |
 | `auth_header_invalid_at_construct` | non-HeaderValue key material → Config / construct err |
 | `toml_rejects_two_providers` | MVP single provider |
 | `toml_rejects_duplicate_provider_endpoint_ids` | duplicate ids rejected |
