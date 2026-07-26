@@ -7,7 +7,7 @@
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0004](./RFC-0004-observability-cost-metering.md) (merged) |
 | **Effort** | 7–9 person-days |
-| **Related RFCs** | [0005](./RFC-0005-sandbox-broker.md) sandbox posture / `Grant::Network` · [0006](./RFC-0006-mcp-host-builtins.md) recording-seam pattern · [0010](./RFC-0010-scheduler-runtime-adapters.md) retry consumer · [0012](./RFC-0012-context-engine.md) full `PromptPack` · [0013](./RFC-0013-capability-registry-workers.md) workers · [0016](./RFC-0016-eval-harness-holdout-gates.md) `ScriptedProvider` |
+| **Related RFCs** | [0005](./RFC-0005-sandbox-broker.md) sandbox posture / `Grant::Network` · [0006](./RFC-0006-mcp-host-builtins.md) recording-seam pattern · [0010](./RFC-0010-scheduler-runtime-adapters.md) scheduler / retry loops (depends on 0003/0004/0006/0009 — **not** on 0007; consumes `ErrorClass` via adapters) · [0012](./RFC-0012-context-engine.md) full `PromptPack` · [0013](./RFC-0013-capability-registry-workers.md) workers (map `RouterError`/`ProviderError` → `ErrorClass`) · [0016](./RFC-0016-eval-harness-holdout-gates.md) `ScriptedProvider` |
 | **Product** | Alloy — AI Engineering Runtime |
 | **Supersedes** | Draft outline of this filename (expanded to implementation grade) |
 
@@ -59,7 +59,7 @@ RFC-0001 published `ModelTier`, `ProviderId`, `CapabilityId`, `BudgetSnapshot`, 
 | Second provider kind or second live provider | Deferred (V2 evolution) |
 | Capability worker prompts / `CapabilityContext` | **RFC-0013** |
 | Full three-domain `PromptPack` assembly | **RFC-0012** |
-| Retry / backoff loops on provider errors | **RFC-0010** (consumes this taxonomy) |
+| Retry / backoff loops on provider errors | **RFC-0010** (retry loops; maps through `ErrorClass` — see §10.4) |
 | Streaming chat completions | Deferred — MVP non-streaming (§3.8) |
 | Cost marketing numbers / savings claims | **Forbidden** (V2 §18.2 / ADR F-08) |
 | OTLP, sixth crate, new OS service, plugin framework | Forbidden |
@@ -70,7 +70,7 @@ RFC-0001 published `ModelTier`, `ProviderId`, `CapabilityId`, `BudgetSnapshot`, 
 
 1. `TomlModelRouter::from_paths(...)` MUST load the §7 schema, resolve exactly one `openai_compatible` provider, and fail closed on invalid config or missing/empty `api_key_env`.
 2. `route` MUST select tier from `[capability_tiers]` else `[policy].default_tier`, select the first matching endpoint, enforce budget denial **without** tier escalation/downgrade, and record `DecisionKind::ModelRoute` (or `Budget` on denial).
-3. `complete` MUST call the selected provider once (no retry loop), map the openai-compatible response into `ModelResponse` + RFC-0004 records, and update `SharedCostMeter` when injected.
+3. `complete` MUST consume the one-shot ticket, re-check budget when a meter is injected (§5.4.1), call the selected provider once (no retry loop), map the openai-compatible response into `ModelResponse` + RFC-0004 records, update `SharedCostMeter` when injected, and durable-append `ModelCall` on a router-owned JoinSet (§5.9.3).
 4. `OpenAiCompatibleProvider::health` MUST return `Health::Healthy` unconditionally (stub).
 5. `[policy].scoring` weights, if present, MUST be parsed and MUST NOT affect routing.
 6. Core Rust sources under `alloy-runtime` (excluding tests that assert absence) MUST contain **zero** vendor model-ID string literals and **zero** `match` arms on provider vendor brands for model selection.
@@ -361,7 +361,7 @@ pub struct RoutingRequest {
     pub requires_structured_output: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct RoutedModel {
     pub endpoint: ModelEndpoint,
     pub tier: ModelTier,
@@ -372,10 +372,30 @@ pub struct RoutedModel {
     pub requires_structured_output: bool,
     /// Event sequence of the route decision, if recording succeeded.
     pub route_event_seq: Option<EventSeq>,
+    /// One-shot ticket shared across clones; consumed by the first successful admission into `complete`.
+    #[serde(skip)]
+    pub(crate) complete_ticket: CompleteTicket,
 }
 ```
 
 **Attribution:** `session` is REQUIRED on `RoutingRequest` because RFC-0004 `DecisionLog` requires a session row for durable append, and route decisions MUST be attributable. This is an additive field relative to the V2 sketch (V2 omitted obs attribution that RFC-0004 already merged).
+
+```rust
+#[derive(Clone, Debug)]
+pub(crate) struct CompleteTicket {
+    used: Arc<AtomicBool>,
+}
+
+impl CompleteTicket {
+    pub(crate) fn new() -> Self;
+    /// Returns true exactly once across all clones.
+    pub(crate) fn try_consume(&self) -> bool;
+}
+```
+
+`RoutedModel` MAY implement `Clone` only by cloning the ticket `Arc` (not minting a fresh ticket). A second `complete` against the same ticket, including via a clone, MUST return `Err(RouterError::AlreadyCompleted)` and MUST NOT perform provider HTTP or metering. `PartialEq` is not derived because the ticket is runtime state.
+
+Test helpers that construct a `RoutedModel` without going through `route` MUST call `CompleteTicket::new()` so each fixture starts with a fresh ticket.
 
 ### 3.9 `SecretString`
 
@@ -414,6 +434,8 @@ pub enum RouterError {
     },
     #[error("budget denied: {0:?}")]
     BudgetDenied(BudgetCheck),
+    #[error("routed model already completed")]
+    AlreadyCompleted,
     #[error("provider: {0}")]
     Provider(#[from] ProviderError),
     #[error("cancelled")]
@@ -439,6 +461,8 @@ pub enum ProviderError {
     MalformedResponse(String),
     #[error("http status {status}: {message}")]
     HttpStatus { status: u16, message: String },
+    #[error("tls: {0}")]
+    Tls(String),
     #[error("transport: {0}")]
     Transport(String),
     #[error("internal: {0}")]
@@ -489,7 +513,7 @@ pub trait ModelRouter: Send + Sync {
 }
 ```
 
-**Contract:** `complete` MUST use `routed.endpoint` / `routed.tier` as selected by a prior `route` (or an equivalent test-constructed `RoutedModel`). Callers MUST NOT mutate `endpoint.model` to bypass TOML.
+**Contract:** `complete` MUST use `routed.endpoint` / `routed.tier` as selected by a prior `route` (or an equivalent test-constructed `RoutedModel`). Callers MUST NOT mutate `endpoint.model` to bypass TOML. `complete` MUST consume `routed.complete_ticket` before provider HTTP (§5.4 / §5.4.1).
 
 ### 3.13 `TomlModelRouter`
 
@@ -534,7 +558,14 @@ pub struct TomlModelRouterParts {
 
 `from_paths`, `OpenAiCompatibleProvider`, `OpenAiCompatibleSpec`, and `http_client` are gated behind `http-provider`. `from_parts`, traits, config DTOs, `RecordingModelProvider`, and all shared types compile without default features.
 
-**Budget policy:** injected at construction from `RuntimeConfig::budget_policy` (§7.6). Used by `route` denial (§5.4). Not read from `router.toml`.
+**Budget policy:** injected at construction from `RuntimeConfig::budget_policy` (§7.6). Used by `route` / `complete` denial (§5.4). Not read from `router.toml`.
+
+**Per-run metering ownership (normative):**
+
+- Production callers MUST bind at most one run-scoped `SharedCostMeter` to a `TomlModelRouter` instance.
+- Concurrent runs MUST NOT share one meter through a process-global / long-lived router.
+- RFC-0010 (run lifecycle) owns constructing the run meter and injecting it when wiring the router for that run.
+- Tests MAY inject a shared meter deliberately; production construction that shares one meter across concurrent runs is a contract violation.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,7 +650,11 @@ pub struct ModelCallRecord {
 
 **Compatibility:** existing event payloads without these fields MUST parse with `None`. `record_model_call` MUST write them when provided. `reaccumulate_cost_from_events` MUST ignore these fields for arithmetic and preserve RFC-0004 cost semantics.
 
-**Source impact:** `ModelCallRecord` is an existing public struct and is not `#[non_exhaustive]` on `main`; adding fields is source-breaking for in-workspace struct literals. The implementation PR MUST update all current literals/tests and MUST consider adding `#[non_exhaustive]` or constructor helpers in the same amendment so later additive fields do not repeat this cost.
+**Source impact:** `ModelCallRecord` is an existing public struct and is not `#[non_exhaustive]` on `main`; adding fields is source-breaking for in-workspace struct literals. The implementation PR MUST:
+
+1. Update all current literals/tests.
+2. Mark `ModelCallRecord` `#[non_exhaustive]` in the same amendment so later additive fields do not repeat this cost.
+3. Provide a documented constructor or builder used by in-tree producers/tests.
 
 **Producer rules in RFC-0007:**
 
@@ -802,7 +837,7 @@ If none match → `Err(RouterError::NoEndpoint { … })`.
 
 ### 5.4 Budget enforcement point
 
-**Denial occurs in `route`, not `complete`.**
+**Primary denial occurs in `route`. `complete` re-checks and enforces single-use.**
 
 1. If `self.cost_meter` is `Some(meter)`, compute `check = meter.check_budget(&self.budget_policy)`.
 2. If no meter is injected, compute `check = check_budget_snapshot(&req.budget_remaining, &self.budget_policy)`.
@@ -810,11 +845,20 @@ If none match → `Err(RouterError::NoEndpoint { … })`.
    - Record `DecisionKind::Budget` with metadata (§9.2).
    - Return `Err(RouterError::BudgetDenied(check))`.
 4. **MUST NOT** escalate or downgrade tier to satisfy budget in MVP.
-5. `complete` MUST NOT re-check `BudgetPolicy`. Run-level post-call warnings remain RFC-0010 (`maybe_signal_budget_warning`).
+5. Successful `route` returns a `RoutedModel` whose `complete_ticket` is fresh (`used = false`).
 
-**Caller observation:** `Err(BudgetDenied(_))` — no provider HTTP occurs.
+#### 5.4.1 `complete` admission (normative)
 
-**Concurrent overshoot:** RFC-0007 bounds admission with `max_in_flight` (§6.3) but does not reserve budget per prompt. If N calls route concurrently before their completions update the meter, all N can pass the same budget check. This bounded overshoot is accepted for MVP and MUST be documented in `Budget` decision metadata as `in_flight_at_route`; RFC-0010 owns stricter per-node serialization / reservation.
+Before provider HTTP, `TomlModelRouter::complete` MUST:
+
+1. Call `routed.complete_ticket.try_consume()`. If false → `Err(RouterError::AlreadyCompleted)` (no HTTP, no meter, no ModelCall).
+2. Re-check budget with the same precedence as `route` (meter first, else snapshot from `CostMeter::to_budget_snapshot` of the injected meter if present, else deny only when no meter and the caller's last known snapshot cannot be re-evaluated — MVP: when meter is injected, re-check meter; when meter is absent, skip re-check and rely on single-use ticket only).
+3. If the re-check is exhausted → `Err(RouterError::BudgetDenied(check))`, record `DecisionKind::Budget`, and leave the ticket consumed so the caller cannot retry the same ticket after denial.
+4. Proceed to provider call only after steps 1–3 succeed.
+
+**Caller observation:** `Err(BudgetDenied(_))` — no provider HTTP occurs. `Err(AlreadyCompleted)` — no provider HTTP occurs.
+
+**Concurrent overshoot:** RFC-0007 bounds admission with `max_in_flight` (§6.3) but does not reserve budget per prompt. If N distinct `route` calls succeed concurrently before their completions update the meter, all N can pass the route-time check. Overshoot is therefore bounded by `min(N_successful_routes, max_in_flight)` outstanding completes, **not** unbounded ticket reuse. RFC-0010 owns stricter per-node serialization / reservation. Budget decision metadata MUST include `in_flight_at_route`.
 
 ### 5.5 `complete` request construction
 
@@ -946,7 +990,19 @@ RFC-0004 synthesizes wire `usage_unknown = input_tokens.is_none() \|\| output_to
 
 If `cost_meter` is `None`, skip metering (tests without meter). Decision log remains independent.
 
-**Cancellation-safe ordering:** after the provider returns `Ok` or a recordable `Err`, the router MUST build the `ModelCallRecord` fields, update `SharedCostMeter` synchronously (no `.await` before `add_model_usage`), then await `record_model_call`. Host-level cancellation (§6.4) MUST NOT be selected during this meter+record critical section. If the caller drops the future during the async append, Rust cancellation may still prevent the durable record; this is recorded only when the append returns an error. `obs_record_errors` MUST count returned obs failures for both route decisions and model-call records. This mirrors RFC-0006’s obs-failure-does-not-fail-call rule while keeping the synchronous meter update first.
+**Cancellation-safe ordering and durable append (normative):**
+
+After the provider returns `Ok` or a recordable `Err`:
+
+1. Build the `ModelCallRecord` fields.
+2. Update `SharedCostMeter` synchronously (no `.await` before `add_model_usage`).
+3. Enqueue the durable append on a **router-owned** `tokio::task::JoinSet` (or equivalent owned task set) that outlives the caller future.
+4. Await that specific append task. Host-level cancellation (§6.4) MUST NOT be selected during this meter+record critical section.
+5. If the caller drops the `complete` future after step 2, the router-owned JoinSet MUST retain the append task so the durable `ModelCall` still completes (or fails into `obs_record_errors`). Dropping the caller future MUST NOT abort the append task.
+6. `shutdown()` MUST drain the JoinSet (await remaining appends up to the post-cancel grace) before returning `Stopped`.
+7. `obs_record_errors` MUST count returned obs failures for both route decisions and model-call records.
+
+This preserves RFC-0004 §7.5's durable-metering invariant after a provider attempt has occurred. Run-level post-call warnings remain RFC-0010 (`maybe_signal_budget_warning`).
 
 #### 5.9.4 RFC-0004 compatibility analysis and amendment
 
@@ -993,15 +1049,18 @@ On successful route-decision append, the returned `EventSeq` MUST be copied into
 | --- | --- | --- | --- |
 | Config / missing API key at construct | N/A — construct fails with `RouterError::Config` | no | no |
 | No endpoint | `Err(NoEndpoint)` | ModelRoute | no |
-| Budget | `Err(BudgetDenied)` | Budget | no |
+| Budget at `route` or `complete` re-check | `Err(BudgetDenied)` | Budget | no |
+| Second `complete` on spent ticket | `Err(AlreadyCompleted)` | no | no |
 | Provider Auth | `Err(Provider(Auth))` | ModelCall + error_class Model | unknown usage |
 | Rate limit | `Err(Provider(RateLimit))` | ModelCall + Model | unknown |
 | Context length | `Err(Provider(ContextLength))` | ModelCall + Model | unknown |
 | Timeout | `Err(Provider(Timeout))` | ModelCall + Timeout | unknown |
+| TLS failure | `Err(Provider(Tls))` | ModelCall + Model | unknown |
+| Transport (non-TLS I/O) | `Err(Provider(Transport))` | ModelCall + Model | unknown |
 | Malformed | `Err(Provider(Malformed…))` | ModelCall + Model | unknown |
 | Host cancellation before provider returns | `Err(Cancelled)` | no ModelCall | no |
 | Caller drops before provider result | no return value | no ModelCall | no |
-| Caller drops during async `record_model_call` after provider result | no return value | append may be lost | meter may already be updated per §5.9.3 |
+| Caller drops after provider success, before/during durable append | no return value (lost join) | ModelCall still appended via JoinSet (§5.9.3) | yes (sync before spawn) |
 | Shutting down | `Err(ShuttingDown)` | no | no |
 
 ### 5.12 Sequence — successful complete
@@ -1018,15 +1077,19 @@ sequenceDiagram
   C->>R: route(req)
   R->>S: tier + endpoint + budget
   R->>D: record(ModelRoute)
-  R-->>C: Ok(RoutedModel)
+  R-->>C: Ok(RoutedModel with fresh ticket)
   C->>R: complete(routed, prompt)
+  Note over R: try_consume ticket; re-check budget (§5.4.1)
   R->>P: complete(endpoint, req)
   P-->>R: Ok(ModelResponse)
   R->>S: derive_usd
-  R->>M: add_model_usage
+  R->>M: add_model_usage (sync)
+  R->>R: spawn JoinSet durable append
   R->>D: record_model_call
   R-->>C: Ok(ModelResponse)
 ```
+
+Drop of the caller future after `add_model_usage` MUST NOT abort the JoinSet append task (§5.9.3).
 
 ---
 
@@ -1073,9 +1136,11 @@ Implementation MUST use an `AtomicU8` phase (`Ready = 0`, `Draining = 1`, `Stopp
 
 | Mechanism | Behaviour |
 | --- | --- |
-| Drop of `complete` / `route` future | In-flight HTTP aborted (reqwest cancel-on-drop); in_flight dec; **no** DecisionLog / meter update |
+| Drop of `route` future | No durable write required beyond best-effort; in_flight dec |
+| Drop of `complete` future **before** provider returns | In-flight HTTP aborted (reqwest cancel-on-drop); in_flight dec; **no** ModelCall / meter update; ticket already consumed → later `complete` → `AlreadyCompleted` |
+| Drop of `complete` future **after** provider success (during JoinSet append await) | Meter already updated; durable `ModelCall` **continues** on router-owned JoinSet (§5.9.3); caller may lose the join |
 | Host-level cancellation token fires before provider returns | `Err(Cancelled)`; no ModelCall unless the provider attempt already returned and entered the meter+record critical section |
-| Shutdown grace expires | router calls `shutdown_token.cancel()`; still-polled in-flight provider calls observe `Err(Cancelled)` |
+| Shutdown grace expires | router calls `shutdown_token.cancel()`; still-polled in-flight provider calls observe `Err(Cancelled)`; JoinSet appends drain per §6.6 |
 
 No per-call `CancellationToken` field is added to V2 trait signatures. The cancellation token is router-owned / injected through `TomlModelRouterParts`, matching the RFC-0006 host-level pattern.
 
@@ -1104,10 +1169,11 @@ shutdown():
   if in_flight > 0 after grace:
     shutdown_token.cancel()
     wait one bounded post-cancel grace of min(1000ms, shutdown_grace_ms)
+  drain router-owned ModelCall JoinSet (await remaining appends up to the same post-cancel grace)
   set Stopped, notify all, return report with remaining_in_flight
 ```
 
-`shutdown` is idempotent. Concurrent callers MUST NOT race a Stopped→Draining transition. The first caller performs cancellation and stores `cancelled_in_flight` in an `AtomicBool`; followers observe the final `Stopped` phase or the bounded follower timeout and report the stored flag plus the current `in_flight`. If `remaining_in_flight > 0`, shutdown MUST log `warn` and return that count in `RouterShutdownReport`.
+`shutdown` is idempotent. Concurrent callers MUST NOT race a Stopped→Draining transition. The first caller performs cancellation and stores `cancelled_in_flight` in an `AtomicBool`; followers observe the final `Stopped` phase or the bounded follower timeout and report the stored flag plus the current `in_flight`. If `remaining_in_flight > 0`, shutdown MUST log `warn` and return that count in `RouterShutdownReport`. JoinSet drain is REQUIRED so durable metering appends started after provider success are not abandoned when the process owner shuts the router down (§5.9.3).
 
 ### 6.7 Connection reuse
 
@@ -1192,6 +1258,7 @@ planning = "standard"
 | `base_url` empty | Config |
 | `base_url` scheme is neither `https` nor `http` | Config |
 | `base_url` uses `http` and host is not loopback (`localhost`, `127.0.0.0/8`, `::1`) | Config |
+| `base_url` contains a query string or fragment | Config |
 | `api_key_env` empty | Config |
 | Env var unset/empty at construct | Config with `example.env` hint |
 | No endpoints under the provider | Config |
@@ -1222,6 +1289,7 @@ planning = "standard"
    - an IPv6 host parsed by `Url` whose `std::net::Ipv6Addr::is_loopback()` is true.
 5. Reject userinfo for all provider URLs (`username` non-empty or `password` present) so `http://127.0.0.1@evil.example.com` cannot confuse review/logs.
 6. Reject hostless URLs.
+7. Reject URLs with a non-empty query (`url.query().is_some()`) or fragment (`url.fragment().is_some()`). Provider base URLs MUST be path-only; query/fragment in config is a config error, not silently stripped.
 
 `localhost.evil.com`, non-canonical integer IPv4 spellings, and IPv4-mapped IPv6 addresses are accepted only if `url::Url` exposes them as loopback IP addresses through the standard `IpAddr` parser; otherwise they are rejected.
 
@@ -1331,7 +1399,8 @@ Full router validation + key resolution moves to `TomlModelRouter::from_paths` /
 | --- | --- | --- | --- | --- | --- |
 | `Config` | load/validate | bad TOML / invariants | no | n/a (construct) | yes |
 | `NoEndpoint` | select | no matching endpoint | no | ModelRoute | yes |
-| `BudgetDenied` | route §5.4 | ceilings exhausted | no | Budget | yes |
+| `BudgetDenied` | route §5.4 / complete §5.4.1 | ceilings exhausted | no | Budget | yes |
+| `AlreadyCompleted` | complete §5.4.1 | ticket already consumed | no | no | yes |
 | `Provider` | complete | wrapped provider failure | see §8.2 | ModelCall | yes |
 | `Cancelled` | host-level cancellation token | cancelled before provider result | no | no | yes |
 | `ShuttingDown` | lifecycle | drain/stop | no | no | yes |
@@ -1347,10 +1416,11 @@ Full router validation + key resolution moves to `TomlModelRouter::from_paths` /
 | `Timeout` | client timeout | connect/request deadline | **yes** | yes | yes |
 | `MalformedResponse` | JSON/shape | unusable body | no | yes | yes (redacted) |
 | `HttpStatus` | other 4xx/5xx | mapped status | 5xx **yes**; other 4xx no | yes | yes |
-| `Transport` | DNS/TLS/connect reset | I/O | **yes** | yes | yes |
+| `Tls` | TLS handshake / cert / protocol failure | non-transient crypto/trust failure | **no** | yes | yes |
+| `Transport` | DNS / connect reset / non-TLS I/O | transient I/O | **yes** | yes | yes |
 | `Internal` | provider bug | invariant | no | optional | yes |
 
-**Retry boundary:** RFC-0007 MUST classify retryability as above and MUST NOT implement a retry loop, backoff, or automatic re-route. RFC-0010 owns retries.
+**Retry boundary:** RFC-0007 MUST classify retryability as above and MUST NOT implement a retry loop, backoff, or automatic re-route. Retry loops belong to RFC-0010; workers/adapters (RFC-0013 / host) map `ProviderError`/`RouterError` into `ErrorClass` before scheduler retry decisions (§10.4).
 
 ### 8.3 HTTP status → `ProviderError` mapping
 
@@ -1362,7 +1432,8 @@ Full router validation + key resolution moves to `TomlModelRouter::from_paths` /
 | Client timeout / `reqwest::Error::is_timeout` | `Timeout` |
 | Other status | `HttpStatus { status, message }` |
 | JSON parse / missing choices | `MalformedResponse` |
-| Non-HTTP I/O | `Transport` |
+| TLS handshake / certificate / protocol errors (`reqwest::Error` TLS class) | `Tls` |
+| Non-HTTP, non-TLS I/O (DNS, reset, broken pipe, …) | `Transport` |
 
 #### 8.3.1 Context-length heuristics
 
@@ -1377,9 +1448,9 @@ Only applied on HTTP 400. Prefer structured `error.code == "context_length_excee
 | ProviderError | `ErrorClass` |
 | --- | --- |
 | `Timeout` | `Timeout` |
-| `Auth`, `RateLimit`, `ContextLength`, `MalformedResponse`, `HttpStatus`, `Transport`, `Internal` | `Model` |
+| `Auth`, `RateLimit`, `ContextLength`, `MalformedResponse`, `HttpStatus`, `Tls`, `Transport`, `Internal` | `Model` |
 
-`BudgetDenied` → DecisionKind::Budget only (not ModelCall); callers MAY map to `ErrorClass::Budget` at scheduler layer (RFC-0010).
+`BudgetDenied` → DecisionKind::Budget only (not ModelCall); callers MAY map to `ErrorClass::Budget` at scheduler layer (RFC-0010 / adapters). `AlreadyCompleted` is a caller contract violation — map to `ErrorClass::Internal` (or equivalent non-retryable class) at the adapter boundary; do not retry.
 
 ### 8.5 Boundary conversion to `RuntimeError`
 
@@ -1402,8 +1473,10 @@ Host code that surfaces router failures to CLI MAY pattern-match `RouterError` d
 | --- | --- |
 | `Config` (including missing API key env) | Operator fixes TOML / exports env; never auto-write `.env` |
 | `BudgetDenied` | Caller ends run or raises budget (RFC-0010/0015) — router does not downgrade |
+| `AlreadyCompleted` | Caller bug / double complete — do not retry the same ticket |
 | `NoEndpoint` | Fix TOML endpoints / capability tiers |
-| `RateLimit` / `Timeout` / `Transport` / 5xx | RFC-0010 may retry |
+| `RateLimit` / `Timeout` / `Transport` / 5xx | RFC-0010 may retry after adapter maps to `ErrorClass` |
+| `Tls` | Fix trust store / endpoint TLS; **not** retryable by default |
 | `Auth` | Fix API key |
 | `ContextLength` | Caller shrinks PromptPack (RFC-0012) — no auto-retry |
 | `MalformedResponse` | Treat as provider defect; no retry by default |
@@ -1496,6 +1569,7 @@ No other new runtime deps required beyond `reqwest` and `url` (`async-trait`, `s
 ### 10.2.1 HTTP body and header safety
 
 - Authorization header MUST be built as a `HeaderValue` and marked `set_sensitive(true)` before insertion.
+- At `OpenAiCompatibleProvider::new` (construct time), the implementation MUST validate that `format!("Bearer {}", api_key.expose())` can be converted into a `HeaderValue`. If construction of the header value fails (invalid bytes), return a construct-time error (`ProviderError` → `RouterError::Config` when wrapped by `from_paths`). Do **not** defer header validation until the first `complete`.
 - Success and error bodies MUST be read with an explicit cap of 1 MiB. Bodies larger than the cap return `ProviderError::MalformedResponse("response body too large")` or `HttpStatus` with a truncated redacted message for non-2xx.
 - Error messages stored in `ProviderError` MUST be redacted and truncated to ≤512 bytes on a UTF-8 character boundary; byte slicing that can panic on multibyte input is forbidden.
 - Request/response debug logging MUST NOT include headers or raw bodies.
@@ -1504,9 +1578,19 @@ No other new runtime deps required beyond `reqwest` and `url` (`async-trait`, `s
 
 `alloy-runtime` remains `#![forbid(unsafe_code)]`. This RFC adds **zero** `unsafe`.
 
-### 10.4 Retry policy ownership
+### 10.4 Retry policy and ErrorClass mapping ownership
 
-**RFC-0010** consumes §8 retryability. RFC-0007 MUST NOT sleep-and-retry inside `OpenAiCompatibleProvider::complete` or `TomlModelRouter::complete`.
+**Boundary (normative):**
+
+| Layer | Owns |
+| --- | --- |
+| RFC-0007 | Produce `RouterError` / `ProviderError` with the retryability classifications in §8 |
+| RFC-0013 workers / host adapters | Map `RouterError` / `ProviderError` → `ErrorClass` (and any scheduler-facing error wrapper) |
+| RFC-0010 | Retry / backoff loops keyed on `ErrorClass` (and run lifecycle / meter injection) |
+
+RFC-0010's dependency list (0003/0004/0006/0009) does **not** include RFC-0007. RFC-0010 MUST NOT be described as consuming `ProviderError` directly. Adapters introduced with workers (RFC-0013) or thin host wiring MAY bridge 0007 errors into the 0010 `ErrorClass` surface.
+
+RFC-0007 MUST NOT sleep-and-retry inside `OpenAiCompatibleProvider::complete` or `TomlModelRouter::complete`.
 
 ---
 
@@ -1520,6 +1604,8 @@ No other new runtime deps required beyond `reqwest` and `url` (`async-trait`, `s
 | `toml_rejects_non_loopback_http_base_url` | `http://example.com` fails |
 | `toml_accepts_loopback_http_base_url` | `http://127.0.0.1` / `http://localhost` accepted for local CI/provider use |
 | `toml_rejects_base_url_userinfo` | `https://user@example.com` rejected |
+| `toml_rejects_base_url_query_or_fragment` | `?x=1` / `#frag` rejected |
+| `auth_header_invalid_at_construct` | non-HeaderValue key material → Config / construct err |
 | `toml_rejects_two_providers` | MVP single provider |
 | `toml_rejects_duplicate_provider_endpoint_ids` | duplicate ids rejected |
 | `toml_rejects_empty_model` | Config error |
@@ -1558,9 +1644,15 @@ No other new runtime deps required beyond `reqwest` and `url` (`async-trait`, `s
 | `openai_malformed` | → `MalformedResponse` |
 | `openai_200_error_object` | 200 with top-level error → `MalformedResponse` |
 | `openai_finish_reason_length` | completion OK; `ModelCallRecord.finish_reason` populated |
+| `openai_content_parts_concat` | content array text parts concatenated; non-text ignored |
+| `openai_refusal_no_content` | refusal → `Ok` with `text: None`, `finish_reason: Some("refusal")` |
+| `openai_body_over_cap` | >1 MiB body → `MalformedResponse` / capped error |
+| `openai_redirect_not_followed` | 3xx with Location → non-success mapped error; no second hop |
+| `openai_tls_classified` | TLS-class reqwest error → `ProviderError::Tls` (not `Transport`) |
 | `route_then_complete_decision_log` | ModelRoute + ModelCall recorded |
 | `model_call_has_endpoint_model_route_seq` | added RFC-0004 fields populated |
 | `usage_unknown_roundtrip_query` | append + `parse_model_call_event` OK when tokens None |
+| `model_call_pre_amendment_event_parses` | event JSON without new fields → `None`s; reaccumulate OK |
 
 ### 11.3 Negative / budget / cancel / concurrency
 
@@ -1568,10 +1660,14 @@ No other new runtime deps required beyond `reqwest` and `url` (`async-trait`, `s
 | --- | --- |
 | `missing_api_key_fail_closed` | construct err; no `.env` write |
 | `budget_denial_no_http` | wiremock received 0 requests |
-| `drop_complete_no_obs` | drop → no ModelCall |
+| `complete_budget_recheck_denies` | meter exhausted between route and complete → `BudgetDenied`; ticket spent |
+| `double_complete_already_completed` | second `complete` / clone → `AlreadyCompleted`; no second HTTP |
+| `drop_complete_before_provider_no_obs` | drop before provider result → no ModelCall |
+| `drop_complete_after_provider_keeps_obs` | drop after provider Ok → ModelCall still durable (JoinSet) |
 | `host_cancel_returns_cancelled` | router cancellation token produces reachable `Cancelled` |
 | `shutdown_rejects_new` | ShuttingDown |
 | `shutdown_idempotent_concurrent` | concurrent shutdowns return final report |
+| `shutdown_drains_joinset` | pending ModelCall appends complete within grace / post-cancel window |
 | `max_in_flight_bounds_admission` | calls above limit await or reject on drain |
 | `concurrent_completes` | N parallel OK with recording/wiremock |
 
@@ -1618,7 +1714,7 @@ Traits, `TomlModelRouter`, one `openai_compatible` provider, full TOML schema, h
 | --- | --- |
 | Retry / backoff / multi-attempt | **RFC-0010** |
 | Full PromptPack domains / assembly | **RFC-0012** |
-| Workers calling router with tools | **RFC-0013** |
+| Workers calling router with tools; map router/provider errors → `ErrorClass` | **RFC-0013** |
 | `ScriptedProvider` body + holdout gates | **RFC-0016** |
 | Multi-provider failover / scoring | ADR F-20 / V2 evolution |
 | Streaming API | Future RFC |
@@ -1645,23 +1741,26 @@ Every criterion is independently testable.
 | 10 | `add_model_usage` called on complete outcomes when meter injected | unit/integration |
 | 11 | USD only when prices + tokens known; else None; `usd_source` set only for derived USD | price + ModelCall tests |
 | 12 | No cost marketing strings in router module | grep / review |
-| 13 | Budget denial at `route`; meter takes precedence over snapshot; no tier escalation | `route_uses_meter_before_snapshot`, `budget_denied_no_escalation` |
+| 13 | Budget denial at `route` and re-check at `complete` when meter injected; single-use ticket; no tier escalation | `route_uses_meter_before_snapshot`, `budget_denied_no_escalation`, `complete_budget_recheck_denies`, `double_complete_already_completed` |
 | 14 | Scoring weights unused | `scoring_weights_ignored` |
 | 15 | `health()` always Healthy | unit |
 | 16 | MVP non-streaming (`stream: false`) | wiremock request assert |
 | 17 | Missing/empty API key fail closed | `missing_api_key_fail_closed` |
-| 18 | Secrets redacted in Debug / errors / events; Authorization header sensitive | secret + redact + header tests |
+| 18 | Secrets redacted in Debug / errors / events; Authorization header sensitive; invalid auth header fails at construct | secret + redact + header + construct tests |
 | 19 | `RecordingModelProvider` satisfies `ModelProvider` | contract test |
-| 20 | Drop cancel performs no obs write; host cancellation returns `Cancelled` | `drop_complete_no_obs`, `host_cancel_returns_cancelled` |
+| 20 | Drop before provider → no ModelCall; drop after provider → durable ModelCall retained; host cancel → `Cancelled` | `drop_complete_before_provider_no_obs`, `drop_complete_after_provider_keeps_obs`, `host_cancel_returns_cancelled` |
 | 21 | `RuntimeConfig::load` no longer parses `[provider.*]` and exposes profile `budget_policy` | config unit tests updated |
 | 22 | `#![forbid(unsafe_code)]` preserved; reqwest version/features/TLS backend justified | crate attrs + Cargo.toml |
-| 23 | Retry loop absent | code review + no sleep-retry in openai.rs |
+| 23 | Retry loop absent; TLS classified separately from Transport | code review + `openai_tls_classified` |
 | 24 | Host egress documented vs sandbox Network grants | §2.6 present |
-| 25 | `ModelCallRecord` additive endpoint/model/route/usd_source/finish_reason/provider_request_id amendment implemented | schema + parse/reaccumulate tests |
+| 25 | `ModelCallRecord` additive fields + `#[non_exhaustive]` + constructor; pre-amendment events parse | schema + `model_call_pre_amendment_event_parses` |
 | 26 | Large prompts preserve durable ModelCall by hash-only body handling | `oversize_prompt_body_hash_only` |
-| 27 | `max_in_flight` bounds concurrent provider calls | semaphore test |
+| 27 | `max_in_flight` bounds concurrent provider calls; shutdown drains JoinSet | semaphore + `shutdown_drains_joinset` |
 | 28 | `--no-default-features` keeps non-HTTP router surfaces compiling | CI feature-gate check |
 | 29 | RFC-0004 and RFC-0001 merged text updated for additive amendments | docs diff |
+| 30 | `base_url` rejects query/fragment; redirects not followed; body cap enforced | URL + `openai_redirect_not_followed` + `openai_body_over_cap` |
+| 31 | Content-parts concat and refusal mapping | `openai_content_parts_concat`, `openai_refusal_no_content` |
+| 32 | Per-run meter ownership documented; production MUST NOT share one meter across concurrent runs | §3.13 + review |
 
 ---
 
@@ -1712,7 +1811,7 @@ Only genuine unresolved items. Settled decisions are not reopened.
 1. Merged RFC-0001 + RFC-0004 on `main` (satisfied).
 2. Implement A→F in order; D and C may overlap after B.
 3. RFC-0016 skeleton may start as soon as traits in slice A land.
-4. RFC-0010 / 0013 consume errors and router after merge.
+4. RFC-0013 / host adapters map `RouterError`/`ProviderError` → `ErrorClass`; RFC-0010 owns retries on `ErrorClass` (does not depend on 0007).
 
 ### 16.4 Risk notes
 

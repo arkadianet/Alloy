@@ -182,7 +182,7 @@ Tracked under each RFC’s **Future extensions** (RenameType / gated LLM Planner
 
 | Scope | Person-days | Person-weeks (approx.) |
 | --- | --- | --- |
-| All RFCs (sum of ranges) | **72–114 pd** | **~14–23 pw** |
+| All RFCs (sum of ranges) | **75–115.5 pd** | **~15–23 pw** |
 | Critical path alone (no parallel) | ~50–76 pd | ~10–15 pw |
 | With Wave A–C parallelization (solo switching) | calendar ~8–12 weeks | matches V2 M1 |
 
