@@ -58,9 +58,10 @@ pub struct TomlModelRouterParts {
     pub cost_meter: Option<SharedCostMeter>,
     /// Run to which this router is bound.
     pub bound_run: Option<RunId>,
-    /// Test-only escape hatch for isolated unit tests.
+    /// Test-only escape hatch retained for API compatibility with unit-test builders.
     ///
-    /// Production builds reject `true` with [`RouterError::Config`].
+    /// Any non-`cfg(test)` library build rejects `true` with [`RouterError::Config`].
+    #[doc(hidden)]
     pub allow_unmetered: bool,
     /// Optional host cancellation token.
     pub shutdown_token: Option<CancellationToken>,

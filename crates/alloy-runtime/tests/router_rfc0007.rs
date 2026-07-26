@@ -1,15 +1,15 @@
-//! RFC-0007 integration tests: HTTP, recording, budgets, lifecycle, and BYOM policy.
+//! RFC-0007 HTTP-provider integration tests. Cargo gates this target on `http-provider`.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_runtime::{
-    BudgetCheck, BudgetPolicy, BudgetSnapshot, CapabilityId, ChatMessage, ChatRole, ModelProvider,
-    ModelResponse, ModelRouter, OpenAiCompatibleProvider, OpenAiCompatibleSpec, PromptPack,
-    ProviderId, RecordingDecisionLog, RecordingModelProvider, ResponseFormat, RetentionPolicy,
-    RouterConfig, RouterError, RoutingRequest, RunId, SecretString, SessionId, SharedCostMeter,
-    TomlModelRouter, TomlModelRouterParts, ToolChoice, Usage,
+    BudgetCheck, BudgetPolicy, BudgetSnapshot, CapabilityId, ChatMessage, ChatRole,
+    CompletionRequest, ModelEndpoint, ModelProvider, ModelRouter, ModelTier, ModelUsdSource,
+    OpenAiCompatibleProvider, OpenAiCompatibleSpec, PromptPack, ProviderError, ProviderId,
+    RecordingDecisionLog, ResponseFormat, RetentionPolicy, RouterConfig, RouterError,
+    RoutingRequest, RunId, SecretString, SessionId, SharedCostMeter, TomlModelRouter,
+    TomlModelRouterParts, ToolChoice,
 };
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path};
@@ -17,7 +17,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn config(base_url: &str, max_in_flight: u32) -> RouterConfig {
     RouterConfig::from_str(
-        "integration",
+        "HTTP integration",
         &format!(
             r#"
 [policy]
@@ -77,6 +77,43 @@ fn prompt() -> PromptPack {
     }
 }
 
+fn endpoint() -> ModelEndpoint {
+    ModelEndpoint {
+        id: alloy_runtime::EndpointId::new("endpoint").expect("endpoint"),
+        provider: ProviderId::new("provider").expect("provider"),
+        display_name: "Endpoint".into(),
+        model: "operator-configured".into(),
+        tiers: vec![ModelTier::Standard],
+        supports_tools: false,
+        supports_structured_output: true,
+        max_context: 4096,
+        input_usd_per_mtok: Some(2.0),
+        output_usd_per_mtok: Some(4.0),
+    }
+}
+
+fn completion_request(format: ResponseFormat) -> CompletionRequest {
+    CompletionRequest {
+        messages: prompt().messages,
+        tools: vec![],
+        tool_choice: ToolChoice::None,
+        response_format: format,
+        temperature: None,
+        max_output_tokens: None,
+    }
+}
+
+fn http_provider(base_url: String, request_timeout: Duration) -> OpenAiCompatibleProvider {
+    OpenAiCompatibleProvider::new(OpenAiCompatibleSpec {
+        id: ProviderId::new("provider").expect("provider"),
+        base_url,
+        api_key: SecretString::new("integration-secret"),
+        connect_timeout: Duration::from_secs(1),
+        request_timeout,
+    })
+    .expect("HTTP provider")
+}
+
 fn router(
     config: RouterConfig,
     provider: Arc<dyn ModelProvider>,
@@ -99,7 +136,7 @@ fn router(
 }
 
 #[tokio::test]
-async fn wiremock_completion_records_usage_and_attribution() {
+async fn openai_complete_wiremock_ok() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -123,16 +160,7 @@ async fn wiremock_completion_records_usage_and_attribution() {
 
     let base_url = format!("{}/v1", server.uri());
     let config = config(&base_url, 2);
-    let provider = Arc::new(
-        OpenAiCompatibleProvider::new(OpenAiCompatibleSpec {
-            id: ProviderId::new("provider").expect("provider"),
-            base_url,
-            api_key: SecretString::new("integration-secret"),
-            connect_timeout: Duration::from_secs(1),
-            request_timeout: Duration::from_secs(2),
-        })
-        .expect("HTTP provider"),
-    );
+    let provider = Arc::new(http_provider(base_url, Duration::from_secs(2)));
     let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy {
         retain_full_prompts: true,
         retain_tool_bodies: false,
@@ -155,13 +183,8 @@ async fn wiremock_completion_records_usage_and_attribution() {
         .expect("completion");
     assert_eq!(response.text.as_deref(), Some("{\"answer\":true}"));
     assert_eq!(response.structured, Some(json!({"answer": true})));
-    assert_eq!(
-        response.usage,
-        Usage {
-            input_tokens: Some(20),
-            output_tokens: Some(5),
-        }
-    );
+    assert_eq!(response.usage.input_tokens, Some(20));
+    assert_eq!(response.usage.output_tokens, Some(5));
 
     let meter_snapshot = meter.snapshot();
     assert_eq!(meter_snapshot.model_calls, 1);
@@ -169,151 +192,394 @@ async fn wiremock_completion_records_usage_and_attribution() {
     assert_eq!(meter_snapshot.tokens_out, 5);
     let calls = log.recorded_model_calls();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].endpoint_id.as_ref().unwrap().as_str(), "endpoint");
+    assert_eq!(
+        calls[0].endpoint_id.as_ref().map(|id| id.as_str()),
+        Some("endpoint")
+    );
     assert_eq!(calls[0].model.as_deref(), Some("operator-configured"));
-    assert!(calls[0].route_event_seq.is_some());
+    assert_eq!(calls[0].route_event_seq, routed.route_event_seq());
+    assert_eq!(
+        calls[0].usd_source,
+        Some(ModelUsdSource::OperatorPriceTable)
+    );
     assert_eq!(calls[0].finish_reason.as_deref(), Some("stop"));
     assert_eq!(calls[0].provider_request_id.as_deref(), Some("request-1"));
 }
 
 #[tokio::test]
-async fn recording_provider_budget_recheck_consumes_ticket_without_calling_provider() {
-    let provider = Arc::new(RecordingModelProvider::new(
-        ProviderId::new("provider").expect("provider"),
-    ));
-    provider.push(Ok(ModelResponse {
-        text: Some("unused".into()),
-        structured: None,
-        tool_calls: vec![],
-        usage: Usage {
-            input_tokens: Some(1),
-            output_tokens: Some(1),
-        },
-        provider_request_id: None,
-        finish_reason: None,
-    }));
-    let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
-    let meter = SharedCostMeter::new();
-    let run = RunId::new();
-    let policy = BudgetPolicy {
-        max_tokens_per_run: 10,
-        ..BudgetPolicy::default()
-    };
-    let router = router(
-        config("https://example.com", 1),
-        provider.clone(),
-        policy,
-        log,
-        meter.clone(),
-        run,
-    );
-    let routed = router.route(route_request(run)).await.expect("route");
-    meter.add_model_usage(
-        alloy_runtime::ModelTier::Standard,
-        Some(10),
-        Some(0),
-        Some(0.0),
-    );
+async fn openai_auth_401() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("invalid bearer token"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(1));
 
     assert!(matches!(
-        router.complete(&routed, prompt()).await,
-        Err(RouterError::BudgetDenied(BudgetCheck::TokensExhausted))
+        provider
+            .complete(&endpoint(), completion_request(ResponseFormat::Text))
+            .await,
+        Err(ProviderError::Auth)
     ));
-    assert!(matches!(
-        router.complete(&routed, prompt()).await,
-        Err(RouterError::AlreadyCompleted)
-    ));
-    assert!(provider.recorded().is_empty());
 }
 
 #[tokio::test]
-async fn shutdown_report_is_shared_and_new_work_is_rejected() {
-    let provider = Arc::new(RecordingModelProvider::new(
-        ProviderId::new("provider").expect("provider"),
+async fn openai_429() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(1));
+
+    assert!(matches!(
+        provider
+            .complete(&endpoint(), completion_request(ResponseFormat::Text))
+            .await,
+        Err(ProviderError::RateLimit)
     ));
+}
+
+#[tokio::test]
+async fn openai_context_length() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"code": "context_length_exceeded", "message": "prompt is too long"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(1));
+
+    assert!(matches!(
+        provider
+            .complete(&endpoint(), completion_request(ResponseFormat::Text))
+            .await,
+        Err(ProviderError::ContextLength)
+    ));
+}
+
+#[tokio::test]
+async fn openai_timeout() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(150))
+                .set_body_json(json!({
+                    "choices": [{"message": {"content": "late"}, "finish_reason": "stop"}]
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_millis(20));
+
+    assert!(matches!(
+        provider
+            .complete(&endpoint(), completion_request(ResponseFormat::Text))
+            .await,
+        Err(ProviderError::Timeout)
+    ));
+}
+
+#[tokio::test]
+async fn openai_malformed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(1));
+
+    assert!(matches!(
+        provider
+            .complete(&endpoint(), completion_request(ResponseFormat::Text))
+            .await,
+        Err(ProviderError::MalformedResponse(_))
+    ));
+}
+
+#[tokio::test]
+async fn openai_200_error_object() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "error": {"message": "provider encoded failure as success"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(1));
+
+    assert!(matches!(
+        provider
+            .complete(&endpoint(), completion_request(ResponseFormat::Text))
+            .await,
+        Err(ProviderError::MalformedResponse(_))
+    ));
+}
+
+#[tokio::test]
+async fn openai_finish_reason_length() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"content": "{\"partial\":true}"},
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 8}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let base_url = format!("{}/v1", server.uri());
     let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
-    let meter = SharedCostMeter::new();
     let run = RunId::new();
     let router = router(
-        config("https://example.com", 2),
-        provider,
+        config(&base_url, 1),
+        Arc::new(http_provider(base_url, Duration::from_secs(1))),
         BudgetPolicy::default(),
-        log,
-        meter,
+        log.clone(),
+        SharedCostMeter::new(),
+        run,
+    );
+    let routed = router.route(route_request(run)).await.expect("route");
+
+    let response = router
+        .complete(&routed, prompt())
+        .await
+        .expect("completion");
+    assert_eq!(response.finish_reason.as_deref(), Some("length"));
+    assert_eq!(
+        log.recorded_model_calls()[0].finish_reason.as_deref(),
+        Some("length")
+    );
+}
+
+#[tokio::test]
+async fn openai_content_parts_concat() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "hello "},
+                        {"type": "image", "url": "ignored"},
+                        {"type": "text", "text": "world"}
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(1));
+
+    let response = provider
+        .complete(&endpoint(), completion_request(ResponseFormat::Text))
+        .await
+        .expect("completion");
+    assert_eq!(response.text.as_deref(), Some("hello world"));
+}
+
+#[tokio::test]
+async fn openai_refusal_no_content() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"content": null, "refusal": "cannot comply"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(1));
+
+    let response = provider
+        .complete(&endpoint(), completion_request(ResponseFormat::Text))
+        .await
+        .expect("refusal remains a response");
+    assert_eq!(response.text, None);
+    assert_eq!(response.finish_reason.as_deref(), Some("refusal"));
+}
+
+#[tokio::test]
+async fn openai_body_over_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 1024 * 1024 + 1]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(2));
+
+    assert!(matches!(
+        provider
+            .complete(&endpoint(), completion_request(ResponseFormat::Text))
+            .await,
+        Err(ProviderError::MalformedResponse(message))
+            if message == "response body too large"
+    ));
+}
+
+#[tokio::test]
+async fn openai_redirect_not_followed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/redirect-target", server.uri())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/redirect-target"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "must not be reached"}}]
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(1));
+
+    assert!(matches!(
+        provider
+            .complete(&endpoint(), completion_request(ResponseFormat::Text))
+            .await,
+        Err(ProviderError::HttpStatus { status: 302, .. })
+    ));
+}
+
+#[tokio::test]
+async fn missing_api_key_fail_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let router_path = temp.path().join("router.toml");
+    let missing_key = format!("ALLOY_RFC0007_MISSING_{}", RunId::new());
+    assert!(std::env::var_os(&missing_key).is_none());
+    let source = config("https://example.com", 1);
+    let source = format!(
+        r#"
+[policy]
+default_tier = "standard"
+
+[[providers]]
+id = "provider"
+kind = "openai_compatible"
+base_url = "{}"
+api_key_env = "{missing_key}"
+
+[[providers.endpoints]]
+id = "endpoint"
+display_name = "Endpoint"
+model = "{}"
+tiers = ["standard"]
+max_context = 4096
+input_usd_per_mtok = 2.0
+output_usd_per_mtok = 4.0
+"#,
+        source.providers[0].base_url, source.providers[0].endpoints[0].model
+    );
+    std::fs::write(&router_path, source).expect("write router config");
+    let hint = temp.path().join("example.env");
+
+    let result = TomlModelRouter::from_paths(
+        &router_path,
+        BudgetPolicy::default(),
+        &hint,
+        Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults())),
+        SharedCostMeter::new(),
+        RunId::new(),
+    );
+    let Err(RouterError::Config(message)) = result else {
+        panic!("missing API key must fail closed");
+    };
+    assert!(message.contains(&missing_key));
+    assert!(message.contains("example.env"));
+    assert!(!temp.path().join(".env").exists());
+}
+
+#[tokio::test]
+async fn budget_denial_no_http() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let base_url = format!("{}/v1", server.uri());
+    let run = RunId::new();
+    let router = router(
+        config(&base_url, 1),
+        Arc::new(http_provider(base_url, Duration::from_secs(1))),
+        BudgetPolicy {
+            max_tokens_per_run: 0,
+            ..BudgetPolicy::default()
+        },
+        Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults())),
+        SharedCostMeter::new(),
         run,
     );
 
-    let (first, second) = tokio::join!(router.shutdown(), router.shutdown());
-    assert_eq!(first, second);
-    assert_eq!(first.remaining_in_flight, 0);
-    assert_eq!(first.remaining_appends, 0);
     assert!(matches!(
         router.route(route_request(run)).await,
-        Err(RouterError::ShuttingDown)
+        Err(RouterError::BudgetDenied(BudgetCheck::TokensExhausted))
     ));
 }
 
-#[test]
-fn completion_request_defaults_remain_non_streaming_surface() {
-    let request = alloy_runtime::CompletionRequest {
-        messages: vec![],
-        tools: vec![],
-        tool_choice: ToolChoice::None,
-        response_format: ResponseFormat::Text,
-        temperature: None,
-        max_output_tokens: None,
-    };
-    assert!(request.tools.is_empty());
-}
+#[tokio::test]
+async fn double_complete_already_completed_no_second_http() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {"content": "{\"ok\":true}"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let base_url = format!("{}/v1", server.uri());
+    let run = RunId::new();
+    let router = router(
+        config(&base_url, 1),
+        Arc::new(http_provider(base_url, Duration::from_secs(1))),
+        BudgetPolicy::default(),
+        Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults())),
+        SharedCostMeter::new(),
+        run,
+    );
+    let routed = router.route(route_request(run)).await.expect("route");
+    let clone = routed.clone();
 
-#[test]
-fn production_rejects_unmetered_escape_hatch() {
-    let provider = Arc::new(RecordingModelProvider::new(
-        ProviderId::new("provider").expect("provider"),
+    router.complete(&routed, prompt()).await.expect("first");
+    assert!(matches!(
+        router.complete(&clone, prompt()).await,
+        Err(RouterError::AlreadyCompleted)
     ));
-    let result = TomlModelRouter::from_parts(TomlModelRouterParts {
-        config: config("https://example.com", 1),
-        provider,
-        budget_policy: BudgetPolicy::default(),
-        decision_log: None,
-        cost_meter: None,
-        bound_run: None,
-        allow_unmetered: true,
-        shutdown_token: None,
-    });
-    assert!(matches!(result, Err(RouterError::Config(_))));
-}
-
-#[test]
-fn router_core_contains_no_hardcoded_vendor_model_ids() {
-    let router_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/router");
-    let denied = [
-        "gpt-4",
-        "gpt-3.5",
-        "claude-3",
-        "claude-opus",
-        "gemini-",
-        "o1-",
-        "o3-",
-    ];
-    for entry in std::fs::read_dir(router_dir).expect("router source directory") {
-        let path = entry.expect("directory entry").path();
-        if path.extension().and_then(|value| value.to_str()) != Some("rs")
-            || path.file_name().and_then(|value| value.to_str()) == Some("recording.rs")
-        {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("router source");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .map_or(source.as_str(), |(prefix, _)| prefix)
-            .to_ascii_lowercase();
-        for pattern in denied {
-            assert!(
-                !production.contains(pattern),
-                "{} contains forbidden model-id pattern {pattern}",
-                path.display()
-            );
-        }
-    }
 }

@@ -43,6 +43,10 @@ wiremock = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 
+[[test]]
+name = "router_rfc0007"
+required-features = ["http-provider"]
+
 [[bench]]
 name = "digest_sha256"
 harness = false
