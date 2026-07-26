@@ -544,7 +544,7 @@ pub trait ModelRouter: Send + Sync {
 }
 ```
 
-**Contract:** `complete` MUST use the sealed `RoutedModel` issued by a prior `route` on **this** router instance. Callers cannot mutate endpoint/model/tier (private fields). `complete` MUST follow §5.4.1 admission precedence (WrongRouter → ticket → budget) before provider HTTP.
+**Contract:** `complete` MUST use the sealed `RoutedModel` issued by a prior `route` on **this** router instance. Callers cannot mutate endpoint/model/tier (private fields). `complete` MUST follow §5.4.1 admission precedence (ShuttingDown → WrongRouter → Cancelled → ticket → budget) before provider HTTP.
 
 ### 3.13 `TomlModelRouter`
 
@@ -978,11 +978,11 @@ Before provider HTTP, `TomlModelRouter::complete` MUST apply this precedence:
 2. If `routed.router_instance_id != self.router_instance_id` → `Err(WrongRouter)` (no ticket consume, no HTTP).
 3. If the router-owned cancellation token is already cancelled → `Err(Cancelled)` (no ticket consume, no HTTP, no meter, no ModelCall).
 4. `routed.complete_ticket.try_consume()`; if false → `Err(AlreadyCompleted)` (no HTTP, no meter, no ModelCall).
-5. If meter present: re-check `meter.check_budget(&self.budget_policy)`, then apply the zero/non-finite USD overlay (§5.4). If exhausted → `Err(BudgetDenied(check))`, record `DecisionKind::Budget`, ticket stays consumed.
+5. If meter present: re-check via an atomic `check_and_snapshot` (or equivalent single-lock `check_budget` + snapshot), then apply the zero/non-finite USD overlay (§5.4). If exhausted → `Err(BudgetDenied(check))`, record `DecisionKind::Budget`, ticket stays consumed.
 6. If meter absent (`allow_unmetered` only): skip budget re-check; single-use ticket still applies.
 7. Proceed to provider call only after steps 1–6 succeed.
 
-**Caller observation:** `Err(BudgetDenied(_))` / `Err(AlreadyCompleted)` / `Err(WrongRouter)` — no provider HTTP occurs.
+**Caller observation:** `Err(ShuttingDown)` / `Err(WrongRouter)` / `Err(Cancelled)` / `Err(AlreadyCompleted)` / `Err(BudgetDenied(_))` — no provider HTTP occurs.
 
 **Concurrent overshoot:** RFC-0007 bounds admission with `max_in_flight` (§6.3) but does not reserve budget per prompt. If N distinct `route` calls succeed concurrently before their completions update the meter, all N can pass the route-time check. Overshoot is therefore bounded by `min(N_successful_routes, max_in_flight)` outstanding completes, **not** unbounded ticket reuse. RFC-0010 owns stricter per-node serialization / reservation. Budget decision metadata MUST include `in_flight_at_route`.
 
