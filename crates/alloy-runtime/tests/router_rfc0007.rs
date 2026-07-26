@@ -583,3 +583,59 @@ async fn double_complete_already_completed_no_second_http() {
         Err(RouterError::AlreadyCompleted)
     ));
 }
+
+/// Self-signed TLS server: client built with platform verifier (no invalid-cert
+/// bypass) MUST classify the failure as [`ProviderError::Tls`], not Transport.
+#[tokio::test]
+async fn openai_tls_classified() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use rustls::ServerConfig;
+    use std::net::SocketAddr;
+    use std::sync::Arc as StdArc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+            .expect("self-signed cert");
+    let cert_der = CertificateDer::from(certified.cert);
+    let key_der =
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+    let mut server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("server config");
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(StdArc::new(server_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr: SocketAddr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let mut tls = acceptor.accept(tcp).await.expect("tls accept");
+        let mut buf = [0u8; 1024];
+        let _ = tls.read(&mut buf).await;
+        let _ = tls
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await;
+    });
+
+    let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleSpec {
+        id: ProviderId::new("provider").expect("provider"),
+        base_url: format!("https://127.0.0.1:{}/v1/", addr.port()),
+        api_key: SecretString::new("test-key"),
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+    })
+    .expect("provider");
+
+    let err = provider
+        .complete(&endpoint(), completion_request(ResponseFormat::Text))
+        .await
+        .expect_err("untrusted cert must fail");
+    assert!(
+        matches!(err, ProviderError::Tls(_)),
+        "expected Tls, got {err:?}"
+    );
+}

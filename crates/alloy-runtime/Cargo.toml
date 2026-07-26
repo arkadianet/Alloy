@@ -42,6 +42,8 @@ serde = { workspace = true }
 wiremock = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [[test]]
 name = "router_rfc0007"

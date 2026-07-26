@@ -169,19 +169,41 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
     }
 
     let message = err.to_string();
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
-    while let Some(current) = source {
-        if current.downcast_ref::<rustls::Error>().is_some() {
-            return ProviderError::Tls(redact_and_truncate(&message, 512));
-        }
-        let type_name = std::any::type_name_of_val(current);
-        if type_name.contains("rustls_pki_types") || type_name.contains("webpki") {
-            return ProviderError::Tls(redact_and_truncate(&message, 512));
-        }
-        source = current.source();
+    if error_chain_contains_tls(&err) {
+        return ProviderError::Tls(redact_and_truncate(&message, 512));
     }
 
     ProviderError::Transport(redact_and_truncate(&message, 512))
+}
+
+/// Walk `Error::source` **and** nested `io::Error::get_ref` payloads.
+///
+/// Hyper/tokio-rustls wrap `rustls::Error` in `io::Error`. `io::Error::source`
+/// returns the *inner* error's source, not the wrapped value itself, so a plain
+/// `source()` walk misses the certificate error (RFC-0007 §8.3.2).
+#[cfg(feature = "http-provider")]
+fn error_chain_contains_tls(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut stack: Vec<&(dyn std::error::Error + 'static)> = vec![err];
+    while let Some(current) = stack.pop() {
+        if current.downcast_ref::<rustls::Error>().is_some() {
+            return true;
+        }
+        // Concrete type names are only informative when `current` is not already a
+        // trait object erased at this layer; still check for PKI crates when present.
+        let type_name = std::any::type_name_of_val(current);
+        if type_name.contains("rustls_pki_types") || type_name.contains("webpki") {
+            return true;
+        }
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            if let Some(inner) = io.get_ref() {
+                stack.push(inner);
+            }
+        }
+        if let Some(src) = current.source() {
+            stack.push(src);
+        }
+    }
+    false
 }
 
 impl From<RouterError> for RuntimeError {
