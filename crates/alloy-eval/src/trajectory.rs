@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::time::SystemTime;
 
 use alloy_runtime::{
     classify_provider_error, Digest, EndpointId, ErrorClass, ModelEndpoint, ModelResponse,
@@ -212,7 +211,7 @@ impl EvalReport {
 }
 
 /// Stable-sort trajectories by fixture id and turn ordinal.
-pub fn sort_trajectories_stable(rows: &mut [EvalTrajectoryRecord]) {
+pub(crate) fn sort_trajectories_stable(rows: &mut [EvalTrajectoryRecord]) {
     rows.sort_by(|left, right| {
         left.fixture_id
             .as_str()
@@ -222,7 +221,7 @@ pub fn sort_trajectories_stable(rows: &mut [EvalTrajectoryRecord]) {
 }
 
 /// Write control trajectories as JSONL and rotate retained run directories.
-pub fn write_trajectory_artifacts(
+pub(crate) fn write_trajectory_artifacts(
     report: &EvalReport,
     artifact_dir: Option<&Path>,
     max_retained_runs: u32,
@@ -240,7 +239,17 @@ pub fn write_trajectory_artifacts(
 
     fs::create_dir_all(artifact_dir)?;
     let run_dir = artifact_dir.join(report.run_id.as_str());
-    match fs::symlink_metadata(&run_dir) {
+    ensure_run_directory(&run_dir)?;
+
+    let jsonl_path = run_dir.join("trajectories.jsonl");
+    ensure_jsonl_target(&jsonl_path)?;
+    write_jsonl_atomically(&run_dir, &jsonl_path, report)?;
+
+    rotate_runs(artifact_dir, &report.run_id, max_retained_runs)
+}
+
+fn ensure_run_directory(run_dir: &Path) -> Result<(), EvalError> {
+    match fs::symlink_metadata(run_dir) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(EvalError::Io(std::io::Error::other(
                 "trajectory run directory is a symlink",
@@ -254,13 +263,15 @@ pub fn write_trajectory_artifacts(
             )));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(&run_dir)?;
+            fs::create_dir(run_dir)?;
         }
         Err(error) => return Err(EvalError::Io(error)),
     }
+    Ok(())
+}
 
-    let jsonl_path = run_dir.join("trajectories.jsonl");
-    match fs::symlink_metadata(&jsonl_path) {
+fn ensure_jsonl_target(jsonl_path: &Path) -> Result<(), EvalError> {
+    match fs::symlink_metadata(jsonl_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(EvalError::Io(std::io::Error::other(
                 "trajectory jsonl is a symlink",
@@ -276,21 +287,57 @@ pub fn write_trajectory_artifacts(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(EvalError::Io(error)),
     }
+    Ok(())
+}
 
+fn write_jsonl_atomically(
+    run_dir: &Path,
+    jsonl_path: &Path,
+    report: &EvalReport,
+) -> Result<(), EvalError> {
+    let temp_name = format!(
+        ".trajectories.jsonl.{}.tmp",
+        uuid::Uuid::new_v4().hyphenated()
+    );
+    let temp_path = run_dir.join(temp_name);
     let mut file = OpenOptions::new()
-        .create(true)
         .write(true)
-        .truncate(true)
-        .open(&jsonl_path)?;
-    for row in &report.trajectories {
-        let line =
-            serde_json::to_string(row).map_err(|error| EvalError::Json(error.to_string()))?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
+        .create_new(true)
+        .open(&temp_path)?;
+
+    if let Err(error) = ensure_run_directory(run_dir) {
+        drop(file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
+
+    let write_result = (|| {
+        for row in &report.trajectories {
+            let line =
+                serde_json::to_string(row).map_err(|error| EvalError::Json(error.to_string()))?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        Ok(())
+    })();
     drop(file);
 
-    rotate_runs(artifact_dir, &report.run_id, max_retained_runs)
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if let Err(error) = ensure_run_directory(run_dir).and_then(|()| ensure_jsonl_target(jsonl_path))
+    {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    // Path-based std APIs leave a residual parent-directory replacement race before rename.
+    if let Err(error) = fs::rename(&temp_path, jsonl_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(EvalError::Io(error));
+    }
+    Ok(())
 }
 
 fn rotate_runs(
@@ -312,7 +359,7 @@ fn rotate_runs(
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
-        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let modified = metadata.modified()?;
         candidates.push((modified, name.to_owned(), entry.path()));
     }
 
@@ -345,11 +392,12 @@ fn is_valid_run_id(run_id: &str) -> bool {
     if bytes.len() != 36 {
         return false;
     }
+    if bytes[14] != b'4' || !matches!(bytes[19], b'8' | b'9' | b'a' | b'b') {
+        return false;
+    }
     for (idx, byte) in bytes.iter().copied().enumerate() {
         match idx {
             8 | 13 | 18 | 23 if byte == b'-' => {}
-            14 if byte == b'4' => {}
-            19 if matches!(byte, b'8' | b'9' | b'a' | b'b') => {}
             8 | 13 | 18 | 23 => return false,
             _ if byte.is_ascii_digit() || matches!(byte, b'a'..=b'f') => {}
             _ => return false,
@@ -464,25 +512,137 @@ mod tests {
     #[test]
     fn trajectory_jsonl_contract() {
         let dir = tempfile::tempdir().unwrap();
-        let report = report("00000000-0000-4000-8000-000000000000", vec![row("a", 0)]);
-        write_trajectory_artifacts(&report, Some(dir.path()), 2).unwrap();
-        let path = dir
-            .path()
-            .join("00000000-0000-4000-8000-000000000000")
-            .join("trajectories.jsonl");
+        let run_id = "00000000-0000-4000-8000-000000000000";
+        let first = report(run_id, vec![row("a", 0), row("b", 0)]);
+        write_trajectory_artifacts(&first, Some(dir.path()), 2).unwrap();
+        let second = report(run_id, vec![row("c", 0)]);
+        write_trajectory_artifacts(&second, Some(dir.path()), 2).unwrap();
+        let path = dir.path().join(run_id).join("trajectories.jsonl");
         let data = std::fs::read_to_string(path).unwrap();
         assert_eq!(data.lines().count(), 1);
         assert!(data.ends_with('\n'));
+        let value: serde_json::Value = serde_json::from_str(data.trim_end()).unwrap();
+        assert_eq!(value["fixture_id"], "c");
     }
 
     #[test]
     fn trajectory_artifact_run_id_validation() {
-        let invalid = report("../bad", vec![]);
-        assert!(matches!(
-            write_trajectory_artifacts(&invalid, None, 2),
-            Err(EvalError::Manifest(message)) if message == "invalid run_id for artifacts"
-        ));
+        for run_id in [
+            "00000000-0000-1000-8000-000000000000",
+            "00000000-0000-4000-7000-000000000000",
+            "00000000-0000-4000-8000-00000000000A",
+            "{00000000-0000-4000-8000-000000000000}",
+            ".",
+            "..",
+            "../00000000-0000-4000-8000-000000000000",
+            "00000000-0000-4000-8000-000000000000/child",
+        ] {
+            let invalid = report(run_id, vec![]);
+            assert!(
+                matches!(
+                    write_trajectory_artifacts(&invalid, None, 2),
+                    Err(EvalError::Manifest(message)) if message == "invalid run_id for artifacts"
+                ),
+                "{run_id} must be rejected"
+            );
+        }
         let valid = report("00000000-0000-4000-8000-000000000000", vec![]);
         assert!(write_trajectory_artifacts(&valid, None, 2).is_ok());
+    }
+
+    #[test]
+    fn trajectory_disk_rotation_ignores_non_uuid_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_run_ids = [
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000002",
+        ];
+        for run_id in old_run_ids {
+            std::fs::create_dir(dir.path().join(run_id)).unwrap();
+        }
+        let ignored = dir.path().join("not-a-run");
+        std::fs::create_dir(&ignored).unwrap();
+
+        let current_run_id = "00000000-0000-4000-8000-000000000003";
+        write_trajectory_artifacts(&report(current_run_id, vec![]), Some(dir.path()), 1).unwrap();
+
+        for run_id in old_run_ids {
+            assert!(!dir.path().join(run_id).exists());
+        }
+        assert!(ignored.is_dir());
+        assert!(dir.path().join(current_run_id).is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trajectory_artifact_symlink_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let run_id = "00000000-0000-4000-8000-000000000000";
+        symlink(outside.path(), dir.path().join(run_id)).unwrap();
+
+        assert!(matches!(
+            write_trajectory_artifacts(&report(run_id, vec![row("a", 0)]), Some(dir.path()), 2),
+            Err(EvalError::Io(_))
+        ));
+        assert!(!outside.path().join("trajectories.jsonl").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trajectory_jsonl_symlink_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let run_id = "00000000-0000-4000-8000-000000000000";
+        let run_dir = dir.path().join(run_id);
+        std::fs::create_dir(&run_dir).unwrap();
+        let outside_jsonl = outside.path().join("trajectories.jsonl");
+        std::fs::write(&outside_jsonl, "do not overwrite\n").unwrap();
+        symlink(&outside_jsonl, run_dir.join("trajectories.jsonl")).unwrap();
+
+        assert!(matches!(
+            write_trajectory_artifacts(&report(run_id, vec![row("a", 0)]), Some(dir.path()), 2),
+            Err(EvalError::Io(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(outside_jsonl).unwrap(),
+            "do not overwrite\n"
+        );
+    }
+
+    #[test]
+    fn trajectories_omit_prompt_and_response_bodies() {
+        let value = serde_json::to_value(row("a", 0)).unwrap();
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected = std::collections::BTreeSet::from([
+            "compile_clean",
+            "complete_ok",
+            "confidence",
+            "duration_ms",
+            "endpoint_id",
+            "error_class",
+            "fixture_id",
+            "fixture_status",
+            "input_tokens",
+            "model_tier",
+            "output_tokens",
+            "provider_id",
+            "request_content_hash",
+            "request_fingerprint",
+            "set",
+            "turn_id",
+            "usd",
+            "usd_source",
+        ]);
+        assert_eq!(keys, expected);
     }
 }

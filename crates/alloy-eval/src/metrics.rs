@@ -77,7 +77,7 @@ pub struct EvalMetrics {
 impl EvalMetrics {
     /// Construct the empty-population Day-1 metric set.
     #[must_use]
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             success_rate: unmeasured(UnmeasuredReason::EmptySample),
             compile_success_rate: unmeasured(UnmeasuredReason::EmptySample),
@@ -93,7 +93,7 @@ impl EvalMetrics {
 }
 
 /// Aggregates finalized fixture outcomes into RFC-0016 metrics.
-pub struct MetricsAggregator;
+pub(crate) struct MetricsAggregator;
 
 impl MetricsAggregator {
     /// Aggregate one logical run of fixture outcomes.

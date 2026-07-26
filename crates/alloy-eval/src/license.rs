@@ -27,6 +27,7 @@ pub enum LicenseClass {
 
 /// License and source-provenance metadata from a fixture manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LicenseMeta {
     /// Permit/deny classification for the fixture corpus.
     pub class: LicenseClass,
@@ -40,7 +41,7 @@ pub struct LicenseMeta {
 ///
 /// Failure: [`EvalError::LicenseForbidden`] for class/SPDX/provenance failures,
 /// missing or invalid `LICENSE`, non-UTF-8 contents, and symlink escapes.
-pub fn validate_license(fixture_dir: &Path, license: &LicenseMeta) -> Result<(), EvalError> {
+pub(crate) fn validate_license(fixture_dir: &Path, license: &LicenseMeta) -> Result<(), EvalError> {
     validate_meta(license)?;
     validate_license_file(fixture_dir)
 }
@@ -204,5 +205,16 @@ mod tests {
                 Err(EvalError::LicenseForbidden(_))
             ));
         }
+    }
+
+    #[test]
+    fn license_metadata_rejects_unknown_fields() {
+        let json = r#"{
+            "class": "permitted",
+            "spdx": "MIT",
+            "source_note": "original test fixture",
+            "unexpected": true
+        }"#;
+        assert!(serde_json::from_str::<LicenseMeta>(json).is_err());
     }
 }

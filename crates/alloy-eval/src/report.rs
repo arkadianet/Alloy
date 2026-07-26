@@ -156,7 +156,7 @@ impl fmt::Display for EvalReport {
 }
 
 /// Assemble report toolchain versions from non-error fixture sidecar records.
-pub fn assemble_report_toolchain(
+pub(crate) fn assemble_report_toolchain(
     pin_toolchain_channel: impl Into<String>,
     non_error_toolchains: &[ToolchainRecord],
 ) -> Result<ToolchainRecord, EvalError> {

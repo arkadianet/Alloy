@@ -8,30 +8,30 @@
 #![forbid(unsafe_code)]
 
 /// Cost claim envelope and USD derivation.
-pub mod cost_claim;
+mod cost_claim;
 mod driver;
 /// Eval harness error types.
-pub mod error;
+mod error;
 /// Request fingerprinting helpers.
-pub mod fingerprint;
+mod fingerprint;
 /// Pure holdout gate evaluation.
-pub mod gate;
+mod gate;
 /// Offline eval harness and fixture runner.
-pub mod harness;
+mod harness;
 /// R17 license validation.
-pub mod license;
+mod license;
 /// Strict fixture manifest loading.
-pub mod manifest;
+mod manifest;
 /// Eval metric aggregation.
-pub mod metrics;
+mod metrics;
 /// Recorded cargo JSON replay.
-pub mod recording;
+mod recording;
 /// Serializable eval reports.
-pub mod report;
+mod report;
 /// Offline scripted model provider.
-pub mod scripted;
+mod scripted;
 /// Eval-local trajectory retention.
-pub mod trajectory;
+mod trajectory;
 
 pub use cost_claim::{CostClaimEnvelope, CostClaimGrade, COST_DISCLAIMER};
 pub use error::{EvalError, ReportError};

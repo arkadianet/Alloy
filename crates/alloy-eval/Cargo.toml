@@ -8,7 +8,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-alloy-runtime = { workspace = true }
+alloy-runtime = { workspace = true, default-features = false }
 async-trait = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
