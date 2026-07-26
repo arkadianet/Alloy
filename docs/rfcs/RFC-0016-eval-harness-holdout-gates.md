@@ -488,6 +488,7 @@ pub struct EvalMetrics {
     pub token_efficiency: MetricField<f64>,
     pub latency_p50_ms: MetricField<u64>,
     pub latency_p95_ms: MetricField<u64>,
+    /// Day-1 is always Unmeasured(CostUncalibrated); numeric p50 is internal.
     pub cost_usd_p50: MetricField<f64>,
     pub retries_mean: MetricField<f64>,
     pub human_interventions: MetricField<f64>,
@@ -504,7 +505,7 @@ pub struct EvalMetrics {
 | `token_efficiency` | `MetricsAggregator` | `(successful_fixtures) / max(1, total_input_tokens + total_output_tokens)` when all token samples known | **Unmeasured(`EmptySample` or `CostInputsIncomplete`)** unless scripts include usage |
 | `latency_p50_ms` | `MetricsAggregator` | p50 of non-Error fixture wall times | **Measured** observational wall clock; scrub in determinism tests |
 | `latency_p95_ms` | `MetricsAggregator` | p95 of non-Error fixture wall times | **Measured** observational wall clock; scrub in determinism tests |
-| `cost_usd_p50` | `MetricsAggregator` via operator prices | p50 of per-fixture derived USD when every fixture in the sample has finite USD | **Unmeasured(`CostUncalibrated`)** in reports exposed as claims; internal scratch MAY hold `Measured` under `CostClaimGrade::UncalibratedInternal` only (§3.8) |
+| `cost_usd_p50` | Report assembler (constant in Day-1) | **Never Measured in Day-1 `EvalMetrics`** | **Always `Unmeasured { reason: CostUncalibrated }`**; computed USD p50 exists only in `CostClaimEnvelope.internal_cost_usd_p50` (§3.8) |
 | `retries_mean` | `MetricsAggregator` | Mean retry count from stack driver | **Unmeasured(`SkeletonDeferred`)** Day-1; **Measured** under full-gate when RFC-0010 linked |
 | `human_interventions` | `MetricsAggregator` | Mean GateHuman interventions | **Unmeasured(`SkeletonDeferred`)** until GateHuman exists |
 | `unsafe_introduced_rate` | `MetricsAggregator` | Introduced / non-Error fixtures whose criteria include `NoNewUnsafe` | **Measured** with a criterion sample; else **Unmeasured(`NotApplicable`)** and gate failure |
@@ -655,9 +656,12 @@ any `usage.output_tokens == None` makes final `tokens_out` `None`. Provider
 incomplete. With no successful responses, both token totals are `None`.
 
 `cost_usd` is `Some` only when the bound endpoint has both prices, at least
-one response succeeded, and both token sides are complete across every
-successful response. It uses the RFC-0007 price formula over the saturated
-totals. If either price or token side is absent, `cost_usd` MUST be `None`.
+one response succeeded, both token sides are complete across every successful
+response, and the RFC-0007 price formula over the saturated totals produces a
+finite value. If either price or token side is absent, or the derived USD is
+non-finite, `cost_usd` MUST be `None`. A non-finite result MUST be logged at
+`debug` without its unstable numeric spelling and treated as an incomplete
+cost input; it MUST NOT enter percentile sorting or propagate NaN/infinity.
 
 Every terminal `Error` outcome, whether produced during load, cancellation,
 join, or execution, MUST have `criteria = vec![]`, `tokens_in = None`,
@@ -706,7 +710,7 @@ pub struct CostClaimEnvelope {
     pub grade: CostClaimGrade,
     /// Present only when grade is CalibratedHoldout (unreachable in Day-1).
     pub marketing_usd_p50: Option<f64>,
-    /// Always populated for operators reading raw reports; may mirror Unmeasured.
+    /// Measured only from a complete finite fixture-cost population.
     pub internal_cost_usd_p50: MetricField<f64>,
     /// Constant disclaimer string (exact bytes).
     #[serde(default = "default_cost_disclaimer")]
@@ -737,13 +741,28 @@ impl CostClaimEnvelope {
 
 1. Day-1 `EvalReport.cost_claim.grade` MUST be `UncalibratedInternal`.
 2. `marketing_usd_p50` MUST be `None` in Day-1.
-3. `CostClaimGrade::CalibratedHoldout` remains reserved for wire compatibility, but Day-1 MUST NOT construct or emit it. Calibrated grade emission is deferred to a future calibration RFC.
-4. Every constructor and report assembly path MUST set `disclaimer` to `COST_DISCLAIMER.to_string()`. The serde default exists only for backward-compatible deserialization of a missing field and MUST return the same bytes.
-5. `EvalReport::marketing_cost_claim(&self) -> Option<f64>` MUST always return `None` in Day-1. Day-1 gate config exposes no calibration grant.
-6. Tracing/logs MAY print `internal_cost_usd_p50` only at `debug` with the disclaimer field present in the same event.
-7. User-facing summaries (CI annotations, default `Display`) MUST NOT print a bare USD number for cost; they print `cost: uncalibrated` or omit the field.
+3. Day-1 `EvalReport.metrics.cost_usd_p50` MUST always be
+   `MetricField::Unmeasured { reason: UnmeasuredReason::CostUncalibrated }`.
+   It MUST never mirror the internal measured estimate. The same invariant
+   applies to every Day-1 `EvalMetrics` embedded in a naive comparison.
+4. `internal_cost_usd_p50` is `Measured(p50)` only when the logical run is
+   non-empty and every fixture has `cost_usd = Some(finite_value)`; compute
+   nearest-rank p50 under §3.6.1. If any fixture lacks finite USD, including
+   `None`, NaN, or infinity, it MUST be
+   `Unmeasured { reason: CostInputsIncomplete }`.
+5. `CostClaimGrade::CalibratedHoldout` remains reserved for wire compatibility, but Day-1 MUST NOT construct or emit it. Calibrated grade emission is deferred to a future calibration RFC.
+6. Every constructor and report assembly path MUST set `disclaimer` to `COST_DISCLAIMER.to_string()`. The serde default exists only for backward-compatible deserialization of a missing field and MUST return the same bytes.
+7. `EvalReport::marketing_cost_claim(&self) -> Option<f64>` MUST always return `None` in Day-1. Day-1 gate config exposes no calibration grant.
+8. Tracing/logs MAY print `internal_cost_usd_p50` only at `debug` with the disclaimer field present in the same event.
+9. User-facing summaries (CI annotations, default `Display`) MUST NOT print a bare USD number for cost; they print `cost: uncalibrated` or omit the field.
 
-**Derivation source:** When computing internal USD, reuse RFC-0007 semantics: USD only when endpoint `input_usd_per_mtok` / `output_usd_per_mtok` and both token counts are known (same formula as `router/price.rs` `derive_usd`). Scripted fixtures that omit usage → no USD for that fixture.
+**Derivation source:** When computing internal USD, reuse RFC-0007 semantics:
+USD only when endpoint `input_usd_per_mtok` /
+`output_usd_per_mtok` and both token counts are known (same formula as
+`router/price.rs` `derive_usd`). Scripted fixtures that omit usage have no USD
+for that fixture. A non-finite derived value is likewise treated as absent,
+logged at `debug`, and excluded from percentiles; no NaN/infinity may cross
+into `FixtureOutcome.cost_usd` or either cost metric.
 
 ### 3.9 Manifest types
 
@@ -751,7 +770,7 @@ impl CostClaimEnvelope {
 /// Manifest schema version. Day-1 writes and accepts only `1`.
 pub const FIXTURE_MANIFEST_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct FixtureId(String);
 
@@ -759,6 +778,16 @@ impl FixtureId {
     /// Non-empty, ≤128 bytes, `[a-z0-9_.-]+`, but never `.` or `..`.
     pub fn new(s: impl Into<String>) -> Result<Self, EvalError>;
     pub fn as_str(&self) -> &str;
+}
+
+impl<'de> Deserialize<'de> for FixtureId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -928,7 +957,10 @@ accounting and MUST NOT be presented as marketing cost.
 `FixtureId::new` MUST reject empty input, more than 128 UTF-8 bytes, any
 character outside `[a-z0-9_.-]`, and the exact path components `"."` and
 `".."`. Every such rejection is `Err(EvalError::Manifest(...))`, never an
-`Io` error or panic.
+`Io` error or panic. `FixtureId` MUST use the custom `Deserialize` shown above;
+deserialization MUST call `FixtureId::new` and map its failure with
+`serde::de::Error::custom`. Derive-based deserialization that can bypass
+`FixtureId::new` is forbidden.
 
 `success_criteria` MUST be non-empty and contain no duplicate enum value.
 Train and holdout goldens used by the skeleton/milestone gates MUST include
@@ -1058,6 +1090,7 @@ deferred in §12.2. Day-1 harness execution only loads committed recordings.
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GateThresholds {
     /// Minimum Measured compile_success_rate on the selected set.
     pub min_compile_success_rate: f64,
@@ -1160,6 +1193,11 @@ pub fn evaluate_gate(
 storing the config. The standalone `gate::evaluate_gate` MUST also fail closed
 with `InvalidThreshold` if passed an unvalidated value; it cannot return
 `EvalError` because the single gate API returns `GateResult`.
+
+`GateThresholds` MUST retain `#[serde(deny_unknown_fields)]`. Every
+`gates/*.toml` loader MUST map TOML deserialization failures, including an
+unknown key, to `EvalError::Manifest`; validation follows successful strict
+deserialization.
 
 Every `f64` copied into a `GateFailure` string MUST use
 `format!("{:.6}", value)`. No debug formatting, locale formatting, or
@@ -1320,13 +1358,6 @@ impl EvalHarness {
     pub async fn run_holdout_with_naive(&self) -> Result<EvalReport, EvalError>;
 }
 
-/// Pre- or post-repair recording side marker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CargoRecordingKind {
-    PreRepair,
-    PostRepair,
-}
-
 pub struct LoadedFixture {
     // private: validated manifest/artifacts, source files, endpoint
     // ordered script entries, and scripts: Option<Arc<ScriptedProvider>>
@@ -1437,8 +1468,7 @@ list is:
   `LicenseClass`, `LicenseMeta`, `ToolchainRecord`, `WorkspaceRef`,
   `NaivePatchMode`, `EndpointPrices`, `ExpectedDiagnostic`, `ScriptTurn`,
   `CargoRecordingRefs`, `SuccessCriterion`, and `FixtureDriverKind`;
-- recording: `CargoJsonRecording`, `RecordedDiagnostic`, and
-  `CargoRecordingKind`;
+- recording: `CargoJsonRecording` and `RecordedDiagnostic`;
 - outcomes/reporting: `FixtureStatus`, `FixtureOutcome`, `CriterionResult`,
   `ReportError`, `EvalMetrics`, `MetricField`, `UnmeasuredReason`,
   `EvalReport`, `CostClaimGrade`, and `CostClaimEnvelope`;
@@ -1616,7 +1646,8 @@ The loader MUST perform these steps in order:
 All manifest paths MUST be relative, non-empty UTF-8 paths. A path is invalid
 if `Path::is_absolute()` is true, any component is `ParentDir` (`..`), a
 Windows prefix/root appears on any platform, or normalization yields an empty
-path. `.` components MAY be rejected rather than normalized.
+path. Path components that are `CurDir` (`.`) MUST be rejected (not normalized
+away).
 
 Lexical checks are necessary but insufficient. The loader MUST canonicalize
 the fixture directory first. For every referenced existing file or directory,
@@ -1636,31 +1667,18 @@ its type. A non-UTF-8 name MUST produce an `Error` outcome with
 The message MUST be produced by §5.2.3 (prefix `invalid_fixture_name:`) and
 MUST NOT use a lossy path as identity.
 
-#### 5.2.3 Bounded UTF-8 messages (normative)
-
-Wherever this RFC requires a “bounded” error/`ReportError`/`GateFailure`/
-join-panic message, implementations MUST apply this exact algorithm:
-
-1. Start from a UTF-8 `String` (lossy conversion, if any, MUST happen before
-   this algorithm and MUST NOT appear in path-identity fields).
-2. If `bytes.len() <= 512`, use the string unchanged.
-3. Otherwise take the longest prefix whose byte length is `<= 509` and that
-   ends on a UTF-8 code-point boundary (never split a multibyte character).
-4. Append the three ASCII bytes `...` (U+002E thrice).
-5. The result MUST be `<= 512` bytes.
-
-Constants:
-
-```text
-EVAL_MESSAGE_MAX_BYTES = 512
-EVAL_MESSAGE_TRUNCATE_SUFFIX = "..."
-```
-
-Join/panic payloads MUST be formatted as `join_failed: {Debug}` of the panic
-payload (or `"join_failed: opaque"` when downcast fails), then passed through
-this algorithm. Path errors MUST be formatted as
-`path: {lossy_display}` then bounded. Implementations MUST NOT embed fixture
-source file bodies in bounded messages.
+A directory entry name that is valid UTF-8 but fails `FixtureId::new`,
+including `"."`, `".."`, a bad character, an empty string if supplied by an
+entry API, or an overlength name, MUST produce an `Error` outcome with
+`ReportError.kind == "invalid_fixture_id"`. Its
+`FixtureOutcome.fixture_id` is the deterministic valid id
+`invalid-id-<lowercase-hex-sha256(name_utf8_bytes)>`, where
+`name_utf8_bytes` is the exact UTF-8 byte sequence, not a normalized spelling.
+Its message MUST be produced by §5.2.3 with prefix
+`invalid_fixture_id:`. This is distinct from the non-UTF-8
+`invalid_fixture_name` / `invalid-path-` case. Enumeration MUST construct this
+`ReportError` directly; routing it through the generic Manifest mapping would
+produce the wrong kind and is forbidden.
 
 After name validation, enumeration skips only entries whose followed metadata
 proves they are not directories. It MUST NOT silently skip a directory whose
@@ -1717,6 +1735,32 @@ non-whitespace character. An empty source note is inconsistent provenance and
 MUST be rejected with `LicenseForbidden`; `Alloy-Original` does not waive this
 rule.
 
+#### 5.2.3 Bounded UTF-8 messages (normative)
+
+Wherever this RFC requires a “bounded” error/`ReportError`/`GateFailure`/
+join-panic message, implementations MUST apply this exact algorithm:
+
+1. Start from a UTF-8 `String` (lossy conversion, if any, MUST happen before
+   this algorithm and MUST NOT appear in path-identity fields).
+2. If `bytes.len() <= 512`, use the string unchanged.
+3. Otherwise take the longest prefix whose byte length is `<= 509` and that
+   ends on a UTF-8 code-point boundary (never split a multibyte character).
+4. Append the three ASCII bytes `...` (U+002E thrice).
+5. The result MUST be `<= 512` bytes.
+
+Constants:
+
+```text
+EVAL_MESSAGE_MAX_BYTES = 512
+EVAL_MESSAGE_TRUNCATE_SUFFIX = "..."
+```
+
+Join/panic payloads MUST be formatted as `join_failed: {Debug}` of the panic
+payload (or `"join_failed: opaque"` when downcast fails), then passed through
+this algorithm. Path errors MUST be formatted as
+`path: {lossy_display}` then bounded. Implementations MUST NOT embed fixture
+source file bodies in bounded messages.
+
 ### 5.3 Scripted turn resolution
 
 #### 5.3.1 Repair-criterion carrier (normative)
@@ -1738,6 +1782,13 @@ still evaluated under §5.5.* after the failure is recorded, unless the
 fixture has already transitioned to `Error` (map desync / wrong endpoint),
 in which case criteria remain the empty vector (§3.7.1).
 
+**SETTLED — sticky carrier:** Once an early Fail path in §5.3 or §5.5 sets a
+carrier criterion to `passed = false` with a non-empty `detail`, every later
+§5.5.* evaluation of that same criterion MUST preserve both fields exactly.
+It MUST NOT flip `passed` back to `true`, clear the detail, or replace it with
+a criterion-specific detail. Other non-carrier criteria still evaluate
+normally and receive their own results.
+
 #### 5.3.2 Turn execution steps
 
 1. The Day-1 driver MUST clone `turn.request` exactly. It MUST NOT rewrite,
@@ -1745,8 +1796,9 @@ in which case criteria remain the empty vector (§3.7.1).
 2. Before `complete`, the driver MUST compare its built request with
    `turn.request`. A mismatch is a thesis/driver-output `Fail` with carrier
    detail exactly `"script miss"` (§5.3.1); the provider MUST NOT be called
-   for that turn. Subsequent turns MUST NOT run; patch oracle runs with no
-   candidate (missing repair text path).
+   for that turn. Subsequent turns MUST NOT run; no candidate exists, so the
+   patch oracle MUST NOT run and execution continues through the missing
+   repair text and criterion paths.
 3. The driver MUST call `provider.complete(&bound_endpoint, request).await`.
    The exact bound endpoint id is mandatory.
 4. Every `ProviderError` returned by `complete` is that turn’s `Err`; it MUST
@@ -1780,14 +1832,18 @@ in which case criteria remain the empty vector (§3.7.1).
      captured repair candidate. The fixture continues to patch/criteria
      evaluation using that candidate.
    - An intentional error-only fixture (no successful `Some(text)` ever)
-     cannot Pass SkeletonReplay/NaiveBaseline; it fails via
-     `"missing repair text"` (§5.3.1) after the turn loop.
+     cannot Pass SkeletonReplay/NaiveBaseline. Its first provider error fails
+     it via `"provider error before repair text"` and stops execution; the
+     sticky-carrier rule prevents a later missing-text check from replacing
+     that detail.
 
 `SkeletonReplay` and `NaiveBaseline` MUST observe at least one successful
 `Response` with `text: Some(...)` among executed turns. If they observe none,
-they MUST Fail with carrier detail exactly `"missing repair text"` (§5.3.1),
-set `compile_clean = Some(false)`, and MUST NOT panic or classify that
-absence as a harness `Error`.
+they MUST Fail and set `compile_clean = Some(false)`. When no prior sticky
+carrier detail exists, the detail is exactly `"missing repair text"`
+(§5.3.1); an earlier `"script miss"` or
+`"provider error before repair text"` remains unchanged. Absence of repair
+text MUST NOT panic or be classified as a harness `Error`.
 
 **Classification rule:** Manifest/load/recording/provider-map/harness bugs are
 `Error`. A request produced incorrectly by the evaluated driver, a scripted
@@ -1830,9 +1886,11 @@ For a fixture with `driver = SkeletonReplay`:
    vary cross-key order, while same-key retries remain FIFO.
 4. Track the last successful `ModelResponse` whose `text` is `Some`. A success
    with `text = None` does not supply repair text. Apply §5.3 to each error.
-5. If no repair text exists, use no candidate bytes and emit
-   `"missing repair text"` as a failed repair detail.
-6. Interpret candidate text as exact UTF-8 bytes under
+5. If no repair text exists, use no candidate bytes, set
+   `"missing repair text"` as the failed carrier detail unless a higher
+   precedence sticky detail is already present, skip the patch oracle, and
+   continue to criterion evaluation.
+6. When candidate text exists, interpret it as exact UTF-8 bytes under
    `NaivePatchMode::FullFileReplace`. Compare it byte-for-byte with the
    committed golden post-repair source corresponding to
    `manifest.naive_target_path`. Newline conversion, formatting, BOM changes,
@@ -1845,9 +1903,11 @@ For a fixture with `driver = SkeletonReplay`:
 8. Evaluate exactly the criteria listed in `manifest.success_criteria`, each
    exactly once, and preserve manifest order in `FixtureOutcome.criteria`.
    The driver MUST NOT auto-add, remove, or reorder a criterion.
-9. **Detail precedence when multiple Fail reasons apply to the same carrier**
-   (normative, first match wins — later reasons MUST NOT overwrite an earlier
-   carrier detail already set in this run):
+9. **Detail precedence when multiple reachable Fail reasons apply to the same
+   carrier** (normative, first match wins — later reasons MUST NOT overwrite
+   an earlier carrier detail already set in this run). This ordering applies
+   only to details whose paths can co-occur without an earlier stop preventing
+   the later operation:
    1. `"script miss"`
    2. `"provider error before repair text"`
    3. `"missing repair text"`
@@ -1855,9 +1915,21 @@ For a fixture with `driver = SkeletonReplay`:
    5. Criterion-specific details from §5.5.1–§5.5.4 (e.g. diagnostics /
       unsafe / unconsumed scripts)
 
-   Example: a patch mismatch after a prior `"provider error before repair
-   text"` keeps the provider-error detail on the carrier; `compile_clean`
-   remains `Some(false)`.
+   Example: missing repair text sets the `CompileClean` carrier to
+   `passed = false`, `detail = "missing repair text"`. A subsequent
+   `NoNewUnsafe` evaluation on its different, non-carrier entry cannot clear
+   or replace the carrier detail. If `CompileClean` is absent and
+   `NoNewUnsafe` is the first criterion, it is the carrier: missing repair
+   text sets the same failed detail, and §5.5.2 MUST NOT later mark it passed
+   merely because no candidate could have introduced unsafe text.
+
+Every criterion evaluator has this exact pass representation:
+
+| Result | `passed` | `detail` |
+| --- | --- | --- |
+| Pass | `true` | `""` |
+
+A passed criterion MUST never carry observational text in `detail`.
 
 `SkeletonReplay` and `NaiveBaseline` MUST always populate
 `compile_clean = Some(true|false)` on every non-Error outcome, even when
@@ -1916,18 +1988,27 @@ such as `myunsafe`, and does match `unsafe `, `unsafe!`, and `unsafe(` with the
 specified left boundary. Implementations MUST NOT substitute AST semantics
 without a successor RFC because that would change golden results.
 
-Set `FixtureOutcome.unsafe_introduced = Some(introduced)`.
-`NoNewUnsafe` passes iff `introduced == false`. Missing candidate text fails
-the criterion and sets `unsafe_introduced = Some(false)` only when there is no
-candidate to have introduced bytes; the missing repair already fails
-the manifest-listed repair criterion under §5.5.
+Set `FixtureOutcome.unsafe_introduced = Some(introduced)` when candidate text
+exists. With no candidate, set it to `Some(false)` as the observation that no
+candidate bytes introduced unsafe text, but fail the criterion; the observed
+boolean does not turn missing output into a pass. Apply this exact result
+table, subject to the sticky-carrier rule:
+
+| Condition | `passed` | Exact `detail` |
+| --- | --- | --- |
+| Candidate present; `introduced == false` | `true` | `""` |
+| Candidate present; `introduced == true` | `false` | `"unsafe introduced"` |
+| Candidate missing; `NoNewUnsafe` is non-carrier | `false` | `"missing repair text"` |
+| Candidate missing; `NoNewUnsafe` is carrier already failed by §5.3/§5.5 | preserve `false` | preserve `"missing repair text"` |
 
 #### 5.5.3 `ExpectedDiagnosticsCleared`
 
 This criterion is evaluated only through a patch-oracle guard:
 
-1. If patch equality failed, the criterion MUST fail with detail
-   `"patch oracle failed; diagnostics not attributable"`.
+1. If patch equality failed, or the patch oracle was skipped because repair
+   text was missing, the criterion MUST fail with detail
+   `"patch oracle failed; diagnostics not attributable"`, unless this
+   criterion is the already-failed carrier protected by §5.3.1.
 2. If patch equality passed, parse `post_repair.diagnostics()`.
 3. For every `ExpectedDiagnostic`, require that no post-repair diagnostic has
    the same code. The pre-repair `message_contains` proves fixture integrity
@@ -1938,6 +2019,16 @@ This criterion is evaluated only through a patch-oracle guard:
 This rule prevents a golden post recording from clearing diagnostics for a
 candidate that did not equal the golden patch.
 
+| Condition | `passed` | Exact `detail` |
+| --- | --- | --- |
+| Patch failed | `false` | `"patch oracle failed; diagnostics not attributable"` |
+| Patch passed; an expected code remains | `false` | `"expected diagnostic remains: {code}"` |
+| Patch passed; every expected code absent | `true` | `""` |
+
+When more than one expected code remains, `{code}` MUST be the first remaining
+code in `manifest.expected_diagnostics` order; exactly one failure detail is
+stored.
+
 #### 5.5.4 `ScriptTurnsConsumed`
 
 For `SkeletonReplay`, when `require_consume_all == true`, pass only when
@@ -1945,12 +2036,22 @@ For `SkeletonReplay`, when `require_consume_all == true`, pass only when
 `remaining_outcomes() == 0`). Every queued duplicate outcome counts; consuming
 one of two outcomes under a fingerprint leaves that key present and fails.
 When `require_consume_all == false`, the criterion passes after execution and
-reports the number left for observability.
+may expose the number left through provider observability, but its passed
+criterion detail remains empty.
 
 For `NaiveBaseline`, install only the selected ordinal-0 repair turn. All other
 manifest turns MUST NOT be inserted. Therefore `require_consume_all` applies
 only to that installed key/queue; ignored control-plane turns cannot cause a
 naive consumption failure.
+
+| Condition | `passed` | Exact `detail` |
+| --- | --- | --- |
+| Consumption required; `remaining_keys().len() == 0` | `true` | `""` |
+| Consumption required; `remaining_keys().len() == n > 0` | `false` | `"unconsumed script keys: {n}"` |
+| Consumption not required | `true` | `""` |
+
+`{n}` is the base-10 rendering of `provider.remaining_keys().len()`, not the
+remaining outcome count.
 
 ### 5.6 Outcome classification
 
@@ -1995,9 +2096,17 @@ Input: `&[FixtureOutcome]` for one logical run (control or naive).
    `passes as f64 / max(1, saturated_input + saturated_output) as f64`.
    Partial token data yields `Unmeasured(CostInputsIncomplete)`. An empty
    population yields `Unmeasured(EmptySample)`.
-7. Cost p50 is internal-only and requires complete finite token and endpoint
-   price inputs. Missing input produces `Unmeasured(CostInputsIncomplete)`;
-   Day-1 wraps it in `UncalibratedInternal` regardless.
+7. Set `EvalMetrics.cost_usd_p50` to
+   `Unmeasured { reason: CostUncalibrated }` unconditionally in Day-1; this
+   public field is never `Measured`. Separately, populate
+   `CostClaimEnvelope.internal_cost_usd_p50`: for a non-empty logical run,
+   when every fixture has `cost_usd = Some(finite_value)`, sort those values
+   and store nearest-rank `Measured(p50)` under
+   `CostClaimGrade::UncalibratedInternal`. If any fixture has `None` or a
+   non-finite value, or the run is empty, store
+   `Unmeasured(CostInputsIncomplete)`. A non-finite price/token derivation is
+   converted to that fixture's `cost_usd = None` and logged at `debug`; it
+   MUST NOT enter sorting or propagate NaN/infinity.
 8. Retry and human-intervention means are Measured only when every relevant
    non-Error outcome supplies the field; otherwise use the §3.6 table reason.
 9. `unsafe_introduced_rate` samples only non-Error fixtures whose manifest
@@ -2267,10 +2376,13 @@ require_beat_naive = false
 naive_epsilon = 0.0
 ```
 
-Unknown keys → hard error. Key `allow_marketing_cost` if present → hard error
-in Day-1. Deserialization MUST be followed by `GateThresholds::validate`;
-non-finite TOML floats, out-of-range rates, and invalid epsilon are rejected
-before harness construction.
+`GateThresholds` carries `#[serde(deny_unknown_fields)]` for every
+`gates/*.toml` load. Unknown keys → `EvalError::Manifest`; key
+`allow_marketing_cost` if present is therefore the same hard error in Day-1.
+All other TOML deserialization errors also map to `EvalError::Manifest`.
+Deserialization MUST be followed by `GateThresholds::validate`; non-finite
+TOML floats, out-of-range rates, and invalid epsilon are rejected before
+harness construction.
 
 ### 7.4 Holdout discipline mechanism (R15)
 
@@ -2534,6 +2646,7 @@ non-hex input specifically with `EvalError::Manifest`.
 | `load_fixture_is_set_qualified` | `load_fixture(Train, id)` and `load_fixture(Holdout, id)` may load distinct same-id fixtures |
 | `load_fixture_rejects_set_or_directory_mismatch` | Caller set, parent directory, manifest set, directory name, and manifest id must agree |
 | `fixture_id_rejects_dot_components` | `FixtureId::new` returns Manifest for `"."`, `".."`, bad charset/length, and empty input |
+| `fixture_id_deserialize_validates` | Custom Deserialize calls `FixtureId::new`; invalid strings become serde custom errors |
 | `manifest_toml_only` | `manifest.toml` loads; JSON-only fixture is not discovered |
 | `manifest_request_usage_dtos_deny_unknown` | Unknown request, nested message, and usage keys fail through crate-private DTOs; runtime types are not direct targets |
 | `manifest_turn_identity_validation` | Duplicate `FixtureTurnId`, duplicate group ordinal, missing/ambiguous repair ordinal 0 rejected |
@@ -2541,6 +2654,7 @@ non-hex input specifically with `EvalError::Manifest`.
 | `manifest_fingerprint_validation` | Optional stored fingerprint must match infallible computed fingerprint |
 | `path_rejects_absolute_parent_and_symlink_escape` | Every path class fails closed under absolute, `..`, and escaping symlink cases |
 | `enumeration_reports_invalid_fixture_entries` | Non-UTF-8 names and escaping directory symlinks produce Error outcomes; fixture-like malformed directories are not skipped |
+| `enumeration_reports_invalid_fixture_ids` | UTF-8 names rejected by `FixtureId::new`, including dot/bad-character cases supplied by the entry test seam, produce kind `invalid_fixture_id`, exact `invalid-id-<lowercase-hex-sha256(name_utf8_bytes)>`, and a bounded `invalid_fixture_id:` message |
 | `license_exact_allowlist` | Exactly five SPDX strings pass only with class permitted |
 | `license_rejects_forbidden_or_unknown` | Forbidden class always fails; aliases/case/whitespace/unknown SPDX fail |
 | `license_file_integrity` | Missing, empty, whitespace, non-UTF-8, non-file, and escaping LICENSE rejected |
@@ -2560,12 +2674,12 @@ non-hex input specifically with `EvalError::Manifest`.
 | `golden_skeleton_pass` | SkeletonReplay passes train fixture offline |
 | `provider_error_before_repair_fails` | Scripted turn Err before repair produces Fail, not Error |
 | `provider_error_before_repair_sets_compile_false` | Ordinary provider Err records criterion detail and `compile_clean=Some(false)`; scripted miss/wrong endpoint is Error |
-| `missing_repair_text_fails` | No successful `Some(text)` yields exact `"missing repair text"` detail |
+| `missing_repair_text_fails` | No successful `Some(text)` and no earlier sticky Fail yields exact `"missing repair text"` detail |
 | `correct_request_missing_map_is_error` | Correct manifest request plus provider miss is map-desync Error |
 | `wrong_driver_request_is_script_miss_fail` | Pre-call request mismatch is Fail with carrier detail `"script miss"` per §5.3.1 |
 | `script_miss_carrier_prefers_compile_clean` | When CompileClean listed, script miss attaches there; otherwise first criterion |
 | `trailing_provider_error_keeps_repair_candidate` | Declared Err after Some(text) does not clear candidate; fixture continues to patch |
-| `detail_precedence_provider_over_patch` | Provider-error detail wins over later patch-oracle detail on same carrier |
+| `carrier_detail_is_sticky_against_later_criterion` | Missing repair text remains on CompileClean while a different criterion evaluates; when NoNewUnsafe is the carrier, its later evaluator cannot flip or overwrite the early failure |
 | `patch_mismatch_fails_compile` | Wrong candidate sets compile false and fails carrier with `"patch oracle failed"` |
 | `bounded_message_utf8_algorithm` | §5.2.3 caps at 512 bytes, UTF-8 boundary, exact `...` suffix |
 | `no_new_unsafe_exact_regex` | Left/right boundaries, one-count-per-line, comments/strings behavior, and post > pre rule |
@@ -2573,6 +2687,7 @@ non-hex input specifically with `EvalError::Manifest`.
 | `expected_diagnostics_cleared` | Each expected code absent after passing patch; patch failure forces criterion failure |
 | `script_turns_consumed_skeleton` | All queues/outcomes required when configured |
 | `script_turns_consumed_naive_installed_only` | Extra control turns are not installed and do not fail naive consumption |
+| `criterion_detail_strings_are_exact` | Passed details are `""`; unsafe, diagnostics, and unconsumed-key failures use the exact §5.5 tables and first expected-code order |
 | `naive_selects_unique_repair_zero` | Capability must equal repair and ordinal 0; node does not create fallback |
 | `criteria_exactly_manifest_list` | Skeleton and naive never auto-add criteria and preserve manifest order |
 | `narrow_driver_still_records_compile` | Skeleton/naive set compile Some even when CompileClean is not listed |
@@ -2586,14 +2701,16 @@ non-hex input specifically with `EvalError::Manifest`.
 | `report_ci_summary_exact` | Exact eight lines, six-place rates, Display delegation, no trailing newline or numeric USD |
 | `public_reexports_complete` | Every item listed in §3.14, including constants and function, compiles from crate root |
 | `cost_disclaimer_default_and_constructor` | Both paths own `String` equal to `COST_DISCLAIMER`; no static ref in serde struct |
+| `day1_public_cost_is_always_uncalibrated` | Every Day-1 `EvalMetrics.cost_usd_p50`, including naive comparison copies, is `Unmeasured(CostUncalibrated)` even when internal p50 is Measured |
+| `internal_cost_p50_requires_complete_finite_inputs` | Complete finite fixture USD yields only envelope `Measured(p50)`; absent/non-finite USD yields `Unmeasured(CostInputsIncomplete)` and no NaN percentile |
 | `compile_rate_none_is_false` | Non-Error `compile_clean=None` is denominator failure and aggregation does not mutate criteria |
 | `latency_excludes_errors` | Error wall times do not enter p50/p95 |
 | `token_sums_saturate` | Input, output, and combined totals never wrap |
-| `outcome_usage_accounting` | Calls count attempts; Ok usage incompleteness is side-specific; Err adds no tokens; USD requires both prices and complete sides |
+| `outcome_usage_accounting` | Calls count attempts; Ok usage incompleteness is side-specific; Err adds no tokens; USD requires both prices, complete sides, and a finite derivation |
 | `error_outcome_fields_canonical` | Load/cancel/join Error outcomes clear criteria and optional measurements; mid-run cancellation retains call count |
 | `report_toolchain_assembly` | Channel is config pin; unique non-Error version pair is used; zero non-Error uses exact `"none"` pair |
 | `unsafe_population_is_criterion_scoped` | Only NoNewUnsafe fixtures sampled; absent sample is Unmeasured |
-| `empty_metrics_are_unmeasured` | Empty logical run uses EmptySample, never numeric zeros |
+| `empty_metrics_are_unmeasured` | Empty logical run uses appropriate Unmeasured reasons, never numeric zeros; public cost remains CostUncalibrated |
 | `determinism_same_input_same_output` | Two serial runs equal after full §5.7.1 scrub |
 | `determinism_concurrent_batch` | Eight concurrent iterations equal after full scrub |
 | `wall_latency_remain_observational` | Unscrubbed wall/latency may differ and are still populated for operators |
@@ -2603,6 +2720,7 @@ non-hex input specifically with `EvalError::Manifest`.
 | Test | Asserts |
 | --- | --- |
 | `gate_skeleton_defaults_pass` | Train golden passes skeleton thresholds |
+| `gate_thresholds_deny_unknown_fields` | Unknown `gates/*.toml` keys fail strict serde and map to `EvalError::Manifest` |
 | `threshold_validate_rejects_non_finite` | NaN and infinities rejected for every f64 field |
 | `threshold_validate_rejects_ranges` | Rates outside 0..=1 and negative epsilon rejected |
 | `gate_unmeasured_dependencies_fail` | Compile, success, unsafe, and required naive Unmeasured each yield MetricUnmeasured |
@@ -2617,7 +2735,7 @@ non-hex input specifically with `EvalError::Manifest`.
 | `holdout_control_rejects_naive_driver` | Control uses manifest driver and NaiveBaseline manifest produces exact load-time Manifest Error; naive side forces NaiveBaseline |
 | `naive_side_errors_fail_gate` | FixtureErrorsPresent counts control and naive Error outcomes |
 | `e2e_holdout_with_naive` | Same holdout ids, both vectors stored, metrics compared, pure gate result attached |
-| `unmeasured_cost_not_marketed` | `marketing_cost_claim()` is `None` |
+| `unmeasured_cost_not_marketed` | Public cost stays `Unmeasured(CostUncalibrated)` and `marketing_cost_claim()` is `None`, regardless of internal envelope measurement |
 | `error_vs_fail_denominator` | Errors excluded from rates; gate fails on errors |
 
 ### 11.6 Lifecycle tests
@@ -2728,7 +2846,7 @@ Every criterion is independently testable.
 | 32 | Empty set returns Ok with EmptySample and failing gate; enumeration fails batch; malformed fixture does not abort siblings | batch lifecycle tests |
 | 33 | Cancellation and join/panic become Error with kinds `cancelled` and `join_failed` | cancellation/join tests |
 | 34 | Day-1 is offline by construction with no live provider API/feature, no reqwest, no harness process-spawn method, and `ALLOY_API_KEY` unset | offline CI §11.7 |
-| 35 | Cost grade emission is only `UncalibratedInternal`; numeric marketing claim remains absent | cost tests |
+| 35 | Cost grade emission is only `UncalibratedInternal`; numeric marketing claim remains absent and public Day-1 cost is unmeasured | cost tests |
 | 36 | ≥1 train and ≥1 holdout golden pass schema/recording/criteria requirements | golden fixture tests |
 | 37 | Holdout hygiene lint and owner discipline are present | workflow/CODEOWNERS review |
 | 38 | ControlPlane is explicit Stub Error; dogfood ban remains | unit test; crate rustdoc; Appendix B |
@@ -2736,23 +2854,27 @@ Every criterion is independently testable.
 | 40 | `ScriptedProvider::new` is fallible and requires `endpoint.provider == id` with the exact Manifest error; endpoint construction creates the id first | `scripted_constructor_provider_match`; §6.3 compile test |
 | 41 | `FixtureId::new` rejects `"."`/`".."` and all invalid forms with Manifest; fingerprint bad hex also uses Manifest | constructor validation tests |
 | 42 | Manifest request, nested message, and usage tables deserialize through deny-unknown crate-private DTOs before runtime conversion | `manifest_request_usage_dtos_deny_unknown` |
-| 43 | Enumeration skips only proven non-directories; non-UTF-8 names, escaping directory symlinks, and invalid fixture-like directories become Error outcomes | `enumeration_reports_invalid_fixture_entries` |
+| 43 | Enumeration skips only proven non-directories; non-UTF-8 names, UTF-8 invalid ids, escaping directory symlinks, and invalid fixture-like directories become Error outcomes | enumeration tests |
 | 44 | `LoadedFixture` validated state is getter-only and its provider is one-shot; a second mutable run returns exact `fixture_already_run` Error | `loaded_fixture_is_one_shot` |
 | 45 | Cancellation checkpoints precede the loop, every complete, patch oracle, and criteria; cancellation clears canonical Error fields while preserving attempted calls mid-run | cancellation checkpoint/accounting tests |
-| 46 | Calls count attempted completes with saturation; successful usage has side-specific completeness; token sums saturate; USD requires both prices and complete token sides | `outcome_usage_accounting`, `token_sums_saturate` |
+| 46 | Calls count attempted completes with saturation; successful usage has side-specific completeness; token sums saturate; USD requires both prices, complete token sides, and finite derivation | `outcome_usage_accounting`, `token_sums_saturate` |
 | 47 | All load/cancel/join Errors have empty criteria and cleared optional measurements; criteria are driver-finalized and aggregation never mutates them | `error_outcome_fields_canonical`, `criteria_exactly_manifest_list` |
 | 48 | Compile rate counts only `Some(true)`; skeleton/naive always set compile Some even for manifests without CompileClean; ordinary pre-repair provider Err is Fail/false while scripted miss/wrong endpoint is Error | compile/provider criterion tests |
-| 49 | Repair-criterion carrier follows §5.3.1; detail precedence follows §5.5 step 9; trailing provider Err after repair text keeps candidate | `script_miss_carrier_prefers_compile_clean`, `detail_precedence_provider_over_patch`, `trailing_provider_error_keeps_repair_candidate` |
+| 49 | Repair-criterion carrier follows §5.3.1 and remains sticky against later evaluation of that same criterion; trailing provider Err after repair text keeps candidate | `script_miss_carrier_prefers_compile_clean`, `carrier_detail_is_sticky_against_later_criterion`, `trailing_provider_error_keeps_repair_candidate` |
 | 50 | Bounded messages use the exact §5.2.3 UTF-8 truncation algorithm (512 / boundary / `...`) | `bounded_message_utf8_algorithm` |
-| 49 | Holdout control uses each manifest driver and rejects a NaiveBaseline control manifest with exact load-time error; naive execution always forces NaiveBaseline | `holdout_control_rejects_naive_driver` |
-| 50 | Gate rejects every non-finite/out-of-range Measured threshold rate with `InvalidMeasuredMetric`, never panic | `gate_invalid_measured_rates_fail` |
-| 51 | Gate checks every control and naive fixture set against `thresholds.set` and emits `SetMismatch` | `gate_rejects_fixture_set_mismatch` |
-| 52 | `report.metrics` is the sole control threshold source; comparison control fields must be byte-equal or emit `InconsistentNaiveComparison`; required absence emits `MissingNaiveComparison` | canonical/missing naive gate tests |
-| 53 | Report toolchain channel is the configured pin; versions are the unique non-Error manifest pair or exact `"none"`/`"none"` when no non-Error fixture exists | `report_toolchain_assembly` |
-| 54 | `run_batch` and `run_holdout_with_naive` always attach `Some(evaluate_gate(...))`, including empty and all-Error reports | `reports_always_attach_gate` |
-| 55 | Crate root re-exports the complete §3.14 list; `EvalHarness::new` validates concurrency, thresholds, pin, and root directory | public API/config compile tests |
-| 56 | `render_ci_summary` and `Display` emit the exact §9.3 eight-line format with no trailing newline or numeric USD | `report_ci_summary_exact` |
-| 57 | LICENSE text/SPDX correspondence remains a Recommended honour check, while required integrity and allowlist checks remain fail-closed | license review; `license_file_integrity` |
+| 51 | Holdout control uses each manifest driver and rejects a NaiveBaseline control manifest with exact load-time error; naive execution always forces NaiveBaseline | `holdout_control_rejects_naive_driver` |
+| 52 | Gate rejects every non-finite/out-of-range Measured threshold rate with `InvalidMeasuredMetric`, never panic | `gate_invalid_measured_rates_fail` |
+| 53 | Gate checks every control and naive fixture set against `thresholds.set` and emits `SetMismatch` | `gate_rejects_fixture_set_mismatch` |
+| 54 | `report.metrics` is the sole control threshold source; comparison control fields must be byte-equal or emit `InconsistentNaiveComparison`; required absence emits `MissingNaiveComparison` | canonical/missing naive gate tests |
+| 55 | Report toolchain channel is the configured pin; versions are the unique non-Error manifest pair or exact `"none"`/`"none"` when no non-Error fixture exists | `report_toolchain_assembly` |
+| 56 | `run_batch` and `run_holdout_with_naive` always attach `Some(evaluate_gate(...))`, including empty and all-Error reports | `reports_always_attach_gate` |
+| 57 | Crate root re-exports the complete §3.14 list; `EvalHarness::new` validates concurrency, thresholds, pin, and root directory | public API/config compile tests |
+| 58 | `render_ci_summary` and `Display` emit the exact §9.3 eight-line format with no trailing newline or numeric USD | `report_ci_summary_exact` |
+| 59 | LICENSE text/SPDX correspondence remains a Recommended honour check, while required integrity and allowlist checks remain fail-closed | license review; `license_file_integrity` |
+| 60 | A UTF-8 directory name rejected by `FixtureId::new` yields kind `invalid_fixture_id`, id `invalid-id-<lowercase-hex-sha256(name_utf8_bytes)>`, and a bounded `invalid_fixture_id:` message | `enumeration_reports_invalid_fixture_ids` |
+| 61 | `FixtureId` custom Deserialize validates through `FixtureId::new`; `GateThresholds` denies unknown `gates/*.toml` fields and maps them to `EvalError::Manifest` | `fixture_id_deserialize_validates`, `gate_thresholds_deny_unknown_fields` |
+| 62 | Public Day-1 `cost_usd_p50` is always `Unmeasured(CostUncalibrated)`; only the internal envelope may hold finite complete-input p50, otherwise `CostInputsIncomplete` | `day1_public_cost_is_always_uncalibrated`, `internal_cost_p50_requires_complete_finite_inputs` |
+| 63 | Every passed criterion has empty detail; unsafe, diagnostic, and unconsumed-script failures use the exact §5.5 strings and sticky-carrier behavior | `criterion_detail_strings_are_exact`, `carrier_detail_is_sticky_against_later_criterion` |
 
 ---
 
