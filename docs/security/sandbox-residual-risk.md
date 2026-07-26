@@ -132,6 +132,27 @@ tokens.
 
 ---
 
+## MCP `fs_read` (RFC-0006)
+
+`fs_read` authorizes a path with `PathPolicy::authorize(.., Read)` and then opens
+the **canonical** `PathBuf` that authorize returned — never the raw argument — so
+deny-globs and jail membership cannot be dodged by a symlink or a `..` segment.
+MVP additionally refuses any path that resolves outside the jail, even a readable
+RO root, so the reported `path` is always jail-relative.
+
+**Residual:** a TOCTOU window remains between authorize and open. An attacker who
+can replace the canonical path with a symlink to a denied file in that window
+could redirect the read. MVP accepts this race: the host is a single trusted
+process, and anyone able to win it already has write access inside the jail.
+Revisit if multi-tenant hosts appear (RFC-0006 §15 open question 2).
+
+**Not a residual:** builtin reads never spawn a process, so no sandbox backend is
+involved and the byte cap (`max_bytes`, hard maximum 1 MiB) bounds memory. Invalid
+UTF-8 interior to the buffer is refused rather than lossily trimmed, so a model
+never receives silently corrupted file content.
+
+---
+
 ## Scratch and bind concurrency
 
 Per-exec trees live under `<jail>/.alloy-sbx/<uuid>/`. Broker-owned bind and
