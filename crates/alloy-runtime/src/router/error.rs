@@ -182,16 +182,11 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
 /// returns the *inner* error's source, not the wrapped value itself, so a plain
 /// `source()` walk misses the certificate error (RFC-0007 §8.3.2).
 #[cfg(feature = "http-provider")]
-fn error_chain_contains_tls(err: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn error_chain_contains_tls(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut stack: Vec<&(dyn std::error::Error + 'static)> = vec![err];
+    let mut certificate_debug_signal = false;
     while let Some(current) = stack.pop() {
         if current.downcast_ref::<rustls::Error>().is_some() {
-            return true;
-        }
-        // Concrete type names are only informative when `current` is not already a
-        // trait object erased at this layer; still check for PKI crates when present.
-        let type_name = std::any::type_name_of_val(current);
-        if type_name.contains("rustls_pki_types") || type_name.contains("webpki") {
             return true;
         }
         if let Some(io) = current.downcast_ref::<std::io::Error>() {
@@ -202,8 +197,11 @@ fn error_chain_contains_tls(err: &(dyn std::error::Error + 'static)) -> bool {
         if let Some(src) = current.source() {
             stack.push(src);
         }
+        let debug = format!("{current:?}");
+        certificate_debug_signal |=
+            debug.contains("InvalidCertificate") || debug.contains("UnknownIssuer");
     }
-    false
+    certificate_debug_signal
 }
 
 impl From<RouterError> for RuntimeError {
@@ -258,5 +256,14 @@ mod tests {
         assert!(message.len() <= 512);
         assert!(!message.contains("sk-"));
         assert!(message.is_char_boundary(message.len()));
+    }
+
+    #[cfg(feature = "http-provider")]
+    #[test]
+    fn tls_nested_io_error_classified() {
+        let rustls = rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer);
+        let inner = std::io::Error::new(std::io::ErrorKind::InvalidData, rustls);
+        let outer = std::io::Error::other(inner);
+        assert!(error_chain_contains_tls(&outer));
     }
 }

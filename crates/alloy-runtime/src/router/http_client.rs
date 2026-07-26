@@ -14,6 +14,7 @@ impl ValidatedHttpClient {
         request_timeout: Duration,
     ) -> Result<Self, ProviderError> {
         let inner = reqwest::Client::builder()
+            .use_rustls_tls()
             .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(false)
             .connect_timeout(connect_timeout)

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION};
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tracing::Instrument;
 use url::Url;
@@ -41,6 +41,7 @@ pub struct OpenAiCompatibleSpec {
 pub struct OpenAiCompatibleProvider {
     id: ProviderId,
     base_url: Url,
+    api_key: SecretString,
     authorization: HeaderValue,
     client: ValidatedHttpClient,
 }
@@ -63,6 +64,7 @@ impl OpenAiCompatibleProvider {
         Ok(Self {
             id: spec.id,
             base_url,
+            api_key: spec.api_key,
             authorization,
             client,
         })
@@ -127,7 +129,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
         };
 
         if !status.is_success() {
-            return Err(map_status(status.as_u16(), &bytes));
+            return Err(map_status(status.as_u16(), &bytes, self.api_key.expose()));
         }
         map_success(&bytes, &request.response_format)
     }
@@ -172,6 +174,66 @@ struct WireResponseFormat {
     kind: &'static str,
 }
 
+#[derive(Deserialize)]
+pub(crate) struct WireResponse {
+    id: Option<String>,
+    choices: Option<Vec<WireChoice>>,
+    usage: Option<WireUsage>,
+    error: Option<Value>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WireChoice {
+    message: Option<WireMessage>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WireMessage {
+    content: Option<WireContent>,
+    refusal: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireContent {
+    Text(String),
+    Parts(Vec<WireContentPart>),
+    Other(Value),
+}
+
+#[derive(Deserialize)]
+struct WireContentPart {
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WireUsage {
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    prompt_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    completion_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct WireErrorEnvelope {
+    error: Option<WireError>,
+}
+
+#[derive(Deserialize)]
+struct WireError {
+    code: Option<String>,
+}
+
+fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)
+        .ok()
+        .and_then(|value| value.as_u64()))
+}
+
 enum BodyReadError {
     TooLarge,
     Request(reqwest::Error),
@@ -188,30 +250,37 @@ async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, BodyRea
     Ok(body)
 }
 
-fn map_status(status: u16, body: &[u8]) -> ProviderError {
+fn map_status(status: u16, body: &[u8], api_key: &str) -> ProviderError {
     match status {
         401 | 403 => ProviderError::Auth,
         429 => ProviderError::RateLimit,
         400 if context_length_signal(body) => ProviderError::ContextLength,
-        _ => ProviderError::HttpStatus {
-            status,
-            message: redact_and_truncate(&String::from_utf8_lossy(body), 512),
-        },
+        _ => {
+            let body = String::from_utf8_lossy(body);
+            let scrubbed = if api_key.is_empty() {
+                body.into_owned()
+            } else {
+                body.replace(api_key, "[REDACTED]")
+            };
+            ProviderError::HttpStatus {
+                status,
+                message: redact_and_truncate(&scrubbed, 512),
+            }
+        }
     }
 }
 
 fn context_length_signal(body: &[u8]) -> bool {
-    let value = serde_json::from_slice::<Value>(body).ok();
-    if value
-        .as_ref()
-        .and_then(|root| root.get("error"))
-        .and_then(|error| error.get("code"))
-        .and_then(Value::as_str)
+    if serde_json::from_slice::<WireErrorEnvelope>(body)
+        .ok()
+        .and_then(|root| root.error)
+        .and_then(|error| error.code)
         .is_some_and(|code| code.eq_ignore_ascii_case("context_length_exceeded"))
     {
         return true;
     }
-    let lowercase = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let scan_len = body.len().min(8 * 1024);
+    let lowercase = String::from_utf8_lossy(&body[..scan_len]).to_ascii_lowercase();
     [
         "context_length_exceeded",
         "context length",
@@ -225,36 +294,31 @@ fn context_length_signal(body: &[u8]) -> bool {
 }
 
 fn map_success(body: &[u8], format: &ResponseFormat) -> Result<ModelResponse, ProviderError> {
-    let root: Value = serde_json::from_slice(body).map_err(|error| {
+    let root: WireResponse = serde_json::from_slice(body).map_err(|error| {
         ProviderError::MalformedResponse(redact_and_truncate(&error.to_string(), 512))
     })?;
-    let object = root
-        .as_object()
-        .ok_or_else(|| ProviderError::MalformedResponse("response root is not an object".into()))?;
-    if object.get("error").is_some_and(|value| value.is_object()) {
+    if root.error.is_some_and(|value| value.is_object()) {
         return Err(ProviderError::MalformedResponse(
             "successful response contains an error object".into(),
         ));
     }
-    let choice = object
-        .get("choices")
-        .and_then(Value::as_array)
+    let choice = root
+        .choices
+        .as_ref()
         .and_then(|choices| choices.first())
-        .and_then(Value::as_object)
         .ok_or_else(|| ProviderError::MalformedResponse("missing response choice".into()))?;
     let message = choice
-        .get("message")
-        .and_then(Value::as_object)
+        .message
+        .as_ref()
         .ok_or_else(|| ProviderError::MalformedResponse("missing response message".into()))?;
 
-    let text = map_content(message.get("content"))?;
-    let refusal = message.get("refusal").and_then(Value::as_str);
-    let finish_reason = if text.is_none() && refusal.is_some() {
+    let text = map_content(message.content.as_ref())?;
+    let finish_reason = if text.is_none() && message.refusal.is_some() {
         Some("refusal".to_owned())
     } else {
         choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
+            .finish_reason
+            .as_deref()
             .map(|value| redact_and_truncate(value, 128))
     };
     let structured = if matches!(format, ResponseFormat::JsonObject) {
@@ -264,13 +328,11 @@ fn map_success(body: &[u8], format: &ResponseFormat) -> Result<ModelResponse, Pr
     } else {
         None
     };
-    let usage = object.get("usage");
-    let input_tokens = usage
-        .and_then(|value| value.get("prompt_tokens"))
-        .and_then(Value::as_u64);
-    let output_tokens = usage
-        .and_then(|value| value.get("completion_tokens"))
-        .and_then(Value::as_u64);
+    let input_tokens = root.usage.as_ref().and_then(|usage| usage.prompt_tokens);
+    let output_tokens = root
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.completion_tokens);
 
     Ok(ModelResponse {
         text,
@@ -280,27 +342,22 @@ fn map_success(body: &[u8], format: &ResponseFormat) -> Result<ModelResponse, Pr
             input_tokens,
             output_tokens,
         },
-        provider_request_id: object
-            .get("id")
-            .and_then(Value::as_str)
+        provider_request_id: root
+            .id
+            .as_deref()
             .map(|value| redact_and_truncate(value, 256)),
         finish_reason,
     })
 }
 
-fn map_content(content: Option<&Value>) -> Result<Option<String>, ProviderError> {
+fn map_content(content: Option<&WireContent>) -> Result<Option<String>, ProviderError> {
     match content {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text.clone())),
-        Some(Value::Array(parts)) => {
+        None => Ok(None),
+        Some(WireContent::Text(text)) => Ok(Some(text.clone())),
+        Some(WireContent::Parts(parts)) => {
             let mut combined = String::new();
             let mut found = false;
-            for text in parts
-                .iter()
-                .filter_map(Value::as_object)
-                .filter_map(|part| part.get("text"))
-                .filter_map(Value::as_str)
-            {
+            for text in parts.iter().filter_map(|part| part.text.as_deref()) {
                 found = true;
                 combined.push_str(text);
             }
@@ -312,9 +369,12 @@ fn map_content(content: Option<&Value>) -> Result<Option<String>, ProviderError>
                 ))
             }
         }
-        Some(_) => Err(ProviderError::MalformedResponse(
-            "response content has an invalid type".into(),
-        )),
+        Some(WireContent::Other(value)) => {
+            let _ = value;
+            Err(ProviderError::MalformedResponse(
+                "response content has an invalid type".into(),
+            ))
+        }
     }
 }
 
@@ -365,10 +425,16 @@ mod tests {
 
     #[test]
     fn maps_status_table_and_structured_object() {
-        assert!(matches!(map_status(401, b"secret"), ProviderError::Auth));
-        assert!(matches!(map_status(429, b"wait"), ProviderError::RateLimit));
         assert!(matches!(
-            map_status(400, b"maximum context exceeded"),
+            map_status(401, b"secret", "key"),
+            ProviderError::Auth
+        ));
+        assert!(matches!(
+            map_status(429, b"wait", "key"),
+            ProviderError::RateLimit
+        ));
+        assert!(matches!(
+            map_status(400, b"maximum context exceeded", "key"),
             ProviderError::ContextLength
         ));
         let body =
@@ -377,5 +443,19 @@ mod tests {
             .unwrap()
             .structured
             .is_some());
+    }
+
+    #[test]
+    fn status_body_scrubs_exact_api_key() {
+        let error = map_status(
+            500,
+            b"upstream echoed exact-secret-value",
+            "exact-secret-value",
+        );
+        let ProviderError::HttpStatus { message, .. } = error else {
+            panic!("unexpected status mapping");
+        };
+        assert!(!message.contains("exact-secret-value"));
+        assert!(message.contains("[REDACTED]"));
     }
 }
