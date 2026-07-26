@@ -55,7 +55,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | [RFC-0013](./RFC-0013-capability-registry-workers.md) | Capability Registry & MVP Workers | Draft | 6–10 pd | 0006, 0007, 0008, 0011, 0012 | **Yes** |
 | [RFC-0014](./RFC-0014-language-backend-rust.md) | LanguageBackend (Rust Module) | Draft | 3–5 pd | 0001, 0011 | M2 path |
 | [RFC-0015](./RFC-0015-cli-profiles-config.md) | CLI, Profiles & Config | Draft | 4–6 pd | 0003, 0004, 0010, 0013 | **Yes** |
-| [RFC-0016](./RFC-0016-eval-harness-holdout-gates.md) | Eval Harness & Holdout Gates | Draft | 5–8 pd | 0001, 0007 | **Yes** (skeleton early) |
+| [RFC-0016](./RFC-0016-eval-harness-holdout-gates.md) | Eval Harness & Holdout Gates | Implemented | 5–8 pd | 0001, 0007 | **Yes** (skeleton early) |
 
 **pd** = person-days. Honest ranges; parallelization shortens calendar time.
 
