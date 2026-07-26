@@ -193,13 +193,6 @@ impl ScriptedProvider {
         self.remaining_outcomes() == 0
     }
 
-    /// Borrow the bound endpoint.
-    #[must_use]
-    #[allow(dead_code)]
-    pub(crate) fn bound_endpoint(&self) -> &ModelEndpoint {
-        &self.endpoint
-    }
-
     fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         match mutex.lock() {
             Ok(guard) => guard,

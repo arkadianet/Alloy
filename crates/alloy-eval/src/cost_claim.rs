@@ -71,7 +71,10 @@ pub(crate) fn derive_eval_usd(endpoint: &ModelEndpoint, usage: &Usage) -> Option
     if usd.is_finite() && usd >= 0.0 {
         Some(usd)
     } else {
-        tracing::debug!("eval USD derivation produced a non-finite or negative value");
+        tracing::debug!(
+            disclaimer = COST_DISCLAIMER,
+            "eval USD derivation produced a non-finite or negative value"
+        );
         None
     }
 }

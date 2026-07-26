@@ -304,7 +304,6 @@ impl FixtureTurnId {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct LoadedFixtureParts {
     pub(crate) manifest: FixtureManifest,
     pub(crate) root: PathBuf,
@@ -316,9 +315,7 @@ pub(crate) struct LoadedFixtureParts {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct FixturePaths {
-    pub(crate) workspace_dir: PathBuf,
     pub(crate) target: PathBuf,
     pub(crate) golden: PathBuf,
     pub(crate) pre_repair: PathBuf,
@@ -331,7 +328,7 @@ pub(crate) struct FixturePaths {
 /// license, and recording checks.
 pub(crate) fn parse_manifest_toml(toml_src: &str) -> Result<FixtureManifest, EvalError> {
     let wire: ManifestWire = toml::from_str(toml_src)
-        .map_err(|err| EvalError::Manifest(format!("manifest toml: {err}")))?;
+        .map_err(|err| EvalError::Manifest(bound_message(format!("manifest toml: {err}"))))?;
     validate_and_convert_manifest(wire)
 }
 
@@ -632,7 +629,6 @@ fn validate_manifest_paths(
     ensure_regular_file(&post_repair)?;
 
     Ok(FixturePaths {
-        workspace_dir,
         target,
         golden,
         pre_repair,
@@ -915,13 +911,15 @@ struct ManifestFixtureTurnIdWire {
 
 impl ManifestFixtureTurnIdWire {
     fn into_turn_id(self) -> Result<FixtureTurnId, EvalError> {
-        let capability = CapabilityId::new(self.capability)
-            .map_err(|err| EvalError::Manifest(format!("turn_id capability: {err}")))?;
+        let capability = CapabilityId::new(self.capability).map_err(|err| {
+            EvalError::Manifest(bound_message(format!("turn_id capability: {err}")))
+        })?;
         let node = self
             .node
             .map(|node| {
-                NodeId::parse(&node)
-                    .map_err(|err| EvalError::Manifest(format!("turn_id node: {err}")))
+                NodeId::parse(&node).map_err(|err| {
+                    EvalError::Manifest(bound_message(format!("turn_id node: {err}")))
+                })
             })
             .transpose()?;
         Ok(FixtureTurnId {

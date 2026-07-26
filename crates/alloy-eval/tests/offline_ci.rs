@@ -143,6 +143,54 @@ fn config_requires_root_constructor() {
 #[test]
 fn public_reexports_complete() {
     use alloy_eval::*;
+
+    let _: Option<RequestFingerprint> = None;
+    let _: Option<ScriptedProvider> = None;
+    let _: Option<ScriptOutcome> = None;
+    let _: Option<ScriptTurnOutcome> = None;
+    let _: Option<ScriptedProviderError> = None;
+    let _: Option<ScriptedInvocation> = None;
+
+    let _: Option<FixtureTurnId> = None;
+    let _: Option<FixtureId> = None;
+    let _: Option<FixtureSet> = None;
+    let _: Option<FixtureManifest> = None;
+    let _: Option<LicenseClass> = None;
+    let _: Option<LicenseMeta> = None;
+    let _: Option<ToolchainRecord> = None;
+    let _: Option<WorkspaceRef> = None;
+    let _: Option<NaivePatchMode> = None;
+    let _: Option<EndpointPrices> = None;
+    let _: Option<ExpectedDiagnostic> = None;
+    let _: Option<ScriptTurn> = None;
+    let _: Option<CargoRecordingRefs> = None;
+    let _: Option<SuccessCriterion> = None;
+    let _: Option<FixtureDriverKind> = None;
+
+    let _: Option<CargoJsonRecording> = None;
+    let _: Option<RecordedDiagnostic> = None;
+
+    let _: Option<FixtureStatus> = None;
+    let _: Option<FixtureOutcome> = None;
+    let _: Option<CriterionResult> = None;
+    let _: Option<ReportError> = None;
+    let _: Option<EvalMetrics> = None;
+    let _: Option<MetricField<f64>> = None;
+    let _: Option<UnmeasuredReason> = None;
+    let _: Option<EvalTrajectoryRecord> = None;
+    let _: Option<EvalReport> = None;
+    let _: Option<CostClaimGrade> = None;
+    let _: Option<CostClaimEnvelope> = None;
+
+    let _: Option<LoadedFixture> = None;
+    let _: Option<EvalHarness> = None;
+    let _: Option<EvalHarnessConfig> = None;
+    let _: Option<GateThresholds> = None;
+    let _: Option<GateResult> = None;
+    let _: Option<GateFailure> = None;
+    let _: Option<NaiveComparisonResult> = None;
+    let _: Option<EvalError> = None;
+
     let _ = COST_DISCLAIMER;
     let _ = NAIVE_BASELINE_LABEL;
     let _ = PERMITTED_SPDX;

@@ -665,6 +665,171 @@ unknown = true
     }
 
     #[test]
+    fn threshold_validate_rejects_non_finite() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for field in 0..4 {
+                let mut thresholds = GateThresholds::skeleton_defaults();
+                match field {
+                    0 => thresholds.min_compile_success_rate = invalid,
+                    1 => thresholds.min_success_rate = invalid,
+                    2 => thresholds.max_unsafe_introduced_rate = invalid,
+                    3 => thresholds.naive_epsilon = invalid,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    matches!(thresholds.validate(), Err(EvalError::Manifest(message)) if message.contains("finite")),
+                    "field {field} accepted {invalid:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn threshold_validate_rejects_ranges() {
+        for invalid in [-0.01, 1.01] {
+            for field in 0..3 {
+                let mut thresholds = GateThresholds::skeleton_defaults();
+                match field {
+                    0 => thresholds.min_compile_success_rate = invalid,
+                    1 => thresholds.min_success_rate = invalid,
+                    2 => thresholds.max_unsafe_introduced_rate = invalid,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    matches!(thresholds.validate(), Err(EvalError::Manifest(message)) if message.contains("0.0..=1.0")),
+                    "field {field} accepted {invalid}"
+                );
+            }
+        }
+
+        let mut thresholds = GateThresholds::skeleton_defaults();
+        thresholds.naive_epsilon = -f64::EPSILON;
+        assert!(matches!(
+            thresholds.validate(),
+            Err(EvalError::Manifest(message)) if message == "naive_epsilon must be non-negative"
+        ));
+    }
+
+    #[test]
+    fn gate_uses_canonical_report_metrics() {
+        let canonical = metrics(
+            MetricField::Measured(1.0),
+            MetricField::Measured(1.0),
+            MetricField::Measured(0.0),
+        );
+        let mut copied = canonical.clone();
+        copied.compile_success_rate = MetricField::Measured(0.0);
+        let mut report = report(canonical.clone());
+        report.naive_comparison = Some(NaiveComparisonResult {
+            control: copied,
+            naive: canonical,
+            control_meets_or_beats_naive: true,
+            detail: NAIVE_BASELINE_LABEL.to_owned(),
+        });
+
+        let result = evaluate_gate(&GateThresholds::skeleton_defaults(), &report);
+
+        assert!(!result.passed);
+        assert_eq!(
+            result.failures,
+            vec![GateFailure::InconsistentNaiveComparison {
+                field: "compile_success_rate".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn gate_unmeasured_dependencies_fail() {
+        let control = metrics(
+            MetricField::Unmeasured {
+                reason: UnmeasuredReason::EmptySample,
+            },
+            MetricField::Unmeasured {
+                reason: UnmeasuredReason::SubsystemAbsent,
+            },
+            MetricField::Unmeasured {
+                reason: UnmeasuredReason::NotApplicable,
+            },
+        );
+        let naive = metrics(
+            MetricField::Unmeasured {
+                reason: UnmeasuredReason::EmptySample,
+            },
+            MetricField::Measured(1.0),
+            MetricField::Measured(0.0),
+        );
+        let mut report = report(control.clone());
+        report.naive_comparison = Some(NaiveComparisonResult {
+            control,
+            naive,
+            control_meets_or_beats_naive: false,
+            detail: NAIVE_BASELINE_LABEL.to_owned(),
+        });
+
+        let result = evaluate_gate(&GateThresholds::milestone_holdout_defaults(), &report);
+        let fields: Vec<&str> = result
+            .failures
+            .iter()
+            .filter_map(|failure| match failure {
+                GateFailure::MetricUnmeasured { field, .. } => Some(field.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "compile_success_rate",
+                "success_rate",
+                "unsafe_introduced_rate",
+                "naive_compile_success_rate",
+            ]
+        );
+    }
+
+    #[test]
+    fn naive_side_errors_fail_gate() {
+        fn error_outcome(id: &str) -> FixtureOutcome {
+            FixtureOutcome {
+                fixture_id: FixtureId::new(id).unwrap(),
+                set: FixtureSet::Train,
+                status: FixtureStatus::Error,
+                criteria: vec![],
+                wall_ms: 0,
+                model_calls: 0,
+                tokens_in: None,
+                tokens_out: None,
+                cost_usd: None,
+                retry_count: None,
+                human_interventions: None,
+                unsafe_introduced: None,
+                compile_clean: None,
+                error: Some(crate::error::ReportError::cancelled()),
+            }
+        }
+
+        let mut report = report(metrics(
+            MetricField::Measured(1.0),
+            MetricField::Measured(1.0),
+            MetricField::Measured(0.0),
+        ));
+        report.fixtures = vec![error_outcome("control-error")];
+        report.naive_fixtures = Some(vec![error_outcome("naive-error")]);
+
+        let result = evaluate_gate(&GateThresholds::skeleton_defaults(), &report);
+        assert_eq!(
+            result
+                .failures
+                .iter()
+                .filter(|failure| matches!(failure, GateFailure::FixtureErrorsPresent { .. }))
+                .count(),
+            1
+        );
+        assert!(result
+            .failures
+            .contains(&GateFailure::FixtureErrorsPresent { count: 2 }));
+    }
+
+    #[test]
     fn lost_to_naive_baseline_uses_canonical_control() {
         let control = metrics(
             MetricField::Measured(0.5),

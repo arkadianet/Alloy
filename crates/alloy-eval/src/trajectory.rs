@@ -12,7 +12,7 @@ use alloy_runtime::{
 use serde::{Deserialize, Serialize};
 
 use crate::cost_claim::derive_eval_usd;
-use crate::error::EvalError;
+use crate::error::{bound_message, EvalError};
 use crate::fingerprint::RequestFingerprint;
 use crate::manifest::{FixtureId, FixtureSet, FixtureTurnId};
 use crate::report::{EvalReport, FixtureStatus};
@@ -313,8 +313,8 @@ fn write_jsonl_atomically(
 
     let write_result = (|| {
         for row in &report.trajectories {
-            let line =
-                serde_json::to_string(row).map_err(|error| EvalError::Json(error.to_string()))?;
+            let line = serde_json::to_string(row)
+                .map_err(|error| EvalError::Json(bound_message(error.to_string())))?;
             file.write_all(line.as_bytes())?;
             file.write_all(b"\n")?;
         }
@@ -513,11 +513,24 @@ mod tests {
     fn trajectory_jsonl_contract() {
         let dir = tempfile::tempdir().unwrap();
         let run_id = "00000000-0000-4000-8000-000000000000";
-        let first = report(run_id, vec![row("a", 0), row("b", 0)]);
+        let empty = report(run_id, vec![]);
+        write_trajectory_artifacts(&empty, Some(dir.path()), 2).unwrap();
+        let path = dir.path().join(run_id).join("trajectories.jsonl");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let mut first = report(run_id, vec![row("a", 0), row("b", 0)]);
+        first.naive_trajectories = Some(vec![row("naive-only", 0)]);
         write_trajectory_artifacts(&first, Some(dir.path()), 2).unwrap();
+        let data = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(data.lines().count(), 2);
+        assert!(data.ends_with('\n'));
+        assert!(!data.contains("naive-only"));
+        for line in data.lines() {
+            let _: EvalTrajectoryRecord = serde_json::from_str(line).unwrap();
+        }
+
         let second = report(run_id, vec![row("c", 0)]);
         write_trajectory_artifacts(&second, Some(dir.path()), 2).unwrap();
-        let path = dir.path().join(run_id).join("trajectories.jsonl");
         let data = std::fs::read_to_string(path).unwrap();
         assert_eq!(data.lines().count(), 1);
         assert!(data.ends_with('\n'));
@@ -571,6 +584,79 @@ mod tests {
         }
         assert!(ignored.is_dir());
         assert!(dir.path().join(current_run_id).is_dir());
+    }
+
+    #[test]
+    fn trajectory_disk_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let oldest = "00000000-0000-4000-8000-000000000002";
+        let newer = "00000000-0000-4000-8000-000000000001";
+        let current = "00000000-0000-4000-8000-000000000003";
+
+        write_trajectory_artifacts(&report(oldest, vec![row("oldest", 0)]), Some(dir.path()), 2)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_trajectory_artifacts(&report(newer, vec![row("newer", 0)]), Some(dir.path()), 2)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        write_trajectory_artifacts(
+            &report(current, vec![row("current", 0)]),
+            Some(dir.path()),
+            2,
+        )
+        .unwrap();
+
+        assert!(!dir.path().join(oldest).exists());
+        assert!(dir.path().join(newer).is_dir());
+        let current_jsonl = dir.path().join(current).join("trajectories.jsonl");
+        let data = std::fs::read_to_string(current_jsonl).unwrap();
+        assert_eq!(data.lines().count(), 1);
+        let parsed: EvalTrajectoryRecord = serde_json::from_str(data.trim_end()).unwrap();
+        assert_eq!(parsed.fixture_id.as_str(), "current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trajectory_rotation_ignores_non_uuid_children() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let eligible = "00000000-0000-4000-8000-000000000001";
+        let current = "00000000-0000-4000-8000-000000000002";
+        let uppercase = "00000000-0000-4000-8000-00000000000A";
+        let non_v4 = "00000000-0000-1000-8000-000000000003";
+        let file = "00000000-0000-4000-8000-000000000004";
+        let symlink_name = "00000000-0000-4000-8000-000000000005";
+
+        std::fs::create_dir(dir.path().join(eligible)).unwrap();
+        std::fs::create_dir(dir.path().join("not-a-run")).unwrap();
+        std::fs::create_dir(dir.path().join(uppercase)).unwrap();
+        std::fs::create_dir(dir.path().join(non_v4)).unwrap();
+        std::fs::create_dir_all(
+            dir.path()
+                .join("nested")
+                .join("00000000-0000-4000-8000-000000000006"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(file), "keep").unwrap();
+        symlink(outside.path(), dir.path().join(symlink_name)).unwrap();
+
+        write_trajectory_artifacts(
+            &report(current, vec![row("current", 0)]),
+            Some(dir.path()),
+            1,
+        )
+        .unwrap();
+
+        assert!(!dir.path().join(eligible).exists());
+        for ignored in ["not-a-run", uppercase, non_v4, "nested", file, symlink_name] {
+            assert!(
+                std::fs::symlink_metadata(dir.path().join(ignored)).is_ok(),
+                "rotation removed ignored child {ignored}"
+            );
+        }
+        assert!(dir.path().join(current).is_dir());
     }
 
     #[cfg(unix)]

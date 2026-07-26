@@ -274,19 +274,20 @@ impl EvalHarness {
     /// assembly fails, or configured trajectory artifacts cannot be written.
     pub async fn run_batch(&self, set: FixtureSet) -> Result<EvalReport, EvalError> {
         let entries = self.enumerate_fixture_entries(set).await?;
-        let span = batch_span(set, entries.len());
+        let fixture_count = entries.len();
+        let span = batch_span(set, fixture_count);
         let batch = self
             .run_entries(
                 set,
                 entries,
                 BatchDriverMode::Manifest,
-                self.new_semaphore(),
+                self.new_semaphore(fixture_count),
             )
             .instrument(span)
             .await;
         let mut report = self.assemble_report(batch)?;
         report.gate = Some(self.evaluate_gate(&report));
-        self.write_trajectory_artifacts(&report)?;
+        self.write_trajectory_artifacts_blocking(&report).await?;
         Ok(report)
     }
 
@@ -327,10 +328,11 @@ impl EvalHarness {
         }
 
         let entries = self.enumerate_fixture_entries(FixtureSet::Holdout).await?;
-        let span = batch_span(FixtureSet::Holdout, entries.len());
+        let fixture_count = entries.len();
+        let span = batch_span(FixtureSet::Holdout, fixture_count);
         // Control and naive share one semaphore so the pair still honours
         // `max_concurrency` overall.
-        let semaphore = self.new_semaphore();
+        let semaphore = self.new_semaphore(fixture_count);
         let (control, naive) = async {
             tokio::join!(
                 self.run_entries(
@@ -391,7 +393,7 @@ impl EvalHarness {
             naive_comparison: Some(comparison),
         };
         report.gate = Some(self.evaluate_gate(&report));
-        self.write_trajectory_artifacts(&report)?;
+        self.write_trajectory_artifacts_blocking(&report).await?;
         Ok(report)
     }
 
@@ -407,6 +409,19 @@ impl EvalHarness {
             self.config.artifact_dir.as_deref(),
             self.config.max_retained_runs,
         )
+    }
+
+    async fn write_trajectory_artifacts_blocking(
+        &self,
+        report: &EvalReport,
+    ) -> Result<(), EvalError> {
+        let harness = self.clone();
+        let report = report.clone();
+        match tokio::task::spawn_blocking(move || harness.write_trajectory_artifacts(&report)).await
+        {
+            Ok(result) => result,
+            Err(error) => Err(EvalError::Internal(join_failed_message(error))),
+        }
     }
 
     pub(crate) async fn run_fixture_collect(
@@ -660,8 +675,10 @@ impl EvalHarness {
         }
     }
 
-    fn new_semaphore(&self) -> Arc<Semaphore> {
-        Arc::new(Semaphore::new(self.config.max_concurrency))
+    fn new_semaphore(&self, fixture_count: usize) -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(
+            self.config.max_concurrency.min(fixture_count.max(1)),
+        ))
     }
 
     /// Acquire one fixture permit, or `None` when cancellation wins the race.
@@ -1143,7 +1160,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn config_validation_rejects_bad_bounds() {
+    fn config_validation_is_complete() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = EvalHarnessConfig::skeleton(dir.path());
         config.max_concurrency = 0;
@@ -1164,6 +1181,33 @@ pub(crate) mod tests {
         assert!(matches!(
             EvalHarness::new(config),
             Err(EvalError::Manifest(_))
+        ));
+
+        let mut config = EvalHarnessConfig::skeleton(dir.path());
+        config.pin_toolchain_channel.clear();
+        assert!(matches!(
+            EvalHarness::new(config),
+            Err(EvalError::Manifest(message)) if message == "pin_toolchain_channel must be non-empty"
+        ));
+
+        let mut config = EvalHarnessConfig::skeleton(dir.path());
+        config.thresholds.min_success_rate = f64::NAN;
+        assert!(matches!(
+            EvalHarness::new(config),
+            Err(EvalError::Manifest(message)) if message == "min_success_rate must be finite"
+        ));
+
+        let file = dir.path().join("not-a-directory");
+        fs::write(&file, "fixture root must be a directory").unwrap();
+        assert!(matches!(
+            EvalHarness::new(EvalHarnessConfig::skeleton(&file)),
+            Err(EvalError::Manifest(message)) if message == "fixture_root must be a directory"
+        ));
+
+        let missing = dir.path().join("missing");
+        assert!(matches!(
+            EvalHarness::new(EvalHarnessConfig::skeleton(missing)),
+            Err(EvalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
         ));
     }
 
@@ -1217,6 +1261,48 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn directory_enumeration_failure_is_batch_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = EvalHarness::new(EvalHarnessConfig::skeleton(dir.path())).unwrap();
+
+        assert!(matches!(
+            harness.run_batch(FixtureSet::Train).await,
+            Err(EvalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_fixture_does_not_abort_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_fixture(
+            dir.path(),
+            FixtureSet::Train,
+            "valid",
+            "skeleton_replay",
+            &toolchain(),
+        );
+        fs::create_dir_all(dir.path().join("train/malformed")).unwrap();
+        let harness = EvalHarness::new(EvalHarnessConfig::skeleton(dir.path())).unwrap();
+
+        let report = harness.run_batch(FixtureSet::Train).await.unwrap();
+
+        assert_eq!(report.fixtures.len(), 2);
+        let malformed = report
+            .fixtures
+            .iter()
+            .find(|outcome| outcome.fixture_id.as_str() == "malformed")
+            .unwrap();
+        assert_eq!(malformed.status, FixtureStatus::Error);
+        assert_eq!(malformed.error.as_ref().unwrap().kind, "fixture_not_found");
+        let valid = report
+            .fixtures
+            .iter()
+            .find(|outcome| outcome.fixture_id.as_str() == "valid")
+            .unwrap();
+        assert_eq!(valid.status, FixtureStatus::Pass, "{valid:?}");
+    }
+
+    #[tokio::test]
     async fn reports_always_attach_gate() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("train")).unwrap();
@@ -1267,6 +1353,50 @@ pub(crate) mod tests {
             assert_eq!(outcome.model_calls, 0);
         }
         assert!(report.trajectories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_during_batch_marks_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        let mut config = EvalHarnessConfig::skeleton(dir.path());
+        config.cancel = Some(token.clone());
+        let harness = EvalHarness::new(config).unwrap();
+        let entries: Vec<LoadedEntry> = ["alpha", "beta"]
+            .into_iter()
+            .map(|id| {
+                let fixture = loaded_fixture_for_tests(id, FixtureDriverKind::SkeletonReplay);
+                LoadedEntry {
+                    id: fixture.manifest.id.clone(),
+                    toolchain: fixture.manifest.toolchain.clone(),
+                    fixture,
+                }
+            })
+            .collect();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+
+        let (phase, ()) = tokio::join!(
+            harness.run_loaded_entries(
+                FixtureSet::Train,
+                entries,
+                BatchDriverMode::Manifest,
+                &semaphore,
+            ),
+            async {
+                tokio::task::yield_now().await;
+                token.cancel();
+                drop(held);
+            }
+        );
+
+        assert_eq!(phase.outcomes.len(), 2);
+        assert!(phase.outcomes.iter().all(|outcome| {
+            outcome.status == FixtureStatus::Error
+                && outcome.error.as_ref().map(|error| error.kind.as_str()) == Some("cancelled")
+                && outcome.model_calls == 0
+        }));
+        assert!(phase.trajectories.is_empty());
     }
 
     #[tokio::test]
@@ -1333,7 +1463,7 @@ pub(crate) mod tests {
                 FixtureSet::Holdout,
                 entries,
                 BatchDriverMode::HoldoutControl,
-                harness.new_semaphore(),
+                harness.new_semaphore(1),
             )
             .await;
         assert_eq!(batch.outcomes.len(), 1);
@@ -1359,6 +1489,146 @@ pub(crate) mod tests {
         assert!(report.trajectories.is_empty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn enumeration_reports_invalid_fixture_entries() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let train = dir.path().join("train");
+        fs::create_dir_all(&train).unwrap();
+        fs::create_dir(train.join(std::ffi::OsString::from_vec(vec![0xff]))).unwrap();
+        symlink(outside.path(), train.join("escaping-symlink")).unwrap();
+        fs::create_dir(train.join("fixture-like-but-malformed")).unwrap();
+        let harness = EvalHarness::new(EvalHarnessConfig::skeleton(dir.path())).unwrap();
+
+        let report = harness.run_batch(FixtureSet::Train).await.unwrap();
+
+        assert_eq!(report.fixtures.len(), 3);
+        let error_kinds: std::collections::BTreeSet<&str> = report
+            .fixtures
+            .iter()
+            .map(|outcome| outcome.error.as_ref().unwrap().kind.as_str())
+            .collect();
+        assert_eq!(
+            error_kinds,
+            std::collections::BTreeSet::from([
+                "fixture_not_found",
+                "invalid_fixture_name",
+                "manifest",
+            ])
+        );
+        assert!(report
+            .fixtures
+            .iter()
+            .all(|outcome| outcome.status == FixtureStatus::Error));
+    }
+
+    #[test]
+    fn naive_fixture_id_mismatch_is_batch_error() {
+        let outcome = |id| {
+            error_outcome(
+                FixtureId::new(id).unwrap(),
+                FixtureSet::Holdout,
+                ReportError::cancelled(),
+            )
+        };
+
+        for (control, naive) in [
+            (vec![outcome("a")], vec![outcome("b")]),
+            (
+                vec![outcome("duplicate"), outcome("duplicate")],
+                vec![outcome("duplicate")],
+            ),
+        ] {
+            assert!(matches!(
+                ensure_same_fixture_id_set(&control, &naive),
+                Err(EvalError::Internal(message))
+                    if message == "control/naive fixture id mismatch"
+            ));
+        }
+    }
+
+    #[test]
+    fn error_outcome_fields_canonical() {
+        let load = load_error_outcome(
+            FixtureId::new("load").unwrap(),
+            FixtureSet::Train,
+            EvalError::Manifest("broken".to_owned()),
+        );
+        let cancelled = cancelled_outcome(FixtureId::new("cancelled").unwrap(), FixtureSet::Train);
+        let joined = error_outcome(
+            FixtureId::new("joined").unwrap(),
+            FixtureSet::Train,
+            ReportError::join_failed("join_failed: test"),
+        );
+
+        for outcome in [load, cancelled, joined] {
+            assert_eq!(outcome.status, FixtureStatus::Error);
+            assert!(outcome.criteria.is_empty());
+            assert_eq!(outcome.wall_ms, 0);
+            assert_eq!(outcome.model_calls, 0);
+            assert_eq!(outcome.tokens_in, None);
+            assert_eq!(outcome.tokens_out, None);
+            assert_eq!(outcome.cost_usd, None);
+            assert_eq!(outcome.retry_count, None);
+            assert_eq!(outcome.human_interventions, None);
+            assert_eq!(outcome.unsafe_introduced, None);
+            assert_eq!(outcome.compile_clean, None);
+            assert!(outcome.error.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn join_failure_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("lib.rs.post");
+        fs::write(&golden, "fixed").unwrap();
+        let harness = EvalHarness::new(EvalHarnessConfig::skeleton(dir.path())).unwrap();
+
+        let mut panicking =
+            loaded_fixture_for_tests("panicking", FixtureDriverKind::SkeletonReplay);
+        panicking.paths.golden = golden.clone();
+        panicking.panic_after_dispatch = true;
+        let mut sibling = loaded_fixture_for_tests("sibling", FixtureDriverKind::SkeletonReplay);
+        sibling.paths.golden = golden;
+        let entries = [panicking, sibling]
+            .into_iter()
+            .map(|fixture| LoadedEntry {
+                id: fixture.manifest.id.clone(),
+                toolchain: fixture.manifest.toolchain.clone(),
+                fixture,
+            })
+            .collect();
+
+        let phase = harness
+            .run_loaded_entries(
+                FixtureSet::Train,
+                entries,
+                BatchDriverMode::Manifest,
+                &harness.new_semaphore(2),
+            )
+            .await;
+
+        assert_eq!(phase.outcomes.len(), 2);
+        let panicking = phase
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.fixture_id.as_str() == "panicking")
+            .unwrap();
+        assert_eq!(panicking.status, FixtureStatus::Error);
+        assert_eq!(panicking.model_calls, 0);
+        assert_eq!(panicking.error.as_ref().unwrap().kind, "join_failed");
+        let sibling = phase
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.fixture_id.as_str() == "sibling")
+            .unwrap();
+        assert_eq!(sibling.status, FixtureStatus::Pass, "{sibling:?}");
+    }
+
     #[tokio::test]
     async fn panic_drops_fixture_trajectory_buffer() {
         let dir = tempfile::tempdir().unwrap();
@@ -1377,7 +1647,7 @@ pub(crate) mod tests {
                 FixtureSet::Train,
                 vec![entry],
                 BatchDriverMode::Manifest,
-                &harness.new_semaphore(),
+                &harness.new_semaphore(1),
             )
             .await;
 
@@ -1585,7 +1855,6 @@ output_tokens = 5
             manifest,
             root: PathBuf::new(),
             paths: FixturePaths {
-                workspace_dir: PathBuf::new(),
                 target: PathBuf::new(),
                 golden: PathBuf::new(),
                 pre_repair: PathBuf::new(),

@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_metrics() {
+    fn empty_metrics_are_unmeasured() {
         let metrics = MetricsAggregator::aggregate(&[]);
         assert_eq!(
             metrics.success_rate,
@@ -278,6 +278,63 @@ mod tests {
             metrics.retries_mean,
             unmeasured(UnmeasuredReason::SkeletonDeferred)
         );
+        assert_eq!(
+            metrics.compile_success_rate,
+            unmeasured(UnmeasuredReason::EmptySample)
+        );
+        assert_eq!(
+            metrics.token_efficiency,
+            unmeasured(UnmeasuredReason::EmptySample)
+        );
+        assert_eq!(
+            metrics.latency_p50_ms,
+            unmeasured(UnmeasuredReason::EmptySample)
+        );
+        assert_eq!(
+            metrics.latency_p95_ms,
+            unmeasured(UnmeasuredReason::EmptySample)
+        );
+        assert_eq!(
+            metrics.human_interventions,
+            unmeasured(UnmeasuredReason::SkeletonDeferred)
+        );
+        assert_eq!(
+            metrics.unsafe_introduced_rate,
+            unmeasured(UnmeasuredReason::EmptySample)
+        );
+    }
+
+    #[test]
+    fn compile_rate_none_is_false() {
+        let mut outcome = outcome(
+            "missing-compile",
+            FixtureStatus::Pass,
+            Some((1, 1)),
+            Some(false),
+        );
+        outcome.compile_clean = None;
+        let outcomes = [outcome];
+
+        let metrics = MetricsAggregator::aggregate(&outcomes);
+
+        assert_eq!(metrics.compile_success_rate, MetricField::Measured(0.0));
+        assert_eq!(outcomes[0].criteria[0].name, SuccessCriterion::NoNewUnsafe);
+        assert!(outcomes[0].criteria[0].passed);
+    }
+
+    #[test]
+    fn latency_excludes_errors() {
+        let mut fast = outcome("fast", FixtureStatus::Pass, Some((1, 1)), Some(false));
+        fast.wall_ms = 10;
+        let mut slow = outcome("slow", FixtureStatus::Fail, Some((1, 1)), Some(false));
+        slow.wall_ms = 30;
+        let mut error = outcome("error", FixtureStatus::Error, Some((1, 1)), Some(false));
+        error.wall_ms = 10_000;
+
+        let metrics = MetricsAggregator::aggregate(&[fast, error, slow]);
+
+        assert_eq!(metrics.latency_p50_ms, MetricField::Measured(10));
+        assert_eq!(metrics.latency_p95_ms, MetricField::Measured(30));
     }
 
     #[test]

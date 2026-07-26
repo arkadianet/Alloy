@@ -5,7 +5,7 @@ use std::path::Path;
 use alloy_runtime::Digest;
 use serde::{Deserialize, Serialize};
 
-use crate::error::EvalError;
+use crate::error::{bound_message, EvalError};
 use crate::manifest::{ExpectedDiagnostic, ToolchainRecord};
 
 /// Cargo JSON recording schema version accepted by RFC-0016.
@@ -52,8 +52,9 @@ impl CargoJsonRecording {
     /// [`EvalError::RecordingInvalid`] for JSON, version, or digest failures.
     pub fn load(path: &Path) -> Result<Self, EvalError> {
         let bytes = std::fs::read(path)?;
-        let recording: Self = serde_json::from_slice(&bytes)
-            .map_err(|err| EvalError::RecordingInvalid(format!("recording json: {err}")))?;
+        let recording: Self = serde_json::from_slice(&bytes).map_err(|err| {
+            EvalError::RecordingInvalid(bound_message(format!("recording json: {err}")))
+        })?;
         if recording.recording_format_version != CARGO_RECORDING_FORMAT_VERSION {
             return Err(EvalError::RecordingInvalid(format!(
                 "recording format version must be {CARGO_RECORDING_FORMAT_VERSION}"
@@ -91,13 +92,17 @@ impl CargoJsonRecording {
         let mut diagnostics = Vec::new();
         for (idx, line) in self.stdout_lines.iter().enumerate() {
             let value: serde_json::Value = serde_json::from_str(line).map_err(|err| {
-                EvalError::RecordingInvalid(format!("malformed cargo json line {idx}: {err}"))
+                EvalError::RecordingInvalid(bound_message(format!(
+                    "malformed cargo json line {idx}: {err}"
+                )))
             })?;
             if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
                 continue;
             }
             let message = value.get("message").ok_or_else(|| {
-                EvalError::RecordingInvalid(format!("compiler-message line {idx} missing message"))
+                EvalError::RecordingInvalid(bound_message(format!(
+                    "compiler-message line {idx} missing message"
+                )))
             })?;
             let level = required_string(message, "level", idx)?.to_owned();
             let message_text = required_string(message, "message", idx)?.to_owned();
@@ -135,10 +140,10 @@ pub(crate) fn validate_expected_diagnostics(
                 && actual.message.contains(&expected.message_contains)
         });
         if !present {
-            return Err(EvalError::RecordingInvalid(format!(
+            return Err(EvalError::RecordingInvalid(bound_message(format!(
                 "missing expected diagnostic {} containing {:?}",
                 expected.code, expected.message_contains
-            )));
+            ))));
         }
     }
     Ok(())
@@ -153,9 +158,9 @@ fn required_string<'a>(
         .get(field)
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            EvalError::RecordingInvalid(format!(
+            EvalError::RecordingInvalid(bound_message(format!(
                 "compiler-message line {line} field {field} must be a string"
-            ))
+            )))
         })
 }
 

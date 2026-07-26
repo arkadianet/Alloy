@@ -153,6 +153,17 @@ pub(crate) async fn run_scripted(
             }
             Some(Err(error)) => {
                 if let Some(error) = provider_map_error(&error) {
+                    if matches!(
+                        &error,
+                        EvalError::Internal(message)
+                            if message.starts_with(SCRIPTED_MISS_PREFIX)
+                    ) {
+                        tracing::warn!(
+                            fixture_id = %fixture.manifest.id,
+                            turn_id = %turn.turn_id.render(),
+                            "eval scripted provider map desynchronized"
+                        );
+                    }
                     return error_output(fixture, started, error, trajectories);
                 }
                 if candidate.is_none() {
@@ -708,7 +719,7 @@ mod tests {
     use crate::harness::tests::{
         loaded_fixture_for_tests, loaded_fixture_with_outcome, response_outcome,
     };
-    use crate::manifest::{FixtureDriverKind, ScriptTurnOutcome};
+    use crate::manifest::{ExpectedDiagnostic, FixtureDriverKind, ScriptTurnOutcome};
     use crate::scripted::ScriptedProviderError;
     use alloy_runtime::ErrorClass;
 
@@ -792,6 +803,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_checkpoints_cover_driver() {
+        let fixture =
+            loaded_fixture_for_tests("cancel-checkpoints", FixtureDriverKind::SkeletonReplay);
+        let token = CancellationToken::new();
+        token.cancel();
+        let output = run(
+            &fixture,
+            fixture.scripts.as_ref().unwrap().clone(),
+            Some(token),
+        )
+        .await;
+        assert_eq!(output.outcome.status, FixtureStatus::Error);
+        assert_eq!(output.outcome.error.as_ref().unwrap().kind, "cancelled");
+        assert_eq!(output.outcome.model_calls, 0);
+        assert_eq!(output.outcome.compile_clean, None);
+        assert!(output.outcome.criteria.is_empty());
+
+        let fixture =
+            loaded_fixture_for_tests("cancel-complete", FixtureDriverKind::SkeletonReplay);
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+        let token = CancellationToken::new();
+        token.cancel();
+        let turn = &fixture.manifest.turns[0];
+        let mut trajectories = Vec::new();
+        let result = dispatch_turn(
+            &provider,
+            &fixture,
+            &turn.turn_id,
+            turn.request.clone(),
+            &Some(token),
+            &mut trajectories,
+        )
+        .await;
+        assert!(result.is_none());
+        assert_eq!(trajectories.len(), 1);
+        assert_eq!(trajectories[0].error_class, Some(ErrorClass::Cancelled));
+        assert_eq!(trajectories[0].compile_clean, None);
+        assert!(!trajectories[0].complete_ok);
+    }
+
+    #[tokio::test]
     async fn wrong_driver_request_is_script_miss_fail() {
         let fixture = loaded_fixture_for_tests("script-miss", FixtureDriverKind::SkeletonReplay);
         let provider = fixture.scripts.as_ref().unwrap().clone();
@@ -806,6 +858,59 @@ mod tests {
         assert_eq!(output.outcome.model_calls, 0);
         assert!(output.trajectories.is_empty());
         assert!(output.outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn correct_request_missing_map_is_error() {
+        let mut fixture = loaded_fixture_for_tests("map-desync", FixtureDriverKind::SkeletonReplay);
+        fixture.script_entries.clear();
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+
+        let output = run(&fixture, provider, None).await;
+
+        assert_eq!(output.outcome.status, FixtureStatus::Error);
+        assert!(output.outcome.criteria.is_empty());
+        assert_eq!(output.outcome.model_calls, 1);
+        assert_eq!(output.outcome.compile_clean, None);
+        let error = output.outcome.error.unwrap();
+        assert_eq!(error.kind, "internal");
+        assert!(error.message.contains(SCRIPTED_MISS_PREFIX), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn script_miss_carrier_prefers_compile_clean() {
+        let mut with_compile =
+            loaded_fixture_for_tests("carrier-compile", FixtureDriverKind::SkeletonReplay);
+        with_compile.manifest.success_criteria = vec![
+            SuccessCriterion::ScriptTurnsConsumed,
+            SuccessCriterion::CompileClean,
+        ];
+        let provider = with_compile.scripts.as_ref().unwrap().clone();
+        let _guard = ForceScriptMiss::enable();
+        let output = run(&with_compile, provider, None).await;
+        assert_eq!(
+            output.outcome.criteria[1].name,
+            SuccessCriterion::CompileClean
+        );
+        assert_eq!(output.outcome.criteria[1].detail, SCRIPT_MISS_DETAIL);
+        assert_eq!(
+            output.outcome.criteria[0].detail,
+            "unconsumed script keys: 1"
+        );
+        drop(_guard);
+
+        let mut without_compile =
+            loaded_fixture_for_tests("carrier-first", FixtureDriverKind::SkeletonReplay);
+        without_compile.manifest.success_criteria =
+            vec![SuccessCriterion::ExpectedDiagnosticsCleared];
+        let provider = without_compile.scripts.as_ref().unwrap().clone();
+        let _guard = ForceScriptMiss::enable();
+        let output = run(&without_compile, provider, None).await;
+        assert_eq!(
+            output.outcome.criteria[0].name,
+            SuccessCriterion::ExpectedDiagnosticsCleared
+        );
+        assert_eq!(output.outcome.criteria[0].detail, SCRIPT_MISS_DETAIL);
     }
 
     #[tokio::test]
@@ -832,6 +937,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_error_before_repair_sets_compile_false() {
+        let fixture = loaded_fixture_with_outcome(
+            "ordinary-provider-error",
+            FixtureDriverKind::SkeletonReplay,
+            ScriptTurnOutcome::Error {
+                error: ScriptedProviderError::Timeout,
+            },
+        );
+        let output = run(&fixture, fixture.scripts.as_ref().unwrap().clone(), None).await;
+        assert_eq!(output.outcome.status, FixtureStatus::Fail);
+        assert_eq!(output.outcome.compile_clean, Some(false));
+        assert_eq!(
+            output.outcome.criteria[0].detail,
+            "provider error before repair text"
+        );
+
+        let fixture = loaded_fixture_for_tests("wrong-endpoint", FixtureDriverKind::SkeletonReplay);
+        let mut other_endpoint = fixture.endpoint.clone();
+        other_endpoint.id = alloy_runtime::EndpointId::new("other").unwrap();
+        let provider = Arc::new(
+            ScriptedProvider::new(other_endpoint.provider.clone(), other_endpoint).unwrap(),
+        );
+        let output = run(&fixture, provider, None).await;
+        assert_eq!(output.outcome.status, FixtureStatus::Error);
+        assert_eq!(output.outcome.compile_clean, None);
+        assert!(output.outcome.criteria.is_empty());
+    }
+
+    #[tokio::test]
     async fn missing_repair_text_fails() {
         let fixture = loaded_fixture_with_outcome(
             "missing-text",
@@ -846,6 +980,70 @@ mod tests {
         assert_eq!(output.outcome.criteria[0].detail, "missing repair text");
         assert_eq!(output.outcome.compile_clean, Some(false));
         assert!(output.outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn trailing_provider_error_keeps_repair_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&golden, "fixed").unwrap();
+        let mut fixture =
+            loaded_fixture_for_tests("trailing-error", FixtureDriverKind::SkeletonReplay);
+        fixture.paths.golden = golden;
+        let mut trailing = fixture.manifest.turns[0].clone();
+        trailing.turn_id.ordinal = 1;
+        trailing.request.max_output_tokens = Some(1);
+        trailing.outcome = ScriptTurnOutcome::Error {
+            error: ScriptedProviderError::RateLimit,
+        };
+        fixture.manifest.turns.push(trailing.clone());
+        fixture.script_entries.push((
+            RequestFingerprint::of(&trailing.request),
+            ScriptOutcome::from(trailing.outcome),
+        ));
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+
+        let output = run(&fixture, provider, None).await;
+
+        assert_eq!(
+            output.outcome.status,
+            FixtureStatus::Pass,
+            "{:?}",
+            output.outcome
+        );
+        assert_eq!(output.outcome.compile_clean, Some(true));
+        assert_eq!(output.outcome.model_calls, 2);
+        assert!(output.outcome.criteria[0].passed);
+    }
+
+    #[test]
+    fn expected_diagnostics_cleared() {
+        let mut fixture =
+            loaded_fixture_for_tests("diagnostics", FixtureDriverKind::SkeletonReplay);
+
+        let passed = evaluate_expected_diagnostics_cleared(&fixture, true).unwrap();
+        assert!(passed.passed);
+        assert_eq!(passed.detail, "");
+
+        let patch_failed = evaluate_expected_diagnostics_cleared(&fixture, false).unwrap();
+        assert!(!patch_failed.passed);
+        assert_eq!(
+            patch_failed.detail,
+            "patch oracle failed; diagnostics not attributable"
+        );
+
+        fixture.post_repair.stdout_lines = vec![serde_json::json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "message": "still broken",
+                "code": { "code": "E0001" }
+            }
+        })
+        .to_string()];
+        let remains = evaluate_expected_diagnostics_cleared(&fixture, true).unwrap();
+        assert!(!remains.passed);
+        assert_eq!(remains.detail, "expected diagnostic remains: E0001");
     }
 
     #[tokio::test]
@@ -897,6 +1095,76 @@ mod tests {
         assert!(provider.is_exhausted());
     }
 
+    #[tokio::test]
+    async fn script_turns_consumed_naive_installed_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&golden, "fixed").unwrap();
+        let mut fixture =
+            loaded_fixture_for_tests("naive-consumption", FixtureDriverKind::NaiveBaseline);
+        fixture.paths.golden = golden;
+        fixture.manifest.success_criteria = vec![SuccessCriterion::ScriptTurnsConsumed];
+        let mut control_only = fixture.manifest.turns[0].clone();
+        control_only.turn_id.capability = alloy_runtime::CapabilityId::new("review").unwrap();
+        control_only.turn_id.ordinal = 1;
+        control_only.request.max_output_tokens = Some(99);
+        control_only.outcome = response_outcome(Some("control-only"));
+        fixture.manifest.turns.push(control_only.clone());
+        fixture.script_entries.push((
+            RequestFingerprint::of(&control_only.request),
+            ScriptOutcome::from(control_only.outcome),
+        ));
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+
+        let output = run_scripted(
+            &fixture,
+            Arc::clone(&provider),
+            None,
+            ScriptedDriverMode::NaiveBaseline,
+        )
+        .await;
+
+        assert_eq!(output.outcome.status, FixtureStatus::Pass);
+        assert!(output.outcome.criteria[0].passed);
+        assert_eq!(output.outcome.criteria[0].detail, "");
+        assert!(provider.is_exhausted());
+        assert_eq!(provider.recorded().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn narrow_driver_still_records_compile() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&golden, "fixed").unwrap();
+
+        let mut skeleton =
+            loaded_fixture_for_tests("narrow-skeleton", FixtureDriverKind::SkeletonReplay);
+        skeleton.paths.golden = golden.clone();
+        skeleton.manifest.success_criteria = vec![SuccessCriterion::ScriptTurnsConsumed];
+        let output = run(&skeleton, skeleton.scripts.as_ref().unwrap().clone(), None).await;
+        assert_eq!(output.outcome.compile_clean, Some(true));
+        assert_eq!(
+            output.outcome.criteria[0].name,
+            SuccessCriterion::ScriptTurnsConsumed
+        );
+
+        let mut naive = loaded_fixture_for_tests("narrow-naive", FixtureDriverKind::NaiveBaseline);
+        naive.paths.golden = golden;
+        naive.manifest.success_criteria = vec![SuccessCriterion::ScriptTurnsConsumed];
+        let output = run_scripted(
+            &naive,
+            naive.scripts.as_ref().unwrap().clone(),
+            None,
+            ScriptedDriverMode::NaiveBaseline,
+        )
+        .await;
+        assert_eq!(output.outcome.compile_clean, Some(true));
+        assert_eq!(
+            output.outcome.criteria[0].name,
+            SuccessCriterion::ScriptTurnsConsumed
+        );
+    }
+
     #[test]
     fn naive_selects_unique_repair_zero() {
         let mut fixture = loaded_fixture_for_tests("naive-plan", FixtureDriverKind::NaiveBaseline);
@@ -934,6 +1202,120 @@ mod tests {
         assert_eq!(output.outcome.criteria[0].detail, "patch oracle failed");
         assert_eq!(output.outcome.compile_clean, Some(false));
         assert!(output.outcome.error.is_none());
+    }
+
+    #[test]
+    fn no_new_unsafe_exact_regex() {
+        assert_eq!(UNSAFE_LINE_PATTERN.as_str(), r"(?m)(^|\s)unsafe(\s|!|\()");
+        assert_eq!(unsafe_line_count("unsafe \n"), 1);
+        assert_eq!(unsafe_line_count(" unsafe! {}\n"), 1);
+        assert_eq!(unsafe_line_count("\tunsafe(foo)\n"), 1);
+        assert_eq!(unsafe_line_count("myunsafe();\n"), 0);
+        assert_eq!(unsafe_line_count("unsafe\n"), 0);
+        assert_eq!(unsafe_line_count("safe\nunsafe \nunsafe!(); unsafe()"), 2);
+        assert_eq!(unsafe_line_count("// unsafe block\n\" unsafe! \"\n"), 2);
+        assert_eq!(
+            unsafe_line_count("unsafe \r\n"),
+            unsafe_line_count("unsafe \n")
+        );
+        assert!(unsafe_line_count("unsafe!()") > unsafe_line_count("safe()"));
+    }
+
+    #[tokio::test]
+    async fn no_new_unsafe_uses_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("lib.rs");
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&target, "fn safe() {}\n").unwrap();
+        std::fs::write(&golden, "fn golden_is_safe() {}\n").unwrap();
+        let mut fixture =
+            loaded_fixture_for_tests("unsafe-candidate", FixtureDriverKind::SkeletonReplay);
+        fixture.paths.target = target;
+        fixture.paths.golden = golden;
+
+        let (introduced, result) =
+            evaluate_no_new_unsafe(&fixture, Some("fn changed() { unsafe { work(); } }\n"))
+                .await
+                .unwrap();
+
+        assert!(introduced);
+        assert!(!result.passed);
+        assert_eq!(result.detail, "unsafe introduced");
+    }
+
+    #[tokio::test]
+    async fn criterion_detail_strings_are_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("lib.rs");
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&target, "fn safe() {}\n").unwrap();
+        std::fs::write(&golden, "fixed").unwrap();
+        let mut fixture =
+            loaded_fixture_for_tests("criterion-details", FixtureDriverKind::SkeletonReplay);
+        fixture.paths.target = target;
+        fixture.paths.golden = golden;
+
+        let (_, safe) = evaluate_no_new_unsafe(&fixture, Some("fn safe() {}\n"))
+            .await
+            .unwrap();
+        assert!(safe.passed);
+        assert_eq!(safe.detail, "");
+        let (_, unsafe_result) =
+            evaluate_no_new_unsafe(&fixture, Some("fn f() { unsafe { f(); } }\n"))
+                .await
+                .unwrap();
+        assert!(!unsafe_result.passed);
+        assert_eq!(unsafe_result.detail, "unsafe introduced");
+
+        fixture
+            .manifest
+            .expected_diagnostics
+            .push(ExpectedDiagnostic {
+                code: "E0002".to_owned(),
+                message_contains: "second".to_owned(),
+            });
+        fixture.post_repair.stdout_lines = vec![
+            serde_json::json!({
+                "reason": "compiler-message",
+                "message": {
+                    "level": "error",
+                    "message": "second remains",
+                    "code": { "code": "E0002" }
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "reason": "compiler-message",
+                "message": {
+                    "level": "error",
+                    "message": "first remains",
+                    "code": { "code": "E0001" }
+                }
+            })
+            .to_string(),
+        ];
+        let diagnostics = evaluate_expected_diagnostics_cleared(&fixture, true).unwrap();
+        assert_eq!(diagnostics.detail, "expected diagnostic remains: E0001");
+        let unattributable = evaluate_expected_diagnostics_cleared(&fixture, false).unwrap();
+        assert_eq!(
+            unattributable.detail,
+            "patch oracle failed; diagnostics not attributable"
+        );
+
+        fixture.post_repair.stdout_lines.clear();
+        fixture.manifest.success_criteria = vec![SuccessCriterion::ScriptTurnsConsumed];
+        let mut extra_request = fixture.manifest.turns[0].request.clone();
+        extra_request.max_output_tokens = Some(42);
+        fixture.script_entries.push((
+            RequestFingerprint::of(&extra_request),
+            ScriptOutcome::from(response_outcome(Some("unused"))),
+        ));
+        let output = run(&fixture, fixture.scripts.as_ref().unwrap().clone(), None).await;
+        assert!(!output.outcome.criteria[0].passed);
+        assert_eq!(
+            output.outcome.criteria[0].detail,
+            "unconsumed script keys: 1"
+        );
     }
 
     #[tokio::test]
