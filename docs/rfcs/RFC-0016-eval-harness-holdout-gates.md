@@ -1625,15 +1625,42 @@ it MUST canonicalize the joined path and require
 that escape the fixture. For `naive_target_path`, the loader MUST canonicalize
 the existing pre-repair target and its committed golden counterpart and apply
 the same containment check. A missing path, canonicalization failure, absolute
-path, `..`, or symlink escape is `EvalError::Manifest` with a bounded path
-description.
+path, `..`, or symlink escape is `EvalError::Manifest` with a message produced
+by §5.2.3 (prefix `path:`).
 
 Directory enumeration first validates each entry name as UTF-8, then inspects
 its type. A non-UTF-8 name MUST produce an `Error` outcome with
 `ReportError.kind == "invalid_fixture_name"`; because it cannot inhabit
 `FixtureId`, its report id is the deterministic valid id
 `invalid-path-<lowercase-hex-sha256(OsStr::as_encoded_bytes())>`.
-The message MUST be bounded and MUST NOT use a lossy path as identity.
+The message MUST be produced by §5.2.3 (prefix `invalid_fixture_name:`) and
+MUST NOT use a lossy path as identity.
+
+#### 5.2.3 Bounded UTF-8 messages (normative)
+
+Wherever this RFC requires a “bounded” error/`ReportError`/`GateFailure`/
+join-panic message, implementations MUST apply this exact algorithm:
+
+1. Start from a UTF-8 `String` (lossy conversion, if any, MUST happen before
+   this algorithm and MUST NOT appear in path-identity fields).
+2. If `bytes.len() <= 512`, use the string unchanged.
+3. Otherwise take the longest prefix whose byte length is `<= 509` and that
+   ends on a UTF-8 code-point boundary (never split a multibyte character).
+4. Append the three ASCII bytes `...` (U+002E thrice).
+5. The result MUST be `<= 512` bytes.
+
+Constants:
+
+```text
+EVAL_MESSAGE_MAX_BYTES = 512
+EVAL_MESSAGE_TRUNCATE_SUFFIX = "..."
+```
+
+Join/panic payloads MUST be formatted as `join_failed: {Debug}` of the panic
+payload (or `"join_failed: opaque"` when downcast fails), then passed through
+this algorithm. Path errors MUST be formatted as
+`path: {lossy_display}` then bounded. Implementations MUST NOT embed fixture
+source file bodies in bounded messages.
 
 After name validation, enumeration skips only entries whose followed metadata
 proves they are not directories. It MUST NOT silently skip a directory whose
@@ -1692,46 +1719,75 @@ rule.
 
 ### 5.3 Scripted turn resolution
 
+#### 5.3.1 Repair-criterion carrier (normative)
+
+Several Fail paths attach a detail string to exactly one
+`CriterionResult`. The carrier is selected by this total order — never by
+implementation preference:
+
+1. If `SuccessCriterion::CompileClean` is present in
+   `manifest.success_criteria`, that entry is the carrier.
+2. Otherwise the **first** entry in `manifest.success_criteria` (manifest
+   order) is the carrier.
+3. Manifests with an empty criteria list are already rejected at load
+   (§5.2); drivers never face an empty list.
+
+The carrier’s `passed` becomes `false` and its `detail` becomes the exact
+detail string named by the failure rule. Every other listed criterion is
+still evaluated under §5.5.* after the failure is recorded, unless the
+fixture has already transitioned to `Error` (map desync / wrong endpoint),
+in which case criteria remain the empty vector (§3.7.1).
+
+#### 5.3.2 Turn execution steps
+
 1. The Day-1 driver MUST clone `turn.request` exactly. It MUST NOT rewrite,
    normalize, trim, append a hidden marker, or synthesize a different request.
 2. Before `complete`, the driver MUST compare its built request with
-   `turn.request`. A mismatch is a thesis/driver-output `Fail` with criterion
-   detail `"script miss"`; the provider need not be called.
+   `turn.request`. A mismatch is a thesis/driver-output `Fail` with carrier
+   detail exactly `"script miss"` (§5.3.1); the provider MUST NOT be called
+   for that turn. Subsequent turns MUST NOT run; patch oracle runs with no
+   candidate (missing repair text path).
 3. The driver MUST call `provider.complete(&bound_endpoint, request).await`.
    The exact bound endpoint id is mandatory.
 4. Every `ProviderError` returned by `complete` is that turn’s `Err`; it MUST
    not be silently converted into an empty response.
-5. A `ProviderError::Internal` whose bounded message begins `scripted miss:`
-   after the driver proved the request equal to the manifest is a provider-map
+5. A `ProviderError::Internal` whose message (before §5.2.3 bounding of any
+   report conversion) begins with the exact prefix `scripted miss:` after the
+   driver proved the request equal to the manifest is a provider-map
    desynchronization. The key was supposed to have been installed, so the
-   fixture status is `Error` with `ReportError::from_eval(&EvalError::Internal(...))`.
-6. A wrong endpoint result `"scripted wrong endpoint"` is always a harness
-   `Error`; the fixture endpoint was bound during load.
+   fixture status is `Error` with
+   `ReportError::from_eval(&EvalError::Internal(...))` and empty criteria.
+6. A wrong endpoint result whose message equals exactly
+   `"scripted wrong endpoint"` is always a harness `Error`; the fixture
+   endpoint was bound during load.
 7. If a driver implementation built the wrong request, that fact remains a
-   `Fail` with `"script miss"`, even if a direct provider call would also have
-   returned `Internal`. Wrong driver text is part of the evaluated thesis;
-   disappearance of a correctly installed map entry is harness integrity.
+   `Fail` with carrier detail `"script miss"` (§5.3.1), even if a direct
+   provider call would also have returned `Internal`. Wrong driver text is
+   part of the evaluated thesis; disappearance of a correctly installed map
+   entry is harness integrity.
 8. A declared `ScriptTurnOutcome::Error` maps through
-   `ScriptedProviderError`. For `SkeletonReplay`, any provider `Err` before
-   the first successful response containing `Some(text)` causes a criterion
-   `Fail`, sets `compile_clean = Some(false)`, and records detail
-   `"provider error before repair text"`. If `CompileClean` is listed, that
-   result carries the detail; otherwise the first listed criterion carries
-   it. The driver MUST NOT auto-add `CompileClean`. The only exceptions are an
-   error message beginning with `"scripted miss"` (including the provider's
-   `"scripted miss:"` form) or exactly `"scripted wrong endpoint"`; those
-   indicate install/map desynchronization and are fixture `Error`. A declared
-   final error after repair text MAY be consumed without invalidating that
-   prior candidate. The rare intentional last error-only fixture is permitted
-   only for direct provider-contract coverage; it is not a passing
-   `SkeletonReplay` fixture.
+   `ScriptedProviderError`. For `SkeletonReplay` / `NaiveBaseline`:
+   - Any provider `Err` **before** the first successful response containing
+     `Some(text)` — except the Error cases in steps 5–6 — causes fixture
+     `Fail`, sets `compile_clean = Some(false)`, and records carrier detail
+     exactly `"provider error before repair text"` (§5.3.1). The driver
+     MUST stop further turns and MUST NOT run the patch oracle against
+     golden compile attribution.
+   - After a successful repair-text response has been observed, any later
+     provider `Err` (including a declared trailing `ScriptTurnOutcome::Error`)
+     MUST be consumed as an ordinary turn result: it increments `model_calls`,
+     contributes no tokens, and MUST NOT clear or invalidate the already
+     captured repair candidate. The fixture continues to patch/criteria
+     evaluation using that candidate.
+   - An intentional error-only fixture (no successful `Some(text)` ever)
+     cannot Pass SkeletonReplay/NaiveBaseline; it fails via
+     `"missing repair text"` (§5.3.1) after the turn loop.
 
-`SkeletonReplay` MUST observe at least one successful `Response` with
-`text: Some(...)` among executed turns. If it observes none, it MUST produce a
-failed manifest-listed repair criterion with exact detail
-`"missing repair text"`: `CompileClean` when listed, otherwise the first
-listed criterion. It MUST NOT add a criterion, panic, or classify that absence
-as a harness error.
+`SkeletonReplay` and `NaiveBaseline` MUST observe at least one successful
+`Response` with `text: Some(...)` among executed turns. If they observe none,
+they MUST Fail with carrier detail exactly `"missing repair text"` (§5.3.1),
+set `compile_clean = Some(false)`, and MUST NOT panic or classify that
+absence as a harness `Error`.
 
 **Classification rule:** Manifest/load/recording/provider-map/harness bugs are
 `Error`. A request produced incorrectly by the evaluated driver, a scripted
@@ -1783,13 +1839,25 @@ For a fixture with `driver = SkeletonReplay`:
    and trailing whitespace all affect equality.
 7. Only when the patch oracle passes may the post-repair recording act as the
    candidate compile oracle. A patch mismatch MUST set
-   `compile_clean = Some(false)` and fail `CompileClean` when listed;
-   otherwise it fails the first listed criterion with `"patch oracle failed"`.
-   It is not permitted to add a criterion or claim compilation from an
-   unrelated golden.
+   `compile_clean = Some(false)` and Fail the repair carrier (§5.3.1) with
+   detail exactly `"patch oracle failed"`. It is not permitted to add a
+   criterion or claim compilation from an unrelated golden.
 8. Evaluate exactly the criteria listed in `manifest.success_criteria`, each
    exactly once, and preserve manifest order in `FixtureOutcome.criteria`.
    The driver MUST NOT auto-add, remove, or reorder a criterion.
+9. **Detail precedence when multiple Fail reasons apply to the same carrier**
+   (normative, first match wins — later reasons MUST NOT overwrite an earlier
+   carrier detail already set in this run):
+   1. `"script miss"`
+   2. `"provider error before repair text"`
+   3. `"missing repair text"`
+   4. `"patch oracle failed"`
+   5. Criterion-specific details from §5.5.1–§5.5.4 (e.g. diagnostics /
+      unsafe / unconsumed scripts)
+
+   Example: a patch mismatch after a prior `"provider error before repair
+   text"` keeps the provider-error detail on the carrier; `compile_clean`
+   remains `Some(false)`.
 
 `SkeletonReplay` and `NaiveBaseline` MUST always populate
 `compile_clean = Some(true|false)` on every non-Error outcome, even when
@@ -1806,16 +1874,17 @@ and sets `FixtureOutcome.compile_clean = Some(true)`. `Ok(false)` fails and
 sets `Some(false)`. `Err` is a fixture `Error`.
 
 A declared provider error observed before the first successful repair text is
-sticky: even if a later candidate byte-matches and the compile oracle is clean,
-`CompileClean` MUST be recorded as a failed workflow criterion with detail
-`"provider error before repair text"` when that criterion is listed.
+sticky under §5.3.2: the driver stops further turns, so a later clean compile
+oracle cannot be attributed. When `CompileClean` is listed it is the carrier
+and MUST fail with detail `"provider error before repair text"`.
 `compile_clean` MUST remain `Some(false)` and overall fixture status is
-`Fail`. When `CompileClean` is not listed, the first listed criterion receives
-the same failed detail as specified in §5.3, without adding a criterion.
+`Fail`. When `CompileClean` is not listed, §5.3.1 assigns the same detail to
+the first listed criterion without adding `CompileClean`.
 
-If patch equality failed or repair text was missing, this criterion MUST fail,
-set `compile_clean = Some(false)`, and state `"patch oracle failed"` or
-`"missing repair text"` respectively. A deserialized non-Error outcome with
+If patch equality failed or repair text was missing, this criterion — when
+listed — MUST fail with detail `"patch oracle failed"` or
+`"missing repair text"` respectively, subject to §5.5 step 9 precedence, and
+`compile_clean` MUST be `Some(false)`. A deserialized non-Error outcome with
 `compile_clean = None` is tolerated for wire compatibility but counts as not
 clean in aggregation. Aggregation MUST NOT alter its criteria.
 
@@ -1830,9 +1899,10 @@ parser. Compile this exact regex:
 
 Read the pre-repair target file as UTF-8. Count the number of **lines** for
 which the regex has at least one match; multiple matches on one line count
-once. Do the same for candidate repair text. For a golden integrity check, the
-post-repair golden MAY also be scanned, but fixture scoring MUST compare
-candidate text against pre-repair file bytes.
+once. Do the same for candidate repair text. Fixture scoring MUST compare
+candidate text against pre-repair file bytes. The post-repair golden MUST NOT
+be used as the `NoNewUnsafe` scoring input (loaders may still verify golden
+UTF-8 readability separately).
 
 ```text
 pre_count  = matching lines in pre-repair source
@@ -2068,7 +2138,8 @@ work may continue after cancellation wins.
 
 The harness MUST retain fixture identity beside each `JoinHandle`, so a join
 failure can be attributed without losing report ordering. Panic payload debug
-text MUST be bounded and MUST NOT expose fixture source contents.
+text MUST be formatted and bounded per §5.2.3 and MUST NOT expose fixture
+source contents.
 
 ### 6.2 Determinism under concurrency
 
@@ -2491,8 +2562,12 @@ non-hex input specifically with `EvalError::Manifest`.
 | `provider_error_before_repair_sets_compile_false` | Ordinary provider Err records criterion detail and `compile_clean=Some(false)`; scripted miss/wrong endpoint is Error |
 | `missing_repair_text_fails` | No successful `Some(text)` yields exact `"missing repair text"` detail |
 | `correct_request_missing_map_is_error` | Correct manifest request plus provider miss is map-desync Error |
-| `wrong_driver_request_is_script_miss_fail` | Pre-call request mismatch is Fail with `"script miss"` |
-| `patch_mismatch_fails_compile` | Wrong candidate sets compile false and fails CompileClean |
+| `wrong_driver_request_is_script_miss_fail` | Pre-call request mismatch is Fail with carrier detail `"script miss"` per §5.3.1 |
+| `script_miss_carrier_prefers_compile_clean` | When CompileClean listed, script miss attaches there; otherwise first criterion |
+| `trailing_provider_error_keeps_repair_candidate` | Declared Err after Some(text) does not clear candidate; fixture continues to patch |
+| `detail_precedence_provider_over_patch` | Provider-error detail wins over later patch-oracle detail on same carrier |
+| `patch_mismatch_fails_compile` | Wrong candidate sets compile false and fails carrier with `"patch oracle failed"` |
+| `bounded_message_utf8_algorithm` | §5.2.3 caps at 512 bytes, UTF-8 boundary, exact `...` suffix |
 | `no_new_unsafe_exact_regex` | Left/right boundaries, one-count-per-line, comments/strings behavior, and post > pre rule |
 | `no_new_unsafe_uses_candidate` | Scoring compares pre source with candidate text, not unconditionally with golden |
 | `expected_diagnostics_cleared` | Each expected code absent after passing patch; patch failure forces criterion failure |
@@ -2667,6 +2742,8 @@ Every criterion is independently testable.
 | 46 | Calls count attempted completes with saturation; successful usage has side-specific completeness; token sums saturate; USD requires both prices and complete token sides | `outcome_usage_accounting`, `token_sums_saturate` |
 | 47 | All load/cancel/join Errors have empty criteria and cleared optional measurements; criteria are driver-finalized and aggregation never mutates them | `error_outcome_fields_canonical`, `criteria_exactly_manifest_list` |
 | 48 | Compile rate counts only `Some(true)`; skeleton/naive always set compile Some even for manifests without CompileClean; ordinary pre-repair provider Err is Fail/false while scripted miss/wrong endpoint is Error | compile/provider criterion tests |
+| 49 | Repair-criterion carrier follows §5.3.1; detail precedence follows §5.5 step 9; trailing provider Err after repair text keeps candidate | `script_miss_carrier_prefers_compile_clean`, `detail_precedence_provider_over_patch`, `trailing_provider_error_keeps_repair_candidate` |
+| 50 | Bounded messages use the exact §5.2.3 UTF-8 truncation algorithm (512 / boundary / `...`) | `bounded_message_utf8_algorithm` |
 | 49 | Holdout control uses each manifest driver and rejects a NaiveBaseline control manifest with exact load-time error; naive execution always forces NaiveBaseline | `holdout_control_rejects_naive_driver` |
 | 50 | Gate rejects every non-finite/out-of-range Measured threshold rate with `InvalidMeasuredMetric`, never panic | `gate_invalid_measured_rates_fail` |
 | 51 | Gate checks every control and naive fixture set against `thresholds.set` and emits `SetMismatch` | `gate_rejects_fixture_set_mismatch` |
