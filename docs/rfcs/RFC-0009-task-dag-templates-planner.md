@@ -72,7 +72,7 @@ RFC-0001 published `TaskDag` type sketches and a `NullScheduler`. RFC-0002 reser
 1. `DagValidator::validate(&TaskDag, ValidateOpts)` MUST enforce every rule in §5.4 in published order; each failure MUST map to exactly one `DagValidationError` variant; **first** violation wins.
 2. `SqliteDagStore` MUST implement `DagStore` over the existing `dag_blobs` table **without** changing the PRIMARY KEY; put/get/delete/`put_if_generation` MUST work through `AlloyStorage::dags()`.
 3. `PlanContext.dag_id` MUST be the id minted by RFC-0003 `submit_goal` (`RunGoalRecord.dag_id`). `plan` MUST NOT allocate a second `DagId`.
-4. Replan MUST bump `generation` by exactly one, CAS-overwrite the `dag_blobs` row for the same `dag_id` via `put_if_generation`, and append a `PlanProduced` session event whose payload references a CAS artifact of the new DAG JSON (§5.6).
+4. Replan MUST bump `generation` by exactly one, atomically replace the `dag_blobs` row via `DagStore::replace_for_replan` (rejects `Running`), and append a `PlanProduced` session event whose payload references a CAS artifact of the new DAG JSON (§5.6).
 5. Prior-generation rows in `dag_blobs` are **not** retained. Prior-generation recoverability MUST come from the session event log + CAS artifact referenced by `PlanProduced` (§5.6.3). `TemplatePlanService` MUST take a **required** `Arc<dyn EventSink>` (not `Option`).
 6. The closed template catalog MUST ship exactly the templates in §5.7; day-1 required template is `repair_local_diagnostic` (Analyze → Edit → VerifyCompile → GateHuman). That template MUST pass validation with default `ValidateOpts` **including** its dual Data+Sequence edges (§5.4 V8/V15 as restated).
 7. `TemplatePlanService` MUST select and instantiate a template from `PlanContext` without calling an LLM; `DisabledLlmPlanService` MUST return `PlanError::PlannerDisabled` from every method. Day-1 production wiring MUST inject `TemplatePlanService`. `DisabledLlmPlanService` is constructed only in tests or behind an explicit future feature flag that is **off** by default.
@@ -194,7 +194,7 @@ Every `TaskNode` MUST satisfy the contract for its `kind`. Validation enforces t
 | `VerifyCompile` | Adapter | MUST be `None` | MUST be `{0,0}` | MUST be `None` | MUST be `None` | **ignored by executors** (any bit pattern allowed in struct) |
 | `VerifyTest` | Adapter | MUST be `None` | `{0,0}` | MUST be `None` | MUST be `None` | ignored |
 | `GateHuman` | Adapter | MUST be `None` | `{0,0}` | MUST be `Some` (non-empty reason) | MUST be `None` | ignored |
-| `Aggregate` | Structural | MUST be `None` | `{0,0}` | MUST be `None` | optional | ignored |
+| `Aggregate` | Structural | MUST be `None` | `{0,0}` | MUST be `None` | MUST be `None` until 0010 specifies Aggregate cache framing | ignored |
 
 **Day-1 note:** Shipped template uses only `Analyze`, `Edit`, `VerifyCompile`, `GateHuman`. `Plan`, `Review`, `VerifyTest`, and `Aggregate` remain validatable kinds for fixtures and future templates; they are not instantiated by the day-1 catalog.
 
@@ -342,6 +342,9 @@ pub trait DagStore: Send + Sync {
     /// [`Self::put_if_generation`]; production replan uses
     /// [`Self::replace_for_replan`]; scheduler checkpoints use
     /// [`Self::put_if_generation`].
+    /// MUST reject `dag.generation > i64::MAX as u64` with `Internal`.
+    /// MUST reject rewriting an existing row to a different `session_id`
+    /// with `Internal`.
     async fn put(&self, dag: &TaskDag) -> Result<(), StoreError>;
 
     /// Compare-and-set write inside a **single** `spawn_db` closure.
@@ -361,6 +364,8 @@ pub trait DagStore: Send + Sync {
     /// MUST set `session_id`, `blob_json`, `updated_at` as in §5.6.1.
     /// MUST reject `dag.generation > i64::MAX as u64` or
     /// `expected.is_some_and(|g| g > i64::MAX as u64)` with `Internal`.
+    /// MUST reject rewriting an existing row to a different `session_id`
+    /// with `Internal`.
     /// MUST NOT run `DagValidator`.
     async fn put_if_generation(
         &self,
@@ -376,8 +381,11 @@ pub trait DagStore: Send + Sync {
     /// 2. Column/blob integrity failures → `ReplanReplaceError::Store(Corrupt|...)`
     /// 3. Stored generation != `expected_generation` → `GenerationMismatch { actual }`
     /// 4. Decoded `state == DagState::Running` → `DagBusy { state: Running }`
-    /// 5. `dag.generation != expected_generation + 1` → `Store(Internal)`
-    /// 6. Else write `dag` and return `Ok(())`
+    /// 5. `expected_generation > i64::MAX as u64` or
+    ///    `dag.generation > i64::MAX as u64` → `Store(Internal)`
+    /// 6. `dag.generation != expected_generation + 1` → `Store(Internal)`
+    /// 7. `dag.session_id` differs from stored column → `Store(Internal)`
+    /// 8. Else write `dag` and return `Ok(())`
     ///
     /// This closes the race where a scheduler could flip `Pending→Running`
     /// between a non-atomic get and put.
@@ -438,7 +446,7 @@ impl SqliteDagStore {
 | Gate | Every method MUST `StorageGate::enter()` for the operation; after `AlloyStorage::close()` → `StoreError::Closed` |
 | Busy | Map SQLite busy identically to other stores; increment `busy_errors` |
 | Construction | Built **once** inside `AlloyStorage::open` (same pattern as `events` / `artifacts`); `dags()` clones the `Arc` |
-| Module location | Concrete type lives in `storage/dags.rs` using `pub(crate)` `DbHandle` / `StorageGate` / `StorageMetrics`. Trait + re-exports may live in `dag/store.rs` or `storage` — implementer picks one; **no** reaching into private modules across the old boundary without `pub(crate)` |
+| Module location | **MUST** live in `storage/dags.rs` (trait + `SqliteDagStore` + `ReplanReplaceError`) using `pub(crate)` `DbHandle` / `StorageGate` / `StorageMetrics`. `dag/store.rs` MAY only `pub use` re-exports. No alternate home. |
 
 ### 3.8 `AlloyStorage` additive API
 
@@ -596,6 +604,9 @@ pub struct CacheKeyMaterials<'a> {
     pub compiler_fingerprint: &'a Digest,
 }
 
+/// Returns `CacheKey(Digest::sha256(canonical_bytes))` where `canonical_bytes`
+/// is exactly the framing in §5.8. `kind_serde_snake_case` MUST match serde’s
+/// `rename_all = "snake_case"` spelling for `NodeKind` (e.g. `verify_compile`).
 pub fn compute_cache_key(m: CacheKeyMaterials<'_>) -> CacheKey;
 
 /// MVP fingerprint helpers (canonical constants).
@@ -817,7 +828,7 @@ crates/alloy-runtime/src/
 | Module | MUST | MUST NOT |
 | --- | --- | --- |
 | `dag::validate` | Enforce §5.4 | Touch SQLite / artifacts |
-| `dag::templates` | Sync build of nodes/edges/ids from manifest | Artifact I/O; LLM |
+| `dag::templates` | `allocate_ids` + `build_topology` (sync); catalog | Artifact I/O; LLM; inventing `ArtifactId`s |
 | `planner::*` | Artifact puts, validate, CAS persist, PlanProduced | Schedule nodes |
 | `storage/dags` | CRUD `dag_blobs` + CAS write | Run validator |
 | `dag::io` | Envelope types shared with 0010 | Belong to planner |
@@ -859,25 +870,52 @@ select(ctx) -> TemplateId:
 
 1. `template_id ← select(ctx)`.
 2. `manifest ← TemplateCatalog::get(template_id)`.
-3. `skeleton ← templates::build_topology(manifest, ctx.dag_id, ctx.session_id, generation=1)` (sync; **every node** `state = Pending`; **`TaskDag.state = DagState::Pending`**; no artifact ids yet).
-4. **Artifact pass (planner):** for each node, `put` input envelopes per §5.3.0; set `input_ref`; `output_ref = None`; `cache_key = None` when `!enable_cache` (day-1: all false).
-5. `DagValidator::validate(&dag, ValidateOpts::default())?`.
-6. `snapshot ← artifacts.put(TaskDag JSON)` with snapshot labels. Serde failure → `PlanError::Internal`.
-7. `dags.put_if_generation(&dag, None)`:
+3. **Phase A (sync):** `ids ← templates::allocate_ids(manifest)` → `TemplateIdMap` (local name → `NodeId`, plus `GateId` per approval node).
+4. **Phase B (async, planner):** using `ids`, `put` every input / `pending_pred` artifact per §5.3.0; build `input_refs: BTreeMap<NodeId, ArtifactId>` covering **every** node. Missing coverage is a crate bug → `Internal`.
+5. **Phase C (sync):** `dag ← templates::build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs })` — every node `Pending`, `TaskDag.state = Pending`, `output_ref = None`, `cache_key = None` when `!enable_cache` (day-1: all false). Every `input_ref` MUST equal the Phase B map entry (no synthetic `ArtifactId::new()`).
+6. `DagValidator::validate(&dag, ValidateOpts::default())?`.
+7. `snapshot ← artifacts.put(TaskDag JSON)` with snapshot labels. Serde failure → `PlanError::Internal`.
+8. `dags.put_if_generation(&dag, None)`:
    - `Ok` → continue
-   - `Err(Conflict)` → `get(dag_id)`; on `Ok(Some(existing))` return `GenerationMismatch { expected: 0, actual: existing.generation }`; on get failure → `Store`/`Internal`
+   - `Err(Conflict)` → `get(ctx.dag_id)`; on `Ok(Some(existing))` return `GenerationMismatch { expected: 0, actual: existing.generation }`; on get failure → `Store`/`Internal`
    - other store errors → `PlanError::Store`
-8. Append `PlanProduced` with `NewSessionEvent { session_id, run_id: Some(ctx.run_id), type_: PlanProduced, payload: to_value(PlanProducedPayload { … replan: false, reason: None }) }`. Payload `to_value` failure → `Internal`.
+9. Append `PlanProduced` with `NewSessionEvent { session_id, run_id: Some(ctx.run_id), type_: PlanProduced, payload: to_value(PlanProducedPayload { … replan: false, reason: None }) }`. Payload `to_value` failure → `Internal`.
    **If append fails after successful CAS insert:** return `PlanError::Event(...)`. The DAG row and snapshot remain durable; there is no distributed rollback. Callers MAY `replan` (which emits a new PlanProduced) or repair by appending a PlanProduced out-of-band; MVP ships no separate repair API.
-9. Return `PlanResult`.
+10. Return `PlanResult`.
+
+**Invariant:** after a successful `plan`/`replan`, every `nodes[*].input_ref` MUST resolve via `ArtifactStore::get` (AC 31).
 
 `load_template(id, ctx)` uses `id` directly (ignores override) and follows the same steps.
 
-### 5.3 Instantiation (sync topology + async artifact pass)
+### 5.3 Instantiation (three-phase; binding)
 
-**Sync (`dag::templates::build_topology`):** allocate node/gate ids; build edges; set kinds/retry/budget/tier/timeout/approval; all `Pending`; `generation` as argument; empty `input_ref` placeholder forbidden — artifact pass immediately follows in the same plan call before validate.
+```rust
+pub struct TemplateIdMap {
+    pub nodes: BTreeMap<String, NodeId>,
+    pub gates: BTreeMap<String, GateId>, // keyed by template node name
+}
 
-**Planner artifact pass:** §5.3.0.
+pub struct BuildTopology<'a> {
+    pub manifest: &'a TemplateManifest,
+    pub dag_id: DagId,
+    pub session_id: SessionId,
+    pub generation: u64,
+    pub ids: &'a TemplateIdMap,
+    pub input_refs: &'a BTreeMap<NodeId, ArtifactId>,
+}
+
+/// Phase A — sync. Duplicate template names or unknown edge endpoints → panic
+/// at catalog init (`catalog_parses` covers shipped manifests) or
+/// `PlanError::Internal` if invoked on a non-catalog manifest in tests.
+pub fn allocate_ids(manifest: &TemplateManifest) -> TemplateIdMap;
+
+/// Phase C — sync, pure. MUST look up every node’s `input_ref` in
+/// `input_refs`; missing key → panic/`Internal` (programmer error).
+/// MUST NOT call `ArtifactId::new()`.
+pub fn build_topology(args: BuildTopology<'_>) -> TaskDag;
+```
+
+Phase B is owned by `TemplatePlanService` (§5.2 steps 4 / §5.3.0).
 
 ### 5.3.0 Plan-time `input_ref` wiring (binding)
 
@@ -973,7 +1011,18 @@ Evaluate **in order V1…V17**. Return the **first** violation.
 
 **V15 vs dual edges:** A hop with both Data and Sequence between the same `(a,b)` yields distinct-pred count 1 and distinct-succ count 1 — **valid**. V8 allows both because `kind` differs.
 
-**V7 procedure (normative):** (a) let `roots` = nodes with zero Data∪Sequence predecessors; if `|roots| != 1` → `MultipleRoots { count: roots.len() }`; (b) DFS/BFS from that unique root over Data∪Sequence successors; any unvisited node → `Unreachable`. Isolated extra nodes are additional roots, so `MultipleRoots` fires when a second component has no Data∪Sequence preds. Unit tests MUST cover `MultipleRoots` with an isolated second node; `Unreachable` MUST still be implemented for step (b).
+**V7 procedure (normative):** (a) let `roots` = nodes with zero Data∪Sequence predecessors; if `|roots| != 1` → `MultipleRoots { count: roots.len() }`; (b) DFS/BFS from that unique root over Data∪Sequence successors; any unvisited node → `Unreachable { node: min unvisited NodeId }`. Isolated extra nodes are additional roots, so `MultipleRoots` fires when a second component has no Data∪Sequence preds. Unit tests MUST cover `MultipleRoots` with an isolated second node; `Unreachable` is defensive and MAY lack a constructible fixture under V7(a).
+
+**Reported-node determinism (normative):**
+
+| Variant | Payload selection |
+| --- | --- |
+| `MissingEndpoint` | Prefer `from` if missing, else `to` (edge order = `edges` vec) |
+| `Cycle` | DFS from lowest `NodeId` over Data∪Sequence; `node` = `to` of the first back-edge discovered |
+| `Unreachable` | Lowest unvisited `NodeId` |
+| `NonLinearTopology { a, b }` | First violating node in ascending `NodeId` order is `a`; `b` is its lowest offending distinct pred or succ (pred preferred if both) |
+| `DuplicateEdge` | First duplicate in `edges` vec order |
+| `DuplicateGateId` | First colliding pair in ascending node-id order (`a < b`) |
 
 ### 5.5 Node data-flow contract (normative)
 
@@ -1074,8 +1123,8 @@ Canonical bytes:
 
 ```text
 b"alloy.cache_key.v1" || 0x00 ||
-kind_serde_snake_case || 0x00 ||   # e.g. verify_compile
-capability_as_str_or_empty || 0x00 ||
+kind_serde_snake_case || 0x00 ||   # serde snake_case of NodeKind, e.g. verify_compile
+capability_as_str_or_empty || 0x00 ||  # CapabilityId::as_str() or empty
 content_digest.as_hex() || 0x00 ||
 policy_hash.as_hex() || 0x00 ||
 tool_versions.as_hex() || 0x00 ||
@@ -1289,7 +1338,7 @@ Including: `MultipleRoots`, `DuplicateGateId`, `DuplicateEdge` with kind, `Retry
 
 ### 11.2 Template golden tests
 
-`repair_local_diagnostic_topology`, `repair_local_diagnostic_validates` (default opts), `catalog_parses`, unknown name parse.
+`repair_local_diagnostic_topology` (normalize: replace UUIDs with stable indices; compare kinds/capabilities/retry/budgets/tiers/timeouts/approval reasons + edge multiset by template name), `repair_local_diagnostic_validates` (default opts), `catalog_parses` (unique node names, resolvable edge endpoints, CapabilityId build), unknown name parse.
 
 ### 11.3 Persistence
 
@@ -1371,6 +1420,10 @@ Every criterion is independently testable by a named test or mechanical check.
 | 28 | Root/non-root `input_ref` envelopes match §5.3.0 (Goal vs pending preds) | unit |
 | 29 | Plan-time ArtifactPut labels/session/run attribution | unit |
 | 30 | `ReplanReason: PartialEq` additive derive present | compile |
+| 31 | After successful `plan`, every `input_ref` resolves via `ArtifactStore::get` | unit/integration |
+| 32 | `allocate_ids` + `build_topology` signatures exist; no synthetic input ids | compile + unit |
+| 33 | `put`/`put_if_generation`/`replace_for_replan` reject generation > i64::MAX | unit |
+| 34 | Session_id rewrite on existing row → `Internal` | unit |
 
 ---
 
@@ -1467,6 +1520,7 @@ Replan: `"replan": true`, `"reason": "user_requested"` for unit variants, or `{"
 - Use `put_if_generation(..., Some(generation))` for checkpoints
 - Stop on `Conflict` after replan
 - On scheduler start / reclaim: if a DAG is `Running` and this process does not own it, transition it via same-generation `put_if_generation` to `Failed` or `ReplanRequired` (crash recovery) before accepting new work
+- On observing `RunControlState::ReplanRequested` for a live run this process owns: stop dispatch and write a non-`Running` `DagState` (`ReplanRequired`) via same-generation `put_if_generation` **before** `PlanService::replan` can succeed (otherwise `DagBusy` is permanent)
 - Rewrite final `input_ref` per §5.3.0
 - Enforce output_ref invariants on Succeeded/CachedHit
 - Enforce GateHuman timeout using `timeout_ms`
