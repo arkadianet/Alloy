@@ -184,9 +184,10 @@ fn has_drive_prefix(s: &str) -> bool {
 /// Strip absolute-path spans and enforce the length / NUL limits.
 ///
 /// Absolute Unix paths (`/…`) and Windows drive paths (`C:\…` / `C:/…`) are
-/// replaced with `<path>` when they begin at a path boundary (start of string,
-/// whitespace, or `=`), so messages like `at path=/home/op/x` do not leak
-/// operator layout while relative mentions like `src/main.rs` stay intact.
+/// replaced with `<path>` unless the preceding character is path-ish
+/// (alphanumeric, `.`, `-`, `_`). That keeps relative mentions like
+/// `src/main.rs` intact while redacting quoted and delimited forms such as
+/// `"/home/op/x"`, `path=/home/op/x`, and `(C:\Users\op\y)`.
 ///
 /// `None` means the caller must substitute a fixed message.
 fn sanitize_msg(msg: &str) -> Option<String> {
@@ -195,29 +196,33 @@ fn sanitize_msg(msg: &str) -> Option<String> {
     }
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
-    let mut at_boundary = true;
+    let mut prev_pathish = false;
     while !rest.is_empty() {
-        if at_boundary && rest.starts_with('/') {
+        if !prev_pathish && rest.starts_with('/') {
             out.push_str("<path>");
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
             rest = &rest[end..];
-            at_boundary = false;
+            prev_pathish = false;
             continue;
         }
-        if at_boundary {
+        if !prev_pathish {
             if let Some(stripped) = strip_drive_path_prefix(rest) {
                 out.push_str("<path>");
                 rest = stripped;
-                at_boundary = false;
+                prev_pathish = false;
                 continue;
             }
         }
         let ch = rest.chars().next().expect("rest non-empty");
         out.push(ch);
         rest = &rest[ch.len_utf8()..];
-        at_boundary = ch.is_whitespace() || ch == '=';
+        prev_pathish = is_path_continuation(ch);
     }
     Some(out.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn is_path_continuation(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')
 }
 
 /// If `s` begins with a Windows drive path (`X:\` or `X:/`), return the
@@ -371,6 +376,20 @@ mod tests {
         // Relative path mentions must not be chewed by the `/` scanner.
         let relative = map_outcome(Ok(outcome(vec!["a.rs"], "wrote src/main.rs ok")), false, 0);
         assert_eq!(relative.content["message"], "wrote src/main.rs ok");
+
+        // Quotes / brackets are not path-ish, so absolute paths still redact.
+        let quoted = map_outcome(
+            Ok(outcome(
+                vec!["a.rs"],
+                r#"conflict in "/home/op/work/src/main.rs" and (C:\Users\op\y)"#,
+            )),
+            false,
+            0,
+        );
+        assert_eq!(
+            quoted.content["message"],
+            r#"conflict in "<path>" and (<path>)"#
+        );
     }
 
     #[test]

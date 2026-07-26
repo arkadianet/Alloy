@@ -1447,7 +1447,7 @@ args_glob subject (argv[1..], space-joined) =
 | Other IO | `Transient { code: "io", message: "fs_read io error" }` (no raw OS strings) |
 | Invalid UTF-8 interior to the returned buffer (see step 6) | `Permanent { code: "not_utf8", … }` with no body |
 
-5. Let `cap = min(max_bytes, 1_048_576)`. Read at most `cap` bytes via `tokio::fs`. Let `raw` be the bytes read. Let `capped = metadata().len() as usize > raw.len()` (same metadata call as the regular-file check) **or** equivalently `raw.len() == cap && file longer` — normative: `capped = (meta.len() as u64) > (raw.len() as u64)`.
+5. Let `cap = min(max_bytes, 1_048_576)`. Open the canonical path, confirm it is a regular file via the opened handle's metadata, then read at most `cap + 1` bytes via `tokio::fs`. Let `raw` be the first `min(n, cap)` bytes of the read. Let `capped = (bytes_read > cap)` — i.e. truncation is derived from the read itself (one-byte peek past the cap), not a pre-open size that can race with writers.
 6. **UTF-8 decode (normative):**
    1. Match `str::from_utf8(&raw)`:
    2. `Ok(text)` → success with that text; `truncated = capped`.
@@ -1481,7 +1481,7 @@ args_glob subject (argv[1..], space-joined) =
 | Field / error text | Rule |
 | --- | --- |
 | `files_touched` | Each entry MUST be jail-relative: non-empty, `/`-separated, no leading `/`, no `\\`, no `.` or `..` path segments, ≤ `MAX_ARG_STRING_BYTES`. On any violation → do **not** forward the outcome; return `Ok(ToolResult::err)` with `Permanent { code: "unsafe_backend_output", message: "files_touched failed validation" }` and content `{ "code": "unsafe_backend_output" }`. |
-| `message` | Run `sanitize_msg`: strip absolute path prefixes (`/`, drive letters), reject if length > 512 or contains NUL; on reject use fixed `"apply_patch completed"`. MUST NOT forward raw patch bodies. |
+| `message` | Run `sanitize_msg`: redact absolute path spans (`/…`, drive letters) unless the preceding character is path-ish (`[A-Za-z0-9._-]`); reject if length > 512 or contains NUL; on reject use fixed `"apply_patch completed"`. MUST NOT forward raw patch bodies. Relative mentions like `src/main.rs` stay intact; quoted/delimited forms like `"/home/…"` are redacted. |
 | Backend error strings | `Io`/`Internal` use fixed messages (§3.7.2). `Unsupported`/`InvalidPatch`/`Conflict` pass through `sanitize_msg` (max 512, no abs paths, no NUL); on reject use the fixed code-only message for that variant. |
 
 4. Map sanitized success/error per §3.7 / §8.4.

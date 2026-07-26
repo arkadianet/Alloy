@@ -146,10 +146,12 @@ could redirect the read. MVP accepts this race: the host is a single trusted
 process, and anyone able to win it already has write access inside the jail.
 Revisit if multi-tenant hosts appear (RFC-0006 §15 open question 2).
 
-**Not a residual:** builtin reads never spawn a process, so no sandbox backend is
-involved and the byte cap (`max_bytes`, hard maximum 1 MiB) bounds memory. Invalid
-UTF-8 interior to the buffer is refused rather than lossily trimmed, so a model
-never receives silently corrupted file content.
+**Not a residual:** `truncated` is derived by reading one byte past `max_bytes`,
+not from a pre-open `metadata().len()`, so concurrent size changes cannot lie
+about whether the returned text was capped. Builtin reads never spawn a process,
+so no sandbox backend is involved and the byte cap (`max_bytes`, hard maximum
+1 MiB) bounds memory. Invalid UTF-8 interior to the buffer is refused rather than
+lossily trimmed, so a model never receives silently corrupted file content.
 
 ---
 

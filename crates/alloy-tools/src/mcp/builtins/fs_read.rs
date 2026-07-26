@@ -112,7 +112,11 @@ pub(crate) async fn execute(prepared: PreparedRead) -> Result<ToolResult, McpErr
     let started = std::time::Instant::now();
     let name = BuiltinToolId::FsRead.name();
 
-    let meta = match tokio::fs::metadata(&prepared.canon).await {
+    let file = match tokio::fs::File::open(&prepared.canon).await {
+        Ok(f) => f,
+        Err(e) => return Ok(io_error_result(&prepared, e, started)),
+    };
+    let meta = match file.metadata().await {
         Ok(m) => m,
         Err(e) => return Ok(io_error_result(&prepared, e, started)),
     };
@@ -128,16 +132,18 @@ pub(crate) async fn execute(prepared: PreparedRead) -> Result<ToolResult, McpErr
         ));
     }
 
-    let file = match tokio::fs::File::open(&prepared.canon).await {
-        Ok(f) => f,
-        Err(e) => return Ok(io_error_result(&prepared, e, started)),
-    };
+    // Read one past the cap so `truncated` comes from the read itself, not a
+    // pre-open size that can race with writers.
+    let want = (prepared.cap as u64).saturating_add(1);
     let mut raw = Vec::new();
-    if let Err(e) = file.take(prepared.cap as u64).read_to_end(&mut raw).await {
+    if let Err(e) = file.take(want).read_to_end(&mut raw).await {
         return Ok(io_error_result(&prepared, e, started));
     }
+    let capped = raw.len() > prepared.cap;
+    if capped {
+        raw.truncate(prepared.cap);
+    }
 
-    let capped = meta.len() > raw.len() as u64;
     let Some((text, truncated)) = decode_utf8(&raw, capped) else {
         return Ok(tool_error(
             &prepared,
