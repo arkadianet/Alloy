@@ -32,7 +32,8 @@ mod tests {
 
     #[tokio::test]
     async fn control_plane_stub_is_error_without_trajectories() {
-        let fixture = loaded_fixture_for_tests("control", crate::manifest::FixtureDriverKind::ControlPlane);
+        let fixture =
+            loaded_fixture_for_tests("control", crate::manifest::FixtureDriverKind::ControlPlane);
         let output = run(&fixture).await;
         assert_eq!(output.outcome.status, FixtureStatus::Error);
         assert_eq!(output.outcome.error.unwrap().kind, "stub");

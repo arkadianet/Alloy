@@ -136,7 +136,10 @@ pub(crate) async fn run_scripted(
                     None,
                 ));
                 accumulate_usage(&mut observations, &response.usage);
-                accumulate_cost(&mut observations, derive_eval_usd(&fixture.endpoint, &response.usage));
+                accumulate_cost(
+                    &mut observations,
+                    derive_eval_usd(&fixture.endpoint, &response.usage),
+                );
                 if let Some(text) = response.text {
                     candidate = Some(text);
                 }
@@ -190,7 +193,9 @@ pub(crate) async fn run_scripted(
                 observations.compile_clean = Some(false);
                 criteria.set_carrier_failure("patch oracle failed");
             }
-            Err(error) => return error_output(fixture, started, EvalError::Io(error), trajectories),
+            Err(error) => {
+                return error_output(fixture, started, EvalError::Io(error), trajectories)
+            }
         }
     }
 
@@ -206,16 +211,22 @@ pub(crate) async fn run_scripted(
                 CriterionResult {
                     name: criterion,
                     passed,
-                    detail: if passed { String::new() } else { "compile not clean".to_owned() },
+                    detail: if passed {
+                        String::new()
+                    } else {
+                        "compile not clean".to_owned()
+                    },
                 }
             }
-            SuccessCriterion::NoNewUnsafe => match evaluate_no_new_unsafe(fixture, candidate.as_deref()) {
-                Ok((introduced, result)) => {
-                    observations.unsafe_introduced = Some(introduced);
-                    result
+            SuccessCriterion::NoNewUnsafe => {
+                match evaluate_no_new_unsafe(fixture, candidate.as_deref()) {
+                    Ok((introduced, result)) => {
+                        observations.unsafe_introduced = Some(introduced);
+                        result
+                    }
+                    Err(error) => return error_output(fixture, started, error, trajectories),
                 }
-                Err(error) => return error_output(fixture, started, error, trajectories),
-            },
+            }
             SuccessCriterion::ExpectedDiagnosticsCleared => {
                 match evaluate_expected_diagnostics_cleared(fixture, observations.patch_passed) {
                     Ok(result) => result,
