@@ -31,6 +31,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "predicates",
+ "rustix 0.38.44",
  "tempfile",
  "tokio",
  "tracing",
