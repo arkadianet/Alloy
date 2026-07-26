@@ -1,13 +1,36 @@
 //! Benchmark deterministic RFC-0007 endpoint selection.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use alloy_runtime::{
-    BudgetPolicy, BudgetSnapshot, CapabilityId, ModelRouter, ProviderId, RecordingDecisionLog,
-    RecordingModelProvider, RetentionPolicy, RouterConfig, RoutingRequest, RunId, SessionId,
-    SharedCostMeter, TomlModelRouter, TomlModelRouterParts,
+    BudgetPolicy, BudgetSnapshot, CapabilityId, DecisionLog, DecisionRecord, EventSeq,
+    ModelCallRecord, ModelRouter, ObsError, ProviderId, RecordingModelProvider, RouterConfig,
+    RoutingRequest, RunId, SessionId, SharedCostMeter, TomlModelRouter, TomlModelRouterParts,
+    ToolCallRecord,
 };
+use async_trait::async_trait;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+
+/// Decision log that assigns sequences without retaining records.
+struct DiscardDecisionLog {
+    next_seq: AtomicU64,
+}
+
+#[async_trait]
+impl DecisionLog for DiscardDecisionLog {
+    async fn record(&self, _rec: DecisionRecord) -> Result<EventSeq, ObsError> {
+        Ok(EventSeq(self.next_seq.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    async fn record_model_call(&self, _rec: ModelCallRecord) -> Result<EventSeq, ObsError> {
+        Ok(EventSeq(self.next_seq.fetch_add(1, Ordering::Relaxed)))
+    }
+
+    async fn record_tool_call(&self, _rec: ToolCallRecord) -> Result<EventSeq, ObsError> {
+        Ok(EventSeq(self.next_seq.fetch_add(1, Ordering::Relaxed)))
+    }
+}
 
 fn router() -> (TomlModelRouter, RunId) {
     let config = RouterConfig::from_str(
@@ -40,7 +63,9 @@ repair = "standard"
     let provider = Arc::new(RecordingModelProvider::new(
         ProviderId::new("provider").expect("provider id"),
     ));
-    let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+    let log = Arc::new(DiscardDecisionLog {
+        next_seq: AtomicU64::new(0),
+    });
     let router = TomlModelRouter::from_parts(TomlModelRouterParts::new(
         config,
         provider,
@@ -73,10 +98,16 @@ fn request(run: RunId) -> RoutingRequest {
 fn bench_router_select(criterion: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
     let (router, run) = router();
+    let request = request(run);
     criterion.bench_function("router_select_first_match", |bencher| {
-        bencher
-            .to_async(&runtime)
-            .iter(|| async { black_box(router.route(request(run)).await.expect("route")) });
+        bencher.to_async(&runtime).iter(|| {
+            let request = request.clone();
+            async {
+                // Drop the handle after selection; admission is released on
+                // route return and discard log avoids DecisionRecord growth.
+                black_box(router.route(request).await.expect("route"))
+            }
+        });
     });
 }
 
