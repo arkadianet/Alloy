@@ -590,7 +590,6 @@ async fn openai_tls_classified() {
     use rustls::ServerConfig;
     use std::net::SocketAddr;
     use std::sync::Arc as StdArc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
 
