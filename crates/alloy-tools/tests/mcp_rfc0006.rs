@@ -69,7 +69,31 @@ fn ensure_permissive_global_tracing_default() {
         // and its `event()` is a no-op, so this only widens the cached
         // interest -- it never observes or alters what any test's own
         // subscriber sees.
-        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        let Err(already_set) =
+            tracing::subscriber::set_global_default(tracing_subscriber::registry())
+        else {
+            return;
+        };
+
+        // Something installed a global default before this suite could. That
+        // is only harmless if it is permissive: a filtering default (for
+        // example the `alloy_runtime=info,alloy=info` filter that
+        // `AlloyRuntime::start` installs, which excludes `alloy_tools`
+        // entirely) would let the deny-warn callsite latch to
+        // `Interest::never()` and silently reintroduce the flake this
+        // function exists to prevent. Fail loudly here rather than let a
+        // future test reopen it as a mystery.
+        //
+        // Note this checks the max-level hint only; it cannot see
+        // target-based filtering. It catches the coarse regression, not
+        // every possible one.
+        let level = tracing::level_filters::LevelFilter::current();
+        assert!(
+            level >= tracing::level_filters::LevelFilter::WARN,
+            "a global tracing default was already installed ({already_set}) and its max level \
+             is {level:?}, which will not dispatch the WARN events this suite captures; \
+             permission_deny_warns_prepare_and_broker would regress to the flake in issue #20"
+        );
     });
 }
 
