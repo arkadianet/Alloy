@@ -31,11 +31,7 @@ retain_tool_bodies = false
     .unwrap();
     std::fs::write(
         dir.join("router.toml"),
-        r#"
-[provider.default]
-kind = "openai_compatible"
-api_key_env = "ALLOY_API_KEY"
-"#,
+        alloy_runtime::default_router_toml(),
     )
     .unwrap();
     std::fs::write(dir.join("example.env"), "ALLOY_API_KEY=\n").unwrap();
@@ -454,6 +450,7 @@ async fn core_ir_serde_round_trips() {
     let fail = FailureIr {
         node: alloy_runtime::NodeId::new(),
         error_class: alloy_runtime::ErrorClass::Compile,
+        retry: alloy_runtime::RetryDisposition::NonRetryable,
         diagnostics: vec![diag],
         notes: "n".into(),
     };

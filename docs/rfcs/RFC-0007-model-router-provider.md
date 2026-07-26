@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Draft |
+| **Status** | Implemented |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0004](./RFC-0004-observability-cost-metering.md) (merged) |
@@ -421,9 +421,10 @@ impl CompleteTicket {
 **`complete` admission precedence (normative, first match wins):**
 1. `ShuttingDown` / phase not Ready (after semaphore wait ends in shutdown)
 2. `WrongRouter`
-3. `AlreadyCompleted` (ticket consume fails)
-4. `BudgetDenied` (re-check when meter present)
-5. Provider call / other errors
+3. `Cancelled` (router-owned cancellation token already cancelled; no ticket consume)
+4. `AlreadyCompleted` (ticket consume fails)
+5. `BudgetDenied` (re-check when meter present)
+6. Provider call / other errors
 
 ### 3.9 `SecretString`
 
@@ -543,7 +544,7 @@ pub trait ModelRouter: Send + Sync {
 }
 ```
 
-**Contract:** `complete` MUST use the sealed `RoutedModel` issued by a prior `route` on **this** router instance. Callers cannot mutate endpoint/model/tier (private fields). `complete` MUST follow §5.4.1 admission precedence (WrongRouter → ticket → budget) before provider HTTP.
+**Contract:** `complete` MUST use the sealed `RoutedModel` issued by a prior `route` on **this** router instance. Callers cannot mutate endpoint/model/tier (private fields). `complete` MUST follow §5.4.1 admission precedence (ShuttingDown → WrongRouter → Cancelled → ticket → budget) before provider HTTP.
 
 ### 3.13 `TomlModelRouter`
 
@@ -576,6 +577,7 @@ impl TomlModelRouter {
 ```
 
 ```rust
+#[non_exhaustive]
 pub struct TomlModelRouterParts {
     pub config: RouterConfig,
     pub provider: Arc<dyn ModelProvider>,
@@ -586,15 +588,32 @@ pub struct TomlModelRouterParts {
     pub cost_meter: Option<SharedCostMeter>,
     /// When set, `route`/`complete` require `RoutingRequest.run == Some(bound_run)`.
     pub bound_run: Option<RunId>,
-    /// Test-only escape hatch. Production MUST leave this `false`.
+    /// Test-only escape hatch; absent from production artifacts.
+    #[cfg(test)]
     pub allow_unmetered: bool,
     pub shutdown_token: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl TomlModelRouterParts {
+    pub fn new(
+        config: RouterConfig,
+        provider: Arc<dyn ModelProvider>,
+        budget_policy: BudgetPolicy,
+        decision_log: Option<Arc<dyn DecisionLog>>,
+        cost_meter: Option<SharedCostMeter>,
+        bound_run: Option<RunId>,
+    ) -> Self;
+
+    pub fn shutdown_token(self, token: CancellationToken) -> Self;
+
+    #[cfg(test)]
+    pub fn allow_unmetered(self) -> Self;
 }
 ```
 
 **Construction ownership:** `from_paths` owns parsing + building `OpenAiCompatibleProvider` with a crate-private validated HTTP client (§3.14). `from_parts` is the injection point for `RecordingModelProvider` / RFC-0016 scripts.
 
-`from_paths` MUST reject `allow_unmetered` semantics: meter + decision log + `bound_run` are always required. `from_parts` MUST return `RouterError::Config` if `allow_unmetered == false` and either meter or decision log is missing, or if `bound_run` is missing when metered. `from_parts` MUST return `Config` if `allow_unmetered == true` outside `#[cfg(test)]` builds of `alloy-runtime` (gate the field setter / constructor path with `cfg(test)` so production artifacts cannot set it).
+`from_paths` MUST reject unmetered semantics: meter + decision log + `bound_run` are always required. `from_parts` MUST return `RouterError::Config` if the test-only escape hatch is disabled and either meter or decision log is missing, or if `bound_run` is missing when metered. The `allow_unmetered` field and builder MUST be compiled only in `#[cfg(test)]` builds of `alloy-runtime`, so production artifacts cannot set it.
 
 `from_paths`, `OpenAiCompatibleProvider`, `OpenAiCompatibleSpec`, and `http_client` are gated behind `http-provider`. `from_parts`, traits, config DTOs, `RecordingModelProvider`, and all shared types compile without default features.
 
@@ -607,7 +626,7 @@ pub struct TomlModelRouterParts {
 - Concurrent runs MUST each own a distinct router instance (distinct `router_instance_id`) and MUST NOT share one meter through a process-global router.
 - The router is the **sole** producer of `SessionEventType::ModelCall` (`DecisionLog::record_model_call`) and `SharedCostMeter::add_model_usage` for each LLM `complete`. Workers MUST NOT also call `add_model_usage` / `record_model_call` for the same provider completion.
 - **`add_worker_metrics` trap:** on `main`, `CostMeter::add_worker_metrics` forwards into `add_model_usage`. Therefore workers MUST NOT call `add_worker_metrics` with token counts that duplicate a router completion. Until RFC-0004 splits worker-non-model metrics from model usage, LLM nodes that used the router MUST leave model tokens to the router only.
-- **`WorkerMetrics` vs unknown provider usage (RFC-0013 amendment):** merged `WorkerMetrics` uses `u64` token fields, but provider usage may be `None`. Workers MUST NOT invent provider tokens as real zeros (RFC-0004). Preferred: amend `WorkerMetrics.input_tokens` / `output_tokens` to `Option<u64>` in the RFC-0013 implementation series and pass through `None` when the provider omitted usage. Interim MVP without that amendment: LLM workers MAY set `0` on `CapabilityOutput.metrics` **only** as “not reported on this struct”, MUST NOT call `add_worker_metrics` with those zeros, and schedulers MUST prefer `ModelCall` / meter snapshots for model spend.
+- **`WorkerMetrics` vs unknown provider usage (RFC-0001 / RFC-0013 amendment):** `WorkerMetrics.input_tokens` / `output_tokens` are `Option<u64>`. When the provider omitted usage, workers MUST pass `None` (never invent `Some(0)` to mean unknown). Schedulers MUST prefer `ModelCall` / meter snapshots for model spend on router-owned completions; workers MUST NOT call `add_worker_metrics` for those completions.
 - **RFC-0004 amendment note:** any merged guidance that workers record model calls / feed model usage for LLM completions is superseded by this RFC for completions owned by `TomlModelRouter`; update RFC-0004 in the same implementation series.
 - **RFC-0013 amendment (normative for binding):** `CapabilityContext` MUST gain `pub run: RunId` (and SHOULD expose the same `session` already present) so workers can build `RoutingRequest { session, run: Some(ctx.run), node: Some(ctx.node), ... }`. Until that lands, host composition MUST inject run id by wrapping the router rather than leaving workers unable to satisfy `bound_run`.
 - RFC-0010 does **not** depend on RFC-0007; it creates the meter. Binding the meter to the router is host/RFC-0013 composition.
@@ -957,14 +976,15 @@ Before provider HTTP, `TomlModelRouter::complete` MUST apply this precedence:
 
 1. Lifecycle/semaphore admission → `ShuttingDown` if draining/stopped.
 2. If `routed.router_instance_id != self.router_instance_id` → `Err(WrongRouter)` (no ticket consume, no HTTP).
-3. `routed.complete_ticket.try_consume()`; if false → `Err(AlreadyCompleted)` (no HTTP, no meter, no ModelCall).
-4. If meter present: re-check `meter.check_budget(&self.budget_policy)`, then apply the zero/non-finite USD overlay (§5.4). If exhausted → `Err(BudgetDenied(check))`, record `DecisionKind::Budget`, ticket stays consumed.
-5. If meter absent (`allow_unmetered` only): skip budget re-check; single-use ticket still applies.
-6. Proceed to provider call only after steps 1–5 succeed.
+3. If the router-owned cancellation token is already cancelled → `Err(Cancelled)` (no ticket consume, no HTTP, no meter, no ModelCall).
+4. `routed.complete_ticket.try_consume()`; if false → `Err(AlreadyCompleted)` (no HTTP, no meter, no ModelCall).
+5. If meter present: re-check via an atomic `check_and_snapshot` (or equivalent single-lock `check_budget` + snapshot), then apply the zero/non-finite USD overlay (§5.4). If exhausted → `Err(BudgetDenied(check))`, record `DecisionKind::Budget`, ticket stays consumed.
+6. If meter absent (`allow_unmetered` only): skip budget re-check; single-use ticket still applies.
+7. Proceed to provider call only after steps 1–6 succeed.
 
-**Caller observation:** `Err(BudgetDenied(_))` / `Err(AlreadyCompleted)` / `Err(WrongRouter)` — no provider HTTP occurs.
+**Caller observation:** `Err(ShuttingDown)` / `Err(WrongRouter)` / `Err(Cancelled)` / `Err(AlreadyCompleted)` / `Err(BudgetDenied(_))` — no provider HTTP occurs.
 
-**Concurrent overshoot:** RFC-0007 bounds admission with `max_in_flight` (§6.3) but does not reserve budget per prompt. If N distinct `route` calls succeed concurrently before their completions update the meter, all N can pass the route-time check. Overshoot is therefore bounded by `min(N_successful_routes, max_in_flight)` outstanding completes, **not** unbounded ticket reuse. RFC-0010 owns stricter per-node serialization / reservation. Budget decision metadata MUST include `in_flight_at_route`.
+**Concurrent overshoot:** RFC-0007 bounds admission with `max_in_flight` (§6.3) but does not reserve budget per prompt. If N distinct `route` calls succeed concurrently before their completions update the meter, all N can pass the route-time check. Overshoot is therefore bounded by `min(N_successful_routes, max_in_flight)` outstanding completes, **not** unbounded ticket reuse. RFC-0010 owns stricter per-node serialization / reservation. Budget decision metadata MUST include `in_flight_at_route` (stable key name; the value is the in-flight gauge sampled at the decision site — route-time for route denials, complete-time for complete recheck denials).
 
 ### 5.5 `complete` request construction
 
@@ -1201,6 +1221,8 @@ Always attempt when `decision_log` is `Some` (session id is present on `RoutingR
 | No endpoint | `ModelRoute` | same without endpoint/model; `error`: `"no_endpoint"` |
 | Budget denied | `Budget` | `capability`, `capability_mapped`, `tier`, `budget_check`, `tokens_in`, `tokens_out`, `usd_spent`, `budget_source` (`"meter"` or `"snapshot"`), `in_flight_at_route` |
 
+`in_flight_at_route` is the stable wire key for the in-flight gauge at the decision site. On route-time `ModelRoute` / `Budget` records it is the route-time count; on complete-time budget recheck denials it remains the same key with the complete-time count (not a separate `in_flight_at_complete` key).
+
 `prompt_body: None`, `content_hash: None` for route decisions.
 
 `budget_check` MUST be one of the strings: `ok`, `tokens_exhausted`, `usd_exhausted`, `tokens_and_usd_exhausted`. The router MUST map explicitly from `BudgetCheck` and MUST NOT rely on `BudgetCheck: Serialize`.
@@ -1222,7 +1244,8 @@ On successful route-decision append, the returned `EventSeq` MUST be copied into
 | TLS failure | `Err(Provider(Tls))` | ModelCall + Model | unknown |
 | Transport (non-TLS I/O) | `Err(Provider(Transport))` | ModelCall + Model | unknown |
 | Malformed | `Err(Provider(Malformed…))` | ModelCall + Model | unknown |
-| Host cancellation before provider returns | `Err(Cancelled)` | no ModelCall | no |
+| Host cancellation before provider HTTP starts | `Err(Cancelled)` | no ModelCall | no |
+| Host cancellation after provider attempt starts, before provider returns | `Err(Cancelled)` | ModelCall + error_class Cancelled | unknown usage |
 | Caller drops before provider result | no return value | no ModelCall | no |
 | Caller drops after provider success, before/during durable append | no return value (lost oneshot) | ModelCall still appended via DurableAppendSupervisor (§5.9.3) | yes (sync before spawn) |
 | Wrong router instance | `Err(WrongRouter)` | no | no |
@@ -1304,7 +1327,8 @@ Implementation MUST use an `AtomicU8` phase (`Ready = 0`, `Draining = 1`, `Stopp
 | Drop of `route` future | No durable write required beyond best-effort; in_flight dec |
 | Drop of `complete` future **before** provider returns | In-flight HTTP aborted (reqwest cancel-on-drop); in_flight dec; **no** ModelCall / meter update; ticket already consumed → later `complete` → `AlreadyCompleted` |
 | Drop of `complete` future **after** provider success (during oneshot await) | Meter already updated; durable `ModelCall` **continues** on DurableAppendSupervisor (§5.9.3); caller may lose the oneshot |
-| Host-level cancellation token fires before provider returns | `Err(Cancelled)`; no ModelCall unless the provider attempt already returned — once returned, meter+spawn MUST run (cancel loses) |
+| Host-level cancellation token fires before provider HTTP starts | `Err(Cancelled)`; no ModelCall; ticket not consumed |
+| Host-level cancellation token fires after provider attempt starts, before provider returns | `Err(Cancelled)` after durable ModelCall with unknown spend + `error_class=Cancelled`; once the provider future has already returned, meter+spawn MUST run (cancel loses) |
 | Shutdown grace expires | router calls `shutdown_token.cancel()`; still-polled in-flight provider calls observe `Err(Cancelled)`; supervised appends drain per §6.6 |
 
 No per-call `CancellationToken` field is added to V2 trait signatures. The cancellation token is router-owned / injected through `TomlModelRouterParts`, matching the RFC-0006 host-level pattern.
@@ -1335,9 +1359,12 @@ shutdown() -> RouterShutdownReport:   // NOT Result — never use `?`
       let _ = report_rx.changed().await; // re-borrow after; cannot miss send
     }
 
-  // Winner only:
+  // Winner only (cancel-safe leadership):
   wake admission waiters so pending route/complete → ShuttingDown
+  tokio::spawn(drain_shutdown(...))   // requires Tokio runtime; aborted callers cannot orphan drain
+  // Winner then falls through to the same watch wait as non-winners
 
+  // drain_shutdown body (runtime-owned task):
   // in_flight drain: ENABLE BEFORE CHECK (must not miss final dec-to-zero)
   let wait = in_flight_notify.notified();
   tokio::pin!(wait);
@@ -1361,12 +1388,13 @@ shutdown() -> RouterShutdownReport:   // NOT Result — never use `?`
   remaining_appends = supervisor.drain_aggregate(post_cancel_or_grace) // one deadline
   phase = Stopped
   report = RouterShutdownReport { cancelled_in_flight: cancelled, remaining_in_flight, remaining_appends }
-  let _ = report_tx.send(Some(report));
+  report_tx.send_replace(Some(report));
   if remaining_in_flight > 0 || remaining_appends > 0 { warn!(...) }
-  return report
+
+  // All callers (winner included) return the shared watch report
 ```
 
-`shutdown` is idempotent and returns `RouterShutdownReport` (not `Result`). Concurrent callers MUST all observe the same cached report via `watch`. In-flight waiting MUST use enable-before-check on `Notify`. Append drain uses one aggregate deadline (§5.9.3).
+`shutdown` is idempotent and returns `RouterShutdownReport` (not `Result`). Concurrent callers MUST all observe the same cached report via `watch`. The CAS winner MUST spawn a runtime-owned drain task so leadership is cancel-safe if the first `shutdown()` future is dropped; every caller (including the winner) waits on `watch` for that report. In-flight waiting MUST use enable-before-check on `Notify`. Append drain uses one aggregate deadline (§5.9.3).
 
 ### 6.7 Connection reuse
 
@@ -1464,6 +1492,7 @@ planning = "standard"
 | `base_url` uses `http` and host is not loopback (`localhost`, `127.0.0.0/8`, `::1`) | Config |
 | `base_url` contains a query string or fragment | Config |
 | `api_key_env` empty | Config |
+| `api_key_env` contains `=` or NUL (would panic in `std::env::var`) | Config |
 | Env var unset/empty at construct | Config with `example.env` hint |
 | No endpoints under the provider | Config |
 | Endpoint `tiers` empty | Config |
@@ -1629,7 +1658,7 @@ Callers MUST pass `RuntimeConfig::budget_policy` into `TomlModelRouter::from_pat
 | `AlreadyCompleted` | complete §5.4.1 | ticket already consumed | no | no | yes |
 | `WrongRouter` | complete §5.4.1 | routed handle from another instance | no | no | yes |
 | `Provider` | complete | wrapped provider failure | see §8.2 | ModelCall | yes |
-| `Cancelled` | host-level cancellation token | cancelled before provider result | no | no | yes |
+| `Cancelled` | host-level cancellation token | cancelled before provider result | no | ModelCall when attempt started (unknown spend); else no | yes |
 | `ShuttingDown` | lifecycle | drain/stop | no | no | yes |
 | `Internal` | invariant | bug | no | optional | yes |
 
@@ -1664,14 +1693,25 @@ Callers MUST pass `RuntimeConfig::budget_policy` into `TomlModelRouter::from_pat
 
 #### 8.3.2 TLS vs Transport classification (normative)
 
-`reqwest = =0.13.4` has no `is_tls()` predicate. Classification MUST walk `reqwest::Error` via `std::error::Error::source` and match:
+`reqwest = =0.13.4` has no `is_tls()` predicate. Classification MUST walk
+`reqwest::Error` via `std::error::Error::source` **and** nested
+`std::io::Error::get_ref()` payloads (hyper/tokio-rustls wrap `rustls::Error`
+inside `io::Error`, and `io::Error::source` returns the *inner* error's source
+rather than the wrapped value):
 
 1. `is_timeout()` → `Timeout` (takes precedence).
-2. Any source downcastable to `rustls::Error` → `Tls`.
-3. Else any source whose `std::any::type_name_of_val` / downcast matches `rustls_pki_types` / webpki certificate errors if present in the tree after `cargo tree` verification → `Tls`.
-4. Else → `Transport` (including connect/DNS/reset/body I/O).
+2. Any source (including nested `io::Error::get_ref`) downcastable to
+   `rustls::Error` → `Tls`.
+3. Else → `Transport` (including connect/DNS/reset/body I/O).
 
-Implementation MUST add a **direct** `alloy-runtime` dependency on the same `rustls` version reqwest 0.13.4 pulls (pin noted in the impl PR via `cargo tree -i rustls`) solely for `downcast_ref` in the mapper. The mapper is a pure function:
+Implementation MUST add a **direct** `alloy-runtime` dependency on the same
+`rustls` version reqwest 0.13.4 pulls (pin noted in the impl PR via
+`cargo tree -i rustls`; verified single `rustls v0.23.42` shared across
+reqwest/hyper-rustls/tokio-rustls/rustls-platform-verifier) solely for
+`downcast_ref` in the mapper. PKI failures surface as
+`rustls::Error::InvalidCertificate(...)` through that shared crate, so a
+separate `rustls_pki_types` / webpki downcast is not required when the tree
+contains only one rustls. The mapper is a pure function:
 
 ```rust
 pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError;
@@ -1832,7 +1872,12 @@ pub struct RouterMetricsSnapshot {
 }
 ```
 
-Incremented on returned results (not on future drops).
+Incremented on returned results (not on future drops). `completes_ok` counts
+successful `Ok(ModelResponse)` returns. `completes_err` counts **every**
+returned `Err` from `complete`, including admission/lifecycle outcomes
+(`ShuttingDown`, `WrongRouter`, `AlreadyCompleted`, `Cancelled`, `BudgetDenied`)
+as well as `Provider` / `Internal` failures. Dropped futures never increment
+either counter.
 
 ---
 
@@ -1872,9 +1917,13 @@ This feature set intentionally recreates reqwest 0.13.4's useful defaults (`rust
 | --- | --- |
 | `reqwest` | First network client |
 | `url = "2.5.8"` | URL parse/loopback validation independent of `http-provider` |
+| `rustls` (direct pin) | `downcast_ref` TLS classification (§8.3.2); version matches reqwest 0.13.4 |
+| `scopeguard` | Panic-safe in-flight / append-pending decrement (§5.9.3) |
+| `zeroize` | Zero `SecretString` material on drop (no derive feature required) |
 | `wiremock` (dev) | Offline HTTP |
+| `rcgen` / `tokio-rustls` (dev) | Self-signed TLS classifier coverage (§8.3.2) |
 
-New runtime deps: `reqwest`, `url`, and a **direct** `rustls` pin matching reqwest 0.13.4’s transitive version (for `downcast_ref` in §8.3.2). Existing deps remain (`async-trait`, `serde`, `tokio`, `thiserror`, `tracing`, `toml`).
+New runtime deps: `reqwest`, `url`, `scopeguard`, `zeroize`, and a **direct** `rustls` pin matching reqwest 0.13.4’s transitive version (for `downcast_ref` in §8.3.2). Existing deps remain (`async-trait`, `serde`, `tokio`, `thiserror`, `tracing`, `toml`).
 
 ### 10.2.1 HTTP body and header safety
 
@@ -2007,7 +2056,7 @@ One test per §8.3 status mapping row.
 
 Normative automated test:
 
-1. Walk `crates/alloy-runtime/src/router/**/*.rs` excluding `recording.rs`. For each file, scan only the prefix before the first line containing `#[cfg(test)]`.
+1. Walk `crates/alloy-runtime/src/router/**/*.rs` and `crates/alloy-runtime/src/obs/**/*.rs`. For each file, scan only the prefix before the trailing unit-test module (`#[cfg(test)] mod tests` / `mod tests {`) so `#[cfg(test)]` field attributes do not truncate production coverage.
 2. Fail if lowercase file contents contain any deny-list substring of known vendor model id patterns (e.g. `gpt-4`, `gpt-3.5`, `claude-3`, `claude-opus`, `gemini-`, `o1-`, `o3-`) as Rust string literals. Use plain case-insensitive substring search; do not add a regex dependency for this.
 3. Review checklist (not mechanically tested): no `match` on provider id/kind may select vendor model ids; `openai_compatible` is a protocol kind only.
 
@@ -2056,7 +2105,7 @@ Every criterion is independently testable.
 | 6 | No `match` on vendor brands for model selection | §11.6 |
 | 7 | Route records `DecisionKind::ModelRoute` | integration |
 | 8 | Complete records `ModelCall` with honest Option tokens | integration |
-| 9 | Omitted/malformed provider usage → token fields None; query invariant holds | `usage_unknown_roundtrip_query` / `malformed_usage_keeps_completion` |
+| 9 | Omitted/malformed provider usage → token fields None; query invariant holds | `usage_unknown_roundtrip_query` / `maps_content_parts_refusal_and_malformed_usage` |
 | 10 | `add_model_usage` called on complete outcomes when meter injected | unit/integration |
 | 11 | USD only when prices + tokens known; else None; `usd_source` set only for derived USD | price + ModelCall tests |
 | 12 | No cost marketing strings in router module | grep / review |
@@ -2067,7 +2116,7 @@ Every criterion is independently testable.
 | 17 | Missing/empty API key fail closed | `missing_api_key_fail_closed` |
 | 18 | Secrets redacted in Debug / errors / events; Authorization header sensitive; invalid auth header fails at construct | secret + redact + header + construct tests |
 | 19 | `RecordingModelProvider` satisfies `ModelProvider` | contract test |
-| 20 | Drop before provider → no ModelCall; drop after provider → durable ModelCall retained; host cancel → `Cancelled` | `drop_complete_before_provider_no_obs`, `drop_complete_after_provider_keeps_obs`, `host_cancel_returns_cancelled` |
+| 20 | Drop before provider → no ModelCall; drop after provider → durable ModelCall retained; pre-start host cancel → `Cancelled` without ModelCall; mid-flight host cancel → `Cancelled` after unknown-spend ModelCall | `drop_complete_before_provider_no_obs`, `drop_complete_after_provider_keeps_obs`, `host_cancel_returns_cancelled`, `mid_flight_host_cancel_returns_cancelled` |
 | 21 | `RuntimeConfig::load` no longer parses `[provider.*]` and exposes profile `budget_policy` | config unit tests updated |
 | 22 | `#![forbid(unsafe_code)]` preserved; reqwest version/features/TLS backend justified | crate attrs + Cargo.toml |
 | 23 | Retry loop absent; TLS classified separately from Transport | code review + `openai_tls_classified` |
@@ -2090,15 +2139,15 @@ Every criterion is independently testable.
 
 Merge only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
 
-- [ ] Architecture compliance: **PASS**
-- [ ] RFC acceptance criteria: **100% satisfied**
-- [ ] Unit tests: **passing**
-- [ ] Integration tests: **passing** (if applicable)
-- [ ] Documentation: **complete**
-- [ ] Public APIs: **reviewed and stable**
-- [ ] Clippy: **clean**
-- [ ] Formatting: **clean**
-- [ ] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
+- [x] Architecture compliance: **PASS**
+- [x] RFC acceptance criteria: **100% satisfied**
+- [x] Unit tests: **passing**
+- [x] Integration tests: **passing** (if applicable)
+- [x] Documentation: **complete**
+- [x] Public APIs: **reviewed and stable**
+- [x] Clippy: **clean**
+- [x] Formatting: **clean**
+- [x] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
 - [ ] Code review: **approved**
 
 ---

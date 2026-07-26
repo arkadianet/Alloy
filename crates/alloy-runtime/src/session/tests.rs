@@ -122,6 +122,7 @@ impl Harness {
             retain_full_prompts: false,
             retain_tool_bodies: false,
             run_timeout: Duration::from_secs(30),
+            budget_policy: crate::types::budget::BudgetPolicy::default(),
         })
         .unwrap();
         let handle = rt.start().await.unwrap();

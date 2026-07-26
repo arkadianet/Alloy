@@ -42,6 +42,8 @@ Capabilities are contracts, not personas. Registry resolves ≤4 LLM capabilitie
 
 From V2 §9.2:
 
+**RFC-0007 binding amendment:** `CapabilityContext` MUST carry `run: RunId` so a worker can create a run-bound `RoutingRequest` and satisfy `TomlModelRouter` attribution checks.
+
 ```rust
 #[async_trait]
 pub trait Capability: Send + Sync {
@@ -55,6 +57,7 @@ pub trait Capability: Send + Sync {
 
 pub struct CapabilityContext {
     pub session: SessionId,
+    pub run: RunId,
     pub node: NodeId,
     pub input: serde_json::Value,
     pub prompt_pack: PromptPack,
@@ -76,6 +79,14 @@ pub struct CapabilityRegistry {
     impls: Vec<Arc<dyn Capability>>,
 }
 ```
+
+**RFC-0007 amendment (error / metering ownership):** when a worker surfaces a
+router/provider failure, it MUST map through `classify_router_error` (or
+`classify_provider_error`) into `FailureIr { error_class, retry, … }` so RFC-0010
+preserves retry disposition. `TomlModelRouter` is the sole producer of
+`DecisionLog::record_model_call` and `SharedCostMeter::add_model_usage` for LLM
+completions it owns; workers MUST NOT also call `add_model_usage` /
+`add_worker_metrics` / `record_model_call` for that same completion.
 
 MVP catalog (V2 §9.3): Planning, Repair, Edit, Review (optional).
 

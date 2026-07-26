@@ -19,7 +19,8 @@ mod redact;
 pub use budget::maybe_signal_budget_warning;
 pub use cost::{BudgetCheck, CostByTier, CostMeter, CostSnapshot, SharedCostMeter, TierCost};
 pub use decision::{
-    DecisionKind, DecisionLog, DecisionRecord, EventDecisionLog, ModelCallRecord, ToolCallRecord,
+    DecisionKind, DecisionLog, DecisionRecord, EventDecisionLog, ModelCallRecord, ModelUsdSource,
+    ToolCallRecord,
 };
 pub use error::ObsError;
 pub use hash::{hash_content, hash_prompt, hash_tool_body};
@@ -28,6 +29,10 @@ pub use query::{
     reaccumulate_cost_from_events, DecisionPage,
 };
 pub use recording::RecordingDecisionLog;
+/// Shared UTF-8-safe truncate used by obs prepare paths and the router.
+pub(crate) use redact::truncate_utf8_bytes;
+/// Body-size limit for router prompt hashing / retention (RFC-0007 §3.17).
+pub(crate) use redact::BODY_MAX_BYTES as MODEL_PROMPT_BODY_MAX_BYTES;
 pub use redact::{
     apply_prompt_retention, apply_tool_retention, redact_json_strings, redact_secrets,
     RetentionPolicy,

@@ -46,6 +46,12 @@ jobs:
       - name: Tests (DoD 3, 4)
         run: cargo test --workspace
 
+      - name: Router without HTTP feature (RFC-0007 §11.7)
+        run: cargo test -p alloy-runtime --no-default-features --locked
+
+      - name: Clippy router without HTTP feature (RFC-0007 §11.7)
+        run: cargo clippy -p alloy-runtime --all-targets --no-default-features --locked -- -D warnings
+
       # `alloy-runtime` is `#![deny(missing_docs)]`; this also catches broken
       # intra-doc links, which the compiler does not surface during a normal build.
       - name: Docs (DoD 5)

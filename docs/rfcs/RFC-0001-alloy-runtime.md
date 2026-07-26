@@ -304,10 +304,22 @@ pub enum ErrorClass {
     Cancelled,
 }
 
+/// Whether RFC-0010 may admit a retry for this failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryDisposition {
+    Retryable,
+    #[default]
+    NonRetryable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailureIr {
     pub node: NodeId,
     pub error_class: ErrorClass,
+    /// Defaults to NonRetryable when reading pre-RFC-0007 payloads.
+    #[serde(default)]
+    pub retry: RetryDisposition,
     pub diagnostics: Vec<DiagnosticEvent>,
     pub notes: String,
 }
@@ -439,6 +451,7 @@ pub struct RuntimeConfig {
     pub retain_full_prompts: bool,          // default false
     pub retain_tool_bodies: bool,           // default false
     pub run_timeout: std::time::Duration,
+    pub budget_policy: BudgetPolicy,
 }
 
 impl RuntimeConfig {
@@ -784,8 +797,8 @@ pub struct ApprovalSpec {
 pub struct WorkerMetrics {
     pub model_tier_used: ModelTier,
     pub provider_id: ProviderId,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: Option<u64>,  // None = not reported / unknown
+    pub output_tokens: Option<u64>, // None = not reported / unknown
     pub tool_calls: u32,
     pub cache_hits: u32,
     pub duration_ms: u64,
@@ -822,11 +835,13 @@ pub mod error;
 // IDs & IR
 pub use types::ids::{
     SessionId, RunId, DagId, NodeId, GateId, ArtifactId, ProfileId, LanguageId,
-    CapabilityId, ProviderId, TransactionId, CheckpointId, GraphNodeId, DiagnosticId,
+    CapabilityId, ProviderId, EndpointId, TransactionId, CheckpointId, GraphNodeId, DiagnosticId,
     GraphVersion, Digest, DigestError, EventSeq, Timestamp, IdError,
 };
 pub use types::budget::{BudgetPolicy, TokenBudget, BudgetSnapshot, ModelTier, CreateSession, Goal, Constraint};
-pub use types::diagnostic::{DiagnosticLevel, SpanRef, DiagnosticEvent, ErrorClass, FailureIr};
+pub use types::diagnostic::{
+    DiagnosticLevel, SpanRef, DiagnosticEvent, ErrorClass, FailureIr, RetryDisposition,
+};
 pub use types::permission::{Glob, ExecAllow, HostAllow, Grant, PermissionToken};
 pub use types::metrics::{WorkerMetrics, RuntimeMetrics};
 
@@ -1235,15 +1250,9 @@ retain_full_prompts = false
 retain_tool_bodies = false
 ```
 
-### `router.toml.example` (placeholder; RFC-0007)
+### `router.toml.example` (schema owned by RFC-0007)
 
-Template only — copy to user-owned `router.toml`. RFC-0001 reads `api_key_env` for presence warnings.
-
-```toml
-# router.toml.example — Author: arkadianet
-[provider.default]
-api_key_env = "ALLOY_API_KEY"
-```
+Template only — copy to user-owned `router.toml`. `RuntimeConfig::load` checks only that the active `router_path` exists; it does not parse provider keys or resolve credentials. RFC-0007 §7 and the shipped [`router.toml.example`](../../router.toml.example) own the complete `[policy]`, `[[providers]]`, `[[providers.endpoints]]`, and `[capability_tiers]` schema.
 
 ### Load sketch
 
@@ -1263,8 +1272,8 @@ impl ConfigPaths {
 
 // RuntimeConfig::load:
 // 1. read profile TOML
-// 2. read router TOML (may be incomplete until 0007)
-// 3. std::env::var for keys named in router — do not parse/write .env files
+// 2. require that router_path exists; RFC-0007 parses its schema
+// 3. do not parse/write .env files
 // 4. resolve data_dir per precedence above
 ```
 

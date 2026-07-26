@@ -150,6 +150,10 @@ name_id!(
     /// Model provider catalog id from router config.
     ProviderId
 );
+name_id!(
+    /// Catalog id for a model endpoint row in `router.toml` (RFC-0007).
+    EndpointId
+);
 
 /// Invalid catalog name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

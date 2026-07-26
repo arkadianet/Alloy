@@ -60,7 +60,13 @@ pub struct RetryPolicy {
 }
 ```
 
-Workers return `FailureIr` only; scheduler may request replan.
+**RFC-0007 amendment (retry admission):** scheduler retry MUST require both
+`failure.retry == RetryDisposition::Retryable` **and** `failure.error_class ∈ policy.retry_on`.
+Do not retry solely because `error_class == Model`. Workers/adapters MUST populate
+`FailureIr.retry` from `classify_router_error` / `ClassifiedRouterFailure` when the
+failure originated in the model router.
+
+Workers return `FailureIr` (with `retry`) only; scheduler may request replan.
 
 ## Internal architecture
 

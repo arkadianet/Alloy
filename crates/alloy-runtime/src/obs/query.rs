@@ -147,21 +147,27 @@ pub fn parse_model_call_event(ev: &SessionEvent) -> Result<ModelCallRecord, ObsE
     if p.usage_unknown != tokens_unknown {
         return Err(ObsError::Invalid("usage_unknown inconsistent".into()));
     }
-    Ok(ModelCallRecord {
-        session: ev.session_id,
-        run: ev.run_id,
-        node: p.node_id,
-        provider_id: p.provider_id,
-        model_tier: p.model_tier,
-        input_tokens: p.input_tokens,
-        output_tokens: p.output_tokens,
-        usd: p.usd,
-        duration_ms: p.duration_ms,
-        confidence: p.confidence,
-        error_class: p.error_class,
-        content_hash: p.content_hash,
-        prompt_body: p.prompt_body,
-    })
+    let mut rec = ModelCallRecord::new(ev.session_id, p.provider_id, p.model_tier)
+        .tokens(p.input_tokens, p.output_tokens)
+        .usd(p.usd)
+        .duration_ms(p.duration_ms)
+        .confidence(p.confidence)
+        .error_class(p.error_class)
+        .content_hash(p.content_hash)
+        .prompt_body(p.prompt_body)
+        .endpoint_id(p.endpoint_id)
+        .model(p.model)
+        .route_event_seq(p.route_event_seq)
+        .usd_source(p.usd_source)
+        .finish_reason(p.finish_reason)
+        .provider_request_id(p.provider_request_id);
+    if let Some(run) = ev.run_id {
+        rec = rec.run(run);
+    }
+    if let Some(node) = p.node_id {
+        rec = rec.node(node);
+    }
+    Ok(rec)
 }
 
 /// Restore a [`ToolCallRecord`] from a session event.

@@ -7,6 +7,11 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["http-provider"]
+# OpenAI-compatible HTTP provider (reqwest + rustls). Traits/recording compile without it.
+http-provider = ["dep:reqwest", "dep:rustls"]
+
 [dependencies]
 async-trait = { workspace = true }
 hex = { workspace = true }
@@ -22,6 +27,11 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
+scopeguard = { workspace = true }
+zeroize = { workspace = true }
+reqwest = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -30,6 +40,15 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
+wiremock = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
+
+[[test]]
+name = "router_rfc0007"
+required-features = ["http-provider"]
 
 [[bench]]
 name = "digest_sha256"
@@ -41,4 +60,8 @@ harness = false
 
 [[bench]]
 name = "obs_cost_redact"
+harness = false
+
+[[bench]]
+name = "router_select"
 harness = false

@@ -2,8 +2,8 @@
 //!
 //! This crate is the foundation defined by **RFC-0001**, extended by **RFC-0002**
 //! (durable storage, artifacts, session event log), **RFC-0003** (session manager
-//! and run controller), **RFC-0004** (observability & cost metering), and tool IR
-//! from **RFC-0006**.
+//! and run controller), **RFC-0004** (observability & cost metering), tool IR
+//! from **RFC-0006**, and model routing/provider support from **RFC-0007**.
 //!
 //! # Crate map
 //!
@@ -15,6 +15,7 @@
 //! - [`adapters`] — Verify*/GateHuman stub traits
 //! - [`session`] — [`SessionPlane`] control plane: Session/RunController (RFC-0003)
 //! - [`obs`] — DecisionLog, CostMeter, redaction/query helpers (RFC-0004)
+//! - [`router`] — sealed model routing, provider traits, and HTTP provider (RFC-0007)
 //! - [`dag`] — TaskDag type sketches (store in RFC-0009)
 //! - [`config`] — TOML + env load (never writes `.env`)
 //!
@@ -30,6 +31,7 @@ pub mod error;
 pub mod events;
 pub mod logging;
 pub mod obs;
+pub mod router;
 pub mod runtime;
 pub mod scheduler;
 pub mod session;
@@ -41,7 +43,7 @@ pub use adapters::{
     UnavailableVerifyCompile, UnavailableVerifyTest, VerifyCompileAdapter, VerifyOutcome,
     VerifyTestAdapter,
 };
-pub use config::{ConfigPaths, RuntimeConfig};
+pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
 pub use dag::{
     ApprovalSpec, Backoff, CacheKey, DependencyEdge, EdgeKind, NodeKind, NodeState, RetryPolicy,
     TaskDag, TaskNode,
@@ -57,8 +59,19 @@ pub use obs::{
     parse_model_call_event, parse_tool_call_event, reaccumulate_cost_from_events,
     redact_json_strings, redact_secrets, BudgetCheck, CostByTier, CostMeter, CostSnapshot,
     DecisionKind, DecisionLog, DecisionPage, DecisionRecord, EventDecisionLog, ModelCallRecord,
-    ObsError, RecordingDecisionLog, RetentionPolicy, SharedCostMeter, TierCost, ToolCallRecord,
+    ModelUsdSource, ObsError, RecordingDecisionLog, RetentionPolicy, SharedCostMeter, TierCost,
+    ToolCallRecord,
 };
+pub use router::{
+    classify_provider_error, classify_router_error, ChatMessage, ChatRole, Citation,
+    ClassifiedRouterFailure, CompletionRequest, ComplexityScore, EndpointConfig, Health,
+    ModelEndpoint, ModelProvider, ModelResponse, ModelRouter, PromptPack, ProviderConfig,
+    ProviderError, ProviderKind, RecordingModelProvider, ResponseFormat, RoutedModel, RouterConfig,
+    RouterError, RouterMetricsSnapshot, RouterPolicy, RouterShutdownReport, RoutingRequest,
+    ScoringWeights, SecretString, TomlModelRouter, TomlModelRouterParts, ToolChoice, Usage,
+};
+#[cfg(feature = "http-provider")]
+pub use router::{OpenAiCompatibleProvider, OpenAiCompatibleSpec};
 pub use runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
 pub use scheduler::{DagOutcome, DagState, NullScheduler, Scheduler};
 pub use session::{
@@ -74,11 +87,13 @@ pub use storage::{
 pub use types::budget::{
     BudgetPolicy, BudgetSnapshot, Constraint, CreateSession, Goal, ModelTier, TokenBudget,
 };
-pub use types::diagnostic::{DiagnosticEvent, DiagnosticLevel, ErrorClass, FailureIr, SpanRef};
+pub use types::diagnostic::{
+    DiagnosticEvent, DiagnosticLevel, ErrorClass, FailureIr, RetryDisposition, SpanRef,
+};
 pub use types::ids::{
-    ArtifactId, CapabilityId, CheckpointId, DagId, DiagnosticId, Digest, DigestError, EventSeq,
-    GateId, GraphNodeId, GraphVersion, IdError, LanguageId, NodeId, ProfileId, ProviderId, RunId,
-    ServerId, SessionId, Timestamp, TransactionId,
+    ArtifactId, CapabilityId, CheckpointId, DagId, DiagnosticId, Digest, DigestError, EndpointId,
+    EventSeq, GateId, GraphNodeId, GraphVersion, IdError, LanguageId, NodeId, ProfileId,
+    ProviderId, RunId, ServerId, SessionId, Timestamp, TransactionId,
 };
 pub use types::metrics::{RuntimeMetrics, WorkerMetrics};
 pub use types::permission::{ExecAllow, Glob, Grant, HostAllow, PermissionToken};

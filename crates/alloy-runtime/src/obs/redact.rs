@@ -99,6 +99,18 @@ pub fn redact_secrets(text: &str) -> String {
     out
 }
 
+/// Truncate to at most `max_bytes` without splitting a UTF-8 code point.
+pub(crate) fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
 /// Recursively redact JSON string leaves and secret-named object values.
 #[must_use]
 pub fn redact_json_strings(value: &serde_json::Value) -> serde_json::Value {

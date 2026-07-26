@@ -100,11 +100,7 @@ retain_tool_bodies = {retain_tools}
     .unwrap();
     std::fs::write(
         dir.join("router.toml"),
-        r#"
-[provider.default]
-kind = "openai_compatible"
-api_key_env = "ALLOY_API_KEY"
-"#,
+        alloy_runtime::default_router_toml(),
     )
     .unwrap();
     std::fs::write(dir.join("example.env"), "ALLOY_API_KEY=\n").unwrap();
@@ -155,21 +151,17 @@ async fn model_call_and_tool_call_round_trip() {
     let h = Host::open(false, false).await;
     let session = h.create_session().await;
     let log = h.log();
-    log.record_model_call(ModelCallRecord {
-        session,
-        run: None,
-        node: None,
-        provider_id: ProviderId::new("default").unwrap(),
-        model_tier: ModelTier::Standard,
-        input_tokens: Some(10),
-        output_tokens: Some(5),
-        usd: Some(0.02),
-        duration_ms: Some(12),
-        confidence: None,
-        error_class: None,
-        content_hash: None,
-        prompt_body: Some("hi".into()),
-    })
+    log.record_model_call(
+        ModelCallRecord::new(
+            session,
+            ProviderId::new("default").unwrap(),
+            ModelTier::Standard,
+        )
+        .tokens(Some(10), Some(5))
+        .usd(Some(0.02))
+        .duration_ms(Some(12))
+        .prompt_body(Some("hi".into())),
+    )
     .await
     .unwrap();
     log.record_tool_call(ToolCallRecord {
@@ -388,38 +380,20 @@ async fn reaccumulate_cost_from_events_test() {
         .unwrap();
 
     let log = h.log();
-    log.record_model_call(ModelCallRecord {
-        session,
-        run: Some(run_a),
-        node: None,
-        provider_id: ProviderId::new("p").unwrap(),
-        model_tier: ModelTier::Premium,
-        input_tokens: Some(10),
-        output_tokens: Some(2),
-        usd: Some(0.1),
-        duration_ms: None,
-        confidence: None,
-        error_class: None,
-        content_hash: None,
-        prompt_body: None,
-    })
+    log.record_model_call(
+        ModelCallRecord::new(session, ProviderId::new("p").unwrap(), ModelTier::Premium)
+            .run(run_a)
+            .tokens(Some(10), Some(2))
+            .usd(Some(0.1)),
+    )
     .await
     .unwrap();
-    log.record_model_call(ModelCallRecord {
-        session,
-        run: Some(run_b),
-        node: None,
-        provider_id: ProviderId::new("p").unwrap(),
-        model_tier: ModelTier::Standard,
-        input_tokens: Some(7),
-        output_tokens: Some(3),
-        usd: Some(0.05),
-        duration_ms: None,
-        confidence: None,
-        error_class: None,
-        content_hash: None,
-        prompt_body: None,
-    })
+    log.record_model_call(
+        ModelCallRecord::new(session, ProviderId::new("p").unwrap(), ModelTier::Standard)
+            .run(run_b)
+            .tokens(Some(7), Some(3))
+            .usd(Some(0.05)),
+    )
     .await
     .unwrap();
 
