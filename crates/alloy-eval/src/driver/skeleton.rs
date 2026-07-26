@@ -21,6 +21,9 @@ use crate::trajectory::EvalTrajectoryRecord;
 
 /// §5.3.1 carrier detail; conformance tests match it byte-for-byte.
 const SCRIPT_MISS_DETAIL: &str = "script miss";
+const CANCEL_BEFORE_COMPLETE: &str = "before_complete";
+const CANCEL_BEFORE_PATCH: &str = "before_patch";
+const CANCEL_BEFORE_CRITERIA: &str = "before_criteria";
 
 /// One `unsafe` occurrence per source line; compiled once for the process.
 static UNSAFE_LINE_PATTERN: LazyLock<Regex> =
@@ -182,6 +185,7 @@ pub(crate) async fn run_scripted(
         criteria.set_carrier_failure("missing repair text");
     }
 
+    maybe_cancel_at_checkpoint(fixture, CANCEL_BEFORE_PATCH, &cancel);
     if is_cancelled(&cancel) {
         return cancelled_output(fixture, started, trajectories);
     }
@@ -206,6 +210,7 @@ pub(crate) async fn run_scripted(
         }
     }
 
+    maybe_cancel_at_checkpoint(fixture, CANCEL_BEFORE_CRITERIA, &cancel);
     if is_cancelled(&cancel) {
         return cancelled_output(fixture, started, trajectories);
     }
@@ -320,6 +325,7 @@ async fn dispatch_turn(
     let request_fingerprint = RequestFingerprint::of(&request);
     let attempt_started = Instant::now();
     let complete = provider.complete(&fixture.endpoint, request);
+    maybe_cancel_at_checkpoint(fixture, CANCEL_BEFORE_COMPLETE, cancel);
     let result = if let Some(token) = cancel {
         tokio::select! {
             biased;
@@ -621,6 +627,19 @@ fn is_cancelled(cancel: &Option<CancellationToken>) -> bool {
         .unwrap_or(false)
 }
 
+fn maybe_cancel_at_checkpoint(
+    _fixture: &LoadedFixture,
+    _checkpoint: &'static str,
+    _cancel: &Option<CancellationToken>,
+) {
+    #[cfg(test)]
+    if _fixture.cancel_at_checkpoint == Some(_checkpoint) {
+        if let Some(token) = _cancel {
+            token.cancel();
+        }
+    }
+}
+
 fn cancelled_output(
     fixture: &LoadedFixture,
     started: Instant,
@@ -802,6 +821,15 @@ mod tests {
         assert!(!trajectories[0].complete_ok);
     }
 
+    fn assert_cancelled_output(output: &FixtureRunOutput, model_calls: u32, trajectories: usize) {
+        assert_eq!(output.outcome.status, FixtureStatus::Error);
+        assert_eq!(output.outcome.error.as_ref().unwrap().kind, "cancelled");
+        assert_eq!(output.outcome.model_calls, model_calls);
+        assert_eq!(output.outcome.compile_clean, None);
+        assert!(output.outcome.criteria.is_empty());
+        assert_eq!(output.trajectories.len(), trajectories);
+    }
+
     #[tokio::test]
     async fn cancel_checkpoints_cover_driver() {
         let fixture =
@@ -814,33 +842,40 @@ mod tests {
             Some(token),
         )
         .await;
-        assert_eq!(output.outcome.status, FixtureStatus::Error);
-        assert_eq!(output.outcome.error.as_ref().unwrap().kind, "cancelled");
-        assert_eq!(output.outcome.model_calls, 0);
-        assert_eq!(output.outcome.compile_clean, None);
-        assert!(output.outcome.criteria.is_empty());
+        assert_cancelled_output(&output, 0, 0);
 
-        let fixture =
+        let mut fixture =
             loaded_fixture_for_tests("cancel-complete", FixtureDriverKind::SkeletonReplay);
+        fixture.cancel_at_checkpoint = Some(CANCEL_BEFORE_COMPLETE);
         let provider = fixture.scripts.as_ref().unwrap().clone();
         let token = CancellationToken::new();
-        token.cancel();
-        let turn = &fixture.manifest.turns[0];
-        let mut trajectories = Vec::new();
-        let result = dispatch_turn(
-            &provider,
-            &fixture,
-            &turn.turn_id,
-            turn.request.clone(),
-            &Some(token),
-            &mut trajectories,
-        )
-        .await;
-        assert!(result.is_none());
-        assert_eq!(trajectories.len(), 1);
-        assert_eq!(trajectories[0].error_class, Some(ErrorClass::Cancelled));
-        assert_eq!(trajectories[0].compile_clean, None);
-        assert!(!trajectories[0].complete_ok);
+        let output = run(&fixture, provider, Some(token)).await;
+        assert_cancelled_output(&output, 1, 1);
+        assert_eq!(
+            output.trajectories[0].error_class,
+            Some(ErrorClass::Cancelled)
+        );
+        assert!(!output.trajectories[0].complete_ok);
+
+        let mut fixture =
+            loaded_fixture_for_tests("cancel-before-patch", FixtureDriverKind::SkeletonReplay);
+        fixture.cancel_at_checkpoint = Some(CANCEL_BEFORE_PATCH);
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+        let output = run(&fixture, provider, Some(CancellationToken::new())).await;
+        assert_cancelled_output(&output, 1, 1);
+        assert!(output.trajectories[0].complete_ok);
+
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&golden, "fixed").unwrap();
+        let mut fixture =
+            loaded_fixture_for_tests("cancel-before-criteria", FixtureDriverKind::SkeletonReplay);
+        fixture.paths.golden = golden;
+        fixture.cancel_at_checkpoint = Some(CANCEL_BEFORE_CRITERIA);
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+        let output = run(&fixture, provider, Some(CancellationToken::new())).await;
+        assert_cancelled_output(&output, 1, 1);
+        assert!(output.trajectories[0].complete_ok);
     }
 
     #[tokio::test]

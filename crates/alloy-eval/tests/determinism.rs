@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use alloy_eval::{
-    EvalHarness, EvalHarnessConfig, EvalReport, FixtureSet, MetricField, UnmeasuredReason,
+    EvalHarness, EvalHarnessConfig, EvalMetrics, EvalReport, FixtureOutcome, FixtureSet,
+    FixtureStatus, MetricField, UnmeasuredReason,
 };
 use serde_json::Value;
 
@@ -65,6 +66,37 @@ fn scrub_latency(metrics: &mut Value) {
     });
 }
 
+fn assert_wall_latency_observed(report: &EvalReport) {
+    let non_error: Vec<&FixtureOutcome> = report
+        .fixtures
+        .iter()
+        .filter(|fixture| fixture.status != FixtureStatus::Error)
+        .collect();
+    assert!(
+        !non_error.is_empty(),
+        "test fixture set must contain samples"
+    );
+    assert!(
+        non_error.iter().all(|fixture| serde_json::to_value(fixture)
+            .unwrap()
+            .get("wall_ms")
+            .is_some()),
+        "non-error fixtures must carry wall_ms before report scrubbing"
+    );
+    assert_measured_latency(&report.metrics);
+}
+
+fn assert_measured_latency(metrics: &EvalMetrics) {
+    assert!(
+        matches!(metrics.latency_p50_ms, MetricField::Measured(_)),
+        "latency_p50_ms must be measured before report scrubbing"
+    );
+    assert!(
+        matches!(metrics.latency_p95_ms, MetricField::Measured(_)),
+        "latency_p95_ms must be measured before report scrubbing"
+    );
+}
+
 #[tokio::test]
 async fn determinism_same_input_same_output() {
     let harness = EvalHarness::new(EvalHarnessConfig::skeleton(fixture_root())).unwrap();
@@ -85,6 +117,17 @@ async fn determinism_concurrent_batch() {
     for report in &reports[1..] {
         assert_eq!(&reports[0], report);
     }
+}
+
+#[tokio::test]
+async fn wall_latency_remain_observational() {
+    let harness = EvalHarness::new(EvalHarnessConfig::skeleton(fixture_root())).unwrap();
+    let a = harness.run_batch(FixtureSet::Train).await.unwrap();
+    let b = harness.run_batch(FixtureSet::Train).await.unwrap();
+
+    assert_wall_latency_observed(&a);
+    assert_wall_latency_observed(&b);
+    assert_eq!(scrub(&a), scrub(&b));
 }
 
 #[tokio::test]

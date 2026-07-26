@@ -97,6 +97,35 @@ fn source_has_no_network_or_dotenv_writes() {
 }
 
 #[test]
+fn harness_driver_public_path_has_no_toolchain_spawn() {
+    for (path, source) in rust_sources() {
+        let relative = path.strip_prefix(crate_root()).expect("source under crate");
+        if relative != Path::new("src/harness.rs") && !relative.starts_with(Path::new("src/driver"))
+        {
+            continue;
+        }
+        for forbidden in ["Command::new(\"cargo\")", "std::process::Command"] {
+            assert!(
+                !source.contains(forbidden),
+                "{} must not spawn toolchains from the harness/driver path",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn alloy_eval_src_has_no_process_command() {
+    for (path, source) in rust_sources() {
+        assert!(
+            !source.contains("std::process::Command"),
+            "{} must not use std::process::Command",
+            path.display()
+        );
+    }
+}
+
+#[test]
 fn package_has_no_live_provider_or_unicode_normalization_feature() {
     let manifest =
         std::fs::read_to_string(crate_root().join("Cargo.toml")).expect("read Cargo.toml");

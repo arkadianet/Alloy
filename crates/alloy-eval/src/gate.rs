@@ -640,7 +640,7 @@ unknown = true
     }
 
     #[test]
-    fn require_naive_comparison_fails_closed() {
+    fn gate_requires_naive_comparison() {
         let report = report(metrics(
             MetricField::Measured(1.0),
             MetricField::Measured(1.0),

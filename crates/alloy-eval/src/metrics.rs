@@ -323,6 +323,21 @@ mod tests {
     }
 
     #[test]
+    fn error_vs_fail_denominator() {
+        let pass = outcome("pass", FixtureStatus::Pass, Some((4, 1)), Some(false));
+        let fail = outcome("fail", FixtureStatus::Fail, Some((2, 3)), Some(false));
+        let mut error = outcome("error", FixtureStatus::Error, Some((10, 10)), Some(false));
+        error.compile_clean = Some(true);
+
+        let metrics = MetricsAggregator::aggregate(&[pass, fail, error]);
+
+        // Error is excluded from both denominators; Fail remains included and
+        // therefore lowers both rates to 1 / (Pass + Fail) = 0.5.
+        assert_eq!(metrics.success_rate, MetricField::Measured(0.5));
+        assert_eq!(metrics.compile_success_rate, MetricField::Measured(0.5));
+    }
+
+    #[test]
     fn latency_excludes_errors() {
         let mut fast = outcome("fast", FixtureStatus::Pass, Some((1, 1)), Some(false));
         fast.wall_ms = 10;

@@ -214,8 +214,14 @@ fn render_metric_f64(metric: &MetricField<f64>) -> String {
 mod tests {
     use super::*;
     use crate::cost_claim::CostClaimEnvelope;
-    use crate::manifest::FixtureSet;
+    use crate::fingerprint::RequestFingerprint;
+    use crate::gate::{GateFailure, GateThresholds, NaiveComparisonResult};
+    use crate::manifest::{FixtureSet, FixtureTurnId};
     use crate::metrics::{EvalMetrics, MetricField, UnmeasuredReason};
+    use alloy_runtime::{
+        CapabilityId, CompletionRequest, EndpointId, ErrorClass, ModelTier, ModelUsdSource,
+        ProviderId, ResponseFormat, ToolChoice,
+    };
 
     fn outcome(id: &str, status: FixtureStatus) -> FixtureOutcome {
         FixtureOutcome {
@@ -260,6 +266,43 @@ mod tests {
         }
     }
 
+    fn trajectory(id: &str, ordinal: u32, status: FixtureStatus) -> EvalTrajectoryRecord {
+        let request = CompletionRequest {
+            messages: vec![],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            response_format: ResponseFormat::Text,
+            temperature: None,
+            max_output_tokens: None,
+        };
+        let fingerprint = RequestFingerprint::of(&request);
+        let request_content_hash = fingerprint.as_digest().clone();
+        EvalTrajectoryRecord {
+            fixture_id: FixtureId::new(id).unwrap(),
+            set: FixtureSet::Train,
+            turn_id: FixtureTurnId {
+                capability: CapabilityId::new("repair").unwrap(),
+                node: None,
+                ordinal,
+            },
+            request_content_hash,
+            request_fingerprint: fingerprint,
+            endpoint_id: EndpointId::new("eval-script").unwrap(),
+            provider_id: ProviderId::new("eval-script").unwrap(),
+            model_tier: ModelTier::Standard,
+            input_tokens: Some(11),
+            output_tokens: Some(7),
+            usd: Some(0.000_039),
+            usd_source: Some(ModelUsdSource::OperatorPriceTable),
+            duration_ms: Some(12),
+            confidence: None,
+            error_class: (status == FixtureStatus::Error).then_some(ErrorClass::Internal),
+            complete_ok: status != FixtureStatus::Error,
+            fixture_status: status,
+            compile_clean: Some(status == FixtureStatus::Pass),
+        }
+    }
+
     #[test]
     fn report_ci_summary_exact() {
         let report = EvalReport {
@@ -300,6 +343,14 @@ cost_disclaimer=internal-only";
 
     #[test]
     fn report_serde_round_trip() {
+        let mut error_fixture = outcome("round-trip-error", FixtureStatus::Error);
+        error_fixture.error = Some(ReportError::from_eval(&EvalError::Manifest(
+            "invalid fixture".to_owned(),
+        )));
+        let naive_metrics = EvalMetrics {
+            compile_success_rate: MetricField::Measured(0.5),
+            ..metrics()
+        };
         let report = EvalReport {
             schema_version: 1,
             run_id: "00000000-0000-4000-8000-000000000000".to_owned(),
@@ -309,16 +360,32 @@ cost_disclaimer=internal-only";
                 rustc_version: "rustc 1.97.1".to_owned(),
                 cargo_version: "cargo 1.97.1".to_owned(),
             },
-            fixtures: vec![outcome("round-trip", FixtureStatus::Pass)],
-            trajectories: vec![],
-            naive_fixtures: None,
-            naive_trajectories: None,
+            fixtures: vec![
+                outcome("round-trip-pass", FixtureStatus::Pass),
+                error_fixture,
+            ],
+            trajectories: vec![
+                trajectory("round-trip-pass", 0, FixtureStatus::Pass),
+                trajectory("round-trip-error", 1, FixtureStatus::Error),
+            ],
+            naive_fixtures: Some(vec![outcome("round-trip-naive", FixtureStatus::Fail)]),
+            naive_trajectories: Some(vec![trajectory("round-trip-naive", 0, FixtureStatus::Fail)]),
             metrics: metrics(),
-            cost_claim: CostClaimEnvelope::uncalibrated(MetricField::Unmeasured {
-                reason: UnmeasuredReason::CostInputsIncomplete,
+            cost_claim: CostClaimEnvelope::uncalibrated(MetricField::Measured(0.000_039)),
+            gate: Some(GateResult {
+                passed: false,
+                thresholds: GateThresholds::skeleton_defaults(),
+                failures: vec![GateFailure::SuccessRate {
+                    actual: "0.500000".to_owned(),
+                    minimum: "1.000000".to_owned(),
+                }],
             }),
-            gate: None,
-            naive_comparison: None,
+            naive_comparison: Some(NaiveComparisonResult {
+                control: metrics(),
+                naive: naive_metrics,
+                control_meets_or_beats_naive: true,
+                detail: "naive_single_turn_patch: compile_success_rate comparison".to_owned(),
+            }),
         };
 
         let json = serde_json::to_vec(&report).unwrap();

@@ -74,7 +74,7 @@ impl ReportError {
         };
         Self {
             kind: kind.to_owned(),
-            message,
+            message: bound_message(message),
         }
     }
 
@@ -157,5 +157,14 @@ mod tests {
         assert_eq!(report.kind, "io");
         assert_eq!(report.message, "denied");
         assert!(!report.message.starts_with("io:"));
+    }
+
+    #[test]
+    fn report_error_from_eval_bounds_messages() {
+        let err = EvalError::Manifest("a".repeat(600));
+        let report = ReportError::from_eval(&err);
+        assert_eq!(report.kind, "manifest");
+        assert!(report.message.len() <= EVAL_MESSAGE_MAX_BYTES);
+        assert!(report.message.ends_with(EVAL_MESSAGE_TRUNCATE_SUFFIX));
     }
 }

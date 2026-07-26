@@ -104,6 +104,8 @@ pub struct LoadedFixture {
     pub(crate) scripts: Option<Arc<ScriptedProvider>>,
     #[cfg(test)]
     pub(crate) panic_after_dispatch: bool,
+    #[cfg(test)]
+    pub(crate) cancel_at_checkpoint: Option<&'static str>,
 }
 
 impl LoadedFixture {
@@ -744,6 +746,8 @@ impl LoadedFixture {
             scripts: Some(provider),
             #[cfg(test)]
             panic_after_dispatch: false,
+            #[cfg(test)]
+            cancel_at_checkpoint: None,
         })
     }
 }
@@ -1869,6 +1873,7 @@ output_tokens = 5
             )],
             scripts: Some(provider),
             panic_after_dispatch: false,
+            cancel_at_checkpoint: None,
         }
     }
 
