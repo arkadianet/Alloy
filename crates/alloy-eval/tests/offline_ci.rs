@@ -65,7 +65,7 @@ fn alloy_eval_does_not_link_reqwest() {
             "alloy-eval",
             "--no-default-features",
             "-e",
-            "normal",
+            "all",
             "--prefix",
             "none",
         ])

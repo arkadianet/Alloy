@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Implemented |
+| **Status** | Implemented (Day-1 harness skeleton; ControlPlane driver deferred) |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0007](./RFC-0007-model-router-provider.md) (merged) |

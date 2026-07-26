@@ -526,42 +526,37 @@ fn validate_criteria(criteria: &[SuccessCriterion]) -> Result<(), EvalError> {
 
 fn validate_turn_ids(turns: &[ScriptTurn]) -> Result<(), EvalError> {
     let mut full = HashSet::new();
-    let mut ordinals = HashSet::new();
     for turn in turns {
         let node = turn.turn_id.node.map(|node| node.to_string());
         let full_key = (
             turn.turn_id.capability.as_str().to_owned(),
-            node.clone(),
+            node,
             turn.turn_id.ordinal,
         );
         if !full.insert(full_key) {
             return Err(EvalError::Manifest("duplicate turn_id".into()));
         }
-        let ordinal_key = (
-            turn.turn_id.capability.as_str().to_owned(),
-            node,
-            turn.turn_id.ordinal,
-        );
-        if !ordinals.insert(ordinal_key) {
-            return Err(EvalError::Manifest(
-                "duplicate ordinal within turn group".into(),
-            ));
-        }
     }
     Ok(())
 }
 
-fn validate_naive_selector(turns: &[ScriptTurn]) -> Result<(), EvalError> {
-    let count = turns
+/// Require exactly one `repair` turn with ordinal 0 (naive baseline selector).
+pub(crate) fn require_single_repair_ordinal_zero(
+    turns: &[ScriptTurn],
+) -> Result<&ScriptTurn, EvalError> {
+    let mut matches = turns
         .iter()
-        .filter(|turn| turn.turn_id.capability.as_str() == "repair" && turn.turn_id.ordinal == 0)
-        .count();
-    if count != 1 {
-        return Err(EvalError::Manifest(
+        .filter(|turn| turn.turn_id.capability.as_str() == "repair" && turn.turn_id.ordinal == 0);
+    match (matches.next(), matches.next()) {
+        (Some(turn), None) => Ok(turn),
+        _ => Err(EvalError::Manifest(
             "exactly one repair ordinal 0 turn is required".into(),
-        ));
+        )),
     }
-    Ok(())
+}
+
+fn validate_naive_selector(turns: &[ScriptTurn]) -> Result<(), EvalError> {
+    require_single_repair_ordinal_zero(turns).map(|_| ())
 }
 
 fn validate_physical_identity(
@@ -637,7 +632,7 @@ fn validate_manifest_paths(
 }
 
 pub(crate) fn validate_relative_path_string(path: &str) -> Result<(), EvalError> {
-    if path.is_empty() || path.starts_with('\\') || path.contains('\\') || has_windows_drive(path) {
+    if path.is_empty() || path.contains('\\') || has_windows_drive(path) {
         return Err(path_error(Path::new(path)));
     }
     let path = Path::new(path);
@@ -1374,32 +1369,9 @@ output_tokens = 2
         assert_serialize(&manifest.turns[0]);
         assert_serialize(&manifest.turns[0].outcome);
 
-        // Rust has no stable negative trait bound. Guard the public derive
-        // surface directly so adding `Deserialize` to any validated manifest
-        // type fails this acceptance test.
-        let source = include_str!("manifest.rs");
-        for declaration in [
-            "pub struct FixtureManifest",
-            "pub struct ScriptTurn",
-            "pub enum ScriptTurnOutcome",
-        ] {
-            let prefix = source
-                .split_once(declaration)
-                .unwrap_or_else(|| panic!("missing declaration: {declaration}"))
-                .0;
-            let derive = prefix
-                .rsplit_once("#[derive(")
-                .unwrap_or_else(|| panic!("missing derive: {declaration}"))
-                .1
-                .lines()
-                .next()
-                .unwrap();
-            assert!(derive.contains("Serialize"), "{declaration}: {derive}");
-            assert!(
-                !derive.contains("Deserialize"),
-                "{declaration} must remain serialize-only: {derive}"
-            );
-        }
+        // Compile-fail negative trait bound: these types must not implement Deserialize.
+        let t = trybuild::TestCases::new();
+        t.compile_fail("tests/ui/manifest_no_deserialize.rs");
     }
 
     #[test]

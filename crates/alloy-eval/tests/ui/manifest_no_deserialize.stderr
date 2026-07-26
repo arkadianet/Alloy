@@ -1,0 +1,68 @@
+error[E0277]: the trait bound `FixtureManifest: serde::de::DeserializeOwned` is not satisfied
+ --> tests/ui/manifest_no_deserialize.rs:5:27
+  |
+5 |     require_deserialize::<alloy_eval::FixtureManifest>();
+  |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `for<'de> Deserialize<'de>` is not implemented for `FixtureManifest`
+  |
+  = help: the following other types implement trait `Deserialize<'de>`:
+            `&'a Path` implements `Deserialize<'de>`
+            `&'a [u8]` implements `Deserialize<'de>`
+            `&'a str` implements `Deserialize<'de>`
+            `()` implements `Deserialize<'de>`
+            `(T,)` implements `Deserialize<'de>`
+            `(T0, T1)` implements `Deserialize<'de>`
+            `(T0, T1, T2)` implements `Deserialize<'de>`
+            `(T0, T1, T2, T3)` implements `Deserialize<'de>`
+          and $N others
+  = note: required for `FixtureManifest` to implement `DeserializeOwned`
+note: required by a bound in `require_deserialize`
+ --> tests/ui/manifest_no_deserialize.rs:2:27
+  |
+2 | fn require_deserialize<T: serde::de::DeserializeOwned>() {}
+  |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_deserialize`
+
+error[E0277]: the trait bound `ScriptTurn: serde::de::DeserializeOwned` is not satisfied
+ --> tests/ui/manifest_no_deserialize.rs:6:27
+  |
+6 |     require_deserialize::<alloy_eval::ScriptTurn>();
+  |                           ^^^^^^^^^^^^^^^^^^^^^^ the trait `for<'de> Deserialize<'de>` is not implemented for `ScriptTurn`
+  |
+  = help: the following other types implement trait `Deserialize<'de>`:
+            `&'a Path` implements `Deserialize<'de>`
+            `&'a [u8]` implements `Deserialize<'de>`
+            `&'a str` implements `Deserialize<'de>`
+            `()` implements `Deserialize<'de>`
+            `(T,)` implements `Deserialize<'de>`
+            `(T0, T1)` implements `Deserialize<'de>`
+            `(T0, T1, T2)` implements `Deserialize<'de>`
+            `(T0, T1, T2, T3)` implements `Deserialize<'de>`
+          and $N others
+  = note: required for `ScriptTurn` to implement `DeserializeOwned`
+note: required by a bound in `require_deserialize`
+ --> tests/ui/manifest_no_deserialize.rs:2:27
+  |
+2 | fn require_deserialize<T: serde::de::DeserializeOwned>() {}
+  |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_deserialize`
+
+error[E0277]: the trait bound `ScriptTurnOutcome: serde::de::DeserializeOwned` is not satisfied
+ --> tests/ui/manifest_no_deserialize.rs:7:27
+  |
+7 |     require_deserialize::<alloy_eval::ScriptTurnOutcome>();
+  |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `for<'de> Deserialize<'de>` is not implemented for `ScriptTurnOutcome`
+  |
+  = help: the following other types implement trait `Deserialize<'de>`:
+            `&'a Path` implements `Deserialize<'de>`
+            `&'a [u8]` implements `Deserialize<'de>`
+            `&'a str` implements `Deserialize<'de>`
+            `()` implements `Deserialize<'de>`
+            `(T,)` implements `Deserialize<'de>`
+            `(T0, T1)` implements `Deserialize<'de>`
+            `(T0, T1, T2)` implements `Deserialize<'de>`
+            `(T0, T1, T2, T3)` implements `Deserialize<'de>`
+          and $N others
+  = note: required for `ScriptTurnOutcome` to implement `DeserializeOwned`
+note: required by a bound in `require_deserialize`
+ --> tests/ui/manifest_no_deserialize.rs:2:27
+  |
+2 | fn require_deserialize<T: serde::de::DeserializeOwned>() {}
+  |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_deserialize`

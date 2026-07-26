@@ -110,7 +110,9 @@ pub(crate) fn bound_message(message: impl Into<String>) -> String {
     if message.len() <= EVAL_MESSAGE_MAX_BYTES {
         return message;
     }
-    let mut end = 509.min(message.len());
+    let mut end = EVAL_MESSAGE_MAX_BYTES
+        .saturating_sub(EVAL_MESSAGE_TRUNCATE_SUFFIX.len())
+        .min(message.len());
     while end > 0 && !message.is_char_boundary(end) {
         end -= 1;
     }

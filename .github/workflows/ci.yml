@@ -52,7 +52,7 @@ jobs:
         run: |
           unset ALLOY_API_KEY
           cargo test -p alloy-eval --locked
-          if cargo tree -p alloy-eval -e normal --prefix none | grep -E '^reqwest '; then
+          if cargo tree -p alloy-eval -e all --prefix none | grep -E '^reqwest '; then
             echo "alloy-eval must not link reqwest" >&2
             exit 1
           fi

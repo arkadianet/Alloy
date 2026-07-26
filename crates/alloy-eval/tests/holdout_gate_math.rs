@@ -106,19 +106,20 @@ fn naive_tie_meets_or_beats() {
 
 #[test]
 fn naive_loss_fails() {
-    let thresholds = GateThresholds::milestone_holdout_defaults();
+    let mut thresholds = GateThresholds::milestone_holdout_defaults();
+    // Control compile meets the configured floor; failure must come only from
+    // the naive-baseline comparison.
+    thresholds.min_compile_success_rate = 0.5;
     let control = metrics(0.5, 1.0, 0.0);
     let naive = metrics(1.0, 1.0, 0.0);
     let report = report(control, Some(naive));
     let result = evaluate_gate(&thresholds, &report);
     assert!(!result.passed);
-    assert!(result.failures.iter().any(|f| matches!(
-        f,
+    assert_eq!(result.failures.len(), 1);
+    assert!(matches!(
+        &result.failures[0],
         alloy_eval::GateFailure::LostToNaiveBaseline { .. }
-    ) || matches!(
-        f,
-        alloy_eval::GateFailure::CompileSuccessRate { .. }
-    )));
+    ));
 }
 
 #[test]

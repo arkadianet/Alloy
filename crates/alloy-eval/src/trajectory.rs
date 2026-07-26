@@ -319,6 +319,7 @@ fn write_jsonl_atomically(
             file.write_all(b"\n")?;
         }
         file.flush()?;
+        file.sync_all()?;
         Ok(())
     })();
     drop(file);

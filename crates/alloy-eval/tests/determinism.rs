@@ -80,7 +80,7 @@ fn assert_wall_latency_observed(report: &EvalReport) {
         non_error.iter().all(|fixture| serde_json::to_value(fixture)
             .unwrap()
             .get("wall_ms")
-            .is_some()),
+            .is_some_and(|value| value.is_number())),
         "non-error fixtures must carry wall_ms before report scrubbing"
     );
     assert_measured_latency(&report.metrics);
@@ -110,10 +110,25 @@ async fn determinism_concurrent_batch() {
     let mut config = EvalHarnessConfig::skeleton(fixture_root());
     config.max_concurrency = 8;
     let harness = EvalHarness::new(config).unwrap();
-    let mut reports = Vec::new();
-    for _ in 0..8 {
-        reports.push(scrub(&harness.run_batch(FixtureSet::Train).await.unwrap()));
-    }
+    let f0 = harness.run_batch(FixtureSet::Train);
+    let f1 = harness.run_batch(FixtureSet::Train);
+    let f2 = harness.run_batch(FixtureSet::Train);
+    let f3 = harness.run_batch(FixtureSet::Train);
+    let f4 = harness.run_batch(FixtureSet::Train);
+    let f5 = harness.run_batch(FixtureSet::Train);
+    let f6 = harness.run_batch(FixtureSet::Train);
+    let f7 = harness.run_batch(FixtureSet::Train);
+    let results = tokio::join!(f0, f1, f2, f3, f4, f5, f6, f7);
+    let reports = [
+        scrub(&results.0.unwrap()),
+        scrub(&results.1.unwrap()),
+        scrub(&results.2.unwrap()),
+        scrub(&results.3.unwrap()),
+        scrub(&results.4.unwrap()),
+        scrub(&results.5.unwrap()),
+        scrub(&results.6.unwrap()),
+        scrub(&results.7.unwrap()),
+    ];
     for report in &reports[1..] {
         assert_eq!(&reports[0], report);
     }

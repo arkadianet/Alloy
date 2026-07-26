@@ -27,7 +27,7 @@ const CANCEL_BEFORE_CRITERIA: &str = "before_criteria";
 
 /// One `unsafe` occurrence per source line; compiled once for the process.
 static UNSAFE_LINE_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)(^|\s)unsafe(\s|!|\()").expect("unsafe line regex is valid"));
+    LazyLock::new(|| Regex::new(r"(^|\s)unsafe(\s|!|\(|\{)").expect("unsafe line regex is valid"));
 
 // Test-only fault injection for the §5.3.2 built-request comparison. The
 // production path never sets it, so `build_turn_request` stays an identity.
@@ -399,19 +399,8 @@ fn execution_plan(
             entries: fixture.script_entries.clone(),
         }),
         ScriptedDriverMode::NaiveBaseline => {
-            let mut matches = fixture.manifest.turns.iter().filter(|turn| {
-                turn.turn_id.capability.as_str() == "repair" && turn.turn_id.ordinal == 0
-            });
-            let Some(turn) = matches.next() else {
-                return Err(EvalError::Manifest(
-                    "exactly one repair ordinal 0 turn is required".to_owned(),
-                ));
-            };
-            if matches.next().is_some() {
-                return Err(EvalError::Manifest(
-                    "exactly one repair ordinal 0 turn is required".to_owned(),
-                ));
-            }
+            let turn =
+                crate::manifest::require_single_repair_ordinal_zero(&fixture.manifest.turns)?;
             Ok(ExecutionPlan {
                 turns: vec![turn.clone()],
                 entries: vec![(
@@ -1241,10 +1230,11 @@ mod tests {
 
     #[test]
     fn no_new_unsafe_exact_regex() {
-        assert_eq!(UNSAFE_LINE_PATTERN.as_str(), r"(?m)(^|\s)unsafe(\s|!|\()");
+        assert_eq!(UNSAFE_LINE_PATTERN.as_str(), r"(^|\s)unsafe(\s|!|\(|\{)");
         assert_eq!(unsafe_line_count("unsafe \n"), 1);
         assert_eq!(unsafe_line_count(" unsafe! {}\n"), 1);
         assert_eq!(unsafe_line_count("\tunsafe(foo)\n"), 1);
+        assert_eq!(unsafe_line_count("unsafe{\n"), 1);
         assert_eq!(unsafe_line_count("myunsafe();\n"), 0);
         assert_eq!(unsafe_line_count("unsafe\n"), 0);
         assert_eq!(unsafe_line_count("safe\nunsafe \nunsafe!(); unsafe()"), 2);
