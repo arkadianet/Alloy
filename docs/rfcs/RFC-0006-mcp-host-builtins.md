@@ -6,10 +6,11 @@
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0005](./RFC-0005-sandbox-broker.md) (merged) |
-| **Effort** | 5–8 person-days |
+| **Effort** | 6–9 person-days |
 | **Related RFCs** | [0004](./RFC-0004-observability-cost-metering.md) optional `DecisionLog` injection · [0008](./RFC-0008-edit-engine.md) real `PatchApplyBackend` · [0010](./RFC-0010-scheduler-runtime-adapters.md) consumes `ToolError` / `cargo_check` · [0013](./RFC-0013-capability-registry-workers.md) `ToolHandle` / selectors · [0015](./RFC-0015-cli-profiles-config.md) profile UX |
 | **Product** | Alloy — AI Engineering Runtime |
 | **Supersedes** | Draft outline of this filename (expanded to implementation grade) |
+| **Review** | Principal systems review 2026-07-26 — required gaps closed; third-pass **Approve** |
 
 **Mental model (V2 §12 / ADR F-09 / ADR F-07):** The MCP host is the **sole tool bus**. Every tool call — builtin or (later) external — shares one schema model, one permission path, one dispatch path, and one result model. Day-1 tools are **in-process builtins registered as if they were MCP tools**. Every `Grant::Exec` still runs exclusively through the RFC-0005 Sandbox Broker. Fail closed. Lazy disclosure. No `graph_query` for Alloy workers (ADR F-04). No raw bash in the default profile.
 
@@ -49,8 +50,9 @@ RFC-0001 published `Grant`, `ExecAllow`, `Glob`, `HostAllow`, `PermissionToken`.
 | `ToolHandle` | Capability-facing wrapper (selectors + platform) |
 | `start_server` / `stop_server` | MVP stubs — unsupported / empty allowlist |
 | Lifecycle / concurrency / shutdown / drain | Normative state machine |
-| Observability | Tracing + optional `DecisionLog` tool-call records |
+| Observability | Tracing + optional `DecisionLog` + `McpMetricsSnapshot` |
 | Tests | Unit, integration, negative, permission, sandbox, cancel, concurrency, schema snapshot |
+| RFC-0005 visibility widenings | Listed `pub(crate)` helpers only — no new public sandbox surface |
 
 ### 1.4 Non-goals
 
@@ -70,13 +72,15 @@ RFC-0001 published `Grant`, `ExecAllow`, `Glob`, `HostAllow`, `PermissionToken`.
 ### 1.5 Day-1 MVP (normative)
 
 1. `InProcessMcpHost::new(...)` MUST register exactly the four builtins listed in §5.2 and MUST NOT register `graph_query`, `bash`, `sh`, or any raw-shell tool.
-2. `tools_for` MUST return only tools matching the supplied selectors, sorted by `ToolName` ascending byte order, capped at `MAX_TOOLS_PER_DISCLOSURE` (32), and MUST return an empty `Vec` when `selectors` is empty (never the full catalogue).
-3. `call` MUST validate token expiry and required grants **before** dispatch; missing/denied/expired/malformed → `Err(McpError::…)` fail closed; never partial execution.
+2. `tools_for` MUST return only tools matching the supplied selectors, sorted by `ToolName` ascending byte order, capped at `MAX_TOOLS_PER_DISCLOSURE` (32), and MUST return an empty `Vec` when `selectors` is empty (never the full catalogue). Cap is enforced by a pure disclosure helper over `&[ToolView]` (§4.1) so it is unit-testable with synthetic views.
+3. `call` MUST follow the §5.1 pipeline exactly. Precedence for simultaneous failures: `InvalidArguments` **before** `PermissionDenied`. Missing/denied/expired → `Err(McpError::…)` fail closed; never partial execution.
 4. `cargo_check` / `cargo_test` MUST invoke `SandboxBroker::exec` with `ExecClass::{Check, Test}` respectively; non-zero child exit MUST surface as `Ok(ToolResult)` with structured payload (not `Err`).
-5. `fs_read` MUST call `PathPolicy::authorize(path, PathAccess::Read)` and MUST deny `.env` / deny-glob paths via that policy.
+5. `fs_read` MUST call `PathPolicy::authorize(path, PathAccess::Read)` on the path to open, MUST open the **canonical** `PathBuf` returned by authorize, and MUST deny `.env` / deny-glob paths via that policy.
 6. `apply_patch` MUST call the injected `PatchApplyBackend`; the MVP stub MUST return the exact deterministic outcome in §3.7.1.
-7. `start_server` / `stop_server` MUST return `Err(McpError::Unsupported { .. })` in MVP (empty out-of-process allowlist).
+7. `start_server` / `stop_server` MUST return `Err(McpError::Unsupported(...))` in MVP (empty out-of-process allowlist).
 8. Builtin tools MUST share the same `ToolView` / `ToolCall` / `ToolResult` / permission / dispatch path as any future external MCP tool would.
+9. Host MUST construct `PathPolicy` from `broker.profile()` at `new` (no injectable divergent policy).
+10. Exec grant pre-check MUST reuse the RFC-0005 sandbox grant matcher (§5.5) — one authorization implementation — with `OperatorHomes`-derived `trusted_path` (§4.4).
 
 ---
 
@@ -100,7 +104,7 @@ RFC-0001 published `Grant`, `ExecAllow`, `Glob`, `HostAllow`, `PermissionToken`.
 
 ### 2.2 Relationship to RFC-0001
 
-Authoritative for: `Grant`, `ExecAllow`, `Glob`, `HostAllow`, `PermissionToken`, `RunId`, `ProfileId`, `Timestamp`, `Digest`, `SessionId`, `NodeId`, `TransactionId`, `ErrorClass`, session event enum including `ToolCall`.
+Authoritative for: `Grant`, `ExecAllow`, `Glob`, `HostAllow`, `PermissionToken`, `RunId`, `ProfileId`, `Timestamp`, `Digest`, `SessionId`, `NodeId`, `TransactionId`, `IdError`, `ErrorClass`, session event enum including `ToolCall`.
 
 This RFC **adds** tool IR types to `alloy-runtime` and MUST NOT redefine permission types. Expiry comparison MUST use the same rule as RFC-0005: `perms.expires.as_ref().map(|t| t.0)` against `Timestamp::now().0` (`OffsetDateTime`); reject when `now >= expires` (inclusive boundary).
 
@@ -108,27 +112,28 @@ This RFC **adds** tool IR types to `alloy-runtime` and MUST NOT redefine permiss
 
 Authoritative for: `SandboxBroker`, `SandboxExecRequest`, `SandboxExecResult`, `SandboxError`, `DenialReason`, `ExecClass`, `PathPolicy`, `PathAccess`, `NativeSandboxBroker`, `RecordingSandboxBroker`, deny globs, quarantine, env scrubbing.
 
-This RFC **consumes** those APIs. It MUST NOT fork a second exec path. Builtins MUST NOT call `std::process::Command` or `tokio::process::Command` (clippy seam from RFC-0005 remains in force).
+This RFC **consumes** those APIs. It MUST NOT fork a second exec path. Builtins MUST NOT call `std::process::Command` or `tokio::process::Command` (clippy seam from RFC-0005 remains in force — crate-wide `clippy.toml`).
 
-**Cancel note:** RFC-0005 reserved `SandboxError::Cancelled` and deferred an explicit cancel field. This RFC cancels in-flight sandbox work by **dropping** the `exec` future (drop-guard kill per RFC-0005 §6.4) and returning `McpError::Cancelled` to the MCP caller. It does **not** require modifying `SandboxExecRequest` in MVP.
+**Cancel note:** RFC-0005 reserved `SandboxError::Cancelled` and deferred an explicit cancel field. This RFC cancels in-flight sandbox work by **dropping** the `exec` future (drop-guard kill per RFC-0005 §6.4). Caller cancel of an MCP `call` is likewise by **dropping the `call` future** (§5.11 / §6.3). No `SandboxExecRequest` modification in MVP.
+
+**Obs note:** RFC-0005 §4 stated `alloy-tools` has no storage/session/obs dependency for the **sandbox** module. This RFC clarifies: `sandbox/` remains free of obs; `mcp/` MAY depend on the `DecisionLog` **trait** only (no storage).
 
 ### 2.4 Already implemented | Added by RFC-0006 | Deferred
 
 | Category | Contents |
 | --- | --- |
 | **Already implemented** | `Grant` / `PermissionToken` / IDs (0001); `DecisionLog` / `ToolCallRecord` (0004); `SandboxBroker` / `PathPolicy` / backends (0005); five-crate workspace; `#![deny(unsafe_code)]` on `alloy-tools` |
-| **Added by RFC-0006** | Tool IR types; `McpPlatform`; `InProcessMcpHost`; four builtins; lazy disclosure; permission gate; `PatchApplyBackend` + stub; `ToolHandle`; MCP errors; host lifecycle; tests; observability hooks |
+| **Added by RFC-0006** | Tool IR types; `McpPlatform`; `InProcessMcpHost`; four builtins; lazy disclosure; permission gate; `PatchApplyBackend` + stub; `ToolHandle`; MCP errors; host lifecycle; metrics snapshot; tests; `pub(crate)` widenings listed in §4.4 |
 | **Deferred** | Custom MCP servers (0013 / V2); EditEngine impl (0008); capability workers (0013); `ra_*`; external-only graph mirror (not designed); community MCP allowlists; network-allow profiles |
 
 ### 2.5 Dependency boundaries
 
 ```text
 alloy-cli ──► alloy-tools ──► alloy-runtime
-                 ├── sandbox/   (RFC-0005)
-                 └── mcp/       (RFC-0006)
+                 ├── sandbox/   (RFC-0005; no DecisionLog)
+                 └── mcp/       (RFC-0006; may use DecisionLog trait)
 
 alloy-runtime MUST NOT depend on alloy-tools.
-alloy-tools MAY depend on alloy-runtime only (types, obs traits, CancellationToken via tokio-util already in runtime — host uses tokio-util directly).
 Exactly five workspace crates. No MCP OS service. No sixth crate.
 ```
 
@@ -152,13 +157,17 @@ pub use sandbox::{ /* existing RFC-0005 re-exports unchanged */ };
 
 pub use mcp::{
     ApplyPatchArgs, ApplyPatchOutcome, BuiltinToolId, CargoCheckArgs, CargoTestArgs,
-    FsReadArgs, InProcessMcpHost, McpError, McpHostConfig, McpPlatform, McpServerSpec,
-    PatchApplyBackend, PatchApplyError, RecordingMcpPlatform, ServerId, StubPatchApplyBackend,
-    ToolHandle, MAX_TOOLS_PER_DISCLOSURE,
+    FsReadArgs, InProcessMcpHost, McpError, McpHostConfig, McpHostPhase, McpMetricsSnapshot,
+    McpPlatform, PatchApplyBackend, PatchApplyError, PermissionDenial,
+    RecordingMcpPlatform, StubPatchApplyBackend, ToolHandle,
+    MAX_ARGUMENT_BYTES, MAX_ARG_STRING_BYTES, MAX_FEATURES, MAX_TOOLS_PER_DISCLOSURE,
 };
+
+// Re-export shared IR that the trait names (also available from alloy-runtime):
+pub use alloy_runtime::{McpServerSpec, McpTransport, ServerId};
 ```
 
-`alloy-tools` remains `#![deny(unsafe_code)]` at the crate root (RFC-0005 already narrowed `forbid` → `deny` for sandbox backend seams only). MCP modules MUST NOT introduce `unsafe`.
+`alloy-tools` remains `#![deny(unsafe_code)]` at the crate root. MCP modules MUST NOT introduce `unsafe`.
 
 ### 3.2 Shared tool IR — `alloy-runtime` (additive)
 
@@ -169,25 +178,44 @@ New module `crates/alloy-runtime/src/types/tools.rs`, re-exported from `types/mo
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::ids::{NodeId, RunId, SessionId};
-use super::permission::PermissionToken;
+use super::ids::{IdError, NodeId, RunId, SessionId, TransactionId};
 
 /// Catalog tool name (`cargo_check`, `fs_read`, …).
 ///
-/// Validation: non-empty, ≤128 bytes, ASCII `[a-z0-9_]` only.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Validation (enforced by [`ToolName::new`] **and** by `Deserialize`):
+/// non-empty, ≤128 bytes, ASCII `[a-z0-9_]` only.
+/// Length **and** charset failures both return `IdError::InvalidName`
+/// (Display: `invalid name id`) — no new error variant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub struct ToolName(String);
 
 impl ToolName {
-    pub fn new(s: impl Into<String>) -> Result<Self, ToolNameError>;
+    pub fn new(s: impl Into<String>) -> Result<Self, IdError> {
+        let s = s.into();
+        if s.is_empty() || s.len() > 128 {
+            return Err(IdError::InvalidName);
+        }
+        if !s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_')) {
+            return Err(IdError::InvalidName);
+        }
+        Ok(Self(s))
+    }
     #[must_use]
-    pub fn as_str(&self) -> &str;
+    pub fn as_str(&self) -> &str { &self.0 }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ToolNameError {
-    #[error("invalid tool name")]
-    Invalid,
+impl std::fmt::Display for ToolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        ToolName::new(s).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Lazy-disclosure selector (capability `required_tools` / host `tools_for`).
@@ -196,7 +224,7 @@ pub enum ToolNameError {
 pub enum ToolSelector {
     /// Exact tool name.
     Name { name: ToolName },
-    /// Tag / group id (e.g. `sel.compiler`). Matching is exact string equality on tags.
+    /// Tag / group id (e.g. `sel.compiler`). Opaque, case-sensitive, exact equality.
     Tag { tag: String },
 }
 
@@ -209,30 +237,17 @@ impl ToolSelector {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ToolCall {
-    /// Tool to invoke (must be a registered name).
     pub name: ToolName,
-    /// JSON arguments matching the tool's `input_schema`.
     pub arguments: Value,
-    /// Optional call id for correlation (UUID string or model-supplied id).
     pub call_id: Option<String>,
-    /// Optional session attribution (observability).
     pub session: Option<SessionId>,
-    /// Optional run attribution.
     pub run: Option<RunId>,
-    /// Optional node attribution.
     pub node: Option<NodeId>,
 }
 
 impl ToolCall {
     pub fn new(name: ToolName, arguments: Value) -> Self {
-        Self {
-            name,
-            arguments,
-            call_id: None,
-            session: None,
-            run: None,
-            node: None,
-        }
+        Self { name, arguments, call_id: None, session: None, run: None, node: None }
     }
     #[must_use]
     pub fn with_call_id(mut self, id: impl Into<String>) -> Self {
@@ -259,7 +274,6 @@ impl ToolCall {
 pub struct ToolView {
     pub name: ToolName,
     pub description: String,
-    /// JSON Schema object for arguments.
     pub input_schema: Value,
     /// Disclosure tags (e.g. `sel.compiler`). Stable, sorted ascending at registration.
     pub tags: Vec<String>,
@@ -267,46 +281,41 @@ pub struct ToolView {
     pub builtin: bool,
 }
 
+impl ToolView {
+    /// Constructor for tests / eval fixtures (`#[non_exhaustive]` requires this).
+    pub fn new(
+        name: ToolName,
+        description: impl Into<String>,
+        input_schema: Value,
+        tags: Vec<String>,
+        builtin: bool,
+    ) -> Self {
+        let mut tags = tags;
+        tags.sort();
+        tags.dedup();
+        Self { name, description: description.into(), input_schema, tags, builtin }
+    }
+}
+
 /// Successful or tool-level-failed invocation payload.
-///
-/// Host/transport failures use `McpError` (in `alloy-tools`). Tool-level failures
-/// (non-zero cargo exit, read denied after grant check maps to host error — see §8,
-/// stub apply, invalid tool business args after schema parse) use `is_error = true`
-/// with `error: Some(ToolError)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ToolResult {
     pub name: ToolName,
     pub call_id: Option<String>,
-    /// Structured content (JSON). For cargo tools: messages / summary object.
     pub content: Value,
-    /// `false` on tool success; `true` when `error` is populated.
+    /// MUST equal `error.is_some()`.
     pub is_error: bool,
     pub error: Option<ToolError>,
-    /// Wall time inside the host dispatch (ms).
     pub duration_ms: u64,
 }
 
 impl ToolResult {
     pub fn ok(name: ToolName, content: Value, duration_ms: u64) -> Self {
-        Self {
-            name,
-            call_id: None,
-            content,
-            is_error: false,
-            error: None,
-            duration_ms,
-        }
+        Self { name, call_id: None, content, is_error: false, error: None, duration_ms }
     }
     pub fn err(name: ToolName, content: Value, error: ToolError, duration_ms: u64) -> Self {
-        Self {
-            name,
-            call_id: None,
-            content,
-            is_error: true,
-            error: Some(error),
-            duration_ms,
-        }
+        Self { name, call_id: None, content, is_error: true, error: Some(error), duration_ms }
     }
     #[must_use]
     pub fn with_call_id(mut self, id: Option<String>) -> Self {
@@ -316,69 +325,67 @@ impl ToolResult {
 }
 
 /// Tool-level failure taxonomy (consumed by RFC-0010 retry policy).
-///
-/// This is **not** a host/transport error. See §8 for mapping rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[non_exhaustive]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolError {
-    /// Transient infrastructure / sandbox / IO style failure worth retry.
     #[error("transient: {code}: {message}")]
     Transient { code: String, message: String },
-    /// Permanent business / policy / stub / unsupported failure — do not retry as-is.
     #[error("permanent: {code}: {message}")]
     Permanent { code: String, message: String },
-    /// Caller-supplied arguments failed validation after JSON Schema parse.
     #[error("invalid_args: {message}")]
     InvalidArgs { message: String },
-    /// Tool executed but the underlying command failed (e.g. cargo non-zero).
-    /// Still returned inside `Ok(ToolResult)`; retry is scheduler policy.
-    #[error("execution_failed: exit={exit_code:?}: {message}")]
+    #[error("execution_failed: exit={exit_code:?} signal={signal:?}: {message}")]
     ExecutionFailed {
         exit_code: Option<i32>,
+        signal: Option<i32>,
         message: String,
     },
 }
 
-/// Out-of-process server spec (MVP: accepted only to return Unsupported).
+/// Out-of-process server spec.
+///
+/// **Unstable shape** — owned by future RFC-0013 allowlist work. MVP accepts the value
+/// only to return `McpError::Unsupported`. Do not treat as a stable serde product payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct McpServerSpec {
-    /// Logical server name.
     pub name: String,
-    /// Transport — MVP ignores and rejects.
     pub transport: McpTransport,
+}
+
+impl McpServerSpec {
+    /// Constructor required because the struct is `#[non_exhaustive]`.
+    pub fn new(name: impl Into<String>, transport: McpTransport) -> Self {
+        Self { name: name.into(), transport }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum McpTransport {
     /// Stdio subprocess (deferred).
     Stdio { command: String, args: Vec<String> },
 }
 
-/// Opaque server id (UUID newtype) — allocated only if a server starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ServerId(uuid::Uuid);
-
-impl ServerId {
-    pub fn new() -> Self { Self(uuid::Uuid::new_v4()) }
-    pub fn as_uuid(&self) -> &uuid::Uuid { &self.0 }
-}
+/// Opaque server id.
+///
+/// **Implementation:** add `uuid_id!(ServerId);` in `crates/alloy-runtime/src/types/ids.rs`
+/// (same macro as `SessionId` — **no** `Default`, includes `Display`/`parse`).
+/// Re-export from `types::tools` and the crate root. Do **not** hand-roll a parallel newtype.
 ```
 
-**Visibility:** all items above are `pub` in `alloy-runtime`. `ServerId` / `McpServerSpec` live in runtime so the `McpPlatform` signature in tools can name them without circular types; `alloy-tools` re-exports them for convenience.
+**Send/Sync:** all tool IR types are `Send + Sync`.
 
-**Send/Sync:** all tool IR types are `Send + Sync` when containing only owned data (satisfied).
-
-**Persistence:** tool IR is serde-stable for session/event payloads and eval fixtures. Field adds MUST be `#[non_exhaustive]` / optional with defaults.
+**Persistence:** tool IR is serde-stable. `ToolName` deserialize MUST reject invalid names (test: `serde_json::from_str::<ToolName>("\"Cargo Check\"")` fails).
 
 ### 3.3 `McpError` — `alloy-tools::mcp`
 
 ```rust
 use std::time::Duration;
 use thiserror::Error;
+use crate::sandbox::SandboxError;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -410,8 +417,10 @@ pub enum McpError {
     #[error("timeout after {0:?}")]
     Timeout(Duration),
 
+    /// Broker / path-policy errors that did not map to a more specific variant.
+    /// Construct **only** via `map_sandbox_error` (crate-private) — **no** `#[from]`.
     #[error("sandbox: {0}")]
-    Sandbox(#[from] crate::sandbox::SandboxError),
+    Sandbox(SandboxError),
 
     #[error("internal: {0}")]
     Internal(String),
@@ -426,8 +435,56 @@ pub enum PermissionDenial {
     PathNotCovered(String),
     #[error("exec not allowlisted for tool")]
     ExecNotAllowlisted,
+    #[error("args not allowlisted for tool")]
+    ArgsNotAllowlisted,
     #[error("tool not disclosed for handle selectors")]
     NotDisclosed,
+}
+
+/// Sole `SandboxError` → `McpError` conversion. MUST be used instead of `?`/`From`.
+pub(crate) fn map_sandbox_error(err: SandboxError) -> McpError {
+    match err {
+        SandboxError::Denied(reason) => McpError::PermissionDenied(map_denial(reason)),
+        SandboxError::TokenExpired => McpError::TokenExpired,
+        SandboxError::Timeout(d) => McpError::Timeout(d),
+        SandboxError::Cancelled => McpError::Cancelled,
+        // Future non-Denied #[non_exhaustive] arms. Messages redacted before wrapping.
+        other => McpError::Sandbox(redact_sandbox_error(other)),
+    }
+}
+
+/// Exhaustive over today's DenialReason arms (no wildcard). When a future RFC adds a
+/// DenialReason variant, this match MUST be updated — that is intentional.
+fn map_denial(reason: crate::sandbox::DenialReason) -> PermissionDenial {
+    use crate::sandbox::DenialReason::*;
+    match reason {
+        MissingExecGrant => PermissionDenial::MissingGrant("exec".into()),
+        ExecNotAllowlisted => PermissionDenial::ExecNotAllowlisted,
+        ArgsNotAllowlisted => PermissionDenial::ArgsNotAllowlisted,
+        PathDenied(_) => PermissionDenial::PathNotCovered("path denied".into()),
+        CwdOutsideJail => PermissionDenial::PathNotCovered("cwd outside jail".into()),
+        NetworkDenied => PermissionDenial::MissingGrant("network".into()),
+        EnvDenied(_) => PermissionDenial::MissingGrant("env".into()),
+        QuarantineBlocked(_) => PermissionDenial::MissingGrant("quarantine".into()),
+    }
+}
+
+/// Rebuild SandboxError variants whose Display may contain absolute host paths,
+/// replacing pathful strings with fixed tokens. Applied at the MCP boundary so
+/// models never see operator filesystem layout (§9.1).
+fn redact_sandbox_error(err: SandboxError) -> SandboxError {
+    match err {
+        SandboxError::Invalid(_) => SandboxError::Invalid("invalid sandbox request".into()),
+        SandboxError::Internal(_) => SandboxError::Internal("internal sandbox error".into()),
+        SandboxError::BackendUnavailable { backend, .. } => SandboxError::BackendUnavailable {
+            backend,
+            message: "backend unavailable".into(),
+        },
+        SandboxError::BackendCannotEnforce(_) =>
+            SandboxError::BackendCannotEnforce("backend cannot enforce policy".into()),
+        SandboxError::Io(_) => SandboxError::Io(std::io::Error::other("sandbox io error")),
+        other => other, // Timeout/Cancelled/TokenExpired/UnsupportedOs/Denied already mapped
+    }
 }
 ```
 
@@ -443,24 +500,22 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait McpPlatform: Send + Sync {
-    /// Start an out-of-process MCP server.
-    ///
-    /// MVP: ALWAYS returns `Err(McpError::Unsupported(...))`.
+    /// MVP: ALWAYS `Err(McpError::Unsupported(...))`.
     async fn start_server(&self, spec: McpServerSpec) -> Result<ServerId, McpError>;
 
-    /// Stop a previously started server.
-    ///
-    /// MVP: ALWAYS returns `Err(McpError::Unsupported(...))` (no servers exist).
+    /// MVP: ALWAYS `Err(McpError::Unsupported(...))`.
     async fn stop_server(&self, id: ServerId) -> Result<(), McpError>;
 
-    /// Lazy disclosure: return tool views matching `selectors`.
-    ///
-    /// MUST obey §5.4 (empty selectors → empty vec; cap; sort; dedupe by name).
+    /// Lazy disclosure — MUST obey §5.4.
     async fn tools_for(&self, selectors: &[ToolSelector]) -> Result<Vec<ToolView>, McpError>;
 
-    /// Invoke a tool under `perms`.
+    /// Invoke a tool under `perms`. Pipeline: §5.1.
     ///
-    /// Pipeline: §5.1. Permission failures → `Err`. Tool-level failures → `Ok(ToolResult{is_error:true})`.
+    /// **Cancellation (normative for RFC-0013):** callers cancel an in-flight call by
+    /// **dropping** the returned future. Drop MUST release the in-flight permit, drop any
+    /// nested `SandboxBroker::exec` future (process-group kill), and MUST NOT write a
+    /// `DecisionLog` record for that call. There is no per-call `CancellationToken` field
+    /// on `ToolCall` in MVP.
     async fn call(
         &self,
         call: ToolCall,
@@ -469,80 +524,126 @@ pub trait McpPlatform: Send + Sync {
 }
 ```
 
-**Ownership:** implementors are typically `Arc`-wrapped. Trait is `Send + Sync`. Methods take `&self`. `call` takes `PermissionToken` by value (cheap clone of grants vec — callers may `clone` if they need to retain).
+**Ownership:** implementors are typically `Arc`-wrapped. Trait is `Send + Sync`. `call` takes `PermissionToken` by value.
 
 **async_trait:** REQUIRED on public traits through M1 (RFC-0001 edition decision).
 
 ### 3.5 `InProcessMcpHost`
 
 ```rust
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use alloy_runtime::obs::DecisionLog;
+use crate::sandbox::SandboxBroker;
 
-use alloy_runtime::obs::DecisionLog; // optional
-use crate::sandbox::{PathPolicy, SandboxBroker};
-
-/// Construction / runtime configuration for the in-process host.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct McpHostConfig {
-    /// Workspace jail (canonical). MUST equal `sandbox.profile().fs_jail`.
-    pub workspace_jail: std::path::PathBuf,
-    /// Max concurrent `call` futures (fairness cap). Default: 64.
+    /// Max concurrent `call` futures. MUST be ≥ 1. Default: 64.
     pub max_in_flight: usize,
-    /// Optional parent cancel (runtime shutdown). Default: new child token.
+    /// Host-level wall-clock timeout around **every** dispatch (including `fs_read` /
+    /// `apply_patch`).
+    ///
+    /// - `None` (default): at `InProcessMcpHost::new`, set to
+    ///   `broker.profile().exec_timeout + Duration::from_secs(60)`.
+    /// - `Some(d)`: used as-is; construction FAILS if `d < exec_timeout`.
+    pub call_timeout: Option<Duration>,
+    /// Parent cancel (runtime shutdown). Default: new token.
     pub cancel: CancellationToken,
 }
 
 impl McpHostConfig {
-    pub fn new(workspace_jail: std::path::PathBuf) -> Self;
+    pub fn new() -> Self {
+        Self {
+            max_in_flight: 64,
+            call_timeout: None,
+            cancel: CancellationToken::new(),
+        }
+    }
+    #[must_use]
+    pub fn with_max_in_flight(mut self, n: usize) -> Self { self.max_in_flight = n; self }
+    /// Pin an explicit timeout (must be ≥ profile exec_timeout at host `new`).
+    #[must_use]
+    pub fn with_call_timeout(mut self, d: Duration) -> Self {
+        self.call_timeout = Some(d);
+        self
+    }
+    #[must_use]
+    pub fn with_cancel(mut self, c: CancellationToken) -> Self { self.cancel = c; self }
 }
 
-pub struct InProcessMcpHost {
-    // private fields — see §4
+impl Default for McpHostConfig {
+    fn default() -> Self { Self::new() }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum McpHostPhase {
+    Running = 1,
+    Draining = 2,
+    Stopped = 3,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpMetricsSnapshot {
+    pub calls_ok: u64,
+    pub calls_tool_error: u64,
+    pub calls_mcp_error: u64,
+    pub denials: u64,
+    pub disclose_truncated: u64,
+    pub in_flight: u64,
+}
+
+pub struct InProcessMcpHost { /* private — §4 */ }
 
 impl InProcessMcpHost {
-    /// Build host, register builtins, share broker + path policy + patch backend.
+    /// Build host. Constructs `PathPolicy::from_profile(broker.profile(), read_only_roots)`.
     ///
-    /// Fails with `McpError::Internal` if `workspace_jail` canonicalization fails or
-    /// does not equal `broker.profile().fs_jail` (byte-equal after canonicalize).
+    /// `homes` MUST be the **same** `OperatorHomes` value used to construct the broker
+    /// (including any `with_operator_homes` override). The host derives
+    /// `trusted_path = trusted_path_dirs(homes) ∪ trusted_roots(homes)` exactly as
+    /// `NativeSandboxBroker::exec_inner` does, so grant pre-check and broker auth agree.
+    ///
+    /// Fails if `max_in_flight == 0`, if an explicitly set `call_timeout` is
+    /// `< broker.profile().exec_timeout` (see §6.2), or if `PathPolicy::from_profile` fails.
     pub fn new(
         broker: Arc<dyn SandboxBroker>,
-        path_policy: PathPolicy,
+        homes: crate::sandbox::OperatorHomes,
+        read_only_roots: Vec<PathBuf>,
         patch_backend: Arc<dyn PatchApplyBackend>,
         config: McpHostConfig,
     ) -> Result<Self, McpError>;
 
-    /// Same as `new` with optional decision-log injection for ToolCall records.
-    pub fn new_with_obs(
-        broker: Arc<dyn SandboxBroker>,
-        path_policy: PathPolicy,
-        patch_backend: Arc<dyn PatchApplyBackend>,
-        config: McpHostConfig,
-        decision_log: Option<Arc<dyn DecisionLog>>,
-    ) -> Result<Self, McpError>;
+    #[must_use]
+    pub fn with_decision_log(self, log: Arc<dyn DecisionLog>) -> Self;
 
-    /// Begin drain: reject new `call` / `tools_for` with `ShuttingDown`; wait for in-flight.
-    pub async fn drain(&self) -> Result<(), McpError>;
+    /// Begin drain: reject new admissions; wait up to `grace` for in-flight; then cancel.
+    /// Mirrors `AlloyRuntime::drain(grace)`. See §6.4.
+    pub async fn drain(&self, grace: Duration) -> Result<(), McpError>;
 
-    /// Cancel token (child of config.cancel). Callers may clone for per-call linkage.
     #[must_use]
     pub fn cancellation(&self) -> CancellationToken;
 
-    /// Test/introspection: number of registered tools (MVP: always 4).
     #[must_use]
-    pub fn registered_len(&self) -> usize;
+    pub fn phase(&self) -> McpHostPhase;
+
+    #[must_use]
+    pub fn metrics(&self) -> McpMetricsSnapshot;
+
+    /// Registered tool names (sorted). MVP: exactly the four builtins.
+    #[must_use]
+    pub fn registered_names(&self) -> Vec<alloy_runtime::ToolName>;
 }
 
 #[async_trait]
 impl McpPlatform for InProcessMcpHost { /* §5 */ }
 ```
 
-**PathPolicy construction:** callers MUST build `PathPolicy::from_profile(broker.profile(), read_only_roots)` using the same RO roots the broker uses for operator cargo/rustup homes when available; for unit tests, `from_profile(profile, vec![])` is permitted. Host MUST NOT construct a divergent deny-glob set.
+**PathPolicy:** constructed **inside** `new` from `broker.profile()` + `read_only_roots`. Callers MUST NOT inject a divergent policy. Jail is always `broker.profile().fs_jail`. **OperatorHomes:** required so exec pre-check roots match the broker without extending `SandboxBroker` (§4.4). Wiring MUST build homes once and pass the same value to `NativeSandboxBroker::with_operator_homes(profile, homes.clone())` and `InProcessMcpHost::new(..., homes, ...)`. Host caches `trusted_path` at `new`; broker recomputes per exec — toolchain install/removal after `new` may diverge; broker re-authorization keeps fail-closed. Host pre-check exists for §5.1 ordering determinism (not because the broker would otherwise skip grant matching).
 
 ### 3.6 Builtin argument / result DTOs
-
-Normative JSON Schemas are in §5.3. Rust DTOs used after schema validation:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -554,7 +655,6 @@ pub struct CargoCheckArgs {
     pub features: Vec<String>,
     #[serde(default)]
     pub all_features: bool,
-    /// MVP: only `"json"` accepted; default `"json"`.
     #[serde(default = "default_message_format")]
     pub message_format: String,
 }
@@ -568,23 +668,17 @@ pub struct CargoTestArgs {
     pub test_name_filter: Option<String>,
     #[serde(default)]
     pub jobs: Option<u32>,
-    /// Soft hint only — broker timeout remains profile `exec_timeout`. Default 600.
-    #[serde(default = "default_test_timeout")]
-    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsReadArgs {
-    /// Path relative to jail OR absolute under jail.
     pub path: String,
-    /// Max bytes to return. Default 262_144. Hard max 1_048_576.
     #[serde(default = "default_fs_read_max")]
     pub max_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyPatchArgs {
-    /// Unified diff text OR JSON `PatchSet` object — see §5.3.4.
     pub patch: serde_json::Value,
     #[serde(default)]
     pub dry_run: bool,
@@ -594,23 +688,26 @@ pub struct ApplyPatchArgs {
 pub struct ApplyPatchOutcome {
     pub dry_run: bool,
     pub files_touched: Vec<String>,
-    pub transaction_id: Option<String>,
+    pub transaction_id: Option<TransactionId>,
     pub message: String,
 }
 
 fn default_message_format() -> String { "json".into() }
-fn default_test_timeout() -> u64 { 600 }
 fn default_fs_read_max() -> usize { 262_144 }
+
+/// Hard cap on serialized `ToolCall.arguments` JSON bytes.
+pub const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+/// Max `features` entries for cargo_check.
+pub const MAX_FEATURES: usize = 64;
+/// Max bytes for any single string field in args.
+pub const MAX_ARG_STRING_BYTES: usize = 4096;
 ```
 
 ### 3.7 `PatchApplyBackend` (injection seam before RFC-0008)
 
-RFC-0008 owns EditEngine. RFC-0006 MUST NOT depend on EditEngine types or behaviour.
-
 ```rust
 #[async_trait]
 pub trait PatchApplyBackend: Send + Sync {
-    /// Apply a patch request produced by the `apply_patch` builtin.
     async fn apply(&self, args: ApplyPatchArgs) -> Result<ApplyPatchOutcome, PatchApplyError>;
 }
 
@@ -629,7 +726,6 @@ pub enum PatchApplyError {
     Internal(String),
 }
 
-/// Deterministic MVP stub. RFC-0008 replaces the injected `Arc<dyn PatchApplyBackend>`.
 pub struct StubPatchApplyBackend;
 
 #[async_trait]
@@ -672,20 +768,20 @@ Ok(ToolResult {
 
 | Requirement | Rule |
 | --- | --- |
-| Trait stability | RFC-0008 MUST implement `PatchApplyBackend` (adapter over `EditEngine`) OR provide `Arc<dyn PatchApplyBackend>` that preserves this trait’s signatures |
-| Host change | RFC-0006 host MUST NOT require code changes beyond injecting a different `Arc<dyn PatchApplyBackend>` |
+| Trait stability | RFC-0008 MUST implement `PatchApplyBackend` (adapter over `EditEngine`) OR provide `Arc<dyn PatchApplyBackend>` preserving these signatures |
+| Host change | Host MUST NOT require code changes beyond injecting a different `Arc<dyn PatchApplyBackend>` |
 | Success mapping | `Ok(ApplyPatchOutcome)` → `Ok(ToolResult{is_error:false, content: serialize(outcome)})` |
-| `Unsupported` | → `ToolError::Permanent { code: "unsupported", … }` |
+| `Unsupported(msg)` | → `ToolError::Permanent { code: "unsupported", message: msg }` except the stub string in §3.7.1 which uses code `edit_engine_unwired` |
 | `InvalidPatch` | → `ToolError::InvalidArgs` |
 | `Conflict` | → `ToolError::Permanent { code: "conflict", … }` |
-| `Io` / `Internal` | → `ToolError::Transient` (`Io`) / `ToolError::Permanent` (`Internal`) |
-| Permissions | Still enforced by host **before** backend call; backend MUST NOT bypass host grants |
-| Second write stack | Forbidden — backend is the sole apply path for `apply_patch` |
+| `Io` | → `ToolError::Transient { code: "io", … }` |
+| `Internal` | → `ToolError::Permanent { code: "internal", … }` |
+| Permissions | Still enforced by host **before** backend call |
+| Second write stack | Forbidden |
 
 ### 3.8 `ToolHandle`
 
 ```rust
-/// Capability-facing wrapper: disclosure + call restricted to a selector set.
 pub struct ToolHandle {
     platform: Arc<dyn McpPlatform>,
     selectors: Vec<ToolSelector>,
@@ -694,11 +790,10 @@ pub struct ToolHandle {
 impl ToolHandle {
     pub fn new(platform: Arc<dyn McpPlatform>, selectors: Vec<ToolSelector>) -> Self;
 
-    /// `platform.tools_for(&self.selectors)`.
     pub async fn tools(&self) -> Result<Vec<ToolView>, McpError>;
 
-    /// Invoke tool if `call.name` is within the disclosed set for `self.selectors`;
-    /// otherwise `Err(McpError::PermissionDenied(NotDisclosed))` **before** platform call.
+    /// If `call.name` ∉ disclosed set for `self.selectors` → `NotDisclosed` before platform call.
+    /// Cancellation: drop the future (§3.4).
     pub async fn call(
         &self,
         call: ToolCall,
@@ -710,26 +805,59 @@ impl ToolHandle {
 }
 ```
 
-**Ownership:** `ToolHandle` is `Clone` via `Arc` clone of platform + owned selectors vec. `Send + Sync`.
+**Clone** via `Arc` clone of platform + owned selectors. `Send + Sync`.
 
-**Disclosure check algorithm for `ToolHandle::call`:** compute `allowed = tools_for(selectors)` name set; if `call.name` ∉ allowed → `NotDisclosed`. This MUST be identical to recomputing disclosure (no stale cache required in MVP; optional cache invalidated on host registry change — registry is immutable after `new`).
+Disclosure check: compute `allowed = tools_for(selectors)` name set; if `call.name` ∉ allowed → `NotDisclosed`. Registry immutable after `new` → no stale-cache issue.
 
 ### 3.9 `RecordingMcpPlatform` (test double)
 
+Full double patterned after `RecordingSandboxBroker` (RFC-0005 §3.7):
+
 ```rust
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
+/// FIFO canned `call` outcomes for RFC-0010 / RFC-0013 tests without a real sandbox.
 pub struct RecordingMcpPlatform {
-    // inner: InProcessMcpHost OR scripted map
+    scripts: Mutex<VecDeque<Result<ToolResult, McpError>>>,
+    recorded: Mutex<Vec<(ToolCall, PermissionToken)>>,
+    views: Vec<ToolView>,
 }
 
 impl RecordingMcpPlatform {
-    /// Wrap a real host and record `(ToolCall, PermissionToken)` in order.
-    pub fn wrap(inner: Arc<dyn McpPlatform>) -> Self;
+    /// Empty script queue; `tools_for` returns `views` filtered by §5.4 helper.
+    pub fn new(views: Vec<ToolView>) -> Self;
+
+    /// Convenience: four builtin views with empty schemas for unit tests.
+    pub fn with_builtin_views() -> Self;
+
+    /// Push a canned `call` outcome (FIFO).
+    pub fn push(&self, outcome: Result<ToolResult, McpError>);
+
+    /// Every `call` is recorded (FIFO) **before** the script is consulted.
     pub fn recorded_calls(&self) -> Vec<(ToolCall, PermissionToken)>;
 }
 
 #[async_trait]
-impl McpPlatform for RecordingMcpPlatform { /* delegate + record on call */ }
+impl McpPlatform for RecordingMcpPlatform {
+    async fn start_server(&self, _spec: McpServerSpec) -> Result<ServerId, McpError> {
+        Err(McpError::Unsupported("recording: start_server".into()))
+    }
+    async fn stop_server(&self, _id: ServerId) -> Result<(), McpError> {
+        Err(McpError::Unsupported("recording: stop_server".into()))
+    }
+    async fn tools_for(&self, selectors: &[ToolSelector]) -> Result<Vec<ToolView>, McpError> {
+        Ok(disclose(&self.views, selectors).0)
+    }
+    async fn call(&self, call: ToolCall, perms: PermissionToken) -> Result<ToolResult, McpError> {
+        self.recorded.lock().unwrap().push((call, perms));
+        self.scripts.lock().unwrap().pop_front()
+            .unwrap_or_else(|| Err(McpError::Internal("recording exhausted".into())))
+    }
+}
 ```
+
+Downstream RFCs that need real sandbox behaviour wrap `InProcessMcpHost` + `RecordingSandboxBroker` instead.
 
 ### 3.10 `BuiltinToolId` & constants
 
@@ -744,25 +872,21 @@ pub enum BuiltinToolId {
 
 impl BuiltinToolId {
     pub const ALL: [BuiltinToolId; 4] = [
-        Self::CargoCheck,
-        Self::CargoTest,
-        Self::FsRead,
-        Self::ApplyPatch,
+        Self::CargoCheck, Self::CargoTest, Self::FsRead, Self::ApplyPatch,
     ];
     #[must_use]
-    pub fn name(self) -> ToolName; // cargo_check / cargo_test / fs_read / apply_patch
+    pub fn name(self) -> ToolName;
     #[must_use]
     pub fn tags(self) -> &'static [&'static str];
 }
 
-/// Hard cap on `tools_for` results.
 pub const MAX_TOOLS_PER_DISCLOSURE: usize = 32;
 
-/// Canonical tags (normative).
-/// cargo_check  → ["sel.compiler"]
-/// cargo_test   → ["sel.test"]
-/// fs_read      → ["sel.fs"]
-/// apply_patch  → ["sel.edit"]
+// Canonical tags (normative, case-sensitive):
+// cargo_check  → ["sel.compiler"]
+// cargo_test   → ["sel.test"]
+// fs_read      → ["sel.fs"]
+// apply_patch  → ["sel.edit"]
 ```
 
 ### 3.11 Existing permission types (normative — do not change)
@@ -775,11 +899,13 @@ Reuse exactly as on `main` / RFC-0005 §3.2. No parallel permission system.
 | --- | --- | --- | --- |
 | Tool IR | `alloy-runtime` | `pub` | callers / serde |
 | `McpPlatform` | `alloy-tools` | `pub` trait | impls |
-| `InProcessMcpHost` | `alloy-tools` | `pub` | `new` / `new_with_obs` |
+| `InProcessMcpHost` | `alloy-tools` | `pub` | `new` + `with_decision_log` |
 | `StubPatchApplyBackend` | `alloy-tools` | `pub` | unit struct |
 | `ToolHandle` | `alloy-tools` | `pub` | `ToolHandle::new` |
+| `RecordingMcpPlatform` | `alloy-tools` | `pub` | `new` / `with_builtin_views` |
 | Builtin handlers | `alloy-tools` | `pub(crate)` | host registry |
-| JSON schemas | `alloy-tools` | `pub(crate)` constants | compile-time |
+| `map_sandbox_error` | `alloy-tools` | `pub(crate)` | internal |
+| `disclose` helper | `alloy-tools` | `pub(crate)` | host + recording + tests |
 
 ---
 
@@ -792,15 +918,16 @@ crates/alloy-runtime/src/types/
 
 crates/alloy-tools/src/mcp/
   mod.rs            # re-exports; module docs
-  error.rs          # McpError, PermissionDenial
+  error.rs          # McpError, PermissionDenial, map_sandbox_error, map_denial, redact_sandbox_error
   platform.rs       # McpPlatform trait
-  host.rs           # InProcessMcpHost, McpHostConfig, drain, in-flight gate
+  host.rs           # InProcessMcpHost, McpHostConfig, McpHostPhase, drain, admission
   registry.rs       # Builtin registration table (immutable after new)
-  disclose.rs       # tools_for filtering, sort, cap, dedupe
-  permission.rs     # token expiry + per-tool grant checks (fail-closed)
+  disclose.rs       # pub(crate) fn disclose(views, selectors) -> (Vec<ToolView>, bool)
+  authz.rs          # token expiry + per-tool grant checks (reuses sandbox::grant)
   handle.rs         # ToolHandle
   recording.rs      # RecordingMcpPlatform
   patch.rs          # PatchApplyBackend, StubPatchApplyBackend, PatchApplyError
+  metrics.rs        # McpMetricsSnapshot atomics
   builtins/
     mod.rs          # BuiltinToolId, dispatch match
     cargo_check.rs
@@ -816,22 +943,34 @@ crates/alloy-tools/src/mcp/
 | Module | Owns | Must not |
 | --- | --- | --- |
 | `registry` | name → handler + `ToolView` | mutate after `new` |
-| `disclose` | selector matching | expose unregistered tools |
-| `permission` | grant/expiry checks | spawn processes |
+| `disclose` | pure filter/sort/cap over `&[ToolView]` | expose unregistered tools; touch IO |
+| `authz` | grant/expiry checks via shared sandbox matcher | spawn processes; duplicate match logic |
 | `builtins/cargo_*` | argv build + sandbox call + result map | bare `Command` |
-| `builtins/fs_read` | `PathPolicy` read + byte cap | ignore deny globs |
+| `builtins/fs_read` | `PathPolicy` read + byte cap | ignore deny globs; open non-canonical path |
 | `builtins/apply_patch` | backend call + error map | implement EditEngine |
-| `host` | lifecycle, concurrency semaphore, obs | redefine sandbox policy |
+| `host` | lifecycle, admission, timeout, obs | redefine sandbox policy |
+
+**`disclose` purity (normative):**
+
+```rust
+pub(crate) fn disclose(
+    views: &[ToolView],
+    selectors: &[ToolSelector],
+) -> (Vec<ToolView>, bool /* truncated */);
+```
+
+Implements the pure filter/sort/cap portion of §5.4. Host handles phase check + metrics. Unit tests call this with synthetic `ToolView::new(...)` lists to prove the cap.
 
 ### 4.2 Dependency direction
 
 ```text
-host → registry → builtins → (sandbox | path_policy | patch_backend)
+host → registry → builtins → (sandbox broker | path_policy | patch_backend)
 host → disclose → registry
-host → permission
+host → authz → sandbox::grant (pub(crate))
 handle → dyn McpPlatform
 builtins MUST NOT import handle
 mcp MUST NOT import alloy-runtime::storage or session control plane
+sandbox/ MUST NOT import mcp/
 ```
 
 ### 4.3 Injection points
@@ -839,10 +978,53 @@ mcp MUST NOT import alloy-runtime::storage or session control plane
 | Dependency | Type | Required |
 | --- | --- | --- |
 | Sandbox broker | `Arc<dyn SandboxBroker>` | yes |
-| Path policy | `PathPolicy` | yes |
+| Operator homes | `OperatorHomes` (same instance semantics as broker) | yes |
+| RO roots | `Vec<PathBuf>` | yes (may be empty; unused by MVP `fs_read` jail-only rule — reserved so RFC-0008 need not change `new`) |
 | Patch backend | `Arc<dyn PatchApplyBackend>` | yes (stub in MVP) |
-| Decision log | `Option<Arc<dyn DecisionLog>>` | no |
-| Cancel | `CancellationToken` in config | yes (default new) |
+| Decision log | via `with_decision_log` | no |
+| Cancel / timeouts | `McpHostConfig` | yes (defaults) |
+
+### 4.4 RFC-0005 visibility widenings (crate-private only)
+
+**No new `pub` sandbox API.** Changes below are `pub(crate)` only so `crate::mcp` can import them.
+
+#### Module path visibility (REQUIRED — otherwise `pub(crate)` items are unreachable)
+
+In `crates/alloy-tools/src/sandbox/mod.rs`, change:
+
+```rust
+pub(crate) mod grant;
+pub(crate) mod path;
+```
+
+(`mod glob`, `mod broker`, backends stay private.) FsRead grant glob expansion is specified inline in §5.5 and MUST match RFC-0005 deny expansion on the §5.5 example table (asserted by `fs_read_grant_examples_table`).
+
+#### Items
+
+| Item | Current on main | Change | Reason |
+| --- | --- | --- | --- |
+| `mod grant` / `mod path` | private modules | `pub(crate) mod` | path reachability from `mcp` |
+| `match_exec_grant` | already `pub(crate)` | keep | single Exec authorization |
+| `MatchedExec`, `ResolvedBinary` | already `pub(crate)` | keep (now mcp-visible) | matcher return types |
+| `trusted_path_dirs`, `trusted_roots` | `pub(crate)` in grant.rs | keep; reachable once `mod grant` is `pub(crate)` | host builds same root set as broker |
+| `PathPolicy::jail(&self) -> &Path` | already `pub(crate)` | keep | jail membership |
+| `relative_for_matching` | already `pub(crate)` in `path.rs` | keep; `mcp` MUST call this (alias name `jail_relative` in mcp code is fine) | `fs_read` grant subject + content `path` — same rendering as deny-glob matching |
+
+MUST NOT re-export these from the `alloy-tools` crate root.
+
+**Trusted-path construction (normative, shared with broker):**
+
+```rust
+let path_dirs = trusted_path_dirs(Some(&homes.cargo_home), Some(&homes.rustup_home));
+let mut trusted_path = path_dirs;
+for root in trusted_roots(Some(&homes.cargo_home), Some(&homes.rustup_home)) {
+    if !trusted_path.contains(&root) {
+        trusted_path.push(root);
+    }
+}
+```
+
+Host stores this `Vec<PathBuf>` at `new` from the injected `OperatorHomes`. Sync FS probes inside `match_exec_grant` / `resolve_executable` run inline on the async worker in MVP (acceptable; same as broker pre-spawn work). Unit tests that assert grant matching MUST supply `homes` pointing at a fixture toolchain dir containing a fake `cargo` binary (or use basename-form grants with `RecordingSandboxBroker` **and** a temp trusted bin dir).
 
 ---
 
@@ -850,44 +1032,59 @@ mcp MUST NOT import alloy-runtime::storage or session control plane
 
 ### 5.1 Request lifecycle pipeline
 
+**Ordering is normative.** Precedence when multiple failures apply: earlier step wins.
+
 ```mermaid
 flowchart TD
-  A[call ToolCall + PermissionToken] --> B{Host phase == Running?}
+  A[call ToolCall + PermissionToken] --> B{phase == Running?}
   B -->|no| Z1[Err ShuttingDown]
-  B -->|yes| C[Acquire in-flight permit]
-  C --> D{Token valid?}
+  B -->|yes| C[Admit: in-flight increment then recheck phase]
+  C -->|lost race| Z1
+  C -->|ok| D{Token expiry}
   D -->|expired| Z2[Err TokenExpired]
-  D -->|malformed| Z3[Err InvalidToken]
   D -->|ok| E{Tool registered?}
   E -->|no| Z4[Err UnknownTool]
-  E -->|yes| F{Grants satisfy tool?}
-  F -->|no| Z5[Err PermissionDenied]
-  F -->|yes| G[Parse args vs JSON Schema]
-  G -->|fail| Z6[Err InvalidArguments]
-  G -->|ok| H{Dispatch builtin}
-  H --> I[cargo_check / cargo_test]
-  H --> J[fs_read]
-  H --> K[apply_patch]
-  I --> L[SandboxBroker::exec]
-  J --> M[PathPolicy::authorize Read + read file]
-  K --> N[PatchApplyBackend::apply]
-  L --> O[Map to ToolResult]
-  M --> O
-  N --> O
-  O --> P[Record obs + tracing]
+  E -->|yes| F[Parse + validate args — pure, no FS]
+  F -->|fail| Z6[Err InvalidArguments]
+  F -->|ok| G[Derive argv / canonical path]
+  G --> H{Grant check}
+  H -->|no| Z5[Err PermissionDenied]
+  H -->|ok| I[Dispatch under call_timeout]
+  I --> J[cargo_check / cargo_test → SandboxBroker::exec]
+  I --> K[fs_read → PathPolicy + tokio::fs]
+  I --> L[apply_patch → PatchApplyBackend]
+  J --> O[Map to ToolResult]
+  K --> O
+  L --> O
+  O --> P[Await DecisionLog §9.2]
   P --> Q[Ok ToolResult]
+  Z1 --> P2[DecisionLog? §9.2 error rules]
+  Z2 --> P2
+  Z4 --> P2
+  Z5 --> P2
+  Z6 --> P2
+  P2 --> Zerr[Err McpError]
 ```
 
-**Ordering is normative.** Permission validation MUST precede argument side effects. Unknown tool MUST NOT leak whether a deferred tool name “will exist”.
+Error exits also pass through DecisionLog rules in §9.2 (not shown as success).
+
+**Admission protocol (normative — StorageGate pattern):**
+
+1. Load phase with `SeqCst`. If not `Running` → `ShuttingDown`.
+2. Acquire semaphore permit (`max_in_flight`).
+3. **Re-check** phase with `SeqCst`. If not `Running`, release permit → `ShuttingDown`.
+4. Hold permit until `call` future completes **or is dropped** (permit released on `Drop`).
+
+**`InvalidArguments` precedes `PermissionDenied`.** A call that is both malformed and ungranted returns `InvalidArguments`.
 
 ### 5.2 Builtin registration table (immutable)
 
 | Name | Tags | Handler | Required grants (host gate) |
 | --- | --- | --- | --- |
-| `cargo_check` | `sel.compiler` | §5.6 | ≥1 `Grant::Exec` that allowlists `cargo` + args matching check invocation |
-| `cargo_test` | `sel.test` | §5.7 | ≥1 `Grant::Exec` that allowlists `cargo` + args matching test invocation |
-| `fs_read` | `sel.fs` | §5.8 | ≥1 `Grant::FsRead(glob)` covering the target path |
-| `apply_patch` | `sel.edit` | §5.9 | ≥1 `Grant::FsWrite(glob)` — MVP: at least one `FsWrite` present; path-level coverage enforced by RFC-0008 backend when wired; stub still requires ≥1 `FsWrite` |
+| `cargo_check` | `sel.compiler` | §5.6 | Exec grant matching intended argv via **shared** `match_exec_grant` |
+| `cargo_test` | `sel.test` | §5.7 | same |
+| `fs_read` | `sel.fs` | §5.8 | `FsRead` covering jail-relative path + PathPolicy Read |
+| `apply_patch` | `sel.edit` | §5.9 | ≥1 `FsWrite` |
 
 **Forbidden registrations (MUST NOT appear):** `graph_query`, `bash`, `sh`, `shell`, `raw_exec`, `clippy_lint`, `miri_test`, `ra_*` (until a future RFC adds them).
 
@@ -910,7 +1107,7 @@ flowchart TD
 }
 ```
 
-Description string (exact): `Run cargo check and return structured rustc messages`.
+Description (exact): `Run cargo check and return structured rustc messages`.
 
 #### 5.3.2 `cargo_test`
 
@@ -921,8 +1118,7 @@ Description string (exact): `Run cargo check and return structured rustc message
     "workspace_root": { "type": "string" },
     "package": { "type": ["string", "null"] },
     "test_name_filter": { "type": ["string", "null"] },
-    "jobs": { "type": ["integer", "null"], "minimum": 1 },
-    "timeout_secs": { "type": "integer", "default": 600, "minimum": 1 }
+    "jobs": { "type": ["integer", "null"], "minimum": 1 }
   },
   "required": ["workspace_root"],
   "additionalProperties": false
@@ -930,6 +1126,8 @@ Description string (exact): `Run cargo check and return structured rustc message
 ```
 
 Description: `Run cargo test and return structured results`.
+
+**No `timeout_secs` field** — host `call_timeout` + broker `exec_timeout` own deadlines (avoids a schema knob that does nothing).
 
 #### 5.3.3 `fs_read`
 
@@ -963,122 +1161,130 @@ Description: `Read a UTF-8 text file under the workspace jail`.
 
 Description: `Apply a unified diff / TextPatch via EditEngine`.
 
-`patch` MUST be either:
-
-* a JSON string containing a unified diff, or
-* a JSON object (opaque to RFC-0006; interpreted by `PatchApplyBackend` / RFC-0008).
-
-MVP stub does not interpret `patch` contents.
+`patch` MUST be either a JSON string (unified diff) or a JSON object (opaque to RFC-0006). MVP stub does not interpret contents.
 
 ### 5.4 Lazy disclosure — `tools_for`
 
 #### Algorithm (normative)
 
-1. If host is draining/shutdown → `Err(ShuttingDown)`.
-2. If `selectors.is_empty()` → return `Ok(vec![])` (**MUST NOT** return the catalogue).
-3. Let `out: BTreeMap<ToolName, ToolView> = {}` (dedupe by name).
-4. For each selector in **input order**:
-   - `Name { name }`: if registered and name equals, insert that `ToolView`.
-   - `Tag { tag }`: for each registered tool whose `tags` contains an exact match for `tag`, insert.
-5. Build `Vec` from map values sorted by `ToolName` ascending (`Ord` on the newtype / bytewise UTF-8).
-6. If `len > MAX_TOOLS_PER_DISCLOSURE` (32): truncate to the first 32 after sort; emit tracing `warn` with `truncated = true`, `returned = 32`.
-7. Return `Ok(vec)`.
+**Host wrapper `tools_for`:**
+1. If host phase ≠ `Running` → `Err(ShuttingDown)`.
+2. Let `views = disclose(&registry_views, selectors)` (pure helper below).
+3. If helper truncated: increment `disclose_truncated`; tracing `warn` with `truncated=true`, `returned=32`.
+4. Return `Ok(views)`.
+
+**Pure helper `disclose(views, selectors) -> Vec<ToolView>`:**
+1. If `selectors.is_empty()` → return `vec![]` (**MUST NOT** return the catalogue).
+2. Let `out: BTreeMap<ToolName, ToolView> = {}`.
+3. For each selector in **input order**:
+   - `Name { name }`: if a view with that name exists in `views`, insert it.
+   - `Tag { tag }`: insert every view whose `tags` contains an exact match.
+   - Unknown names / tags that match nothing: **silently ignored**.
+4. Build `Vec` from map values sorted by `ToolName` ascending.
+5. If `len > MAX_TOOLS_PER_DISCLOSURE` (32): truncate to first 32 (caller detects truncation by comparing pre/post length or a returned flag — **normative MVP:** helper returns `(Vec<ToolView>, truncated: bool)`).
 
 #### Why the full catalogue is never exposed
 
-Eager MCP schema tax exhausts model context (V2 §12 / industry lesson). Capabilities declare `required_tools` selectors; the host discloses only that slice. Empty selectors mean “disclose nothing”, not “disclose all”. Truncation is a safety cap, not a pagination API.
+Eager MCP schema tax exhausts model context (V2 §12). Empty selectors mean “disclose nothing”, not “disclose all”. Truncation is a safety cap, not pagination.
 
 #### Duplicate handling
 
-Duplicate selectors and overlapping tag/name matches collapse by `ToolName`. First inserted view wins (views are identical per name).
-
-#### Ordering
-
-Output order is **by tool name**, never by selector order, never by registration luck.
+Overlapping selectors collapse by `ToolName`. Views per name are identical.
 
 ### 5.5 Permission enforcement
 
 #### Validation point
 
-Exactly once per `call`, after in-flight acquire and before schema parse side effects that touch the filesystem. `tools_for` does **not** require a `PermissionToken`.
+After argument parse (pure) and path/argv derivation; before any filesystem open or sandbox spawn. `tools_for` does **not** require a `PermissionToken`.
 
 #### Token checks (ordered)
 
 | Step | Condition | Error |
 | --- | --- | --- |
-| 1 | `perms.grants` encoding impossible / non-UTF8 tool-unrelated — N/A on typed token | — |
-| 2 | `expires: Some(t)` and `Timestamp::now().0 >= t.0` | `TokenExpired` |
-| 3 | `run_id` is always present on typed token — no extra check | — |
-| 4 | `profile` empty impossible (`ProfileId` validates) | — |
-| 5 | Tool-specific grant rules below | `PermissionDenied(...)` |
+| 1 | `expires: Some(t)` and `Timestamp::now().0 >= t.0` | `TokenExpired` |
+| 2 | Tool-specific grant rules below | `PermissionDenied(...)` |
+| 3 | Uncompilable grant glob pattern | `InvalidToken("grant glob: …")` |
 
-**Malformed token:** on this API the token is a typed Rust value. `InvalidToken` is reserved for future byte-parsed tokens; MVP host MAY return `InvalidToken` only if a defensive invariant fails (e.g. internal conversion). Callers constructing tokens in-process do not hit this path.
+**Malformed token:** typed Rust value in MVP; `InvalidToken` used for uncompilable grant globs and defensive invariants only.
 
 #### Per-tool grant rules
 
-**`cargo_check`**
+**`cargo_check` / `cargo_test`**
 
-1. Build the **intended argv** (§5.6) **before** sandbox call.
-2. Require at least one `Grant::Exec(ExecAllow)` such that:
-   - binary allow matches `cargo` under the same basename/path rules as RFC-0005 §5.3 **logical** match against argv `[0]=cargo` (host-level pre-check uses basename equality `allow.binary == "cargo"` OR path form — MVP host pre-check ONLY accepts basename form `binary == "cargo"` to keep determinism without PATH probes at the gate);
-   - `args_glob` is `None` OR matches space-joined `argv[1..]` with the RFC-0005 §5.3 glob dialect.
-3. If no Exec grants → `MissingGrant("exec")`.
-4. If Exec grants exist but none match → `ExecNotAllowlisted`.
-
-**`cargo_test`:** same with test argv.
+1. Build intended argv (§5.6 / §5.7).
+2. Resolve `cwd` = canonicalize `workspace_root` relative to jail; require membership via `PathPolicy::authorize_cwd` (map denials via `map_sandbox_error`).
+3. Call **`sandbox::grant::match_exec_grant(&perms, &argv, backend, &cwd, &self.trusted_path)`** where `backend = profile.backend_for(class)` and `self.trusted_path` is the vector built at `new` from the injected `OperatorHomes` (§4.4). Same function the broker uses — path-form and basename-form `ExecAllow.binary` both work.
+4. Map matcher errors through `map_sandbox_error` (preserves `ExecNotAllowlisted` vs `ArgsNotAllowlisted`).
 
 **`fs_read`**
 
-1. Resolve path relative to `workspace_jail` if not absolute.
-2. `PathPolicy::authorize(&path, PathAccess::Read)`. Map outcomes:
+1. Resolve input path: if relative, join with jail; if absolute, use as-is.
+2. `let canon = path_policy.authorize(&path, PathAccess::Read)?` via `map_sandbox_error`.
+3. **MVP:** if `canon` is not under `path_policy.jail()`, return `PermissionDenied(PathNotCovered("outside jail".into()))` — out-of-jail RO-root reads are **not** supported for `fs_read` in MVP (keeps content `path` jail-relative well-defined).
+4. Let `rel = jail_relative(&canon, path_policy.jail())?` (`/`-separated, no leading `/`; map Err via `map_sandbox_error`).
+5. Require ≥1 `Grant::FsRead(Glob)` matching `rel` under the dialect below. Zero FsRead grants → `MissingGrant("fs_read")`. Some grants but none match → `PathNotCovered(rel)` (rel is jail-relative — safe to return).
 
-| `PathPolicy` / authorize result | Host result |
+**`FsRead` glob dialect (normative):**
+
+Builder: `GlobBuilder::new(pat).literal_separator(true).case_insensitive(cfg!(target_os = "macos")).backslash_escape(true)`.
+
+Expansion (same spirit as RFC-0005 §3.6 deny expansion):
+
+| Pattern form | Matchers added |
 | --- | --- |
-| `Ok(canon)` | continue |
-| `Err(SandboxError::Denied(PathDenied(s)))` | `Err(McpError::PermissionDenied(PathNotCovered(s)))` |
-| `Err(SandboxError::Denied(CwdOutsideJail))` | `Err(McpError::PermissionDenied(PathNotCovered("cwd outside jail".into())))` |
-| `Err(other SandboxError)` | `Err(McpError::Sandbox(other))` |
+| contains `/`, does not start with `**/` | `pat` and `**/`+`pat` |
+| contains `/`, starts with `**/` | `pat` only |
+| no `/` | `pat` and `**/`+`pat` |
 
-3. Additionally require some `Grant::FsRead(Glob)` whose glob matches the **jail-relative** path string (`/`-separated, no leading slash) using:
+Full-match against jail-relative path. Uncompilable pattern → `InvalidToken`.
 
-```text
-GlobBuilder::new(pat).literal_separator(true).case_insensitive(cfg!(target_os="macos")).build()
-```
+**Normative examples (MUST be unit tests `fs_read_grant_examples_table`):**
 
-Full-match against jail-relative path. If path is under an RO root outside jail (authorized by PathPolicy), match grant globs against the same relative rendering used by PathPolicy deny checks for that root; MVP builtins are expected to read workspace files — RO-root reads without matching `FsRead` still fail closed with `MissingGrant`/`PathNotCovered`.
+| Grant glob | jail-relative path | Match? |
+| --- | --- | --- |
+| `src/main.rs` | `src/main.rs` | yes |
+| `src/**` | `src/main.rs` | yes |
+| `*.rs` | `src/main.rs` | yes (via `**/*.rs` expansion) |
+| `*.rs` | `main.rs` | yes |
+| `**/*.rs` | `src/lib.rs` | yes |
+| `src/**` | `README.md` | no |
+| `.env` | `.env` | PathPolicy deny wins first |
 
-4. No matching FsRead → `MissingGrant("fs_read")` if zero FsRead grants, else `PathNotCovered(rel)`.
+**`apply_patch`**
 
-**`Grant::Network` / `Grant::GitWrite`:** ignored by all four MVP builtins (neither sufficient nor required). Presence does not authorize Exec or FsRead.
+1. Require ≥1 `Grant::FsWrite(_)`. If none → `MissingGrant("fs_write")`.
+2. MVP stub does not path-expand the patch; fine-grained path grants → RFC-0008.
+
+**`Grant::Network` / `Grant::GitWrite`:** ignored by all four MVP builtins.
 
 #### Hand-rolled JSON argument validation (normative)
 
 MVP MUST NOT add a schema crate. Validators MUST enforce:
 
-| Tool | Rules |
+| Rule | Limit / behaviour |
 | --- | --- |
-| all | root MUST be a JSON object; unknown keys → `InvalidArguments("additional property: …")` |
-| `cargo_check` | `workspace_root`: string, non-empty; `package`: string or null or absent; `features`: array of strings (default `[]`); `all_features`: bool (default false); `message_format`: absent/`"json"` only |
-| `cargo_test` | `workspace_root` non-empty string; `package` string/null/absent; `test_name_filter` string/null/absent; `jobs` integer ≥1 or null/absent; `timeout_secs` integer ≥1 (default 600) |
-| `fs_read` | `path` non-empty string; `max_bytes` integer in `1..=1048576` (default 262144) |
-| `apply_patch` | `patch` present (any JSON value except missing); `dry_run` bool (default false) |
+| Serialized `arguments` bytes | ≤ `MAX_ARGUMENT_BYTES` (64 KiB) else `InvalidArguments("arguments too large")` |
+| Root | JSON object; unknown keys → `InvalidArguments("additional property: …")` |
+| Any string field | ≤ `MAX_ARG_STRING_BYTES` (4096); NUL bytes forbidden |
+| `cargo_check.features` | ≤ `MAX_FEATURES` (64) entries |
+| `cargo_check` | `workspace_root` non-empty; `package` string/null/absent; `features` string array; `all_features` bool; `message_format` absent/`"json"` only |
+| `cargo_test` | `workspace_root` non-empty; `package` string/null/absent; `test_name_filter` string/null/absent; `jobs` integer ≥1 or null/absent |
+| `fs_read` | `path` non-empty; `max_bytes` in `1..=1048576` (default 262144) |
+| `apply_patch` | `patch` present; `dry_run` bool (default false) |
 
-Type mismatches → `Err(McpError::InvalidArguments(...))` with a stable message prefix `type error: <field>`.
+Type mismatches → `InvalidArguments` with prefix `type error: <field>`.
 
-**`apply_patch` grant rule**
-
-1. Require ≥1 `Grant::FsWrite(_)`. If none → `MissingGrant("fs_write")`.
-2. MVP stub does not path-expand the patch; fine-grained path grants are enforced by RFC-0008 backend **in addition** to this gate. Host MUST still fail closed without any FsWrite.
+Host MUST reject oversized args **before** grant check so broker argv caps are not the first line of defence for model input. Relationship: host caps ensure intended argv stays within RFC-0005 argv limits (256 elems / 64 KiB) for legal cargo feature lists.
 
 #### Denied vs missing
 
 | Situation | Variant |
 | --- | --- |
 | Zero grants of the needed kind | `MissingGrant` |
-| Some grants but path/argv not covered | `PathNotCovered` / `ExecNotAllowlisted` |
+| Some grants but path/argv not covered | `PathNotCovered` / `ExecNotAllowlisted` / `ArgsNotAllowlisted` |
 | ToolHandle disclosure miss | `NotDisclosed` |
 
-All are deterministic functions of `(tool, args, perms, policy)` — no wall-clock dependence except expiry.
+Deterministic functions of `(tool, parsed_args, perms, policy, backend)` — wall-clock only via expiry.
 
 #### Fail-closed
 
@@ -1092,40 +1298,31 @@ On any permission error: no sandbox spawn, no file read, no backend apply, no pa
 argv = ["cargo", "check"]
 + optional ["-p", package] if package is Some(non-empty)
 + if all_features { ["--all-features"] }
-  else for f in features { ["--features", f] }  // one --features per entry, in input order
+  else for f in features { ["--features", f] }  // input order
 + ["--message-format", "json"]
 ```
-
-`message_format` other than `"json"` → `Err(InvalidArguments)` at parse.
 
 #### Sandbox request
 
 ```rust
 SandboxExecRequest::new(
     argv,
-    cwd,              // canonicalize(workspace_root); must be inside jail via authorize_cwd
-    perms.clone(),    // same token
+    cwd,                 // authorize_cwd'ed
+    perms.clone(),
     ExecClass::Check,
 )
-// env_allow: empty in MVP
+// env_allow: empty
 ```
-
-`workspace_root` MUST canonicalize inside the jail (`PathPolicy::authorize_cwd` or equivalent membership). Outside → `PermissionDenied(PathNotCovered)` / deny before exec.
 
 #### Result mapping
 
 | Sandbox outcome | MCP result |
 | --- | --- |
-| `Ok(r)` with `exit_code == Some(0)` | `Ok(ToolResult::ok)` content §5.6.1 |
-| `Ok(r)` with other exit / signal | `Ok(ToolResult::err)` with `ToolError::ExecutionFailed` |
-| `Err(TokenExpired)` | `Err(McpError::TokenExpired)` |
-| `Err(Denied(_))` | `Err(McpError::PermissionDenied(...))` mapped per §8.3 |
-| `Err(Timeout(d))` | `Err(McpError::Timeout(d))` |
-| `Err(Cancelled)` | `Err(McpError::Cancelled)` |
-| `Err(BackendUnavailable\|…)` | `Err(McpError::Sandbox(...))` — also reflected as non-retryable at host boundary; see §8 |
-| `Err(Io\|Internal\|Invalid)` | `Err(McpError::Sandbox(...))` |
+| `Ok(r)` `exit_code == Some(0)` | `Ok(ToolResult::ok)` content §5.6.1 |
+| `Ok(r)` other exit / signal | `Ok(ToolResult::err)` `ExecutionFailed { exit_code, signal, … }` |
+| any `Err(e)` | `Err(map_sandbox_error(e))` |
 
-#### 5.6.1 Success / execution-failed content shape
+#### 5.6.1 Content shape
 
 ```json
 {
@@ -1141,30 +1338,51 @@ SandboxExecRequest::new(
 }
 ```
 
-Messages are not re-parsed in MVP; RFC-0010 / diagnostics ingest may parse `stdout_utf8` JSON lines. Lossy UTF-8 replacement is REQUIRED (never return raw bytes in JSON).
+Messages are not re-parsed in MVP. Lossy UTF-8 REQUIRED.
 
 ### 5.7 `cargo_test` execution
 
-Argv:
+**Exact argv construction (normative):**
 
 ```text
-["cargo", "test"]
-+ optional -p package
-+ optional test_name_filter as extra argv element after options
-+ optional ["--jobs", jobs.to_string()]
-+ ["--", "--nocapture"]   // MVP fixed; enables capturing test output in stdout
+argv = ["cargo", "test"]
++ optional ["-p", package] if package is Some(non-empty)
++ optional ["--jobs", jobs.to_string()] if jobs is Some
++ ["--", "--nocapture"]
++ optional [test_name_filter] if test_name_filter is Some(non-empty)
+  // filter AFTER `--` so it is a test-name filter, not a cargo option
 ```
 
-`ExecClass::Test`. Result mapping identical to §5.6. `timeout_secs` is recorded in tracing only; broker enforces `profile.exec_timeout` (MUST NOT silently override profile without an additive broker API — MVP does not override).
+**Worked example**
+
+Inputs: `package=None`, `jobs=Some(2)`, `test_name_filter=Some("foo")`
+
+```text
+argv = ["cargo", "test", "--jobs", "2", "--", "--nocapture", "foo"]
+args_glob subject (argv[1..], space-joined) =
+  "test --jobs 2 -- --nocapture foo"
+```
+
+`ExecClass::Test`. Result mapping identical to §5.6. Unit test: `argv_cargo_test_mapping`.
 
 ### 5.8 `fs_read` execution
 
-1. Permission + PathPolicy (§5.5).
-2. `std::fs::metadata` + open via `tokio::fs` (file IO is **not** a SandboxBroker exec). Symlinks already handled by `PathPolicy::authorize` canonicalize rules.
-3. If not a regular file → `Ok(ToolResult::err)` with `ToolError::Permanent { code: "not_a_file", ... }`.
-4. Read at most `min(max_bytes, 1_048_576)` bytes.
-5. If content is not valid UTF-8 → `ToolError::Permanent { code: "not_utf8", ... }` with no body.
-6. Success content:
+1. Permission + PathPolicy (§5.5) → `canon`.
+2. Open **`canon`** (the `PathBuf` returned by `authorize`), not the raw args path. Use **`tokio::fs` only** (no `std::fs` in the async path).
+3. Residual risk: TOCTOU between authorize and open. Document in `docs/security/sandbox-residual-risk.md` under a new “MCP fs_read” subsection: MVP accepts the race inside a single-process trusted host; open the canonical path. Fail closed on open/read errors per the table below.
+4. Metadata / open / read error mapping (normative):
+
+| Condition | Result |
+| --- | --- |
+| Not a regular file after canonicalize (dir/socket/…) — symlinks are resolved by `authorize` before this check | `Ok(ToolResult::err)` `Permanent { code: "not_a_file", … }` |
+| Open/read `NotFound` | `Permanent { code: "not_found", … }` |
+| Open/read `PermissionDenied` (EACCES) | `Permanent { code: "io_denied", … }` |
+| Other IO | `Transient { code: "io", message: "fs_read io error" }` (no raw OS strings) |
+| Bytes not valid UTF-8 **after** trim | `Permanent { code: "not_utf8", … }` with no body |
+
+5. Read at most `min(max_bytes, 1_048_576)` bytes via `tokio::fs`.
+6. **UTF-8 trim (normative):** interpret read bytes with `str::from_utf8`. If `Err(e)`, keep only `bytes[..e.valid_up_to()]` as the text; if `valid_up_to() == 0` and bytes non-empty → `not_utf8`. Truncation that splits a codepoint MUST NOT surface as `not_utf8`.
+7. Success content:
 
 ```json
 {
@@ -1175,9 +1393,9 @@ Argv:
 }
 ```
 
-`truncated: true` if file size > returned bytes.
+`bytes` = length of returned UTF-8 text in bytes. `truncated: true` iff `metadata().len() > bytes_read` (from the same metadata call used for the regular-file check) **or** UTF-8 trim shortened the buffer.
 
-**No sandbox exec** for reads. Deny globs still apply via PathPolicy (`.env` denied).
+**No sandbox exec** for reads.
 
 ### 5.9 `apply_patch` execution
 
@@ -1191,21 +1409,22 @@ Argv:
 sequenceDiagram
   participant W as Caller/ToolHandle
   participant H as InProcessMcpHost
-  participant P as permission
+  participant A as authz
   participant B as SandboxBroker
   participant O as DecisionLog?
 
   W->>H: call(cargo_check, perms)
-  H->>H: in-flight permit
-  H->>P: expiry + Exec grant pre-check
-  P-->>H: ok
-  H->>B: exec(Check, argv=cargo check …)
+  H->>H: admit (increment + recheck)
+  H->>H: parse args
+  H->>A: match_exec_grant (shared)
+  A-->>H: ok
+  H->>B: exec(Check, argv=…)
   B-->>H: Ok(SandboxExecResult)
-  H->>O: record_tool_call (optional)
+  H->>O: await record_tool_call
   H-->>W: Ok(ToolResult)
 ```
 
-### 5.11 Host-level cancel during sandbox exec
+### 5.11 Cancellation
 
 ```mermaid
 sequenceDiagram
@@ -1213,13 +1432,39 @@ sequenceDiagram
   participant H as Host
   participant B as Broker
 
-  W->>H: call(...)
+  W->>H: call(...) future
   H->>B: exec future
-  Note over H: select! exec vs host.cancel.cancelled()
-  H--xB: drop exec future on cancel
+  W--xH: drop call future
+  H--xB: drop exec future
   Note over B: drop guard kills process group
-  H-->>W: Err(Cancelled)
+  Note over H: release in-flight permit; no DecisionLog record
 ```
+
+Host-wide shutdown cancel (§6.4) uses the same drop path after grace expires, returning `Err(Cancelled)` to still-polled callers. Dropped callers receive no value.
+
+**RFC-0013 contract:** per-node cancel = drop the `ToolHandle::call` / `McpPlatform::call` future for that node. No extra token field required on `ToolCall` in MVP.
+
+### 5.12 Host-level `call_timeout` and shutdown cancel
+
+Every dispatch (cargo / fs_read / apply_patch) runs under:
+
+```rust
+tokio::select! {
+    _ = self.cancel.cancelled() => Err(McpError::Cancelled),
+    result = tokio::time::timeout(effective_call_timeout, dispatch_fut) => match result {
+        Ok(inner) => inner,
+        Err(_) => Err(McpError::Timeout(effective_call_timeout)),
+    },
+}
+```
+
+| Outcome | Behaviour |
+| --- | --- |
+| `call_timeout` fires | drop nested exec/IO future; `Err(Timeout(effective_call_timeout))` |
+| `cancel` fires (drain step 3) | drop nested future; `Err(Cancelled)` for **still-polled** callers |
+| caller drops `call` future | nested drop; no return value; no DecisionLog |
+
+`McpError::Timeout` is reachable for all builtins. `McpError::Cancelled` is produced **only** by the host (RFC-0005 broker `Cancelled` is unreachable without a request cancel field).
 
 ---
 
@@ -1230,60 +1475,94 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
   [*] --> Running: new() ok
-  Running --> Draining: drain() called
-  Draining --> Stopped: in-flight == 0
-  Running --> Stopped: Arc dropped AND in-flight == 0
-  Draining --> Draining: in-flight calls finish
+  Running --> Draining: drain(grace) begins
+  Draining --> Stopped: in-flight == 0 OR grace elapsed + cancel complete
 ```
 
-| State | `tools_for` | `call` | `start/stop_server` |
+| State | `tools_for` | new `call` admissions | in-flight `call` |
 | --- | --- | --- | --- |
-| Running | service | service | Unsupported |
-| Draining | `Err(ShuttingDown)` | `Err(ShuttingDown)` for **new** calls; in-flight finish | Unsupported |
-| Stopped | `Err(ShuttingDown)` | `Err(ShuttingDown)` | Unsupported |
+| Running | service | service | run |
+| Draining | `Err(ShuttingDown)` | `Err(ShuttingDown)` | finish until grace; then cancel |
+| Stopped | `Err(ShuttingDown)` | `Err(ShuttingDown)` | none |
+
+Observable via `phase()`. Dropping the last `Arc` cancels outstanding work via token; there is **no** `Running → Stopped` transition observed after destruction.
 
 ### 6.2 Startup
 
-1. Validate jail == broker profile jail.
-2. Build immutable registry of four builtins + schemas.
-3. Set state `Running`.
-4. No background tasks. No threads beyond Tokio tasks created by `call`.
+1. Validate `config.max_in_flight >= 1` else `McpError::Internal("max_in_flight must be >= 1")`.
+2. Resolve effective `call_timeout`: if `config.call_timeout` is `None` → `broker.profile().exec_timeout + 60s`; if `Some(d)` and `d < exec_timeout` → `Internal("call_timeout < exec_timeout")`; else use `d`.
+3. Build `trusted_path` from `homes` per §4.4.
+4. `PathPolicy::from_profile(broker.profile(), read_only_roots)?` mapped via `map_sandbox_error` / `Internal`.
+5. Build immutable registry of four builtins + schemas.
+6. Phase = `Running`. No background tasks.
 
 ### 6.3 Concurrent calls
 
 | Rule | Value |
 | --- | --- |
-| Concurrent `call` | ALLOWED up to `max_in_flight` (default 64) |
-| Excess | wait fairly on Tokio semaphore (FIFO-ish; no priority) |
-| Concurrent `tools_for` | ALLOWED; no permit required |
-| Shared state | registry immutable; broker concurrent per RFC-0005 |
-| Fairness | no tool-name priority; scheduler enforces `max_parallel_cargo=1` |
-| Ordering guarantees | none across calls; each call is independent |
-| `PermissionToken` | not mutated by host |
+| Concurrent `call` | ALLOWED up to `max_in_flight` |
+| Excess | wait on Tokio semaphore |
+| Concurrent `tools_for` | ALLOWED; no permit |
+| Drop of `call` future | release permit; drop nested exec; **no** DecisionLog write; drain’s in-flight counter decrements |
+| Fairness | no tool-name priority; scheduler owns `max_parallel_cargo=1` |
+| Ordering | none across calls |
 
 ### 6.4 Shutdown / drain
 
-1. `drain().await` sets `Draining`, clones cancel token and calls `cancel.cancel()`.
-2. In-flight `call` bodies that select on cancel return `Err(Cancelled)` if still in sandbox; post-sandbox mapping completes normally if already finished exec.
-3. When in-flight counter hits 0, state `Stopped`.
-4. Dropping the last `Arc<InProcessMcpHost>` SHOULD cancel; MUST NOT leak child processes (broker drop-guard).
+**Primitives (normative):** `phase: AtomicU8` (`SeqCst`) + `tokio::sync::Notify` (`drain_notify`) + in-flight `AtomicUsize` + semaphore.
+
+**Notify ordering (normative — avoid lost wakeups):** always subscribe *before* re-checking the condition:
+
+```rust
+let notified = drain_notify.notified();
+tokio::pin!(notified);
+if condition_met() { break; }
+notified.await;
+```
+
+```text
+drain(grace):
+  1. Loop compare_exchange phase:
+       Stopped  → return Ok(())                         // idempotent
+       Draining → follower: wait (enable-then-check) until Stopped OR  grace+5s
+                  bound; then Ok(()) (or Ok if already Stopped)
+       Running  → CAS Running→Draining; on success become winner; else retry
+  2. Winner: wait until in_flight == 0 OR grace elapsed
+       `tokio::select!` between `sleep(grace)` and enable-then-check in_flight==0 loop
+       (in-flight decrements MUST `notify_waiters`)
+  3. If in_flight > 0: `cancel.cancel()` so still-polled calls observe cancel (§5.12)
+  4. Wait up to **additional** `Duration::from_secs(5)` for in_flight == 0
+       (enable-then-check). If still > 0 after 5s → still set Stopped, then return
+       `Err(Internal("drain: in-flight did not reach 0"))`
+  5. Store phase = Stopped; `drain_notify.notify_waiters()`; Ok(())
+```
+
+Callers blocked on the semaphore when drain begins: when a permit frees they recheck phase and receive `ShuttingDown` (semaphore is **not** closed). Winner/follower election uses only the phase CAS — no separate mutex.
+
+**Test:** `drain_idempotent_concurrent_followers` — two concurrent `drain(grace)` both `Ok`, `phase()==Stopped`, wrapped in `tokio::time::timeout` so a lost wakeup fails the suite.
 
 ### 6.5 Synchronization
 
 | Resource | Sync |
 | --- | --- |
-| Registry | immutable after `new` — no lock |
-| State | `tokio::sync::RwLock` or `AtomicU8` phase |
-| In-flight | `tokio::sync::Semaphore` + atomic counter |
-| Recording double | `Mutex<Vec<...>>` |
-| DecisionLog | assumed `Send+Sync`; errors from obs MUST NOT fail the tool call (log `warn`, still return ToolResult) |
+| Registry | immutable after `new` |
+| Phase | `AtomicU8` with `SeqCst` loads/stores |
+| Drain wakeups | `tokio::sync::Notify` (`drain_notify`) |
+| Admission | semaphore + phase recheck (§5.1) |
+| In-flight count | atomic; inc on admit; dec on future drop/complete **and** `notify_waiters` |
+| Trusted path | immutable `Vec<PathBuf>` from `homes` at `new` |
+| Recording double | `Mutex<VecDeque<…>>` / `Mutex<Vec<…>>` |
+| DecisionLog | awaited inline before `call` returns (success **and** mapped error paths in §9.2); errors `warn` only |
 
 ### 6.6 Startup failure modes
 
 | Failure | Result |
 | --- | --- |
-| Jail mismatch | `Err(McpError::Internal(...))` from `new` |
-| Schema constant invalid JSON | panic at test / `new` defensive check → `Internal` |
+| `max_in_flight == 0` | `Err(Internal("max_in_flight must be >= 1"))` |
+| `call_timeout: Some(d)` with `d < exec_timeout` | `Err(Internal("call_timeout < exec_timeout"))` |
+| `call_timeout: None` | set effective timeout = `exec_timeout + 60s` (never fails this check) |
+| `PathPolicy::from_profile` fails | `Err(map_sandbox_error(...))` or `Internal` |
+| Schema constant invalid | panic in tests / `Internal` at `new` |
 
 ---
 
@@ -1295,12 +1574,10 @@ stateDiagram-v2
 | --- | --- |
 | `SandboxProfile` / broker | exec timeout, caps, backends, jail, deny globs |
 | `McpHostConfig` | in-process DI only — **not** a TOML surface |
-| `PermissionToken` | grants from caller (issuer lands in later RFCs / profiles) |
-| `profiles/default.toml` | existing `[sandbox]`; `allow_raw_bash=false` already architectural |
+| `PermissionToken` | grants from caller |
+| `profiles/default.toml` | existing `[sandbox]` |
 
-**No new `example.env` keys are required.** Optional process env already documented by RFC-0005 (`ALLOY_CONTAINER_*`) remains sufficient. Do not create or modify `.env`.
-
-If a future RFC adds MCP server allowlists, it MUST extend `example.env` / profile TOML then — out of scope here.
+**No new `example.env` keys.** Optional process env from RFC-0005 remains sufficient. Do not create or modify `.env`.
 
 ---
 
@@ -1308,80 +1585,67 @@ If a future RFC adds MCP server allowlists, it MUST extend `example.env` / profi
 
 ### 8.1 `McpError` variant table
 
-| Variant | Producer | Meaning | Retryable? | Persist in events? | Caller visibility |
+| Variant | Producer | Meaning | Retryable? | Persist? | Caller visibility |
 | --- | --- | --- | --- | --- | --- |
-| `UnknownTool` | host lookup | name not registered | no | yes (tool_name, denied) | yes |
-| `PermissionDenied` | permission gate / handle | fail-closed authz | no (until grants change) | yes `denied=true` | yes |
-| `TokenExpired` | gate / sandbox map | expiry inclusive | no | yes | yes |
-| `InvalidToken` | defensive | malformed token invariant | no | yes | yes |
-| `InvalidArguments` | schema parse | bad JSON / schema | no | yes | yes |
-| `Unsupported` | start/stop server | MVP stub servers | no | optional | yes |
-| `ShuttingDown` | lifecycle | drain/stop | no for this host | optional | yes |
-| `Cancelled` | cancel select | caller/runtime cancel | no | yes | yes |
-| `Timeout` | sandbox timeout map | wall clock | maybe (scheduler) | yes | yes |
-| `Sandbox` | broker errors | isolation/policy/backend | depends on inner | yes | yes |
-| `Internal` | host bug | invariant | no | yes | yes |
+| `UnknownTool` | host lookup | name not registered | no | yes | yes |
+| `PermissionDenied` | authz / handle | fail-closed authz | no | yes | yes |
+| `TokenExpired` | gate / map | expiry inclusive | no | yes | yes |
+| `InvalidToken` | bad grant glob / invariant | malformed grants | no | yes | yes |
+| `InvalidArguments` | schema / size caps | bad JSON / bounds | no | yes | yes |
+| `Unsupported` | start/stop / recording | MVP stub servers | no | optional | yes |
+| `ShuttingDown` | lifecycle | drain/stop | no | optional | yes |
+| `Cancelled` | host `select!` on `cancel` after drain grace | shutdown cancel | no | yes | yes |
+| `Timeout` | `call_timeout` or sandbox timeout | wall clock | maybe | yes | yes |
+| `Sandbox` | `map_sandbox_error` default arm (redacted) | backend/IO/internal after deny mapping | depends — `Denied` never appears here | yes | yes |
+| `Internal` | host bug / construction | invariant | no | yes | yes |
 
 ### 8.2 `ToolError` variant table
 
-| Variant | Producer | Meaning | Retryable? (RFC-0010 hint) | Inside `Ok(ToolResult)`? |
+| Variant | Producer | Meaning | Retryable? | Inside `Ok(ToolResult)`? |
 | --- | --- | --- | --- | --- |
-| `Transient` | mapped IO/backend soft failures from patch backend; reserved | worth retry | **yes** | yes |
-| `Permanent` | stub apply, not_a_file, not_utf8, unsupported patch | do not retry as-is | **no** | yes |
-| `InvalidArgs` | backend invalid patch after host schema pass | bad patch body | **no** | yes |
-| `ExecutionFailed` | cargo non-zero / signal | tool ran, command failed | **policy** (often yes for repair loops) | yes |
+| `Transient` | patch `Io`; test backend | worth retry | yes | yes |
+| `Permanent` | stub apply, not_a_file, not_utf8, conflict, internal | do not retry as-is | no | yes |
+| `InvalidArgs` | patch `InvalidPatch` | bad patch body | no | yes |
+| `ExecutionFailed` | cargo non-zero / signal | tool ran, command failed | policy | yes |
 
-### 8.3 `SandboxError` → `McpError` / `ToolError` boundary
+### 8.3 `SandboxError` → `McpError`
 
-| `SandboxError` | Mapping |
-| --- | --- |
-| `Denied(MissingExecGrant)` | `McpError::PermissionDenied(MissingGrant("exec"))` |
-| `Denied(ExecNotAllowlisted\|ArgsNotAllowlisted)` | `McpError::PermissionDenied(ExecNotAllowlisted)` |
-| `Denied(PathDenied(s))` / `CwdOutsideJail` | `McpError::PermissionDenied(PathNotCovered(s))` |
-| `Denied(NetworkDenied)` | `McpError::Sandbox(Denied(NetworkDenied))` |
-| `Denied(EnvDenied(s))` | `McpError::Sandbox(Denied(EnvDenied(s)))` |
-| `Denied(QuarantineBlocked(s))` | `McpError::Sandbox(Denied(QuarantineBlocked(s)))` |
-| `TokenExpired` | `McpError::TokenExpired` |
-| `Timeout(d)` | `McpError::Timeout(d)` |
-| `Cancelled` | `McpError::Cancelled` |
-| `BackendUnavailable` / `BackendCannotEnforce` / `UnsupportedOs` | `McpError::Sandbox(...)` (operator fix; not ToolError) |
-| `Invalid` / `Io` / `Internal` | `McpError::Sandbox(...)` |
+Sole conversion: `map_sandbox_error` (§3.3).
 
-**Non-zero cargo exit is never `McpError`.** It is `Ok(ToolResult{is_error:true, error:ExecutionFailed})`.
+* `SandboxError::Denied(reason)` → `PermissionDenied(map_denial(reason))` (`map_denial` has **no** wildcard — new `DenialReason` variants fail to compile until mapped).
+* `TokenExpired` / `Timeout` / `Cancelled` → same-named `McpError`.
+* All other / future non-Denied arms → `McpError::Sandbox(redact_sandbox_error(other))`.
 
 ### 8.4 `PatchApplyError` → `ToolResult`
 
 | PatchApplyError | ToolError |
 | --- | --- |
-| `Unsupported` | `Permanent { code: "edit_engine_unwired" or "unsupported", ... }` |
+| Stub `Unsupported` with exact §3.7.1 string | `Permanent { code: "edit_engine_unwired", … }` |
+| Other `Unsupported` | `Permanent { code: "unsupported", … }` |
 | `InvalidPatch` | `InvalidArgs` |
-| `Conflict` | `Permanent { code: "conflict", ... }` |
-| `Io` | `Transient { code: "io", ... }` |
-| `Internal` | `Permanent { code: "internal", ... }` |
+| `Conflict` | `Permanent { code: "conflict", … }` |
+| `Io` | `Transient { code: "io", … }` |
+| `Internal` | `Permanent { code: "internal", … }` |
 
-Always `Ok(ToolResult{is_error:true})` — not `Err(McpError)`, except permission failures before backend.
+Always `Ok(ToolResult{is_error:true})` except permission failures before backend.
 
 ### 8.5 Recovery semantics
 
 | Failure | Recovery |
 | --- | --- |
-| PermissionDenied | Caller must obtain broader token / fix selectors — host does not escalate |
-| TokenExpired | Caller re-issues token |
-| Timeout / Cancelled | Caller retries explicitly if policy says so |
-| BackendUnavailable | Operator changes profile/host — never bare-exec fallback |
-| ExecutionFailed (cargo) | Scheduler/worker repair loop (RFC-0010/0013) |
-| edit_engine_unwired | Install RFC-0008 backend — stub never partially applies |
+| PermissionDenied | broader token / fix selectors — host does not escalate |
+| TokenExpired | re-issue token |
+| Timeout / Cancelled | explicit retry if policy says so |
+| BackendUnavailable (via Sandbox) | operator fixes host/profile — **never** bare-exec |
+| ExecutionFailed | scheduler/worker repair loop |
+| edit_engine_unwired | install RFC-0008 backend |
 
 ### 8.6 Retryability summary for RFC-0010
 
-RFC-0010 MUST treat:
-
-* `Err(McpError::Timeout)` / `Err(McpError::Sandbox(Io\|Internal))` as infrastructure failures.
-* `Ok(... ToolError::Transient)` as retryable tool failure.
-* `Ok(... ToolError::ExecutionFailed)` as compile/test failure subject to repair retries.
-* `Ok(... ToolError::Permanent\|InvalidArgs)` and `Err(PermissionDenied|UnknownTool|InvalidArguments|TokenExpired)` as non-retryable without external change.
-
-This RFC does not implement the scheduler.
+* `Err(Timeout)` / `Err(Sandbox(_))` → infrastructure (operator / backend).
+* `Ok(ToolError::Transient)` → retryable tool failure.
+* `Ok(ToolError::ExecutionFailed)` → compile/test failure; repair retries.
+* `Ok(Permanent|InvalidArgs)` and `Err(PermissionDenied|UnknownTool|InvalidArguments|TokenExpired|InvalidToken)` → non-retryable without external change.
 
 ---
 
@@ -1389,50 +1653,57 @@ This RFC does not implement the scheduler.
 
 ### 9.1 Tracing spans (REQUIRED)
 
-| Span / event | Level | Fields (names normative) |
+| Span / event | Level | Fields |
 | --- | --- | --- |
 | `alloy.mcp.call` | info span | `tool`, `run_id?`, `call_id?`, `builtin=true` |
 | `alloy.mcp.disclose` | debug span | `selector_count`, `returned`, `truncated` |
-| permission deny | warn event | `tool`, `reason` |
-| sandbox map | debug | `sandbox_variant` |
-| cancel | info | `tool` |
-| drain | info | `in_flight` |
-| obs record failure | warn | `err` (no secrets) |
+| permission deny | warn | `tool`, `reason` |
+| cancel / timeout | info | `tool` |
+| drain | info | `in_flight`, `grace_ms` |
+| obs record failure | warn | `err` |
 
-**MUST NOT** log: full permission grant lists with filesystem contents, `.env` values, raw patch bodies at info, env values.
+**MUST NOT** log: full grant lists, `.env` values, raw patch bodies at info, env values, absolute host paths.
 
 ### 9.2 `DecisionLog` integration (optional)
 
-When `decision_log: Some(log)`:
+When a decision log is installed via `with_decision_log`:
 
-After each `call` completes (including `Err` paths where a tool name is known), when `decision_log` is `Some` **and** `call.session` is `Some(session)`, host MUST invoke `record_tool_call` with:
+**Skip entirely (no record) when:** `call.session` is `None`, **or** the `call` future was **dropped**.
+
+**Otherwise await** `record_tool_call` **before** returning `Ok` or `Err` (including `ShuttingDown`, `UnknownTool`, authz, args, timeout, sandbox):
 
 | Field | Value |
 | --- | --- |
-| `session` | `call.session` (unwrap — skipped entirely if `None`) |
+| `session` | `call.session.unwrap()` (only when `Some`) |
 | `run` | `call.run` |
 | `node` | `call.node` |
 | `tool_name` | `call.name.as_str().to_string()` |
 | `tool_server` | `Some("alloy.builtins".into())` |
-| `latency_ms` | `Some(duration_ms)` measured for the call |
-| `denied` | `true` iff the `call` returned `Err(McpError::PermissionDenied(_))`, `Err(McpError::TokenExpired)`, `Err(McpError::InvalidToken(_))`, or `Err(McpError::UnknownTool(_))`; otherwise `false` (including `Ok(ToolResult{is_error:true})`) |
-| `content_hash` | `None` in MVP |
-| `body` | `None` in MVP (retention / body capture deferred to callers / RFC-0015 wiring) |
+| `latency_ms` | `Some(elapsed_ms)` from admit to record time (always `Some` when recording) |
+| `denied` | `true` iff return is `Err(PermissionDenied(_))` (includes mapped network/env/quarantine/path/exec denials); else `false` |
+| `content_hash` | `None` |
+| `body` | `None` |
 
-If `call.session` is `None`, host MUST skip `record_tool_call` (MUST NOT invent a `SessionId`). Obs / `DecisionLog` errors MUST be logged at `warn` and MUST NOT change the `call` return value.
+Note: `TokenExpired` / `InvalidToken` / `UnknownTool` set `denied=false` (not a grant denial). Obs errors → `warn`; MUST NOT change return value.
 
-### 9.3 Metrics (MVP counters / histograms)
+### 9.3 Metrics — `McpMetricsSnapshot`
 
-Use `tracing` + optional simple atomics on the host (no new metrics crate):
+```rust
+impl InProcessMcpHost {
+    pub fn metrics(&self) -> McpMetricsSnapshot;
+}
+```
 
-| Metric | Type | Labels |
-| --- | --- | --- |
-| `alloy_mcp_calls_total` | counter | `tool`, `outcome={ok,tool_error,mcp_error}` |
-| `alloy_mcp_call_duration_ms` | histogram (tracing) | `tool` |
-| `alloy_mcp_in_flight` | gauge | — |
-| `alloy_mcp_disclose_truncated_total` | counter | — |
+| Field | Incremented when |
+| --- | --- |
+| `calls_ok` | `Ok(ToolResult{is_error:false})` |
+| `calls_tool_error` | `Ok(ToolResult{is_error:true})` |
+| `calls_mcp_error` | `Err(_)` returned to caller (not drops) |
+| `denials` | `Err(PermissionDenied(_))` |
+| `disclose_truncated` | disclosure truncated |
+| `in_flight` | current admitted calls (gauge) |
 
-No OTLP exporter in this RFC.
+No Prometheus exporter. Pattern matches `StorageMetricsSnapshot` / `SessionPlane::metrics()`.
 
 ---
 
@@ -1440,28 +1711,25 @@ No OTLP exporter in this RFC.
 
 ### 10.1 `alloy-runtime` additions
 
-| Dep | Justification |
-| --- | --- |
-| existing `serde` / `serde_json` / `thiserror` / `uuid` | tool IR |
-
-No new crate dependencies required for tool IR.
+Existing `serde` / `serde_json` / `thiserror` / `uuid` only. No new deps.
 
 ### 10.2 `alloy-tools` additions
 
 | Dep | Justification |
 | --- | --- |
-| existing sandbox stack | Exec / PathPolicy |
-| `async-trait` | `McpPlatform` / backends |
+| existing sandbox stack | Exec / PathPolicy / grant matcher |
+| `async-trait` | traits |
 | `serde` / `serde_json` | schemas + DTOs |
-| `thiserror` | `McpError` |
+| `thiserror` | errors |
 | `tracing` | spans |
-| `tokio` | fs + semaphore + select |
-| `tokio-util` | `CancellationToken` (add workspace dep to `alloy-tools` if not already transitive — **MUST** declare directly) |
-| *(none new for schema)* | MVP MUST use **hand-rolled** validators matching §5.3 exactly. MUST NOT add a `jsonschema` dependency in this RFC |
+| `tokio` | fs + semaphore + timeout + select |
+| `tokio-util` | `CancellationToken` — **declare directly** |
+
+Hand-rolled validators only — **no** `jsonschema` crate.
 
 ### 10.3 `unsafe`
 
-`alloy-tools` remains `#![deny(unsafe_code)]`. MCP modules MUST NOT use `unsafe`. No change to RFC-0005 backend allow-list seams.
+`#![deny(unsafe_code)]`. MCP modules MUST NOT use `unsafe`.
 
 ---
 
@@ -1472,58 +1740,83 @@ No new crate dependencies required for tool IR.
 | Test | Asserts |
 | --- | --- |
 | `tool_name_rejects_invalid` | empty, unicode, uppercase, symbols |
-| `disclose_empty_selectors_empty` | `tools_for([]) == []` |
-| `disclose_by_name` | exact tool |
-| `disclose_by_tag_compiler` | only `cargo_check` |
-| `disclose_dedupe_and_sort` | overlapping selectors → sorted unique |
-| `disclose_cap_truncates` | >32 matches truncates (force via test registry harness if needed; MVP only 4 tools so test disclose helper unit-wise) |
+| `tool_name_serde_validates` | `"Cargo Check"` deserialize fails |
+| `disclose_empty_selectors_empty` | `[]` |
+| `disclose_by_name` / `disclose_by_tag_compiler` | filter |
+| `disclose_unknown_name_ignored` | no error |
+| `disclose_dedupe_and_sort` | sorted unique |
+| `disclose_cap_truncates` | synthetic >32 views via pure `disclose` |
+| `invalid_args_before_permission` | malformed + no grants → `InvalidArguments` |
 | `unknown_tool_err` | `UnknownTool` |
-| `token_expired_inclusive` | `now == expires` → `TokenExpired` |
+| `token_expired_inclusive` | `now == expires` |
 | `cargo_check_missing_exec` | `MissingGrant` |
-| `cargo_check_args_not_allowlisted` | Exec present but glob mismatch |
-| `fs_read_denies_dotenv` | PathPolicy deny → PermissionDenied |
-| `fs_read_requires_fs_read_grant` | jail ok but no grant → MissingGrant |
-| `apply_patch_stub_deterministic` | exact ToolError code/message §3.7.1 |
-| `apply_patch_requires_fs_write` | no FsWrite → MissingGrant |
-| `no_graph_query_registered` | `registered_len()==4`; lookup graph_query UnknownTool |
-| `no_bash_registered` | UnknownTool for `bash`/`sh` |
-| `schema_snapshots` | JSON Schema constants match committed snapshots |
-| `argv_cargo_check_mapping` | features / package / all_features |
-| `tool_handle_not_disclosed` | call outside selectors → NotDisclosed |
-| `recording_platform_records` | FIFO calls |
+| `cargo_check_args_not_allowlisted` | `ArgsNotAllowlisted` |
+| `cargo_check_path_form_exec_allow` | `/usr/bin/cargo`-style grant accepted via shared matcher when resolvable |
+| `fs_read_grant_examples_table` | §5.5 table |
+| `fs_read_denies_dotenv` | PathPolicy deny |
+| `fs_read_requires_fs_read_grant` | MissingGrant |
+| `fs_read_rejects_outside_jail` | PathNotCovered |
+| `fs_read_max_bytes_truncates` | `truncated: true` |
+| `fs_read_max_bytes_over_hard_max` | InvalidArguments |
+| `apply_patch_stub_deterministic` | §3.7.1 |
+| `apply_patch_requires_fs_write` | MissingGrant |
+| `apply_patch_error_map_all_variants` | test backend returns each `PatchApplyError` → §8.4 |
+| `no_graph_query_registered` | `registered_names()` exact set |
+| `no_bash_registered` | UnknownTool |
+| `schema_snapshots` | committed JSON |
+| `argv_cargo_check_mapping` | features/package/all_features |
+| `argv_cargo_test_mapping` | §5.7 worked example |
+| `tool_handle_not_disclosed` | NotDisclosed |
+| `recording_platform_fifo` | push/pop/exhausted |
+| `map_sandbox_error_table` | §8.3 rows including default |
+| `arguments_too_large` | InvalidArguments |
+| `tool_result_invariant` | `is_error == error.is_some()` |
+| `construction_rejects_zero_in_flight` | Internal |
+| `construction_call_timeout_default_ok` | `None` timeout succeeds even if exec_timeout > 1860 |
+| `construction_explicit_timeout_too_small` | Internal |
+| `signal_execution_failed` | `ExecutionFailed { signal: Some(_), … }` |
+| `fs_read_utf8_trim_on_truncate` | split codepoint → truncated text, not not_utf8 |
+| `fs_read_not_found_code` | Permanent not_found |
+| `no_abs_paths_in_mcp_errors` | Sandbox/PermissionDenied Display has no `/home` style paths |
+| `denied_flag_on_quarantine` | QuarantineBlocked → PermissionDenied → denied=true in obs |
 
 ### 11.2 Integration
 
 | Test | Asserts |
 | --- | --- |
-| `cargo_check_fixture_sandboxed` | Recording or Native broker; fixture crate; Ok ToolResult with exit code |
-| `cargo_check_compile_error_is_tool_result` | non-zero → `ExecutionFailed` inside Ok |
-| `cargo_test_uses_exec_class_test` | recorded request class is `Test` |
-| `fs_read_workspace_file` | reads fixture file text |
-| `fs_read_dotenv_denied_integration` | `.env` sentinel unreadable |
+| `cargo_check_fixture_sandboxed` | Ok ToolResult |
+| `cargo_check_compile_error_is_tool_result` | ExecutionFailed inside Ok |
+| `cargo_test_uses_exec_class_test` | recorded class Test; env_allow empty; cwd in jail |
+| `fs_read_workspace_file` | text |
+| `fs_read_dotenv_denied_integration` | denied |
+| `fs_read_opens_canonical_path` | symlink authorize then open canon |
 | `start_server_unsupported` | Unsupported |
 | `drain_rejects_new_calls` | ShuttingDown |
+| `drain_grace_then_cancel` | in-flight cancelled after grace |
+| `drain_idempotent_concurrent_followers` | two concurrent drain → both Ok, Stopped; under timeout |
+| `host_timeout_fs_read` | Timeout without sandbox |
+| `metrics_snapshot_counts` | ok/error/denial counters |
 
 ### 11.3 Negative / permission / sandbox / cancel / concurrency
 
 | Test | Asserts |
 | --- | --- |
-| `permission_fail_closed_no_exec` | Recording broker `recorded()` empty after deny |
-| `sandbox_denied_maps` | Denied → PermissionDenied/Sandbox per §8.3 |
-| `cancel_during_exec` | cancel host token → `Cancelled`; no orphan (broker) |
-| `concurrent_calls_semaphore` | >max_in_flight tasks complete without deadlock |
-| `stub_never_writes` | workspace digest unchanged after apply_patch stub |
+| `permission_fail_closed_no_exec` | Recording broker empty after deny |
+| `cancel_by_drop_no_orphan` | drop call → no child; no DecisionLog |
+| `concurrent_calls_semaphore` | no deadlock |
+| `stub_never_writes` | digest unchanged |
+| `tools_for_during_drain` | ShuttingDown |
 
 ### 11.4 Schema snapshot
 
-Commit `crates/alloy-tools/src/mcp/schema/snapshots/*.json` and assert equality in tests.
+Commit `crates/alloy-tools/src/mcp/schema/snapshots/*.json`.
 
 ### 11.5 Failure recovery
 
 | Test | Asserts |
 | --- | --- |
 | `obs_failure_does_not_fail_call` | DecisionLog err → tool still Ok |
-| `backend_unavailable_surfaces` | Sandbox BackendUnavailable → McpError::Sandbox |
+| `backend_unavailable_surfaces` | McpError::Sandbox |
 
 ---
 
@@ -1531,31 +1824,21 @@ Commit `crates/alloy-tools/src/mcp/schema/snapshots/*.json` and assert equality 
 
 ### 12.1 Implemented by RFC-0006
 
-* Tool IR in `alloy-runtime`
-* `McpPlatform` + `InProcessMcpHost`
-* Four builtins with schemas
-* Lazy disclosure rules
-* Permission gate
-* Sandbox + PathPolicy integration
-* `StubPatchApplyBackend` + injection contract
-* `ToolHandle`
-* Lifecycle / concurrency / cancel-by-drop
-* Observability hooks
-* Tests listed in §11
+Tool IR; `McpPlatform` + host; four builtins; lazy disclosure; permission gate with shared grant matcher; PathPolicy construction; stub apply; ToolHandle; RecordingMcpPlatform; lifecycle/drain/cancel-by-drop; metrics snapshot; tests; residual-risk note for fs_read.
 
 ### 12.2 Deferred (reference only — no design)
 
 | Item | RFC / note |
 | --- | --- |
-| EditEngine TextPatch + git checkpoint | **RFC-0008** — replaces stub backend |
+| EditEngine TextPatch + git checkpoint | **RFC-0008** |
 | Custom MCP servers / allowlists | **RFC-0013** / V2 deferred |
 | Capability workers using ToolHandle | **RFC-0013** |
 | VerifyCompile adapter behaviour | **RFC-0010** |
-| `ra_*` builtins | future RFC when RA wired |
-| External-only `graph_query` mirror | V2-permitted; **not designed here** |
+| `ra_*` builtins | future RFC |
+| External-only `graph_query` mirror | V2-permitted; **not designed** |
 | `graph_query` for Alloy workers | **Deleted (ADR F-04)** |
 | rustdoc / git / crate MCP | deferred |
-| Plugin / marketplace APIs | out of scope |
+| Per-call CancellationToken field on ToolCall | deferred — drop-future is MVP |
 | `jsonschema` crate / network=allow | deferred |
 
 ---
@@ -1565,27 +1848,35 @@ Commit `crates/alloy-tools/src/mcp/schema/snapshots/*.json` and assert equality 
 | # | Criterion | Proof |
 | --- | --- | --- |
 | 1 | `McpPlatform` signatures match §3.4 | compile + API review |
-| 2 | Exactly four builtins registered; no `graph_query`; no bash/sh | `no_graph_query_registered` + `no_bash_registered` |
-| 3 | Builtins share ToolView/Call/Result path (no side door) | single dispatch in `builtins/mod.rs`; no public backdoor APIs |
-| 4 | `tools_for([])` empty; tag/name filter; sort; cap 32 | unit disclose tests |
-| 5 | Permission fail-closed before side effects | `permission_fail_closed_no_exec` |
-| 6 | Expiry inclusive boundary | `token_expired_inclusive` |
-| 7 | `cargo_check` → `ExecClass::Check` via `SandboxBroker::exec` | integration + recording |
-| 8 | `cargo_test` → `ExecClass::Test` | recording class assert |
-| 9 | Non-zero cargo exit is `Ok(ToolResult{ExecutionFailed})` | integration |
-| 10 | `fs_read` uses `PathPolicy::authorize(Read)`; `.env` denied | unit + integration |
-| 11 | `apply_patch` stub returns exact deterministic Permanent error | `apply_patch_stub_deterministic` |
-| 12 | `start_server`/`stop_server` Unsupported | unit |
-| 13 | Cancel drops sandbox future → `Cancelled` | `cancel_during_exec` |
-| 14 | Drain rejects new calls | `drain_rejects_new_calls` |
-| 15 | Schema snapshots committed | `schema_snapshots` |
-| 16 | No new bare `Command::new` in mcp modules | clippy disallowed_methods |
-| 17 | `alloy-runtime` does not depend on `alloy-tools` | cargo metadata |
-| 18 | Five crates only; no `.env` writes | workspace + review |
-| 19 | ToolError taxonomy stable for RFC-0010 | types public + §8 tables |
-| 20 | Series Definition of Done below | checklist |
-
-Every criterion is independently testable. Subjective wording avoided.
+| 2 | Exactly four builtins; no `graph_query`; no bash/sh | `registered_names()` + unit tests |
+| 3 | Builtin handlers are `pub(crate)`; only reachable via `call` | public API surface + `BuiltinToolId::ALL` dispatch test |
+| 4 | `tools_for([])` empty; tag/name filter; sort; cap 32 via pure `disclose` | unit disclose tests including synthetic >32 |
+| 5 | `InvalidArguments` before `PermissionDenied` | `invalid_args_before_permission` |
+| 6 | Permission fail-closed before side effects | `permission_fail_closed_no_exec` |
+| 7 | Expiry inclusive | `token_expired_inclusive` |
+| 8 | Exec pre-check uses shared `match_exec_grant` (path + basename) | `cargo_check_path_form_exec_allow` + ArgsNotAllowlisted test |
+| 9 | `cargo_check` → `ExecClass::Check` via broker | integration + recording |
+| 10 | `cargo_test` → `ExecClass::Test`; argv matches §5.7 | recording + `argv_cargo_test_mapping` |
+| 11 | Non-zero exit and signal → `Ok(ExecutionFailed)` | integration + `signal_execution_failed` |
+| 12 | `fs_read` opens authorize’s canonical path; `.env` denied; outside jail denied | unit + integration |
+| 13 | `apply_patch` stub exact Permanent; all PatchApplyError maps | stub + `apply_patch_error_map_all_variants` |
+| 14 | `start_server`/`stop_server` Unsupported | unit |
+| 15 | Drop call cancels sandbox; no DecisionLog; no orphan | `cancel_by_drop_no_orphan` |
+| 16 | `drain(grace)` idempotent; rejects new calls; cancels after grace | drain tests |
+| 17 | `call_timeout` covers non-exec builtins | `host_timeout_fs_read` |
+| 18 | Schema snapshots committed | `schema_snapshots` |
+| 19 | No bare `Command::new` (crate-wide clippy already) | `cargo clippy -p alloy-tools -- -D warnings` |
+| 20 | `alloy-runtime` ↛ `alloy-tools`; five crates; no `.env` writes | `cargo metadata` + `rg` for `.env` writes in mcp |
+| 21 | `map_sandbox_error` table + ToolError taxonomy | unit tables |
+| 22 | `DecisionLog` contract (denied variants, skip if no session, await) | unit with recording log |
+| 23 | `McpMetricsSnapshot` readable via `metrics()` | `metrics_snapshot_counts` |
+| 24 | Construction rejects `max_in_flight == 0`; rejects explicit `call_timeout < exec_timeout`; defaults `None` → exec+60s | unit |
+| 25 | PathPolicy built from broker profile (no injectable divergent policy); `OperatorHomes` injected | API + unit |
+| 26 | `map_sandbox_error` maps all `DenialReason` to `PermissionDenied`; redacts host paths in `Sandbox` | `map_sandbox_error_table` + `no_abs_paths_in_mcp_errors` |
+| 27 | `fs_read` UTF-8 trim on truncation; open/read error codes | unit |
+| 28 | `McpServerSpec::new` constructible; `start_server` Unsupported | unit |
+| 29 | Drain CAS+Notify; follower wait; 5s post-cancel bound | `drain_grace_then_cancel` |
+| 30 | Series Definition of Done below | checklist |
 
 ---
 
@@ -1608,32 +1899,33 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 
 ## 15. Open Questions
 
-1. **Fine-grained `apply_patch` path grants before RFC-0008:** MVP requires any `FsWrite` grant. Should RFC-0008 mandate host-side path extraction from unified diffs before backend call? Deferred to RFC-0008 without changing this host gate.
-2. **`ToolCall.session` required for obs:** MVP skips recording when session is `None`. Should RFC-0010 require attribution fields on all adapter calls? Leave to RFC-0010.
+1. **Fine-grained `apply_patch` path grants before RFC-0008:** MVP requires any `FsWrite`. Should RFC-0008 mandate host-side path extraction from unified diffs before backend call? Deferred to RFC-0008.
+2. **Post-canonicalize TOCTOU on `fs_read`:** residual risk documented; revisit if multi-tenant hosts appear (out of MVP).
 
-**Settled (do not reopen):** ADR F-04/F-07/F-09; sole tool bus; builtins in-process; sandbox for all Exec; no raw bash default; lazy disclosure never dumps catalogue; `PermissionToken`/`Grant` from main; stub apply deterministic `edit_engine_unwired`; `start_server` unsupported in MVP; ≤5 crates; never write `.env`; external graph mirror not designed here.
+**Settled (do not reopen):** ADR F-04/F-07/F-09; sole tool bus; builtins in-process; sandbox for all Exec; shared grant matcher; no injectable PathPolicy; no raw bash; lazy disclosure never dumps catalogue; `PermissionToken`/`Grant` from main; stub apply `edit_engine_unwired`; `start_server` unsupported; cancel-by-drop; `drain(grace)`; ≤5 crates; never write `.env`; external graph mirror not designed; InvalidArguments before PermissionDenied.
 
 ---
 
 ## 16. Estimated Implementation Effort
 
-**5–8 person-days.**
+**6–9 person-days.**
 
 | Slice | Effort | Depends on |
 | --- | --- | --- |
-| Tool IR in `alloy-runtime` + re-exports | 0.5d | main |
-| `McpError` / platform trait / registry / schemas | 1d | IR |
-| Permission + disclose + ToolHandle | 1d | registry |
-| `cargo_check` / `cargo_test` builtins + sandbox mapping | 1.5–2d | RFC-0005 |
-| `fs_read` + PathPolicy | 0.5–1d | RFC-0005 |
-| `PatchApplyBackend` stub + apply_patch | 0.5d | — |
-| Lifecycle / cancel / concurrency | 0.5–1d | host |
-| Observability hooks | 0.5d | RFC-0004 types |
-| Tests + schema snapshots + clippy | 1–1.5d | all |
+| Tool IR + validating Deserialize | 0.5d | main |
+| `pub(crate)` sandbox widenings + `map_sandbox_error` | 0.5d | RFC-0005 |
+| Platform / registry / schemas / disclose helper | 1d | IR |
+| authz (shared matcher) + FsRead grant table | 1–1.5d | widenings |
+| cargo builtins + argv tests | 1.5d | authz |
+| fs_read + residual-risk note | 0.5–1d | PathPolicy |
+| Patch stub + apply_patch | 0.5d | — |
+| Lifecycle / drain(grace) / cancel-by-drop / timeout | 1d | host |
+| Recording double + metrics + obs | 0.5d | RFC-0004 |
+| Tests + snapshots + clippy | 1–1.5d | all |
 
-**Sequencing:** IR → platform/registry/schemas → permission/disclose → cargo builtins → fs_read → stub apply → lifecycle → obs → tests.
+**Sequencing:** IR → widenings → platform/disclose → authz → cargo → fs_read → stub → lifecycle → obs/metrics → tests.
 
-**Dependencies:** RFC-0001 + RFC-0005 merged on `main` (satisfied). Does not block on RFC-0008 (stub). Unblocks RFC-0008 (wire backend), RFC-0010 (VerifyCompile), RFC-0013 (ToolHandle).
+**Unblocks:** RFC-0008, RFC-0010, RFC-0013.
 
 ---
 
