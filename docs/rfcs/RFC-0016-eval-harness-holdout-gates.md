@@ -3015,6 +3015,14 @@ run id MUST open `trajectories.jsonl` with create/write/truncate semantics, so
 a successful second write is a truncate-overwrite idempotent replacement, not
 an append or duplicate.
 
+Before creating or truncating `trajectories.jsonl`, the writer MUST inspect
+that file path without following symlinks (e.g. `symlink_metadata`). If
+`trajectories.jsonl` already exists as a symlink — including a symlink whose
+target is outside `artifact_dir` — the writer MUST fail closed with
+`EvalError::Io`, MUST NOT open/follow/truncate the symlink target, and MUST
+NOT delete the symlink. Only a missing path or an existing regular file may
+be opened for create/write/truncate.
+
 The JSONL file is control-only: it contains `report.trajectories` in report
 order and MUST NOT contain any row from `naive_trajectories`. An empty control
 vector creates a zero-byte empty file. Otherwise, each line is exactly one
@@ -3423,6 +3431,7 @@ non-hex input specifically with `EvalError::Manifest`.
 | `trajectory_jsonl_contract` | Empty control rows produce a zero-byte file; every non-empty line is one object plus `\n`; naive rows are excluded; rewriting the same run id truncates and replaces rather than appends; serde failures map to `Json` and filesystem/write failures to `Io` |
 | `trajectory_artifact_run_id_validation` | A canonical lowercase UUID v4 is accepted; `.`, `..`, `/`, `\`, absolute/multi-component paths, uppercase/braced/simple UUIDs, non-v4 UUIDs, suffixes, and whitespace return exact `Manifest("invalid run_id for artifacts")` before any child path is created |
 | `trajectory_artifact_symlink_fails_closed` | A canonical run-id child that already exists as a symlink to an outside directory returns `Io`, does not follow/remove it, and leaves the outside target untouched |
+| `trajectory_jsonl_symlink_fails_closed` | An existing `trajectories.jsonl` symlink (including one pointing outside `artifact_dir`) returns `Io` without opening, following, truncating, or deleting the symlink |
 | `trajectory_disk_rotation` | With `artifact_dir = Some(tempdir)` and `max_retained_runs = 2`, a third successful run uses `remove_dir_all` on the oldest eligible UUID-named sibling by mtime, retains the new run, and writes valid one-row-per-line control-only JSONL |
 | `trajectory_rotation_ignores_non_uuid_children` | Rotation ignores non-UUID, uppercase/non-v4 UUID, nested, file, and symlink children even when older; they neither count toward the cap nor get deleted |
 | `trajectory_duration_is_scrubbed` | Full determinism scrub clears `duration_ms` in both control and naive trajectory vectors |
@@ -3626,7 +3635,7 @@ Every criterion is independently testable.
 | 84 | Trajectory durations are observational and both control and naive values are included in the normative determinism scrub | `trajectory_duration_is_scrubbed`; determinism tests |
 | 85 | Cancellation after dispatch increments `model_calls` and emits exactly one row with unknown token/USD/source fields, `complete_ok = false`, direct `ErrorClass::Cancelled`, `duration_ms = Some`, final `fixture_status = Error`, and `compile_clean = None`; cancellation before the dispatch select increments neither, and finalized row count matches saturated `model_calls` | `cancel_after_dispatch_retains_exact_row` |
 | 86 | Control and naive trajectories are each stably sorted by `fixture_id.as_str()` ascending and then `turn_id.ordinal` ascending, with manifest declaration order breaking ties and no `FixtureId: Ord` requirement | `trajectory_sort_key_is_pinned` |
-| 87 | `EvalReport.run_id` is canonical lowercase UUID v4; the artifact writer rejects every other or multi-component value with exact `Manifest("invalid run_id for artifacts")` before joining, and an existing run-path symlink fails closed without touching its target | `trajectory_artifact_run_id_validation`; `trajectory_artifact_symlink_fails_closed` |
+| 87 | `EvalReport.run_id` is canonical lowercase UUID v4; the artifact writer rejects every other or multi-component value with exact `Manifest("invalid run_id for artifacts")` before joining; an existing run-path symlink fails closed; an existing `trajectories.jsonl` symlink fails closed without touching its target | `trajectory_artifact_run_id_validation`; `trajectory_artifact_symlink_fails_closed`; `trajectory_jsonl_symlink_fails_closed` |
 | 88 | Rotation considers only immediate real directories named by canonical UUID v4, ignores every other child, uses `remove_dir_all`, and same-run rewrites truncate-overwrite the control JSONL | `trajectory_rotation_ignores_non_uuid_children`; `trajectory_disk_rotation`; `trajectory_jsonl_contract` |
 
 ---
