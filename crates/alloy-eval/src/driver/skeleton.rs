@@ -1,18 +1,42 @@
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use alloy_runtime::{ModelProvider, ProviderError};
+use alloy_runtime::{
+    CompletionRequest, ModelEndpoint, ModelProvider, ModelResponse, ProviderError, Usage,
+};
 use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
 use crate::cost_claim::derive_eval_usd;
-use crate::error::{EvalError, ReportError};
+use crate::error::{bound_message, EvalError, ReportError};
 use crate::fingerprint::RequestFingerprint;
 use crate::harness::{FixtureRunOutput, LoadedFixture};
-use crate::manifest::{ScriptTurn, SuccessCriterion};
+use crate::manifest::{FixtureTurnId, ScriptTurn, SuccessCriterion};
 use crate::report::{CriterionResult, FixtureOutcome, FixtureStatus};
 use crate::scripted::{ScriptOutcome, ScriptedProvider};
 use crate::trajectory::EvalTrajectoryRecord;
+
+// TODO(RFC-0016): replace with `crate::scripted::SCRIPTED_MISS_PREFIX` and
+// `crate::scripted::SCRIPTED_WRONG_ENDPOINT` once `scripted` exports them.
+// These must stay byte-identical to the strings `ScriptedProvider::complete`
+// produces (§5.3.2 steps 5-6).
+const SCRIPTED_MISS_PREFIX: &str = "scripted miss:";
+const SCRIPTED_WRONG_ENDPOINT: &str = "scripted wrong endpoint";
+
+/// §5.3.1 carrier detail; conformance tests match it byte-for-byte.
+const SCRIPT_MISS_DETAIL: &str = "script miss";
+
+/// One `unsafe` occurrence per source line; compiled once for the process.
+static UNSAFE_LINE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)(^|\s)unsafe(\s|!|\()").expect("unsafe line regex is valid"));
+
+// Test-only fault injection for the §5.3.2 built-request comparison. The
+// production path never sets it, so `build_turn_request` stays an identity.
+#[cfg(test)]
+thread_local! {
+    static FORCE_SCRIPT_MISS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScriptedDriverMode {
@@ -28,10 +52,31 @@ struct CriteriaState {
 struct RunObservations {
     tokens_in: Option<u64>,
     tokens_out: Option<u64>,
+    tokens_in_incomplete: bool,
+    tokens_out_incomplete: bool,
+    successful_responses: u32,
     cost_usd: Option<f64>,
     compile_clean: Option<bool>,
     unsafe_introduced: Option<bool>,
     patch_passed: bool,
+}
+
+impl RunObservations {
+    /// Token and cost fields start absent: they only become `Some` once a
+    /// successful response actually reports them (§3.7.1).
+    fn new() -> Self {
+        Self {
+            tokens_in: None,
+            tokens_out: None,
+            tokens_in_incomplete: false,
+            tokens_out_incomplete: false,
+            successful_responses: 0,
+            cost_usd: None,
+            compile_clean: None,
+            unsafe_introduced: None,
+            patch_passed: false,
+        }
+    }
 }
 
 pub(crate) async fn run(
@@ -71,23 +116,21 @@ pub(crate) async fn run_scripted(
     }
 
     let mut candidate = None::<String>;
-    let mut observations = RunObservations {
-        tokens_in: Some(0),
-        tokens_out: Some(0),
-        cost_usd: Some(0.0),
-        compile_clean: None,
-        unsafe_introduced: None,
-        patch_passed: false,
-    };
+    let mut observations = RunObservations::new();
 
     for turn in &plan.turns {
         if is_cancelled(&cancel) {
             return cancelled_output(fixture, started, trajectories);
         }
 
-        let request = turn.request.clone();
+        let request = build_turn_request(turn);
         if request != turn.request {
-            criteria.set_carrier_failure("script miss");
+            tracing::warn!(
+                fixture_id = %fixture.manifest.id,
+                turn_id = %turn.turn_id.render(),
+                "eval driver built a request that misses the script"
+            );
+            criteria.set_carrier_failure(SCRIPT_MISS_DETAIL);
             break;
         }
 
@@ -95,67 +138,25 @@ pub(crate) async fn run_scripted(
             return cancelled_output(fixture, started, trajectories);
         }
 
-        let request_fingerprint = RequestFingerprint::of(&request);
-        let attempt_started = Instant::now();
-        let complete = provider.complete(&fixture.endpoint, request);
-        let complete_result = if let Some(token) = &cancel {
-            tokio::select! {
-                biased;
-                _ = token.cancelled() => {
-                    let duration_ms = elapsed_ms(attempt_started);
-                    trajectories.push(EvalTrajectoryRecord::cancelled(
-                        fixture.manifest.id.clone(),
-                        fixture.manifest.set,
-                        turn.turn_id.clone(),
-                        request_fingerprint,
-                        &fixture.endpoint,
-                        Some(duration_ms),
-                        FixtureStatus::Error,
-                        None,
-                    ));
-                    return cancelled_output(fixture, started, trajectories);
-                }
-                result = complete => result,
-            }
-        } else {
-            complete.await
-        };
-        let duration_ms = elapsed_ms(attempt_started);
+        let dispatched = dispatch_turn(
+            &provider,
+            fixture,
+            &turn.turn_id,
+            request,
+            &cancel,
+            &mut trajectories,
+        )
+        .await;
 
-        match complete_result {
-            Ok(response) => {
-                trajectories.push(EvalTrajectoryRecord::from_response(
-                    fixture.manifest.id.clone(),
-                    fixture.manifest.set,
-                    turn.turn_id.clone(),
-                    request_fingerprint,
-                    &fixture.endpoint,
-                    &response,
-                    Some(duration_ms),
-                    FixtureStatus::Error,
-                    None,
-                ));
+        match dispatched {
+            None => return cancelled_output(fixture, started, trajectories),
+            Some(Ok(response)) => {
                 accumulate_usage(&mut observations, &response.usage);
-                accumulate_cost(
-                    &mut observations,
-                    derive_eval_usd(&fixture.endpoint, &response.usage),
-                );
                 if let Some(text) = response.text {
                     candidate = Some(text);
                 }
             }
-            Err(error) => {
-                trajectories.push(EvalTrajectoryRecord::from_provider_error(
-                    fixture.manifest.id.clone(),
-                    fixture.manifest.set,
-                    turn.turn_id.clone(),
-                    request_fingerprint,
-                    &fixture.endpoint,
-                    &error,
-                    Some(duration_ms),
-                    FixtureStatus::Error,
-                    None,
-                ));
+            Some(Err(error)) => {
                 if let Some(error) = provider_map_error(&error) {
                     return error_output(fixture, started, error, trajectories);
                 }
@@ -168,6 +169,8 @@ pub(crate) async fn run_scripted(
         }
     }
 
+    finalize_cost(&mut observations, &fixture.endpoint);
+
     if candidate.is_none() {
         observations.compile_clean = Some(false);
         criteria.set_carrier_failure("missing repair text");
@@ -178,7 +181,7 @@ pub(crate) async fn run_scripted(
     }
 
     if let Some(candidate) = candidate.as_deref() {
-        match std::fs::read(&fixture.paths.golden) {
+        match read_bytes(fixture.paths.golden.clone()).await {
             Ok(golden) if candidate.as_bytes() == golden.as_slice() => {
                 observations.patch_passed = true;
                 match fixture.post_repair.compile_clean() {
@@ -193,9 +196,7 @@ pub(crate) async fn run_scripted(
                 observations.compile_clean = Some(false);
                 criteria.set_carrier_failure("patch oracle failed");
             }
-            Err(error) => {
-                return error_output(fixture, started, EvalError::Io(error), trajectories)
-            }
+            Err(error) => return error_output(fixture, started, error, trajectories),
         }
     }
 
@@ -219,7 +220,7 @@ pub(crate) async fn run_scripted(
                 }
             }
             SuccessCriterion::NoNewUnsafe => {
-                match evaluate_no_new_unsafe(fixture, candidate.as_deref()) {
+                match evaluate_no_new_unsafe(fixture, candidate.as_deref()).await {
                     Ok((introduced, result)) => {
                         observations.unsafe_introduced = Some(introduced);
                         result
@@ -275,6 +276,92 @@ pub(crate) async fn run_scripted(
         },
         trajectories,
     }
+}
+
+/// Build the request the driver sends for `turn`.
+///
+/// Day-1 replays `turn.request` byte-for-byte (§5.3.2 step 1); the seam exists
+/// so a future driver that synthesizes requests still gets compared against
+/// the manifest before the provider is called.
+fn build_turn_request(turn: &ScriptTurn) -> CompletionRequest {
+    #[cfg(test)]
+    if FORCE_SCRIPT_MISS.with(std::cell::Cell::get) {
+        let mut request = turn.request.clone();
+        request.max_output_tokens = Some(
+            request
+                .max_output_tokens
+                .unwrap_or_default()
+                .saturating_add(1),
+        );
+        return request;
+    }
+    turn.request.clone()
+}
+
+/// Race one `complete` against cancellation and append exactly one trajectory
+/// row for the dispatch (§3.16 / §5.3.2 step 3).
+///
+/// Returns `None` when cancellation won; the row is still recorded because the
+/// invocation was attempted.
+async fn dispatch_turn(
+    provider: &ScriptedProvider,
+    fixture: &LoadedFixture,
+    turn_id: &FixtureTurnId,
+    request: CompletionRequest,
+    cancel: &Option<CancellationToken>,
+    trajectories: &mut Vec<EvalTrajectoryRecord>,
+) -> Option<Result<ModelResponse, ProviderError>> {
+    let request_fingerprint = RequestFingerprint::of(&request);
+    let attempt_started = Instant::now();
+    let complete = provider.complete(&fixture.endpoint, request);
+    let result = if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => {
+                trajectories.push(EvalTrajectoryRecord::cancelled(
+                    fixture.manifest.id.clone(),
+                    fixture.manifest.set,
+                    turn_id.clone(),
+                    request_fingerprint,
+                    &fixture.endpoint,
+                    Some(elapsed_ms(attempt_started)),
+                    FixtureStatus::Error,
+                    None,
+                ));
+                return None;
+            }
+            result = complete => result,
+        }
+    } else {
+        complete.await
+    };
+    let duration_ms = Some(elapsed_ms(attempt_started));
+
+    trajectories.push(match &result {
+        Ok(response) => EvalTrajectoryRecord::from_response(
+            fixture.manifest.id.clone(),
+            fixture.manifest.set,
+            turn_id.clone(),
+            request_fingerprint,
+            &fixture.endpoint,
+            response,
+            duration_ms,
+            FixtureStatus::Error,
+            None,
+        ),
+        Err(error) => EvalTrajectoryRecord::from_provider_error(
+            fixture.manifest.id.clone(),
+            fixture.manifest.set,
+            turn_id.clone(),
+            request_fingerprint,
+            &fixture.endpoint,
+            error,
+            duration_ms,
+            FixtureStatus::Error,
+            None,
+        ),
+    });
+    Some(result)
 }
 
 struct ExecutionPlan {
@@ -358,7 +445,7 @@ impl CriteriaState {
     }
 }
 
-fn evaluate_no_new_unsafe(
+async fn evaluate_no_new_unsafe(
     fixture: &LoadedFixture,
     candidate: Option<&str>,
 ) -> Result<(bool, CriterionResult), EvalError> {
@@ -372,7 +459,7 @@ fn evaluate_no_new_unsafe(
             },
         ));
     };
-    let pre_source = std::fs::read_to_string(&fixture.paths.target)?;
+    let pre_source = read_to_string(fixture.paths.target.clone()).await?;
     let pre_count = unsafe_line_count(&pre_source);
     let post_count = unsafe_line_count(candidate);
     let introduced = post_count > pre_count;
@@ -422,37 +509,94 @@ fn evaluate_expected_diagnostics_cleared(
 }
 
 fn unsafe_line_count(source: &str) -> usize {
-    let regex = Regex::new(r"(?m)(^|\s)unsafe(\s|!|\()").expect("unsafe regex is valid");
-    source.lines().filter(|line| regex.is_match(line)).count()
+    source
+        .lines()
+        .filter(|line| UNSAFE_LINE_PATTERN.is_match(line))
+        .count()
 }
 
-fn accumulate_usage(observations: &mut RunObservations, usage: &alloy_runtime::Usage) {
-    observations.tokens_in = match (observations.tokens_in, usage.input_tokens) {
-        (Some(total), Some(value)) => Some(total.saturating_add(value)),
-        _ => None,
-    };
-    observations.tokens_out = match (observations.tokens_out, usage.output_tokens) {
-        (Some(total), Some(value)) => Some(total.saturating_add(value)),
-        _ => None,
-    };
+/// Accumulate one successful response's usage (§3.7.1).
+///
+/// A side that a successful response left absent is incomplete for the whole
+/// fixture and stays `None`; later responses cannot revive it.
+fn accumulate_usage(observations: &mut RunObservations, usage: &Usage) {
+    observations.successful_responses = observations.successful_responses.saturating_add(1);
+    accumulate_usage_side(
+        &mut observations.tokens_in,
+        &mut observations.tokens_in_incomplete,
+        usage.input_tokens,
+    );
+    accumulate_usage_side(
+        &mut observations.tokens_out,
+        &mut observations.tokens_out_incomplete,
+        usage.output_tokens,
+    );
 }
 
-fn accumulate_cost(observations: &mut RunObservations, usd: Option<f64>) {
-    observations.cost_usd = match (observations.cost_usd, usd) {
-        (Some(total), Some(value)) if value.is_finite() => Some(total + value),
+fn accumulate_usage_side(total: &mut Option<u64>, incomplete: &mut bool, value: Option<u64>) {
+    match value {
+        None => {
+            *incomplete = true;
+            *total = None;
+        }
+        Some(value) if !*incomplete => {
+            *total = Some(total.unwrap_or(0).saturating_add(value));
+        }
+        Some(_) => {}
+    }
+}
+
+/// Derive fixture USD exactly once from the saturated totals (§3.7.1).
+///
+/// Per-response USD is never summed: repeated rounding would drift from the
+/// RFC-0007 formula applied to the totals.
+fn finalize_cost(observations: &mut RunObservations, endpoint: &ModelEndpoint) {
+    observations.cost_usd = match (
+        observations.successful_responses,
+        observations.tokens_in,
+        observations.tokens_out,
+    ) {
+        (0, _, _) => None,
+        (_, Some(input_tokens), Some(output_tokens)) => derive_eval_usd(
+            endpoint,
+            &Usage {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+            },
+        ),
         _ => None,
     };
 }
 
 fn provider_map_error(error: &ProviderError) -> Option<EvalError> {
     match error {
-        ProviderError::Internal(message) if message.starts_with("scripted miss:") => {
+        ProviderError::Internal(message) if message.starts_with(SCRIPTED_MISS_PREFIX) => {
             Some(EvalError::Internal(message.clone()))
         }
-        ProviderError::Internal(message) if message == "scripted wrong endpoint" => {
+        ProviderError::Internal(message) if message == SCRIPTED_WRONG_ENDPOINT => {
             Some(EvalError::Internal(message.clone()))
         }
         _ => None,
+    }
+}
+
+async fn read_bytes(path: PathBuf) -> Result<Vec<u8>, EvalError> {
+    join_blocking(tokio::task::spawn_blocking(move || std::fs::read(path)).await)
+}
+
+async fn read_to_string(path: PathBuf) -> Result<String, EvalError> {
+    join_blocking(tokio::task::spawn_blocking(move || std::fs::read_to_string(path)).await)
+}
+
+fn join_blocking<T>(
+    joined: Result<std::io::Result<T>, tokio::task::JoinError>,
+) -> Result<T, EvalError> {
+    match joined {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(EvalError::Io(error)),
+        Err(error) => Err(EvalError::Internal(bound_message(format!(
+            "join_failed: {error:?}"
+        )))),
     }
 }
 
@@ -538,13 +682,35 @@ fn saturating_len_u32(len: usize) -> u32 {
 }
 
 #[cfg(test)]
+struct ForceScriptMiss;
+
+#[cfg(test)]
+impl ForceScriptMiss {
+    fn enable() -> Self {
+        FORCE_SCRIPT_MISS.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceScriptMiss {
+    fn drop(&mut self) {
+        FORCE_SCRIPT_MISS.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::tests::loaded_fixture_for_tests;
-    use crate::manifest::FixtureDriverKind;
+    use crate::harness::tests::{
+        loaded_fixture_for_tests, loaded_fixture_with_outcome, response_outcome,
+    };
+    use crate::manifest::{FixtureDriverKind, ScriptTurnOutcome};
+    use crate::scripted::ScriptedProviderError;
+    use alloy_runtime::ErrorClass;
 
     #[test]
-    fn carrier_detail_is_sticky() {
+    fn carrier_detail_is_sticky_against_later_criterion() {
         let mut state = CriteriaState::new(&[
             SuccessCriterion::NoNewUnsafe,
             SuccessCriterion::ExpectedDiagnosticsCleared,
@@ -560,12 +726,29 @@ mod tests {
         );
         assert!(!state.results[0].passed);
         assert_eq!(state.results[0].detail, "missing repair text");
+
+        // A non-carrier criterion still records its own result.
+        state.set_result(
+            1,
+            CriterionResult {
+                name: SuccessCriterion::ExpectedDiagnosticsCleared,
+                passed: true,
+                detail: String::new(),
+            },
+        );
+        assert!(state.results[1].passed);
     }
 
     #[test]
-    fn unsafe_count_is_line_based() {
+    fn no_new_unsafe_is_line_scoped() {
         assert_eq!(unsafe_line_count("unsafe\n"), 0);
         assert_eq!(unsafe_line_count("unsafe ()\nunsafe!();\nmyunsafe();\n"), 2);
+        // Only the line carrying `unsafe` counts, not the whole source.
+        assert_eq!(
+            unsafe_line_count("fn a() {}\nfn b() { unsafe { } }\nfn c() {}\n"),
+            1
+        );
+        assert_eq!(unsafe_line_count(""), 0);
     }
 
     #[tokio::test]
@@ -578,5 +761,164 @@ mod tests {
         assert_eq!(output.outcome.error.unwrap().kind, "cancelled");
         assert_eq!(output.outcome.model_calls, 0);
         assert!(output.trajectories.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_after_dispatch_retains_exact_row() {
+        let fixture = loaded_fixture_for_tests("dispatch", FixtureDriverKind::SkeletonReplay);
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut trajectories = Vec::new();
+        let turn = &fixture.manifest.turns[0];
+
+        let dispatched = dispatch_turn(
+            &provider,
+            &fixture,
+            &turn.turn_id,
+            turn.request.clone(),
+            &Some(token),
+            &mut trajectories,
+        )
+        .await;
+
+        assert!(dispatched.is_none());
+        assert_eq!(trajectories.len(), 1);
+        assert_eq!(trajectories[0].error_class, Some(ErrorClass::Cancelled));
+        assert!(!trajectories[0].complete_ok);
+    }
+
+    #[tokio::test]
+    async fn wrong_driver_request_is_script_miss_fail() {
+        let fixture = loaded_fixture_for_tests("script-miss", FixtureDriverKind::SkeletonReplay);
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+        let _guard = ForceScriptMiss::enable();
+
+        let output = run(&fixture, provider, None).await;
+
+        assert_eq!(output.outcome.status, FixtureStatus::Fail);
+        assert_eq!(output.outcome.criteria[0].detail, SCRIPT_MISS_DETAIL);
+        assert!(!output.outcome.criteria[0].passed);
+        // The provider was never called for the mismatched turn.
+        assert_eq!(output.outcome.model_calls, 0);
+        assert!(output.trajectories.is_empty());
+        assert!(output.outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_error_before_repair_fails() {
+        let fixture = loaded_fixture_with_outcome(
+            "provider-error",
+            FixtureDriverKind::SkeletonReplay,
+            ScriptTurnOutcome::Error {
+                error: ScriptedProviderError::RateLimit,
+            },
+        );
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+
+        let output = run(&fixture, provider, None).await;
+
+        assert_eq!(output.outcome.status, FixtureStatus::Fail);
+        assert_eq!(
+            output.outcome.criteria[0].detail,
+            "provider error before repair text"
+        );
+        assert_eq!(output.outcome.compile_clean, Some(false));
+        assert_eq!(output.outcome.model_calls, 1);
+        assert!(output.outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_repair_text_fails() {
+        let fixture = loaded_fixture_with_outcome(
+            "missing-text",
+            FixtureDriverKind::SkeletonReplay,
+            response_outcome(None),
+        );
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+
+        let output = run(&fixture, provider, None).await;
+
+        assert_eq!(output.outcome.status, FixtureStatus::Fail);
+        assert_eq!(output.outcome.criteria[0].detail, "missing repair text");
+        assert_eq!(output.outcome.compile_clean, Some(false));
+        assert!(output.outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn patch_mismatch_fails_compile() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&golden, "not the candidate\n").unwrap();
+        let mut fixture =
+            loaded_fixture_for_tests("patch-mismatch", FixtureDriverKind::SkeletonReplay);
+        fixture.paths.golden = golden;
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+
+        let output = run(&fixture, provider, None).await;
+
+        assert_eq!(output.outcome.status, FixtureStatus::Fail);
+        assert_eq!(output.outcome.criteria[0].detail, "patch oracle failed");
+        assert_eq!(output.outcome.compile_clean, Some(false));
+        assert!(output.outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn outcome_usage_accounting() {
+        // No successful response: both token sides and cost stay absent.
+        let fixture = loaded_fixture_with_outcome(
+            "no-success",
+            FixtureDriverKind::SkeletonReplay,
+            ScriptTurnOutcome::Error {
+                error: ScriptedProviderError::RateLimit,
+            },
+        );
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+        let output = run(&fixture, provider, None).await;
+        assert_eq!(output.outcome.tokens_in, None);
+        assert_eq!(output.outcome.tokens_out, None);
+        assert_eq!(output.outcome.cost_usd, None);
+
+        // One success with complete usage: totals present, cost derived once
+        // from the totals when the endpoint carries both prices.
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("lib.rs.post");
+        std::fs::write(&golden, "fixed").unwrap();
+        let mut fixture = loaded_fixture_for_tests("usage", FixtureDriverKind::SkeletonReplay);
+        fixture.paths.golden = golden;
+        fixture.endpoint.input_usd_per_mtok = Some(2.0);
+        fixture.endpoint.output_usd_per_mtok = Some(4.0);
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+        let output = run(&fixture, provider, None).await;
+        assert_eq!(output.outcome.tokens_in, Some(1));
+        assert_eq!(output.outcome.tokens_out, Some(2));
+        assert_eq!(
+            output.outcome.cost_usd,
+            Some(2.0 / 1_000_000.0 + 8.0 / 1_000_000.0)
+        );
+
+        // A successful response missing one side voids that side, and with it
+        // the cost, even though the other side is complete.
+        let mut fixture =
+            loaded_fixture_with_outcome("half-usage", FixtureDriverKind::SkeletonReplay, {
+                ScriptTurnOutcome::Response {
+                    text: Some("fixed".to_owned()),
+                    structured: None,
+                    usage: Usage {
+                        input_tokens: Some(7),
+                        output_tokens: None,
+                    },
+                    provider_request_id: None,
+                    finish_reason: None,
+                }
+            });
+        fixture.paths.golden = dir.path().join("lib.rs.post");
+        fixture.endpoint.input_usd_per_mtok = Some(2.0);
+        fixture.endpoint.output_usd_per_mtok = Some(4.0);
+        let provider = fixture.scripts.as_ref().unwrap().clone();
+        let output = run(&fixture, provider, None).await;
+        assert_eq!(output.outcome.tokens_in, Some(7));
+        assert_eq!(output.outcome.tokens_out, None);
+        assert_eq!(output.outcome.cost_usd, None);
     }
 }

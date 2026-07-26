@@ -21,7 +21,9 @@ jobs:
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
 
-          mapfile -t changed_paths < <(git diff --name-only "$base" "$head")
+          # Three-dot: diff against the merge base, so commits landed on the
+          # base branch after this PR forked are not attributed to the PR.
+          mapfile -t changed_paths < <(git diff --name-only "$base...$head")
 
           touched_holdout=false
           touched_tuning_surface=false
