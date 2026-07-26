@@ -1999,7 +1999,7 @@ table, subject to the sticky-carrier rule:
 | Candidate present; `introduced == false` | `true` | `""` |
 | Candidate present; `introduced == true` | `false` | `"unsafe introduced"` |
 | Candidate missing; `NoNewUnsafe` is non-carrier | `false` | `"missing repair text"` |
-| Candidate missing; `NoNewUnsafe` is carrier already failed by §5.3/§5.5 | preserve `false` | preserve `"missing repair text"` |
+| Candidate missing; `NoNewUnsafe` is carrier already failed by §5.3/§5.5 | preserve `false` | preserve existing sticky detail |
 
 #### 5.5.3 `ExpectedDiagnosticsCleared`
 
