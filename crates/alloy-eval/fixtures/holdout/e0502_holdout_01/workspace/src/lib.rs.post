@@ -1,0 +1,6 @@
+pub fn broken_total() -> i32 {
+    let mut total = 10;
+    let snapshot = total;
+    total += 5;
+    snapshot + total
+}

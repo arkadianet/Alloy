@@ -1,0 +1,6 @@
+set = "train"
+min_compile_success_rate = 1.0
+min_success_rate = 1.0
+max_unsafe_introduced_rate = 0.0
+require_beat_naive = false
+naive_epsilon = 0.0

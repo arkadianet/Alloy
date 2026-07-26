@@ -1,0 +1,51 @@
+name: eval-holdout-hygiene
+
+on:
+  pull_request:
+
+jobs:
+  eval-holdout-hygiene:
+    name: eval-holdout-hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reject mixed holdout and tuning changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+
+          # Three-dot: diff against the merge base, so commits landed on the
+          # base branch after this PR forked are not attributed to the PR.
+          mapfile -t changed_paths < <(git diff --name-only "$base...$head")
+
+          touched_holdout=false
+          touched_tuning_surface=false
+
+          for path in "${changed_paths[@]}"; do
+            case "$path" in
+              crates/alloy-eval/fixtures/holdout/*)
+                touched_holdout=true
+                ;;
+            esac
+
+            case "$path" in
+              prompts/*|*/prompts/*|templates/*|*/templates/*|crates/alloy-runtime/src/router/openai.rs)
+                touched_tuning_surface=true
+                ;;
+            esac
+          done
+
+          if [[ "$touched_holdout" == true && "$touched_tuning_surface" == true ]]; then
+            echo "PRs must not change holdout fixtures and prompt/template/router tuning surfaces together."
+            printf 'Changed paths:\n'
+            printf '  %s\n' "${changed_paths[@]}"
+            exit 1
+          fi

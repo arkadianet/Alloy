@@ -1,0 +1,9 @@
+pub fn broken() -> i32 {
+    let mut x = 1;
+    {
+        let r = &mut x;
+        *r += 1;
+    }
+    let y = &x;
+    *y
+}

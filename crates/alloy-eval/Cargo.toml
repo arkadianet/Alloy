@@ -1,6 +1,6 @@
 [package]
 name = "alloy-eval"
-description = "Alloy eval harness (stub until RFC-0016)"
+description = "Alloy eval harness and holdout gates (RFC-0016)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,24 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+alloy-runtime = { workspace = true, default-features = false }
+async-trait = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }
+trybuild = { workspace = true }
+
+[[bench]]
+name = "fingerprint"
+harness = false
