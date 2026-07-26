@@ -401,7 +401,8 @@ mod tests {
         assert!(serde_json::from_value::<ToolResult>(bad2).is_err());
 
         let ok = ToolResult::ok(ToolName::new("cargo_check").unwrap(), json!({}), 1);
-        let round = serde_json::from_value::<ToolResult>(serde_json::to_value(&ok).unwrap()).unwrap();
+        let round =
+            serde_json::from_value::<ToolResult>(serde_json::to_value(&ok).unwrap()).unwrap();
         assert!(!round.is_error());
         assert!(round.error().is_none());
     }
