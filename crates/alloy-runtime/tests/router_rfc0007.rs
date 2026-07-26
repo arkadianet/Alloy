@@ -610,13 +610,11 @@ async fn openai_tls_classified() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr: SocketAddr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.expect("accept");
-        let mut tls = acceptor.accept(tcp).await.expect("tls accept");
-        let mut buf = [0u8; 1024];
-        let _ = tls.read(&mut buf).await;
-        let _ = tls
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .await;
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        // Client rejects the untrusted cert; accept may fail — that is expected.
+        let _ = acceptor.accept(tcp).await;
     });
 
     let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleSpec {

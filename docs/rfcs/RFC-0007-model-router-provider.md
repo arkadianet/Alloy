@@ -421,9 +421,10 @@ impl CompleteTicket {
 **`complete` admission precedence (normative, first match wins):**
 1. `ShuttingDown` / phase not Ready (after semaphore wait ends in shutdown)
 2. `WrongRouter`
-3. `AlreadyCompleted` (ticket consume fails)
-4. `BudgetDenied` (re-check when meter present)
-5. Provider call / other errors
+3. `Cancelled` (router-owned cancellation token already cancelled; no ticket consume)
+4. `AlreadyCompleted` (ticket consume fails)
+5. `BudgetDenied` (re-check when meter present)
+6. Provider call / other errors
 
 ### 3.9 `SecretString`
 
@@ -975,10 +976,11 @@ Before provider HTTP, `TomlModelRouter::complete` MUST apply this precedence:
 
 1. Lifecycle/semaphore admission → `ShuttingDown` if draining/stopped.
 2. If `routed.router_instance_id != self.router_instance_id` → `Err(WrongRouter)` (no ticket consume, no HTTP).
-3. `routed.complete_ticket.try_consume()`; if false → `Err(AlreadyCompleted)` (no HTTP, no meter, no ModelCall).
-4. If meter present: re-check `meter.check_budget(&self.budget_policy)`, then apply the zero/non-finite USD overlay (§5.4). If exhausted → `Err(BudgetDenied(check))`, record `DecisionKind::Budget`, ticket stays consumed.
-5. If meter absent (`allow_unmetered` only): skip budget re-check; single-use ticket still applies.
-6. Proceed to provider call only after steps 1–5 succeed.
+3. If the router-owned cancellation token is already cancelled → `Err(Cancelled)` (no ticket consume, no HTTP, no meter, no ModelCall).
+4. `routed.complete_ticket.try_consume()`; if false → `Err(AlreadyCompleted)` (no HTTP, no meter, no ModelCall).
+5. If meter present: re-check `meter.check_budget(&self.budget_policy)`, then apply the zero/non-finite USD overlay (§5.4). If exhausted → `Err(BudgetDenied(check))`, record `DecisionKind::Budget`, ticket stays consumed.
+6. If meter absent (`allow_unmetered` only): skip budget re-check; single-use ticket still applies.
+7. Proceed to provider call only after steps 1–6 succeed.
 
 **Caller observation:** `Err(BudgetDenied(_))` / `Err(AlreadyCompleted)` / `Err(WrongRouter)` — no provider HTTP occurs.
 
@@ -1682,14 +1684,25 @@ Callers MUST pass `RuntimeConfig::budget_policy` into `TomlModelRouter::from_pat
 
 #### 8.3.2 TLS vs Transport classification (normative)
 
-`reqwest = =0.13.4` has no `is_tls()` predicate. Classification MUST walk `reqwest::Error` via `std::error::Error::source` and match:
+`reqwest = =0.13.4` has no `is_tls()` predicate. Classification MUST walk
+`reqwest::Error` via `std::error::Error::source` **and** nested
+`std::io::Error::get_ref()` payloads (hyper/tokio-rustls wrap `rustls::Error`
+inside `io::Error`, and `io::Error::source` returns the *inner* error's source
+rather than the wrapped value):
 
 1. `is_timeout()` → `Timeout` (takes precedence).
-2. Any source downcastable to `rustls::Error` → `Tls`.
-3. Else any source whose `std::any::type_name_of_val` / downcast matches `rustls_pki_types` / webpki certificate errors if present in the tree after `cargo tree` verification → `Tls`.
-4. Else → `Transport` (including connect/DNS/reset/body I/O).
+2. Any source (including nested `io::Error::get_ref`) downcastable to
+   `rustls::Error` → `Tls`.
+3. Else → `Transport` (including connect/DNS/reset/body I/O).
 
-Implementation MUST add a **direct** `alloy-runtime` dependency on the same `rustls` version reqwest 0.13.4 pulls (pin noted in the impl PR via `cargo tree -i rustls`) solely for `downcast_ref` in the mapper. The mapper is a pure function:
+Implementation MUST add a **direct** `alloy-runtime` dependency on the same
+`rustls` version reqwest 0.13.4 pulls (pin noted in the impl PR via
+`cargo tree -i rustls`; verified single `rustls v0.23.42` shared across
+reqwest/hyper-rustls/tokio-rustls/rustls-platform-verifier) solely for
+`downcast_ref` in the mapper. PKI failures surface as
+`rustls::Error::InvalidCertificate(...)` through that shared crate, so a
+separate `rustls_pki_types` / webpki downcast is not required when the tree
+contains only one rustls. The mapper is a pure function:
 
 ```rust
 pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError;
@@ -1850,7 +1863,12 @@ pub struct RouterMetricsSnapshot {
 }
 ```
 
-Incremented on returned results (not on future drops).
+Incremented on returned results (not on future drops). `completes_ok` counts
+successful `Ok(ModelResponse)` returns. `completes_err` counts **every**
+returned `Err` from `complete`, including admission/lifecycle outcomes
+(`ShuttingDown`, `WrongRouter`, `AlreadyCompleted`, `Cancelled`, `BudgetDenied`)
+as well as `Provider` / `Internal` failures. Dropped futures never increment
+either counter.
 
 ---
 

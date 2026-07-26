@@ -74,7 +74,6 @@ pub(crate) fn budget_decision_for_route(
         counters,
         budget_source,
         in_flight,
-        "in_flight_at_route",
     )
 }
 
@@ -99,11 +98,9 @@ pub(crate) fn budget_decision_for_complete(
         counters,
         "meter",
         in_flight,
-        "in_flight_at_route",
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn budget_decision(
     session: crate::SessionId,
     run: Option<crate::RunId>,
@@ -115,9 +112,8 @@ fn budget_decision(
     counters: BudgetCounters,
     budget_source: &'static str,
     in_flight: usize,
-    in_flight_field: &'static str,
 ) -> DecisionRecord {
-    let mut metadata = serde_json::json!({
+    let metadata = serde_json::json!({
         "capability": capability,
         "capability_mapped": source == TierSource::CapabilityMap,
         "tier": tier_name(tier),
@@ -126,11 +122,8 @@ fn budget_decision(
         "tokens_out": counters.tokens_out,
         "usd_spent": counters.usd_spent,
         "budget_source": budget_source,
+        "in_flight_at_route": in_flight,
     });
-    metadata
-        .as_object_mut()
-        .expect("budget metadata is constructed as an object")
-        .insert(in_flight_field.into(), serde_json::json!(in_flight));
     DecisionRecord {
         session,
         run,
