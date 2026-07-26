@@ -1548,6 +1548,9 @@ impl EvalHarness {
 }
 ```
 
+The Day-1 `SkeletonReplay`, `NaiveBaseline`, and stub `ControlPlane` drivers
+MUST each return a `FixtureRunOutput` to `run_fixture_collect`.
+
 The public `run_fixture` signature MUST remain
 `-> FixtureOutcome`; it MAY implement the convenience path by awaiting
 `run_fixture_collect`, returning `.outcome`, and discarding `.trajectories`.
@@ -1774,10 +1777,21 @@ The retention posture is the RFC-0004 `RetentionPolicy::defaults()` posture:
 | Provider `Err` | `None` / `None` | `None` / `None` | `false` | `Some(classify_provider_error(&err).class)` |
 | Cancel after dispatch | `None` / `None` | `None` / `None` | `false` | `Some(ErrorClass::Cancelled)` — **not** via `classify_provider_error` |
 
+Cancelled-row identity fields (`fixture_id`, `set`, `turn_id`,
+`request_fingerprint` / `request_content_hash`, `endpoint_id`, and
+`provider_id`) MUST be taken from the dispatched turn's built request and the
+bound endpoint, exactly as for `Ok` and provider-`Err` rows.
+
 Trajectory USD therefore uses the exact uncalibrated derivation and validity
 rules in §3.8. To prevent fixture and trajectory arithmetic from drifting,
-`trajectory` or `cost_claim` MAY expose a shared
-`pub(crate) fn derive_eval_usd(...)`; it MUST NOT be publicly re-exported.
+`trajectory` or `cost_claim` MAY expose this shared helper:
+
+```rust
+pub(crate) fn derive_eval_usd(endpoint: &ModelEndpoint, usage: &Usage) -> Option<f64>;
+```
+
+Its semantics MUST be identical to the §3.8 inline formula and the runtime
+`derive_usd`; it MUST NOT be publicly re-exported.
 
 - Day-1 MUST set `model_tier = ModelTier::Standard` and `confidence = None`.
   It MUST NOT infer routing policy from endpoint tier lists.
@@ -1792,6 +1806,9 @@ one Cancelled row with the table shape above and
 perform further fixture work. If cancellation wins at any checkpoint before
 that select is entered, the turn was not dispatched: there is no
 `model_calls` increment and no trajectory row for that turn.
+The complete-racing `tokio::select!` MUST use `biased;`, with the cancellation
+branch listed first. If cancellation is already set when the select is entered,
+the cancellation branch MUST win without polling the `complete` future.
 
 `EvalReport.trajectories` and `naive_trajectories` are intentionally unbounded
 relative to the current batch. This is acceptable for the MVP corpus of
@@ -2682,8 +2699,9 @@ Both successful assembly paths always attach `gate = Some(...)` as specified in
 
 Day-1 `FixtureDriverKind::ControlPlane` MUST construct
 `EvalError::Stub("control_plane driver awaits RFCs 0008-0015".into())`, convert
-it with `ReportError::from_eval`, and return a `FixtureOutcome` with
-`status: Error`.
+it with `ReportError::from_eval`, and return a `FixtureRunOutput` to
+`run_fixture_collect` whose `outcome` is a `FixtureOutcome` with
+`status: Error` and whose `trajectories` is empty.
 
 It MUST NOT silently skip.
 
