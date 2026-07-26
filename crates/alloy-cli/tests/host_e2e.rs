@@ -15,6 +15,10 @@
 //!
 //! Author: arkadianet
 
+// Signals are the subject of half these tests; the target is Unix-only rather
+// than partially compiled.
+#![cfg(unix)]
+
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -151,25 +155,9 @@ fn wait_for_path(child: &mut Child, path: &Path) {
     panic!("timed out waiting for {}", path.display());
 }
 
-/// Wait for `marker`, or — while storage is not yet wired by the CLI — settle
-/// for the host having come up healthy without creating anything.
-fn wait_for_marker_or_settle(child: &mut Child, marker: &Path) {
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(2) {
-        if marker.exists() {
-            return;
-        }
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!("host exited early with {status}");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
 /// SIGTERM via `rustix` so these tests stay free of `unsafe`, like the crates
 /// they exercise. `Child::kill` sends SIGKILL and would bypass the drain path
 /// that is the whole point of the test.
-#[cfg(unix)]
 fn send_sigterm(child: &Child) {
     let pid = rustix::process::Pid::from_raw(child.id() as i32).expect("live child pid");
     rustix::process::kill_process(pid, rustix::process::Signal::Term).expect("send SIGTERM");
@@ -284,20 +272,56 @@ fn relative_workspace_root_resolves_without_duplication() {
 }
 
 /// `ALLOY_DATA_DIR` outranks `<workspace>/.alloy`.
+///
+/// The override points at a path that does not exist yet, so the assertion is
+/// positive — the host must *create* that directory. Asserting only that
+/// `<workspace>/.alloy` is absent would also pass if the override were ignored
+/// and no data dir were created at all.
 #[test]
 fn alloy_data_dir_env_overrides_workspace_dir() {
     let ws = workspace();
-    let elsewhere = tempfile::tempdir().unwrap();
-    let marker = elsewhere.path().join("artifacts");
+    let parent = tempfile::tempdir().unwrap();
+    let override_dir = parent.path().join("custom-data");
+    assert!(!override_dir.exists(), "override must start absent");
 
-    let mut child = spawn_host(ws.path(), Some(elsewhere.path()));
-    // The override is observable as the absence of a workspace-local data dir.
-    wait_for_marker_or_settle(&mut child, &marker);
+    let mut child = spawn_host(ws.path(), Some(&override_dir));
+    wait_for_path(&mut child, &override_dir);
+    assert!(override_dir.is_dir(), "the override path must be created");
     assert!(
         !ws.path().join(".alloy").exists(),
         "workspace .alloy must not be created when ALLOY_DATA_DIR is set"
     );
     terminate_and_expect_clean_exit(child);
+}
+
+/// Run to completion with a deadline, returning `(status, stderr)`.
+///
+/// `Command::output()` waits forever. These paths fail in config load today, but
+/// a regression that reached the host loop would hang CI instead of failing it.
+fn run_bounded(workspace: &Path, log: &Path) -> (std::process::ExitStatus, String) {
+    let err = File::create(log).unwrap();
+    let mut child = Command::new(alloy_bin())
+        .arg("host")
+        .arg("--workspace")
+        .arg(workspace)
+        .env_remove("ALLOY_DATA_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err))
+        .spawn()
+        .unwrap();
+
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return (status, std::fs::read_to_string(log).unwrap_or_default());
+        }
+        if start.elapsed() > EXIT_TIMEOUT {
+            let _ = child.kill();
+            panic!("a config failure must exit, not start the host loop");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 // --- config failure modes ---------------------------------------------------
@@ -309,16 +333,8 @@ fn missing_router_toml_exits_nonzero_and_names_the_fix() {
     write_profile(dir.path());
     std::fs::write(dir.path().join("example.env"), "ALLOY_API_KEY=\n").unwrap();
 
-    let out = Command::new(alloy_bin())
-        .arg("host")
-        .arg("--workspace")
-        .arg(dir.path())
-        .env_remove("ALLOY_DATA_DIR")
-        .output()
-        .unwrap();
-
-    assert!(!out.status.success(), "must not start without a router");
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (status, stderr) = run_bounded(dir.path(), &dir.path().join("err.log"));
+    assert!(!status.success(), "must not start without a router");
     assert!(
         stderr.contains("router.toml.example"),
         "error should name the remedy, got: {stderr}"
@@ -332,16 +348,8 @@ fn missing_profile_toml_exits_nonzero() {
     write_router(dir.path());
     std::fs::write(dir.path().join("example.env"), "ALLOY_API_KEY=\n").unwrap();
 
-    let out = Command::new(alloy_bin())
-        .arg("host")
-        .arg("--workspace")
-        .arg(dir.path())
-        .env_remove("ALLOY_DATA_DIR")
-        .output()
-        .unwrap();
-
-    assert!(!out.status.success(), "must not start without a profile");
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let (status, stderr) = run_bounded(dir.path(), &dir.path().join("err.log"));
+    assert!(!status.success(), "must not start without a profile");
     assert!(
         stderr.contains("profile"),
         "error should name the missing profile, got: {stderr}"

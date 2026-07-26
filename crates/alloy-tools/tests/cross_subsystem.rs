@@ -25,7 +25,10 @@ use alloy_runtime::{
     CreateSession, ExecAllow, Glob, Grant, LanguageId, PermissionToken, ProfileId, RunId,
     RuntimeConfig, SessionEventType, SessionId, ToolCall, ToolName, ToolSelector,
 };
-use alloy_tools::mcp::{InProcessMcpHost, McpHostConfig, McpPlatform, StubPatchApplyBackend};
+use alloy_tools::mcp::{
+    InProcessMcpHost, McpError, McpHostConfig, McpPlatform, PermissionDenial,
+    StubPatchApplyBackend, ToolHandle,
+};
 use alloy_tools::{
     BackendStatus, NativeSandboxBroker, OperatorHomes, SandboxBroker, SandboxError, SandboxProfile,
 };
@@ -39,7 +42,7 @@ struct Stack {
     rt: AlloyRuntime,
     _root: TempDir,
     storage: Arc<AlloyStorage>,
-    host: InProcessMcpHost,
+    host: Arc<InProcessMcpHost>,
     jail: PathBuf,
     plane: SessionPlane,
     workspace: PathBuf,
@@ -85,15 +88,21 @@ impl Stack {
         let homes = OperatorHomes::new(cargo_home, rustup_home);
 
         let profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
+        // A skip past this point must still close the runtime and storage it
+        // already opened, or the process warns about dropping them un-closed.
         let broker = match NativeSandboxBroker::with_operator_homes(profile, homes.clone()).await {
             Ok(b) => match check_backend_status(&b) {
                 BackendStatus::Available { .. } => b,
-                BackendStatus::Unavailable { reason } => return skip(&reason),
+                BackendStatus::Unavailable { reason } => {
+                    return skip_after_open(rt, &storage, &reason).await
+                }
                 BackendStatus::NotApplicable => {
-                    return skip("check backend not applicable on this platform")
+                    return skip_after_open(rt, &storage, "not applicable on this platform").await
                 }
             },
-            Err(SandboxError::BackendUnavailable { message, .. }) => return skip(&message),
+            Err(SandboxError::BackendUnavailable { message, .. }) => {
+                return skip_after_open(rt, &storage, &message).await
+            }
             Err(e) => panic!("broker construction failed: {e}"),
         };
 
@@ -112,6 +121,7 @@ impl Stack {
         )
         .unwrap()
         .with_decision_log(decision_log);
+        let host = Arc::new(host);
 
         let plane = SessionPlane::new(handle, Arc::clone(&storage));
         let workspace = root.path().to_path_buf();
@@ -181,9 +191,21 @@ fn check_backend_status(broker: &NativeSandboxBroker) -> BackendStatus {
     }
 }
 
-fn skip(reason: &str) -> Option<Stack> {
+/// Skip cleanly once the runtime and storage are already open.
+///
+/// Composition coverage is effectively Linux-only: on a host without an
+/// isolation backend these tests report success while asserting nothing, so CI
+/// on such a platform must set `ALLOY_REQUIRE_LANDLOCK=1` to turn the skip into
+/// a failure rather than silent green.
+async fn skip_after_open(
+    rt: AlloyRuntime,
+    storage: &Arc<AlloyStorage>,
+    reason: &str,
+) -> Option<Stack> {
+    storage.close().await.ok();
+    rt.shutdown().await.ok();
     if std::env::var("ALLOY_REQUIRE_LANDLOCK").as_deref() == Ok("1") {
-        panic!("ALLOY_REQUIRE_LANDLOCK=1 but the check backend is Unavailable: {reason}");
+        panic!("ALLOY_REQUIRE_LANDLOCK=1 but the check backend is unavailable: {reason}");
     }
     eprintln!("skip: sandbox unavailable ({reason}); set ALLOY_REQUIRE_LANDLOCK=1 to fail");
     None
@@ -204,10 +226,19 @@ fn write_config_fixtures(root: &Path) {
     std::fs::write(root.join("example.env"), "ALLOY_API_KEY=\n").unwrap();
 }
 
+/// Name of the file the stand-in `cargo` touches when it actually runs.
+const RAN_MARKER: &str = "cargo-ran";
+
 /// A stand-in `cargo` on the trusted PATH. The binary being fake is fine — the
-/// subject under test is the plumbing from tool call to durable event, not cargo.
+/// subject under test is the plumbing from tool call to durable event, not
+/// cargo. It leaves a marker in its working directory so a test can distinguish
+/// "denied before exec" from "executed, then reported as denied".
 fn write_fake_cargo(path: &Path) {
-    std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(
+        path,
+        format!("#!/bin/sh\ntouch ./{RAN_MARKER} 2>/dev/null\nexit 0\n"),
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -282,6 +313,11 @@ async fn tool_call_is_durably_recorded_across_the_whole_stack() {
     assert_eq!(record.session, session);
     assert_eq!(record.tool_name, "cargo_check");
     assert!(!record.denied, "a successful call is not a denial");
+    assert!(
+        stack.jail.join(RAN_MARKER).exists(),
+        "the stand-in cargo must really execute, otherwise the denial test's \
+         absence-of-marker assertion would pass vacuously"
+    );
 
     stack.shutdown().await;
 }
@@ -313,33 +349,52 @@ async fn denied_tool_call_is_durably_recorded_and_does_not_execute() {
     );
     let record = parse_tool_call_event(&events[0]).expect("denial event must be parseable");
     assert!(record.denied, "the recorded event must be marked denied");
+    assert!(
+        !stack.jail.join(RAN_MARKER).exists(),
+        "fail-closed means the binary never ran, not that it ran and was then reported denied"
+    );
 
     stack.shutdown().await;
 }
 
-/// Disclosure and dispatch must agree: a tool the handle does not disclose
-/// must not be callable through it. Crosses the 0006 selector path and the
-/// 0005 authorization path in one assertion.
+/// Disclosure must gate *dispatch*, not merely listing.
+///
+/// The selector gate lives on [`ToolHandle::call`], not on the platform — so a
+/// test that only inspects `tools_for` proves nothing about callability. This
+/// drives a real call through a handle scoped to `fs_read` and requires
+/// `cargo_check` to be refused with [`PermissionDenial::NotDisclosed`], even
+/// though the token carries a valid Exec grant.
 #[tokio::test]
-async fn undisclosed_tool_is_not_callable() {
+async fn undisclosed_tool_is_not_callable_through_a_scoped_handle() {
     let Some(stack) = Stack::build().await else {
         return;
     };
+    let session = stack.new_session().await;
 
-    let disclosed = stack
-        .host
-        .tools_for(&[ToolSelector::name(ToolName::new("fs_read").unwrap())])
-        .await
-        .unwrap();
-    assert_eq!(
-        disclosed.len(),
-        1,
-        "selector should disclose exactly fs_read"
+    let handle = ToolHandle::new(
+        Arc::clone(&stack.host) as Arc<dyn McpPlatform>,
+        vec![ToolSelector::name(ToolName::new("fs_read").unwrap())],
     );
+
+    let disclosed = handle.tools().await.unwrap();
+    assert_eq!(disclosed.len(), 1, "handle should disclose exactly fs_read");
     assert_eq!(disclosed[0].name.as_str(), "fs_read");
+
+    // Valid Exec grant, but the tool is outside the handle's selector set.
+    let err = handle
+        .call(cargo_check_call(session), exec_token(&stack.jail))
+        .await
+        .expect_err("an undisclosed tool must not dispatch");
     assert!(
-        !disclosed.iter().any(|v| v.name.as_str() == "cargo_check"),
-        "cargo_check must not be disclosed by an fs_read selector"
+        matches!(
+            err,
+            McpError::PermissionDenied(PermissionDenial::NotDisclosed)
+        ),
+        "expected NotDisclosed, got {err:?}"
+    );
+    assert!(
+        !stack.jail.join(RAN_MARKER).exists(),
+        "an undisclosed tool must not reach the sandbox"
     );
 
     stack.shutdown().await;
