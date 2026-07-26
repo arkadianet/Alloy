@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::obs::{hash_prompt, ModelCallRecord, ModelUsdSource, MODEL_PROMPT_BODY_MAX_BYTES};
 use crate::types::ids::ProviderId;
 
-use super::error::{classify_provider_error, ProviderError, RouterError};
+use super::error::{classify_provider_error, ProviderError};
 use super::price::derive_usd;
 use super::types::{ModelResponse, PromptPack, RoutedModel};
 
@@ -15,6 +15,7 @@ pub(crate) struct ModelCallBuild {
     pub(crate) output_tokens: Option<u64>,
     pub(crate) usd: Option<f64>,
     pub(crate) prompt_body_oversize: bool,
+    pub(crate) canonical_len: usize,
 }
 
 pub(crate) fn build_model_call_record(
@@ -23,9 +24,12 @@ pub(crate) fn build_model_call_record(
     prompt: &PromptPack,
     duration: Duration,
     result: &Result<ModelResponse, ProviderError>,
-) -> Result<ModelCallBuild, RouterError> {
-    let canonical = serde_json::to_string(&prompt.messages)
-        .map_err(|error| RouterError::Internal(format!("serialize canonical prompt: {error}")))?;
+) -> ModelCallBuild {
+    let canonical = serde_json::to_string(&prompt.messages).unwrap_or_else(|error| {
+        tracing::error!(%error, "canonical prompt serialization unexpectedly failed");
+        "[]".to_owned()
+    });
+    let canonical_len = canonical.len();
     let prompt_body_oversize = canonical.len() > MODEL_PROMPT_BODY_MAX_BYTES;
     let prompt_body = (!prompt_body_oversize).then(|| canonical.clone());
     let content_hash = Some(hash_prompt(&canonical));
@@ -74,13 +78,14 @@ pub(crate) fn build_model_call_record(
         record = record.node(node);
     }
 
-    Ok(ModelCallBuild {
+    ModelCallBuild {
         record,
         input_tokens,
         output_tokens,
         usd,
         prompt_body_oversize,
-    })
+        canonical_len,
+    }
 }
 
 #[cfg(test)]
@@ -153,8 +158,7 @@ mod tests {
             &prompt,
             Duration::from_millis(4),
             &result,
-        )
-        .unwrap();
+        );
         assert!(built.prompt_body_oversize);
         assert!(built.record.prompt_body.is_none());
         assert!(built.record.content_hash.is_some());
@@ -174,8 +178,7 @@ mod tests {
             &prompt,
             Duration::ZERO,
             &Err(ProviderError::Timeout),
-        )
-        .unwrap();
+        );
         assert_eq!(built.input_tokens, None);
         assert_eq!(built.output_tokens, None);
         assert_eq!(built.record.error_class, Some(crate::ErrorClass::Timeout));

@@ -58,13 +58,48 @@ pub struct TomlModelRouterParts {
     pub cost_meter: Option<SharedCostMeter>,
     /// Run to which this router is bound.
     pub bound_run: Option<RunId>,
-    /// Test-only escape hatch retained for API compatibility with unit-test builders.
-    ///
-    /// Any non-`cfg(test)` library build rejects `true` with [`RouterError::Config`].
-    #[doc(hidden)]
+    /// Test-only escape hatch for isolated router unit tests.
     pub allow_unmetered: bool,
     /// Optional host cancellation token.
     pub shutdown_token: Option<CancellationToken>,
+}
+
+impl TomlModelRouterParts {
+    /// Construct router dependencies with host cancellation disabled.
+    pub fn new(
+        config: RouterConfig,
+        provider: Arc<dyn ModelProvider>,
+        budget_policy: BudgetPolicy,
+        decision_log: Option<Arc<dyn DecisionLog>>,
+        cost_meter: Option<SharedCostMeter>,
+        bound_run: Option<RunId>,
+    ) -> Self {
+        Self {
+            config,
+            provider,
+            budget_policy,
+            decision_log,
+            cost_meter,
+            bound_run,
+            allow_unmetered: false,
+            shutdown_token: None,
+        }
+    }
+
+    /// Attach a host cancellation token.
+    #[must_use]
+    pub fn shutdown_token(mut self, token: CancellationToken) -> Self {
+        self.shutdown_token = Some(token);
+        self
+    }
+
+    /// Permit missing observability dependencies in isolated unit tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn allow_unmetered(mut self) -> Self {
+        self.allow_unmetered = true;
+        self
+    }
 }
 
 /// Final, shared result of router shutdown.
@@ -87,13 +122,13 @@ pub struct TomlModelRouter {
     cost_meter: Option<SharedCostMeter>,
     bound_run: Option<RunId>,
     router_instance_id: u64,
-    phase: AtomicU8,
+    phase: Arc<AtomicU8>,
     semaphore: Semaphore,
     admission_notify: Notify,
-    in_flight_notify: Notify,
+    in_flight_notify: Arc<Notify>,
     shutdown_token: CancellationToken,
     report_tx: watch::Sender<Option<RouterShutdownReport>>,
-    metrics: RouterMetrics,
+    metrics: Arc<RouterMetrics>,
     append_supervisor: Arc<DurableAppendSupervisor>,
 }
 
@@ -140,16 +175,14 @@ impl TomlModelRouter {
             request_timeout: config.policy.request_timeout,
         })
         .map_err(|error| RouterError::Config(redact_and_truncate(&error.to_string(), 512)))?;
-        Self::from_parts(TomlModelRouterParts {
+        Self::from_parts(TomlModelRouterParts::new(
             config,
-            provider: Arc::new(provider),
+            Arc::new(provider),
             budget_policy,
-            decision_log: Some(decision_log),
-            cost_meter: Some(cost_meter),
-            bound_run: Some(bound_run),
-            allow_unmetered: false,
-            shutdown_token: None,
-        })
+            Some(decision_log),
+            Some(cost_meter),
+            Some(bound_run),
+        ))
     }
 
     /// Construct from injected parts after revalidating all configuration invariants.
@@ -168,13 +201,10 @@ impl TomlModelRouter {
             ));
         }
 
+        #[cfg(test)]
         let allow_unmetered = parts.allow_unmetered;
         #[cfg(not(test))]
-        if allow_unmetered {
-            return Err(RouterError::Config(
-                "allow_unmetered is available only in alloy-runtime unit tests".into(),
-            ));
-        }
+        let allow_unmetered = false;
 
         if !allow_unmetered {
             if parts.decision_log.is_none() {
@@ -194,7 +224,7 @@ impl TomlModelRouter {
             }
         }
 
-        let metrics = RouterMetrics::default();
+        let metrics = Arc::new(RouterMetrics::default());
         let append_supervisor = Arc::new(DurableAppendSupervisor {
             pending: AtomicUsize::new(0),
             done_notify: Notify::new(),
@@ -210,9 +240,9 @@ impl TomlModelRouter {
             cost_meter: parts.cost_meter,
             bound_run: parts.bound_run,
             router_instance_id: NEXT_ROUTER_INSTANCE_ID.fetch_add(1, Ordering::SeqCst),
-            phase: AtomicU8::new(PHASE_READY),
+            phase: Arc::new(AtomicU8::new(PHASE_READY)),
             admission_notify: Notify::new(),
-            in_flight_notify: Notify::new(),
+            in_flight_notify: Arc::new(Notify::new()),
             shutdown_token: parts.shutdown_token.unwrap_or_default(),
             report_tx,
             metrics,
@@ -241,60 +271,57 @@ impl TomlModelRouter {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
-            .is_err()
+            .is_ok()
         {
-            loop {
-                if let Some(report) = *report_rx.borrow() {
-                    return report;
+            self.semaphore.close();
+            self.admission_notify.notify_waiters();
+
+            let grace = self.config.policy.shutdown_grace;
+            let metrics = Arc::clone(&self.metrics);
+            let in_flight_notify = Arc::clone(&self.in_flight_notify);
+            let shutdown_token = self.shutdown_token.clone();
+            let append_supervisor = Arc::clone(&self.append_supervisor);
+            let phase = Arc::clone(&self.phase);
+            let report_tx = self.report_tx.clone();
+            tokio::spawn(async move {
+                let report = drain_shutdown(
+                    grace,
+                    &metrics,
+                    &in_flight_notify,
+                    &shutdown_token,
+                    &append_supervisor,
+                )
+                .await;
+                phase.store(PHASE_STOPPED, Ordering::SeqCst);
+                report_tx.send_replace(Some(report));
+                if report.remaining_in_flight > 0 || report.remaining_appends > 0 {
+                    tracing::warn!(
+                        remaining_in_flight = report.remaining_in_flight,
+                        remaining_appends = report.remaining_appends,
+                        "router stopped with unfinished work"
+                    );
                 }
-                if report_rx.changed().await.is_err() {
-                    return RouterShutdownReport {
-                        cancelled_in_flight: true,
-                        remaining_in_flight: self.metrics.in_flight.load(Ordering::SeqCst),
-                        remaining_appends: self.append_supervisor.pending.load(Ordering::SeqCst),
-                    };
-                }
+            });
+        }
+
+        loop {
+            if let Some(report) = *report_rx.borrow() {
+                return report;
+            }
+            if report_rx.changed().await.is_err() {
+                return RouterShutdownReport {
+                    cancelled_in_flight: true,
+                    remaining_in_flight: self.metrics.in_flight.load(Ordering::SeqCst),
+                    remaining_appends: self.append_supervisor.pending.load(Ordering::SeqCst),
+                };
             }
         }
-
-        self.semaphore.close();
-        self.admission_notify.notify_waiters();
-
-        let grace = self.config.policy.shutdown_grace;
-        wait_for_zero(&self.metrics.in_flight, &self.in_flight_notify, grace).await;
-
-        let mut cancelled = false;
-        let mut append_budget = grace;
-        if self.metrics.in_flight.load(Ordering::SeqCst) > 0 {
-            self.shutdown_token.cancel();
-            cancelled = true;
-            let post_cancel = grace.min(POST_CANCEL_MAX);
-            wait_for_zero(&self.metrics.in_flight, &self.in_flight_notify, post_cancel).await;
-            append_budget = post_cancel;
-        }
-
-        let remaining_in_flight = self.metrics.in_flight.load(Ordering::SeqCst);
-        let remaining_appends = self.append_supervisor.drain_aggregate(append_budget).await;
-        self.phase.store(PHASE_STOPPED, Ordering::SeqCst);
-        let report = RouterShutdownReport {
-            cancelled_in_flight: cancelled,
-            remaining_in_flight,
-            remaining_appends,
-        };
-        let _ = self.report_tx.send(Some(report));
-        if remaining_in_flight > 0 || remaining_appends > 0 {
-            tracing::warn!(
-                remaining_in_flight,
-                remaining_appends,
-                "router stopped with unfinished work"
-            );
-        }
-        report
     }
 
     async fn admit(&self) -> Result<AdmissionGuard<'_>, RouterError> {
         let shutdown = self.admission_notify.notified();
         tokio::pin!(shutdown);
+        shutdown.as_mut().enable();
         if self.phase.load(Ordering::SeqCst) != PHASE_READY {
             return Err(RouterError::ShuttingDown);
         }
@@ -396,7 +423,7 @@ impl TomlModelRouter {
         );
         let route_event_seq = self.record_decision(decision).await;
         self.metrics.routes_ok.fetch_add(1, Ordering::Relaxed);
-        Ok(RoutedModel::new(
+        Ok(RoutedModel::mint(
             endpoint,
             tier,
             &request,
@@ -412,100 +439,111 @@ impl TomlModelRouter {
         prompt: PromptPack,
         span: &tracing::Span,
     ) -> Result<ModelResponse, RouterError> {
-        let _admission = self.admit().await?;
-        if routed.router_instance_id() != self.router_instance_id {
-            return Err(RouterError::WrongRouter);
-        }
-        if !routed.try_consume() {
-            return Err(RouterError::AlreadyCompleted);
-        }
+        let (normalized, receiver) = {
+            let _admission = self.admit().await?;
+            if routed.router_instance_id() != self.router_instance_id {
+                return Err(RouterError::WrongRouter);
+            }
+            if self.shutdown_token.is_cancelled() {
+                return Err(RouterError::Cancelled);
+            }
+            if !routed.try_consume() {
+                return Err(RouterError::AlreadyCompleted);
+            }
 
-        if let Some(meter) = &self.cost_meter {
-            let check = apply_usd_ceiling_overlay(
-                meter.check_budget(&self.budget_policy),
-                &self.budget_policy,
+            if let Some(meter) = &self.cost_meter {
+                let (meter_check, snapshot) = meter.check_and_snapshot(&self.budget_policy);
+                let check = apply_usd_ceiling_overlay(meter_check, &self.budget_policy);
+                if check.is_exhausted() {
+                    tracing::warn!(
+                        budget_check = super::decision_bridge::budget_check_name(check),
+                        capability = %routed.capability(),
+                        "model completion denied by budget recheck"
+                    );
+                    let decision = budget_decision_for_complete(
+                        routed,
+                        check,
+                        BudgetCounters {
+                            tokens_in: snapshot.tokens_in,
+                            tokens_out: snapshot.tokens_out,
+                            usd_spent: snapshot.usd_spent,
+                        },
+                        self.metrics.in_flight.load(Ordering::SeqCst),
+                    );
+                    self.record_decision(decision).await;
+                    return Err(RouterError::BudgetDenied(check));
+                }
+            }
+
+            let request = CompletionRequest {
+                messages: prompt.messages.clone(),
+                tools: vec![],
+                tool_choice: ToolChoice::None,
+                response_format: if routed.requires_structured_output() {
+                    ResponseFormat::JsonObject
+                } else {
+                    ResponseFormat::Text
+                },
+                temperature: None,
+                max_output_tokens: None,
+            };
+            let started = tokio::time::Instant::now();
+            let provider_call = self.provider.complete(routed.endpoint(), request);
+            tokio::pin!(provider_call);
+            let provider_result = tokio::select! {
+                biased;
+                result = &mut provider_call => result,
+                () = self.shutdown_token.cancelled() => return Err(RouterError::Cancelled),
+            };
+            let duration = started.elapsed();
+            span.record(
+                "duration_ms",
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
             );
-            if check.is_exhausted() {
-                let snapshot = meter.snapshot();
-                let decision = budget_decision_for_complete(
-                    routed,
-                    check,
-                    BudgetCounters {
-                        tokens_in: snapshot.tokens_in,
-                        tokens_out: snapshot.tokens_out,
-                        usd_spent: snapshot.usd_spent,
-                    },
-                    self.metrics.in_flight.load(Ordering::SeqCst),
+
+            let normalized = match provider_result {
+                Ok(mut response) => {
+                    response.finish_reason = response
+                        .finish_reason
+                        .as_deref()
+                        .map(|value| redact_and_truncate(value, 128));
+                    response.provider_request_id = response
+                        .provider_request_id
+                        .as_deref()
+                        .map(|value| redact_and_truncate(value, 256));
+                    Ok(response)
+                }
+                Err(error) => Err(normalize_provider_error(error)),
+            };
+            let built =
+                build_model_call_record(routed, self.provider.id(), &prompt, duration, &normalized);
+            if built.prompt_body_oversize {
+                self.metrics
+                    .model_call_prompt_body_oversize
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    session = %routed.session(),
+                    bytes = built.canonical_len,
+                    limit = crate::obs::MODEL_PROMPT_BODY_MAX_BYTES,
+                    "prompt body omitted from model-call record"
                 );
-                self.record_decision(decision).await;
-                return Err(RouterError::BudgetDenied(check));
             }
-        }
-
-        let request = CompletionRequest {
-            messages: prompt.messages.clone(),
-            tools: vec![],
-            tool_choice: ToolChoice::None,
-            response_format: if routed.requires_structured_output() {
-                ResponseFormat::JsonObject
-            } else {
-                ResponseFormat::Text
-            },
-            temperature: None,
-            max_output_tokens: None,
-        };
-        let started = tokio::time::Instant::now();
-        let provider_call = self.provider.complete(routed.endpoint(), request);
-        tokio::pin!(provider_call);
-        let provider_result = tokio::select! {
-            biased;
-            result = &mut provider_call => result,
-            () = self.shutdown_token.cancelled() => return Err(RouterError::Cancelled),
-        };
-        let duration = started.elapsed();
-        span.record(
-            "duration_ms",
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-        );
-
-        let normalized = match provider_result {
-            Ok(mut response) => {
-                response.finish_reason = response
-                    .finish_reason
-                    .as_deref()
-                    .map(|value| redact_and_truncate(value, 128));
-                response.provider_request_id = response
-                    .provider_request_id
-                    .as_deref()
-                    .map(|value| redact_and_truncate(value, 256));
-                Ok(response)
+            if let Some(meter) = &self.cost_meter {
+                meter.add_model_usage(
+                    routed.tier(),
+                    built.input_tokens,
+                    built.output_tokens,
+                    built.usd,
+                );
             }
-            Err(error) => Err(normalize_provider_error(error)),
+            let receiver = self
+                .decision_log
+                .as_ref()
+                .map(|log| self.append_supervisor.spawn(Arc::clone(log), built.record));
+            (normalized, receiver)
         };
-        let built =
-            build_model_call_record(routed, self.provider.id(), &prompt, duration, &normalized)?;
-        if built.prompt_body_oversize {
-            self.metrics
-                .model_call_prompt_body_oversize
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                session = %routed.session(),
-                bytes = serde_json::to_string(&prompt.messages)
-                    .map_or(0, |value| value.len()),
-                limit = crate::obs::MODEL_PROMPT_BODY_MAX_BYTES,
-                "prompt body omitted from model-call record"
-            );
-        }
-        if let Some(meter) = &self.cost_meter {
-            meter.add_model_usage(
-                routed.tier(),
-                built.input_tokens,
-                built.output_tokens,
-                built.usd,
-            );
-        }
-        if let Some(log) = &self.decision_log {
-            let receiver = self.append_supervisor.spawn(Arc::clone(log), built.record);
+
+        if let Some(receiver) = receiver {
             match receiver.await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -528,12 +566,9 @@ impl TomlModelRouter {
         request: &RoutingRequest,
     ) -> (BudgetCheck, BudgetCounters, &'static str) {
         if let Some(meter) = &self.cost_meter {
-            let snapshot = meter.snapshot();
+            let (meter_check, snapshot) = meter.check_and_snapshot(&self.budget_policy);
             (
-                apply_usd_ceiling_overlay(
-                    meter.check_budget(&self.budget_policy),
-                    &self.budget_policy,
-                ),
+                apply_usd_ceiling_overlay(meter_check, &self.budget_policy),
                 BudgetCounters {
                     tokens_in: snapshot.tokens_in,
                     tokens_out: snapshot.tokens_out,
@@ -609,9 +644,10 @@ impl ModelRouter for TomlModelRouter {
             Ok(_) => {
                 self.metrics.completes_ok.fetch_add(1, Ordering::Relaxed);
             }
-            Err(_) => {
+            Err(RouterError::Provider(_) | RouterError::Internal(_)) => {
                 self.metrics.completes_err.fetch_add(1, Ordering::Relaxed);
             }
+            Err(_) => {}
         }
         result
     }
@@ -646,9 +682,11 @@ impl DurableAppendSupervisor {
         let (sender, receiver) = oneshot::channel();
         self.pending.fetch_add(1, Ordering::SeqCst);
         let supervisor = Arc::clone(self);
-        tokio::spawn(async move {
+        let pending_guard = guard((), {
             let cleanup_supervisor = Arc::clone(&supervisor);
-            let pending_guard = guard((), move |()| cleanup_supervisor.finish_one());
+            move |()| cleanup_supervisor.finish_one()
+        });
+        tokio::spawn(async move {
             let result = log.record_model_call(record).await.map(|_| ());
             if result.is_err() {
                 supervisor.obs_record_errors.fetch_add(1, Ordering::Relaxed);
@@ -693,6 +731,32 @@ impl DurableAppendSupervisor {
                 return pending;
             }
         }
+    }
+}
+
+async fn drain_shutdown(
+    grace: Duration,
+    metrics: &RouterMetrics,
+    in_flight_notify: &Notify,
+    shutdown_token: &CancellationToken,
+    append_supervisor: &DurableAppendSupervisor,
+) -> RouterShutdownReport {
+    wait_for_zero(&metrics.in_flight, in_flight_notify, grace).await;
+
+    let mut cancelled = false;
+    let mut append_budget = grace;
+    if metrics.in_flight.load(Ordering::SeqCst) > 0 {
+        shutdown_token.cancel();
+        cancelled = true;
+        let post_cancel = grace.min(POST_CANCEL_MAX);
+        wait_for_zero(&metrics.in_flight, in_flight_notify, post_cancel).await;
+        append_budget = post_cancel;
+    }
+
+    RouterShutdownReport {
+        cancelled_in_flight: cancelled,
+        remaining_in_flight: metrics.in_flight.load(Ordering::SeqCst),
+        remaining_appends: append_supervisor.drain_aggregate(append_budget).await,
     }
 }
 
@@ -796,16 +860,14 @@ output_usd_per_mtok = 1.0
         let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
         let meter = SharedCostMeter::new();
         let run = RunId::new();
-        let router = TomlModelRouter::from_parts(TomlModelRouterParts {
-            config: config(),
-            provider: provider.clone(),
-            budget_policy: BudgetPolicy::default(),
-            decision_log: Some(log.clone()),
-            cost_meter: Some(meter.clone()),
-            bound_run: Some(run),
-            allow_unmetered: false,
-            shutdown_token: None,
-        })
+        let router = TomlModelRouter::from_parts(TomlModelRouterParts::new(
+            config(),
+            provider.clone(),
+            BudgetPolicy::default(),
+            Some(log.clone()),
+            Some(meter.clone()),
+            Some(run),
+        ))
         .unwrap();
         let routed = router.route(request(run)).await.unwrap();
         let clone = routed.clone();
@@ -843,19 +905,20 @@ output_usd_per_mtok = 1.0
         let id = ProviderId::new("provider").unwrap();
         let provider = Arc::new(RecordingModelProvider::new(id));
         let run = RunId::new();
-        let router = TomlModelRouter::from_parts(TomlModelRouterParts {
-            config: config(),
-            provider,
-            budget_policy: BudgetPolicy {
-                max_usd_per_run: 0.0,
-                ..BudgetPolicy::default()
-            },
-            decision_log: None,
-            cost_meter: None,
-            bound_run: Some(run),
-            allow_unmetered: true,
-            shutdown_token: None,
-        })
+        let router = TomlModelRouter::from_parts(
+            TomlModelRouterParts::new(
+                config(),
+                provider,
+                BudgetPolicy {
+                    max_usd_per_run: 0.0,
+                    ..BudgetPolicy::default()
+                },
+                None,
+                None,
+                Some(run),
+            )
+            .allow_unmetered(),
+        )
         .unwrap();
         assert!(matches!(
             router.route(request(run)).await,
@@ -875,16 +938,14 @@ output_usd_per_mtok = 1.0
         let provider = Arc::new(RecordingModelProvider::new(
             ProviderId::new("provider").unwrap(),
         ));
-        let result = TomlModelRouter::from_parts(TomlModelRouterParts {
-            config: config(),
+        let result = TomlModelRouter::from_parts(TomlModelRouterParts::new(
+            config(),
             provider,
-            budget_policy: BudgetPolicy::default(),
-            decision_log: None,
-            cost_meter: None,
-            bound_run: None,
-            allow_unmetered: false,
-            shutdown_token: None,
-        });
+            BudgetPolicy::default(),
+            None,
+            None,
+            None,
+        ));
         assert!(matches!(result, Err(RouterError::Config(_))));
 
         let mut without_prices = config();

@@ -14,8 +14,12 @@ use super::types::{CompletionRequest, Health, ModelEndpoint, ModelResponse};
 /// FIFO scripted outcomes plus recorded invocations. Performs no network I/O.
 pub struct RecordingModelProvider {
     id: ProviderId,
-    outcomes: Mutex<VecDeque<Result<ModelResponse, ProviderError>>>,
-    invocations: Mutex<Vec<(ModelEndpoint, CompletionRequest)>>,
+    state: Mutex<RecordingState>,
+}
+
+struct RecordingState {
+    outcomes: VecDeque<Result<ModelResponse, ProviderError>>,
+    invocations: Vec<(ModelEndpoint, CompletionRequest)>,
 }
 
 impl RecordingModelProvider {
@@ -24,20 +28,22 @@ impl RecordingModelProvider {
     pub fn new(id: ProviderId) -> Self {
         Self {
             id,
-            outcomes: Mutex::new(VecDeque::new()),
-            invocations: Mutex::new(Vec::new()),
+            state: Mutex::new(RecordingState {
+                outcomes: VecDeque::new(),
+                invocations: Vec::new(),
+            }),
         }
     }
 
     /// Append one scripted outcome to the FIFO.
     pub fn push(&self, outcome: Result<ModelResponse, ProviderError>) {
-        Self::lock(&self.outcomes).push_back(outcome);
+        Self::lock(&self.state).outcomes.push_back(outcome);
     }
 
     /// Return a snapshot of invocations in call order.
     #[must_use]
     pub fn recorded(&self) -> Vec<(ModelEndpoint, CompletionRequest)> {
-        Self::lock(&self.invocations).clone()
+        Self::lock(&self.state).invocations.clone()
     }
 
     fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -62,8 +68,10 @@ impl ModelProvider for RecordingModelProvider {
         endpoint: &ModelEndpoint,
         request: CompletionRequest,
     ) -> Result<ModelResponse, ProviderError> {
-        Self::lock(&self.invocations).push((endpoint.clone(), request));
-        Self::lock(&self.outcomes)
+        let mut state = Self::lock(&self.state);
+        state.invocations.push((endpoint.clone(), request));
+        state
+            .outcomes
             .pop_front()
             .unwrap_or_else(|| Err(ProviderError::Internal("recording exhausted".into())))
     }

@@ -287,6 +287,13 @@ impl SharedCostMeter {
         self.lock().check_budget(policy)
     }
 
+    /// Atomically check the budget and capture the counters used by that check.
+    #[must_use]
+    pub fn check_and_snapshot(&self, policy: &BudgetPolicy) -> (BudgetCheck, CostSnapshot) {
+        let meter = self.lock();
+        (meter.check_budget(policy), meter.snapshot())
+    }
+
     /// Run a closure under the meter lock (keep sections short).
     ///
     /// Non-reentrant: calling other [`SharedCostMeter`] methods inside `f` deadlocks.

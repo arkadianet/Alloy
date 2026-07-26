@@ -271,7 +271,7 @@ impl RoutedModel {
         self.route_event_seq
     }
 
-    pub(crate) fn new(
+    pub(crate) fn mint(
         endpoint: ModelEndpoint,
         tier: ModelTier,
         req: &RoutingRequest,
@@ -292,6 +292,25 @@ impl RoutedModel {
             router_instance_id,
             complete_ticket: CompleteTicket::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(
+        endpoint: ModelEndpoint,
+        tier: ModelTier,
+        req: &RoutingRequest,
+        capability_mapped: bool,
+        route_event_seq: Option<EventSeq>,
+        router_instance_id: u64,
+    ) -> Self {
+        Self::mint(
+            endpoint,
+            tier,
+            req,
+            capability_mapped,
+            route_event_seq,
+            router_instance_id,
+        )
     }
 
     pub(crate) fn router_instance_id(&self) -> u64 {
