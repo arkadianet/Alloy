@@ -984,7 +984,7 @@ Before provider HTTP, `TomlModelRouter::complete` MUST apply this precedence:
 
 **Caller observation:** `Err(ShuttingDown)` / `Err(WrongRouter)` / `Err(Cancelled)` / `Err(AlreadyCompleted)` / `Err(BudgetDenied(_))` — no provider HTTP occurs.
 
-**Concurrent overshoot:** RFC-0007 bounds admission with `max_in_flight` (§6.3) but does not reserve budget per prompt. If N distinct `route` calls succeed concurrently before their completions update the meter, all N can pass the route-time check. Overshoot is therefore bounded by `min(N_successful_routes, max_in_flight)` outstanding completes, **not** unbounded ticket reuse. RFC-0010 owns stricter per-node serialization / reservation. Budget decision metadata MUST include `in_flight_at_route`.
+**Concurrent overshoot:** RFC-0007 bounds admission with `max_in_flight` (§6.3) but does not reserve budget per prompt. If N distinct `route` calls succeed concurrently before their completions update the meter, all N can pass the route-time check. Overshoot is therefore bounded by `min(N_successful_routes, max_in_flight)` outstanding completes, **not** unbounded ticket reuse. RFC-0010 owns stricter per-node serialization / reservation. Budget decision metadata MUST include `in_flight_at_route` (stable key name; the value is the in-flight gauge sampled at the decision site — route-time for route denials, complete-time for complete recheck denials).
 
 ### 5.5 `complete` request construction
 
@@ -1220,6 +1220,8 @@ Always attempt when `decision_log` is `Some` (session id is present on `RoutingR
 | Endpoint selected | `ModelRoute` | `capability`, `capability_mapped`, `tier`, `tier_source`, `endpoint_id`, `provider_id`, `model` (wire id from config), `requires_tools`, `requires_structured_output`, `in_flight_at_route` |
 | No endpoint | `ModelRoute` | same without endpoint/model; `error`: `"no_endpoint"` |
 | Budget denied | `Budget` | `capability`, `capability_mapped`, `tier`, `budget_check`, `tokens_in`, `tokens_out`, `usd_spent`, `budget_source` (`"meter"` or `"snapshot"`), `in_flight_at_route` |
+
+`in_flight_at_route` is the stable wire key for the in-flight gauge at the decision site. On route-time `ModelRoute` / `Budget` records it is the route-time count; on complete-time budget recheck denials it remains the same key with the complete-time count (not a separate `in_flight_at_complete` key).
 
 `prompt_body: None`, `content_hash: None` for route decisions.
 
@@ -2043,7 +2045,7 @@ One test per §8.3 status mapping row.
 
 Normative automated test:
 
-1. Walk `crates/alloy-runtime/src/router/**/*.rs` excluding `recording.rs`. For each file, scan only the prefix before the first line containing `#[cfg(test)]`.
+1. Walk `crates/alloy-runtime/src/router/**/*.rs` and `crates/alloy-runtime/src/obs/**/*.rs`. For each file, scan only the prefix before the first line containing `#[cfg(test)]` (fixture asserts may name deny-list patterns).
 2. Fail if lowercase file contents contain any deny-list substring of known vendor model id patterns (e.g. `gpt-4`, `gpt-3.5`, `claude-3`, `claude-opus`, `gemini-`, `o1-`, `o3-`) as Rust string literals. Use plain case-insensitive substring search; do not add a regex dependency for this.
 3. Review checklist (not mechanically tested): no `match` on provider id/kind may select vendor model ids; `openai_compatible` is a protocol kind only.
 

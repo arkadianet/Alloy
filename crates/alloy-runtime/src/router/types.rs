@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::obs::redact_secrets;
+use crate::obs::{redact_secrets, truncate_utf8_bytes};
 use crate::types::budget::{BudgetSnapshot, ModelTier};
 use crate::types::ids::{
     CapabilityId, Digest, EndpointId, EventSeq, NodeId, ProviderId, RunId, SessionId,
@@ -365,17 +365,6 @@ impl Serialize for RoutedModel {
     }
 }
 
-pub(crate) fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let mut end = max_bytes.min(value.len());
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
-}
-
 pub(crate) fn redact_and_truncate(value: &str, max_bytes: usize) -> String {
     truncate_utf8_bytes(&redact_secrets(value), max_bytes)
 }
@@ -430,7 +419,7 @@ mod tests {
 
     #[test]
     fn truncation_preserves_utf8_boundaries_and_redacts_first() {
-        assert_eq!(truncate_utf8_bytes("éé", 3), "é");
+        assert_eq!(crate::obs::truncate_utf8_bytes("éé", 3), "é");
         let value = redact_and_truncate("api_key=sk-abcdefghij", 32);
         assert!(!value.contains("sk-"));
     }

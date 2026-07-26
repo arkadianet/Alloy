@@ -1,8 +1,8 @@
 //! Construction of route and budget decision metadata.
 
-use crate::obs::{BudgetCheck, DecisionKind, DecisionRecord};
-use crate::types::budget::ModelTier;
-use crate::types::ids::ProviderId;
+use crate::obs::{BudgetCheck, CostSnapshot, DecisionKind, DecisionRecord};
+use crate::types::budget::{BudgetSnapshot, ModelTier};
+use crate::types::ids::{NodeId, ProviderId, RunId, SessionId};
 
 use super::select::TierSource;
 use super::types::{ModelEndpoint, RoutedModel, RoutingRequest};
@@ -11,6 +11,42 @@ pub(crate) struct BudgetCounters {
     pub(crate) tokens_in: u64,
     pub(crate) tokens_out: u64,
     pub(crate) usd_spent: Option<f64>,
+}
+
+impl From<&CostSnapshot> for BudgetCounters {
+    fn from(snapshot: &CostSnapshot) -> Self {
+        Self {
+            tokens_in: snapshot.tokens_in,
+            tokens_out: snapshot.tokens_out,
+            usd_spent: snapshot.usd_spent,
+        }
+    }
+}
+
+impl From<&BudgetSnapshot> for BudgetCounters {
+    fn from(snapshot: &BudgetSnapshot) -> Self {
+        Self {
+            tokens_in: snapshot.tokens_in,
+            tokens_out: snapshot.tokens_out,
+            usd_spent: Some(snapshot.usd_spent),
+        }
+    }
+}
+
+/// Packed inputs for a `DecisionKind::Budget` record.
+struct BudgetDecisionInput<'a> {
+    session: SessionId,
+    run: Option<RunId>,
+    node: Option<NodeId>,
+    capability: &'a str,
+    tier: ModelTier,
+    source: TierSource,
+    check: BudgetCheck,
+    counters: BudgetCounters,
+    budget_source: &'static str,
+    /// Gauge sampled at the decision site; metadata key remains `in_flight_at_route`
+    /// even when this value is taken at complete-time recheck (§5.10).
+    in_flight: usize,
 }
 
 pub(crate) fn route_decision(
@@ -63,72 +99,64 @@ pub(crate) fn budget_decision_for_route(
     budget_source: &'static str,
     in_flight: usize,
 ) -> DecisionRecord {
-    budget_decision(
-        request.session,
-        request.run,
-        request.node,
-        request.capability.as_str(),
+    budget_decision(BudgetDecisionInput {
+        session: request.session,
+        run: request.run,
+        node: request.node,
+        capability: request.capability.as_str(),
         tier,
         source,
         check,
         counters,
         budget_source,
         in_flight,
-    )
+    })
 }
 
+/// Budget denial recorded at complete-time recheck.
+///
+/// `in_flight` is the complete-time gauge; the metadata key remains
+/// `in_flight_at_route` per §5.10 (stable wire name across route and complete).
 pub(crate) fn budget_decision_for_complete(
     routed: &RoutedModel,
     check: BudgetCheck,
     counters: BudgetCounters,
     in_flight: usize,
 ) -> DecisionRecord {
-    budget_decision(
-        routed.session(),
-        routed.run(),
-        routed.node(),
-        routed.capability().as_str(),
-        routed.tier(),
-        if routed.capability_mapped() {
+    budget_decision(BudgetDecisionInput {
+        session: routed.session(),
+        run: routed.run(),
+        node: routed.node(),
+        capability: routed.capability().as_str(),
+        tier: routed.tier(),
+        source: if routed.capability_mapped() {
             TierSource::CapabilityMap
         } else {
             TierSource::Default
         },
         check,
         counters,
-        "meter",
+        budget_source: "meter",
         in_flight,
-    )
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn budget_decision(
-    session: crate::SessionId,
-    run: Option<crate::RunId>,
-    node: Option<crate::NodeId>,
-    capability: &str,
-    tier: ModelTier,
-    source: TierSource,
-    check: BudgetCheck,
-    counters: BudgetCounters,
-    budget_source: &'static str,
-    in_flight: usize,
-) -> DecisionRecord {
+fn budget_decision(input: BudgetDecisionInput<'_>) -> DecisionRecord {
     let metadata = serde_json::json!({
-        "capability": capability,
-        "capability_mapped": source == TierSource::CapabilityMap,
-        "tier": tier_name(tier),
-        "budget_check": budget_check_name(check),
-        "tokens_in": counters.tokens_in,
-        "tokens_out": counters.tokens_out,
-        "usd_spent": counters.usd_spent,
-        "budget_source": budget_source,
-        "in_flight_at_route": in_flight,
+        "capability": input.capability,
+        "capability_mapped": input.source == TierSource::CapabilityMap,
+        "tier": tier_name(input.tier),
+        "budget_check": budget_check_name(input.check),
+        "tokens_in": input.counters.tokens_in,
+        "tokens_out": input.counters.tokens_out,
+        "usd_spent": input.counters.usd_spent,
+        "budget_source": input.budget_source,
+        "in_flight_at_route": input.in_flight,
     });
     DecisionRecord {
-        session,
-        run,
-        node,
+        session: input.session,
+        run: input.run,
+        node: input.node,
         kind: DecisionKind::Budget,
         metadata,
         content_hash: None,

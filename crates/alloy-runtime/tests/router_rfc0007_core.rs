@@ -1233,8 +1233,8 @@ async fn scoring_weights_ignored() {
 }
 
 #[test]
-fn router_core_contains_no_hardcoded_vendor_model_ids() {
-    let router_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/router");
+fn router_and_obs_contain_no_hardcoded_vendor_model_ids() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let denied = [
         "gpt-4",
         "gpt-3.5",
@@ -1244,9 +1244,13 @@ fn router_core_contains_no_hardcoded_vendor_model_ids() {
         "o1-",
         "o3-",
     ];
-    let mut directories = vec![router_dir];
+    // RFC-0007 §11.6: no hardcoded vendor model IDs in router core or obs surfaces
+    // that record route / complete metadata.
+    let mut directories = vec![manifest.join("src/router"), manifest.join("src/obs")];
     while let Some(directory) = directories.pop() {
-        for entry in std::fs::read_dir(directory).expect("router source directory") {
+        for entry in std::fs::read_dir(&directory).unwrap_or_else(|error| {
+            panic!("source directory {}: {error}", directory.display())
+        }) {
             let path = entry.expect("directory entry").path();
             if path.is_dir() {
                 directories.push(path);
@@ -1255,7 +1259,7 @@ fn router_core_contains_no_hardcoded_vendor_model_ids() {
             if path.extension().and_then(|value| value.to_str()) != Some("rs") {
                 continue;
             }
-            let source = std::fs::read_to_string(&path).expect("router source");
+            let source = std::fs::read_to_string(&path).expect("source file");
             let production = source
                 .split_once("#[cfg(test)]")
                 .map_or(source.as_str(), |(prefix, _)| prefix)

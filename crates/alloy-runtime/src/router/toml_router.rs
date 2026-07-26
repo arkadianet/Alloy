@@ -466,11 +466,7 @@ impl TomlModelRouter {
                     let decision = budget_decision_for_complete(
                         routed,
                         check,
-                        BudgetCounters {
-                            tokens_in: snapshot.tokens_in,
-                            tokens_out: snapshot.tokens_out,
-                            usd_spent: snapshot.usd_spent,
-                        },
+                        BudgetCounters::from(&snapshot),
                         self.metrics.in_flight.load(Ordering::SeqCst),
                     );
                     self.record_decision(decision).await;
@@ -572,11 +568,7 @@ impl TomlModelRouter {
             let (meter_check, snapshot) = meter.check_and_snapshot(&self.budget_policy);
             (
                 apply_usd_ceiling_overlay(meter_check, &self.budget_policy),
-                BudgetCounters {
-                    tokens_in: snapshot.tokens_in,
-                    tokens_out: snapshot.tokens_out,
-                    usd_spent: snapshot.usd_spent,
-                },
+                BudgetCounters::from(&snapshot),
                 "meter",
             )
         } else {
@@ -585,11 +577,7 @@ impl TomlModelRouter {
                     check_budget_snapshot(&request.budget_remaining, &self.budget_policy),
                     &self.budget_policy,
                 ),
-                BudgetCounters {
-                    tokens_in: request.budget_remaining.tokens_in,
-                    tokens_out: request.budget_remaining.tokens_out,
-                    usd_spent: Some(request.budget_remaining.usd_spent),
-                },
+                BudgetCounters::from(&request.budget_remaining),
                 "snapshot",
             )
         }
