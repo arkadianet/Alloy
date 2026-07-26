@@ -605,7 +605,10 @@ pub struct TomlModelRouterParts {
 - RFC-0004 / run lifecycle (surfaced by RFC-0010 scheduler host) creates one `SharedCostMeter` per run.
 - RFC-0013 workers / host composition bind that meter + a session `DecisionLog` into a **run-scoped** `TomlModelRouter` via `from_paths` / `from_parts` (`bound_run` set).
 - Concurrent runs MUST each own a distinct router instance (distinct `router_instance_id`) and MUST NOT share one meter through a process-global router.
-- The router is the **sole** producer of `DecisionKind::ModelCall` / `add_model_usage` for each `complete`. Workers MUST NOT also call `add_model_usage` / `record_model_call` for the same provider completion (avoids double-accounting vs a naive reading of RFC-0004 worker guidance). Worker-only metrics remain via `add_worker_metrics`.
+- The router is the **sole** producer of `SessionEventType::ModelCall` (`DecisionLog::record_model_call`) and `SharedCostMeter::add_model_usage` for each LLM `complete`. Workers MUST NOT also call `add_model_usage` / `record_model_call` for the same provider completion.
+- **`add_worker_metrics` trap:** on `main`, `CostMeter::add_worker_metrics` forwards into `add_model_usage`. Therefore workers MUST NOT call `add_worker_metrics` with token counts that duplicate a router completion. Until RFC-0004 splits worker-non-model metrics from model usage, LLM nodes that used the router MUST leave model tokens to the router only (worker `WorkerMetrics` may still be returned on `CapabilityOutput` for scheduler display without re-feeding the meter).
+- **RFC-0004 amendment note:** any merged guidance that workers record model calls / feed model usage for LLM completions is superseded by this RFC for completions owned by `TomlModelRouter`; update RFC-0004 in the same implementation series.
+- **RFC-0013 amendment (normative for binding):** `CapabilityContext` MUST gain `pub run: RunId` (and SHOULD expose the same `session` already present) so workers can build `RoutingRequest { session, run: Some(ctx.run), node: Some(ctx.node), ... }`. Until that lands, host composition MUST inject run id by wrapping the router rather than leaving workers unable to satisfy `bound_run`.
 - RFC-0010 does **not** depend on RFC-0007; it creates the meter. Binding the meter to the router is host/RFC-0013 composition.
 
 ```rust
@@ -850,8 +853,9 @@ No cycles. `openai` MUST NOT import `toml_router`.
 
 | Seam | Type | Consumer |
 | --- | --- | --- |
-| Decision log | `Option<Arc<dyn DecisionLog>>` | tests / runtime host |
-| Cost meter | `Option<SharedCostMeter>` | RFC-0010 run lifecycle |
+| Decision log | `Arc<dyn DecisionLog>` (required in production) | host / RFC-0013 composition |
+| Cost meter | `SharedCostMeter` (required in production; created by run lifecycle / RFC-0004) | bound by host / RFC-0013 into run-scoped router |
+| Bound run | `RunId` | host / RFC-0013 composition |
 | Provider | `Arc<dyn ModelProvider>` | Recording / Scripted / OpenAI |
 | Budget policy | `BudgetPolicy` | profile (RFC-0001 / 0015) |
 
@@ -930,14 +934,17 @@ Production routers always have a meter (§3.13). Algorithm:
 
 1. If `bound_run` is `Some(id)` and `req.run != Some(id)` → `Err(RouterError::Config("run mismatch"))` (or `Internal` if invariant broken after admission); do not select an endpoint.
 2. If `self.cost_meter` is `Some(meter)`, compute `check = meter.check_budget(&self.budget_policy)`.
-3. If no meter (`allow_unmetered` test path only), compute `check = check_budget_snapshot(&req.budget_remaining, &self.budget_policy)` and document that this path is test-only.
-4. If `check.is_exhausted()`:
+3. If no meter (`allow_unmetered` test path only), compute `check = check_budget_snapshot(&req.budget_remaining, &self.budget_policy)`.
+4. Apply the zero/non-finite USD ceiling overlay (§5.4): if `!max_usd.is_finite() || max_usd <= 0.0`, force USD exhausted into `check`.
+5. If `check.is_exhausted()`:
    - Record `DecisionKind::Budget` with metadata (§9.2).
    - Return `Err(RouterError::BudgetDenied(check))`.
-5. **MUST NOT** escalate or downgrade tier to satisfy budget in MVP.
-6. Successful `route` returns a sealed `RoutedModel` stamped with `router_instance_id` and a fresh ticket (`used = false`).
+6. **MUST NOT** escalate or downgrade tier to satisfy budget in MVP.
+7. Successful `route` returns a sealed `RoutedModel` stamped with `router_instance_id` and a fresh ticket (`used = false`).
 
-**USD price fail-closed:** when `budget_policy.max_usd_per_run.is_finite() && budget_policy.max_usd_per_run > 0.0`, every endpoint MUST declare both `input_usd_per_mtok` and `output_usd_per_mtok` (finite, `>= 0`) at config validation (§7.2). Otherwise a finite USD ceiling could never advance on known-token completions. If `max_usd_per_run == 0.0`, USD is immediately exhausted by `CostMeter::check_budget` (existing RFC-0004 semantics) — price fields MAY be omitted.
+**USD price fail-closed:** when `budget_policy.max_usd_per_run.is_finite() && budget_policy.max_usd_per_run > 0.0`, every endpoint MUST declare both `input_usd_per_mtok` and `output_usd_per_mtok` (finite, `>= 0`) at config validation (§7.2). Otherwise a finite USD ceiling could never advance on known-token completions.
+
+**Zero / non-finite USD ceiling (normative router overlay):** RFC-0004 `CostMeter::check_budget` does **not** treat `max_usd_per_run == 0.0` as exhausted while `usd_spent` is still `None`. The router MUST NOT inherit that hole. Before accepting a route or complete, if `!max_usd_per_run.is_finite() || max_usd_per_run <= 0.0`, the router MUST deny with `BudgetDenied(UsdExhausted)` (or `TokensAndUsdExhausted` if tokens are also exhausted) **even when** `meter.check_budget` returns `Ok`. Price fields MAY be omitted when this overlay applies. Unit test: `zero_usd_ceiling_denies_with_unknown_spend`.
 
 #### 5.4.1 `complete` admission (normative)
 
@@ -1095,6 +1102,8 @@ struct DurableAppendSupervisor {
     obs_record_errors: Arc<AtomicU64>,
 }
 
+type AppendNotify = Result<(), ObsError>; // oneshot payload
+
 // inside complete, after provider returns Ok or ANY ProviderError:
 // 0. If host cancel and provider result race: once the provider future has
 //    resolved (Ok or Err), the no-await meter+spawn critical section MUST run;
@@ -1102,18 +1111,19 @@ struct DurableAppendSupervisor {
 // 1. Normalize/redact ModelResponse or ProviderError at the router boundary (§5.9.5).
 // 2. Build ModelCallRecord (always for ProviderError, including Internal).
 // 3. If meter present: add_model_usage synchronously (no .await before this).
-// 4. let (tx, rx) = oneshot::channel();
-// 5. let handle = tokio::spawn(async move {
+// 4. let (tx, rx) = oneshot::channel::<AppendNotify>();
+// 5. let handle: JoinHandle<()> = tokio::spawn(async move {
 //        let res = decision_log.record_model_call(rec).await;
 //        if res.is_err() { obs_record_errors.fetch_add(1, Relaxed); }
-//        let _ = tx.send(res); // receiver may be gone
-//        res
+//        let _ = tx.send(res.map(|_| ())); // receiver may be gone; do not use res after move
 //    });
 // 6. supervisor.handles.lock().push(handle);
 // 7. Host-level cancellation MUST NOT be selected between steps 3–6.
 // 8. Await `rx` only to surface completion to the caller:
 //      - Ok(_) → continue (obs errors already counted; complete still returns provider outcome)
 //      - Err(RecvError) → caller dropped; append task keeps running on supervisor
+// 9. shutdown drain: for handle in handles { tokio::time::timeout(budget, handle).await ... }
+//    counting timed-out / still-joined failures into remaining_appends.
 ```
 
 Rules:
@@ -1295,19 +1305,22 @@ On expiry → `ProviderError::Timeout` (retryable classification for RFC-0010; *
 
 ```text
 shared state:
-  report_cell: Mutex<Option<RouterShutdownReport>>  // written once
-  report_notify: Notify
+  // Prefer tokio::sync::watch::channel(None) so receivers cannot miss publication.
+  report_tx / report_rx: watch::Sender/Receiver<Option<RouterShutdownReport>>
+  // If Notify is used instead, followers MUST enable-before-check:
+  //   let wait = notify.notified(); pin!(wait);
+  //   if let Some(r) = cell { return r; }
+  //   wait.await; ...
 
 shutdown():
-  // Fast path: already published
-  if let Some(r) = report_cell.lock().clone() { return r }
+  if let Some(r) = *report_rx.borrow() { return r }
 
   winner = compare_exchange(Ready, Draining)
   if not winner:
-    // Follower: wait until report_cell is Some (no shorter timeout than winner)
+    // Follower: wait on watch until Some (cannot miss notify_waiters)
     loop {
-      if let Some(r) = report_cell.lock().clone() { return r }
-      report_notify.notified().await
+      if let Some(r) = *report_rx.borrow() { return r }
+      report_rx.changed().await?
     }
 
   // Winner only:
@@ -1321,17 +1334,15 @@ shutdown():
     cancelled = true
     wait post_cancel = min(1000ms, shutdown_grace_ms)
   remaining_in_flight = in_flight.load()
-  // Drain durable appends with the same post_cancel budget (or shutdown_grace if no cancel)
   remaining_appends = supervisor.drain_timeout(post_cancel_or_grace)
   phase = Stopped
   report = RouterShutdownReport { cancelled_in_flight: cancelled, remaining_in_flight, remaining_appends }
-  *report_cell.lock() = Some(report)
-  report_notify.notify_waiters()
+  report_tx.send(Some(report))?   // all followers observe the same value
   if remaining_in_flight > 0 || remaining_appends > 0 { warn!(...) }
   return report
 ```
 
-`shutdown` is idempotent. Concurrent callers MUST NOT race a Stopped→Draining transition and MUST all observe the **same** cached `RouterShutdownReport`. Followers NEVER use a shorter wait than the winner; they block on `report_cell`. `Stopped` is published only after the winner finishes in-flight drain **and** append drain attempt. Durable append drain is REQUIRED (§5.9.3).
+`shutdown` is idempotent. Concurrent callers MUST NOT race a Stopped→Draining transition and MUST all observe the **same** cached `RouterShutdownReport`. Followers wait on `watch` (or Notify with enable-before-check) and MUST NOT use a shorter timeout than the winner. `Stopped` is published only after the winner finishes in-flight drain **and** append drain attempt. Durable append drain is REQUIRED (§5.9.3).
 
 ### 6.7 Connection reuse
 
@@ -1443,7 +1454,7 @@ planning = "standard"
 | capability key empty or >128 UTF-8 bytes after trim | Config |
 | `max_in_flight > 1024` (MVP hard cap; MUST also be `<= tokio::sync::Semaphore::MAX_PERMITS`) | Config |
 | finite `max_usd_per_run > 0` but an endpoint omits either price field | Config |
-| serde unknown fields on fixed-schema DTOs (`RouterPolicy`, `ProviderConfig`, `EndpointConfig`, `ScoringWeights`) | Config (`deny_unknown_fields`) |
+| serde unknown fields on fixed-schema DTOs including the **root** private parse DTO (`RouterFile` / equivalent), `RouterPolicy`, `ProviderConfig`, `EndpointConfig`, `ScoringWeights` | Config (`deny_unknown_fields`) |
 
 **Trailing slash / path join:** parse `base_url` into `url::Url` at construct; join `chat/completions` via `Url::join`. Do not string-concatenate after trimming a single slash.
 
@@ -1693,7 +1704,22 @@ pub fn classify_router_error(err: &RouterError) -> ClassifiedRouterFailure;
 | `RouterError::AlreadyCompleted` / `WrongRouter` / `NoEndpoint` / `Config` / `ShuttingDown` / `Internal` | `Internal` | `NonRetryable` |
 | `RouterError::Provider(e)` | `classify_provider_error(e)` | same |
 
-RFC-0013 / host adapters MUST return `ClassifiedRouterFailure` (or an equivalent pair) to the scheduler. RFC-0010 MUST treat `retry == Retryable` as the admission gate for backoff **in addition to** `retry_on` containing `class` (normative cross-RFC amendment note for the RFC-0010 stub: do not retry solely because `class == Model`).
+RFC-0013 / host adapters MUST return `ClassifiedRouterFailure` (or an equivalent pair) to the scheduler. RFC-0010 MUST treat `retry == Retryable` as the admission gate for backoff **in addition to** `retry_on` containing `class` (do not retry solely because `class == Model`).
+
+**Carrier amendment (normative, same implementation series as RFC-0007 code):** merged `FailureIr` (`types/diagnostic.rs`) MUST gain an additive field:
+
+```rust
+pub struct FailureIr {
+    pub node: NodeId,
+    pub error_class: ErrorClass,
+    /// Default `RetryDisposition::NonRetryable` for back-compat serde / struct update.
+    pub retry: RetryDisposition,
+    pub diagnostics: Vec<DiagnosticEvent>,
+    pub notes: String,
+}
+```
+
+`RetryDisposition` lives in `alloy_runtime::router` and is re-exported at the crate root (or moved to `types` if RFC-0001 prefers a shared home — either is fine if one public path is documented). Workers (RFC-0013) that surface router failures MUST populate `failure.retry` from `classify_router_error`. RFC-0010 retry admission MUST read `FailureIr.retry` (and still require `error_class ∈ retry_on`). Update RFC-0001 / RFC-0010 / RFC-0013 stubs in the same docs PR series when implementing.
 
 ### 8.5 Boundary conversion to `RuntimeError`
 
@@ -1807,7 +1833,7 @@ This feature set intentionally recreates reqwest 0.13.4's useful defaults (`rust
 | `url = "2.5.8"` | URL parse/loopback validation independent of `http-provider` |
 | `wiremock` (dev) | Offline HTTP |
 
-No other new runtime deps required beyond `reqwest` and `url` (`async-trait`, `serde`, `tokio`, `thiserror`, `tracing`, `toml` already present).
+New runtime deps: `reqwest`, `url`, and a **direct** `rustls` pin matching reqwest 0.13.4’s transitive version (for `downcast_ref` in §8.3.2). Existing deps remain (`async-trait`, `serde`, `tokio`, `thiserror`, `tracing`, `toml`).
 
 ### 10.2.1 HTTP body and header safety
 
@@ -1915,7 +1941,10 @@ RFC-0007 MUST NOT sleep-and-retry inside `OpenAiCompatibleProvider::complete` or
 | `wrong_router_rejected` | complete on different instance → `WrongRouter` |
 | `from_parts_requires_meter` | missing meter/log without allow_unmetered → Config |
 | `usd_budget_requires_prices` | max_usd > 0 without prices → Config |
+| `zero_usd_ceiling_denies_with_unknown_spend` | max_usd == 0 + meter with usd_spent None → BudgetDenied |
+| `toml_rejects_unknown_root_key` | misspelled top-level table → Config |
 | `classify_retry_disposition_table` | §8.4.1 matrix unit-tested |
+| `failure_ir_carries_retry` | adapter/worker maps ClassifiedRouterFailure into FailureIr.retry |
 | `max_in_flight_bounds_admission` | calls above limit await or reject on drain |
 | `concurrent_completes` | N parallel OK with recording/wiremock |
 
