@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-runtime",
  "async-trait",
+ "criterion",
  "regex",
  "serde",
  "serde_json",

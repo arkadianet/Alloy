@@ -147,6 +147,7 @@ impl EvalTrajectoryRecord {
         row
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn base(
         fixture_id: FixtureId,
         set: FixtureSet,
@@ -241,8 +242,7 @@ pub fn write_trajectory_artifacts(
     let run_dir = artifact_dir.join(report.run_id.as_str());
     match fs::symlink_metadata(&run_dir) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(EvalError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(EvalError::Io(std::io::Error::other(
                 "trajectory run directory is a symlink",
             )));
         }
@@ -262,8 +262,7 @@ pub fn write_trajectory_artifacts(
     let jsonl_path = run_dir.join("trajectories.jsonl");
     match fs::symlink_metadata(&jsonl_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(EvalError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(EvalError::Io(std::io::Error::other(
                 "trajectory jsonl is a symlink",
             )));
         }

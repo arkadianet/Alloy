@@ -302,13 +302,13 @@ mod tests {
             1,
             vec![line("error", Some("E0502"), "cannot borrow as mutable")],
         );
-        assert_eq!(rec.compile_clean().unwrap(), false);
+        assert!(!rec.compile_clean().unwrap());
         assert_eq!(rec.diagnostics().unwrap()[0].code.as_deref(), Some("E0502"));
     }
 
     #[test]
     fn golden_post_repair_passes_compile() {
         let rec = recording(0, vec![json!({ "reason": "build-finished" }).to_string()]);
-        assert_eq!(rec.compile_clean().unwrap(), true);
+        assert!(rec.compile_clean().unwrap());
     }
 }

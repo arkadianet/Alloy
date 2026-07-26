@@ -558,7 +558,7 @@ mod tests {
                 detail: String::new(),
             },
         );
-        assert_eq!(state.results[0].passed, false);
+        assert!(!state.results[0].passed);
         assert_eq!(state.results[0].detail, "missing repair text");
     }
 

@@ -1,4 +1,4 @@
-//! Endpoint-bound, request-keyed FIFO scripted [`ModelProvider`].
+//! Endpoint-bound, request-keyed FIFO scripted [`alloy_runtime::ModelProvider`].
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard};

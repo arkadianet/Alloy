@@ -11,7 +11,7 @@ rust-version.workspace = true
 default = []
 
 [dependencies]
-alloy-runtime = { workspace = true }
+alloy-runtime = { workspace = true, features = ["http-provider"] }
 async-trait = { workspace = true }
 globset = { workspace = true }
 libc = { workspace = true }
