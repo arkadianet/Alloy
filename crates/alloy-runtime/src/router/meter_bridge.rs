@@ -30,9 +30,9 @@ pub(crate) fn build_model_call_record(
         "[]".to_owned()
     });
     let canonical_len = canonical.len();
-    let prompt_body_oversize = canonical.len() > MODEL_PROMPT_BODY_MAX_BYTES;
-    let prompt_body = (!prompt_body_oversize).then(|| canonical.clone());
+    let prompt_body_oversize = canonical_len > MODEL_PROMPT_BODY_MAX_BYTES;
     let content_hash = Some(hash_prompt(&canonical));
+    let prompt_body = (!prompt_body_oversize).then_some(canonical);
     let duration_ms = Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
 
     let (input_tokens, output_tokens, usd, error_class, finish_reason, request_id) = match result {
@@ -110,7 +110,7 @@ mod tests {
             requires_tools: false,
             requires_structured_output: false,
         };
-        RoutedModel::new(
+        RoutedModel::mint(
             ModelEndpoint {
                 id: EndpointId::new("endpoint").unwrap(),
                 provider: ProviderId::new("provider").unwrap(),

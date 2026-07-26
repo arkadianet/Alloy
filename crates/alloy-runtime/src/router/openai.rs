@@ -178,6 +178,7 @@ struct WireResponseFormat {
 pub(crate) struct WireResponse {
     id: Option<String>,
     choices: Option<Vec<WireChoice>>,
+    #[serde(default, deserialize_with = "deserialize_optional_usage")]
     usage: Option<WireUsage>,
     error: Option<Value>,
 }
@@ -199,7 +200,7 @@ pub(crate) struct WireMessage {
 enum WireContent {
     Text(String),
     Parts(Vec<WireContentPart>),
-    Other(Value),
+    Other(#[allow(dead_code)] Value),
 }
 
 #[derive(Deserialize)]
@@ -234,6 +235,21 @@ where
         .and_then(|value| value.as_u64()))
 }
 
+/// Malformed / wrong-typed `usage` MUST NOT fail an otherwise valid completion (§5.7).
+fn deserialize_optional_usage<'de, D>(deserializer: D) -> Result<Option<WireUsage>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| {
+        // Reject sequences: serde would otherwise map `[prompt, completion]` positionally.
+        if !value.is_object() {
+            return None;
+        }
+        serde_json::from_value(value).ok()
+    }))
+}
+
 enum BodyReadError {
     TooLarge,
     Request(reqwest::Error),
@@ -256,7 +272,9 @@ fn map_status(status: u16, body: &[u8], api_key: &str) -> ProviderError {
         429 => ProviderError::RateLimit,
         400 if context_length_signal(body) => ProviderError::ContextLength,
         _ => {
-            let body = String::from_utf8_lossy(body);
+            // Bound work before scrubbing; final message is ≤512 UTF-8 bytes.
+            let prefix = utf8_prefix(body, 4 * 1024);
+            let body = String::from_utf8_lossy(prefix);
             let scrubbed = if api_key.is_empty() {
                 body.into_owned()
             } else {
@@ -267,6 +285,14 @@ fn map_status(status: u16, body: &[u8], api_key: &str) -> ProviderError {
                 message: redact_and_truncate(&scrubbed, 512),
             }
         }
+    }
+}
+
+fn utf8_prefix(bytes: &[u8], max_bytes: usize) -> &[u8] {
+    let end = max_bytes.min(bytes.len());
+    match std::str::from_utf8(&bytes[..end]) {
+        Ok(_) => &bytes[..end],
+        Err(error) => &bytes[..error.valid_up_to()],
     }
 }
 
@@ -369,12 +395,9 @@ fn map_content(content: Option<&WireContent>) -> Result<Option<String>, Provider
                 ))
             }
         }
-        Some(WireContent::Other(value)) => {
-            let _ = value;
-            Err(ProviderError::MalformedResponse(
-                "response content has an invalid type".into(),
-            ))
-        }
+        Some(WireContent::Other(_)) => Err(ProviderError::MalformedResponse(
+            "response content has an invalid type".into(),
+        )),
     }
 }
 
@@ -400,6 +423,12 @@ mod tests {
             provider.completion_url().unwrap().as_str(),
             "https://example.com/v1/chat/completions"
         );
+        let trailing =
+            OpenAiCompatibleProvider::new(spec("https://example.com/v1/", "secret")).unwrap();
+        assert_eq!(
+            trailing.completion_url().unwrap().as_str(),
+            "https://example.com/v1/chat/completions"
+        );
         assert!(provider.authorization.is_sensitive());
         assert!(OpenAiCompatibleProvider::new(spec("https://example.com", "bad\nkey")).is_err());
     }
@@ -416,17 +445,44 @@ mod tests {
         assert_eq!(response.usage.input_tokens, None);
         assert_eq!(response.usage.output_tokens, None);
 
+        let bad_usage_container = br#"{
+            "choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
+            "usage":"not-an-object"
+        }"#;
+        let response = map_success(bad_usage_container, &ResponseFormat::Text).unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+        assert_eq!(response.usage.input_tokens, None);
+        assert_eq!(response.usage.output_tokens, None);
+
+        let usage_array = br#"{
+            "choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
+            "usage":[1,2]
+        }"#;
+        let response = map_success(usage_array, &ResponseFormat::Text).unwrap();
+        assert_eq!(response.usage.input_tokens, None);
+
         let refusal =
             br#"{"choices":[{"message":{"content":null,"refusal":"no"},"finish_reason":"stop"}]}"#;
         let response = map_success(refusal, &ResponseFormat::Text).unwrap();
         assert_eq!(response.text, None);
         assert_eq!(response.finish_reason.as_deref(), Some("refusal"));
+
+        let invalid_content =
+            br#"{"choices":[{"message":{"content":123},"finish_reason":"stop"}]}"#;
+        assert!(matches!(
+            map_success(invalid_content, &ResponseFormat::Text),
+            Err(ProviderError::MalformedResponse(_))
+        ));
     }
 
     #[test]
     fn maps_status_table_and_structured_object() {
         assert!(matches!(
             map_status(401, b"secret", "key"),
+            ProviderError::Auth
+        ));
+        assert!(matches!(
+            map_status(403, b"forbidden", "key"),
             ProviderError::Auth
         ));
         assert!(matches!(

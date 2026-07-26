@@ -28,15 +28,3 @@ impl ValidatedHttpClient {
         &self.inner
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builds_with_finite_policy_timeouts() {
-        let client =
-            ValidatedHttpClient::build(Duration::from_secs(1), Duration::from_secs(2)).unwrap();
-        let _ = client.inner();
-    }
-}

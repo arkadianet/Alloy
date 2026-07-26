@@ -29,10 +29,10 @@ pub use query::{
     reaccumulate_cost_from_events, DecisionPage,
 };
 pub use recording::RecordingDecisionLog;
-/// Body-size limit for router prompt hashing / retention (RFC-0007 §3.17).
-pub(crate) use redact::BODY_MAX_BYTES as MODEL_PROMPT_BODY_MAX_BYTES;
 /// Shared UTF-8-safe truncate used by obs prepare paths and the router.
 pub(crate) use redact::truncate_utf8_bytes;
+/// Body-size limit for router prompt hashing / retention (RFC-0007 §3.17).
+pub(crate) use redact::BODY_MAX_BYTES as MODEL_PROMPT_BODY_MAX_BYTES;
 pub use redact::{
     apply_prompt_retention, apply_tool_retention, redact_json_strings, redact_secrets,
     RetentionPolicy,

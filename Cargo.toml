@@ -50,4 +50,4 @@ wiremock = "0.6"
 scopeguard = "1"
 rcgen = "0.13"
 tokio-rustls = "0.26"
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1" }

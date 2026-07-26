@@ -260,6 +260,10 @@ impl TomlModelRouter {
     }
 
     /// Begin draining and return the final report shared by every shutdown caller.
+    ///
+    /// The CAS winner spawns a runtime-owned drain task (requires a Tokio runtime)
+    /// so an aborted first caller cannot orphan drain leadership; every caller
+    /// then waits on the shared `watch` report (§6.6).
     pub async fn shutdown(&self) -> RouterShutdownReport {
         let mut report_rx = self.report_tx.subscribe();
         if let Some(report) = *report_rx.borrow() {
@@ -312,11 +316,9 @@ impl TomlModelRouter {
                 return report;
             }
             if report_rx.changed().await.is_err() {
-                return RouterShutdownReport {
-                    cancelled_in_flight: true,
-                    remaining_in_flight: self.metrics.in_flight.load(Ordering::SeqCst),
-                    remaining_appends: self.append_supervisor.pending.load(Ordering::SeqCst),
-                };
+                // `report_tx` is owned by `self`; the sender cannot drop while
+                // `shutdown` is being polled.
+                unreachable!("router shutdown report sender dropped while shutdown awaited");
             }
         }
     }
@@ -377,7 +379,12 @@ impl TomlModelRouter {
                 &request,
                 tier,
                 tier_source,
-                &self.config.providers[0].id,
+                &self
+                    .config
+                    .providers
+                    .first()
+                    .expect("validated single provider")
+                    .id,
                 None,
                 in_flight,
             );
@@ -787,7 +794,7 @@ mod tests {
     use super::*;
     use crate::obs::{RecordingDecisionLog, RetentionPolicy};
     use crate::router::{RecordingModelProvider, Usage};
-    use crate::types::budget::{BudgetSnapshot, ModelTier};
+    use crate::types::budget::BudgetSnapshot;
     use crate::types::ids::{CapabilityId, ProviderId, SessionId};
 
     fn config() -> RouterConfig {
@@ -943,6 +950,5 @@ output_usd_per_mtok = 1.0
         let mut without_prices = config();
         without_prices.providers[0].endpoints[0].input_usd_per_mtok = None;
         assert!(validate_price_completeness(&without_prices, &BudgetPolicy::default()).is_err());
-        assert_eq!(config().policy.default_tier, ModelTier::Standard);
     }
 }

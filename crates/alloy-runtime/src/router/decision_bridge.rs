@@ -57,6 +57,7 @@ pub(crate) fn route_decision(
     endpoint: Option<&ModelEndpoint>,
     in_flight: usize,
 ) -> DecisionRecord {
+    // `capability` keeps the caller's spelling; tier lookup uses ASCII-lowercased keys.
     let mut metadata = serde_json::json!({
         "capability": request.capability.as_str(),
         "capability_mapped": source == TierSource::CapabilityMap,

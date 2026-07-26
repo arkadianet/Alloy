@@ -160,10 +160,6 @@ impl RuntimeConfig {
                 paths.example_env.display()
             )));
         }
-        // Existence only — schema validation is `RouterConfig::load` (RFC-0007).
-        let _ = std::fs::metadata(&paths.router).map_err(|e| {
-            RuntimeError::Config(format!("stat router {}: {e}", paths.router.display()))
-        })?;
 
         let (data_dir, data_dir_rule) = resolve_data_dir(&paths)?;
 

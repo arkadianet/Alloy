@@ -158,7 +158,7 @@ async fn budget_denial_no_provider_call() {
     assert_eq!(decisions[0].kind, DecisionKind::Budget);
     assert_eq!(decisions[0].metadata["budget_check"], "tokens_exhausted");
     assert_eq!(decisions[0].metadata["budget_source"], "meter");
-    assert!(decisions[0].metadata.get("in_flight_at_route").is_some());
+    assert_eq!(decisions[0].metadata["in_flight_at_route"], 1);
     let metrics = router.metrics();
     assert_eq!(metrics.routes_budget_denied, 1);
     assert_eq!(metrics.completes_err, 0);
@@ -188,7 +188,8 @@ async fn complete_budget_recheck_denies() {
     let budget = decisions.last().expect("completion budget decision");
     assert_eq!(budget.kind, DecisionKind::Budget);
     assert_eq!(budget.metadata["budget_check"], "tokens_exhausted");
-    assert!(budget.metadata.get("in_flight_at_route").is_some());
+    assert_eq!(budget.metadata["budget_source"], "meter");
+    assert_eq!(budget.metadata["in_flight_at_route"], 1);
     let metrics = router.metrics();
     assert_eq!(metrics.routes_ok, 1);
     // BudgetDenied + AlreadyCompleted both return Err from complete (§9.3).
@@ -268,7 +269,7 @@ async fn route_decision_metadata_is_normative() {
     assert_eq!(decision.metadata["model"], "operator-configured");
     assert_eq!(decision.metadata["requires_tools"], false);
     assert_eq!(decision.metadata["requires_structured_output"], true);
-    assert!(decision.metadata.get("in_flight_at_route").is_some());
+    assert_eq!(decision.metadata["in_flight_at_route"], 1);
 }
 
 #[tokio::test]
@@ -298,7 +299,7 @@ async fn no_endpoint_records_model_route() {
     assert_eq!(decision.metadata["provider_id"], "provider");
     assert_eq!(decision.metadata["requires_tools"], true);
     assert_eq!(decision.metadata["requires_structured_output"], true);
-    assert!(decision.metadata.get("in_flight_at_route").is_some());
+    assert_eq!(decision.metadata["in_flight_at_route"], 1);
     assert!(decision.metadata.get("endpoint_id").is_none());
     assert!(decision.metadata.get("model").is_none());
     assert_eq!(router.metrics().routes_no_endpoint, 1);
@@ -501,6 +502,7 @@ async fn mid_flight_host_cancel_returns_cancelled() {
         started: Notify::new(),
     });
     let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+    let meter = SharedCostMeter::new();
     let run = RunId::new();
     let cancellation = CancellationToken::new();
     let router = Arc::new(
@@ -509,8 +511,8 @@ async fn mid_flight_host_cancel_returns_cancelled() {
                 config("https://example.com"),
                 provider.clone(),
                 BudgetPolicy::default(),
-                Some(log),
-                Some(SharedCostMeter::new()),
+                Some(log.clone()),
+                Some(meter.clone()),
                 Some(run),
             )
             .shutdown_token(cancellation.clone()),
@@ -532,6 +534,22 @@ async fn mid_flight_host_cancel_returns_cancelled() {
         Err(RouterError::Cancelled)
     ));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(meter.snapshot().model_calls, 0);
+    assert!(log.recorded_model_calls().is_empty());
+}
+
+#[tokio::test]
+async fn bound_run_mismatch_rejects_without_decision() {
+    let (provider, log, _, run, router) = recording_dependencies(BudgetPolicy::default());
+    let mut request = route_request(run);
+    request.run = Some(RunId::new());
+
+    assert!(matches!(
+        router.route(request).await,
+        Err(RouterError::Config(_))
+    ));
+    assert!(provider.recorded().is_empty());
+    assert!(log.recorded_decisions().is_empty());
 }
 
 struct BlockingDecisionLog {
@@ -1248,9 +1266,9 @@ fn router_and_obs_contain_no_hardcoded_vendor_model_ids() {
     // that record route / complete metadata.
     let mut directories = vec![manifest.join("src/router"), manifest.join("src/obs")];
     while let Some(directory) = directories.pop() {
-        for entry in std::fs::read_dir(&directory).unwrap_or_else(|error| {
-            panic!("source directory {}: {error}", directory.display())
-        }) {
+        for entry in std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("source directory {}: {error}", directory.display()))
+        {
             let path = entry.expect("directory entry").path();
             if path.is_dir() {
                 directories.push(path);
@@ -1260,10 +1278,7 @@ fn router_and_obs_contain_no_hardcoded_vendor_model_ids() {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("source file");
-            let production = source
-                .split_once("#[cfg(test)]")
-                .map_or(source.as_str(), |(prefix, _)| prefix)
-                .to_ascii_lowercase();
+            let production = production_source_prefix(&source).to_ascii_lowercase();
             for pattern in denied {
                 assert!(
                     !production.contains(pattern),
@@ -1273,4 +1288,17 @@ fn router_and_obs_contain_no_hardcoded_vendor_model_ids() {
             }
         }
     }
+}
+
+/// Strip the trailing unit-test module so `#[cfg(test)]` field attributes do not
+/// truncate production scans (e.g. `allow_unmetered` early in `toml_router.rs`).
+fn production_source_prefix(source: &str) -> &str {
+    const MARKERS: &[&str] = &["\n#[cfg(test)]\nmod tests", "\nmod tests {"];
+    let mut cut = source.len();
+    for marker in MARKERS {
+        if let Some(idx) = source.find(marker) {
+            cut = cut.min(idx);
+        }
+    }
+    &source[..cut]
 }

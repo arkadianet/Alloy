@@ -1357,9 +1357,12 @@ shutdown() -> RouterShutdownReport:   // NOT Result — never use `?`
       let _ = report_rx.changed().await; // re-borrow after; cannot miss send
     }
 
-  // Winner only:
+  // Winner only (cancel-safe leadership):
   wake admission waiters so pending route/complete → ShuttingDown
+  tokio::spawn(drain_shutdown(...))   // requires Tokio runtime; aborted callers cannot orphan drain
+  // Winner then falls through to the same watch wait as non-winners
 
+  // drain_shutdown body (runtime-owned task):
   // in_flight drain: ENABLE BEFORE CHECK (must not miss final dec-to-zero)
   let wait = in_flight_notify.notified();
   tokio::pin!(wait);
@@ -1383,12 +1386,13 @@ shutdown() -> RouterShutdownReport:   // NOT Result — never use `?`
   remaining_appends = supervisor.drain_aggregate(post_cancel_or_grace) // one deadline
   phase = Stopped
   report = RouterShutdownReport { cancelled_in_flight: cancelled, remaining_in_flight, remaining_appends }
-  let _ = report_tx.send(Some(report));
+  report_tx.send_replace(Some(report));
   if remaining_in_flight > 0 || remaining_appends > 0 { warn!(...) }
-  return report
+
+  // All callers (winner included) return the shared watch report
 ```
 
-`shutdown` is idempotent and returns `RouterShutdownReport` (not `Result`). Concurrent callers MUST all observe the same cached report via `watch`. In-flight waiting MUST use enable-before-check on `Notify`. Append drain uses one aggregate deadline (§5.9.3).
+`shutdown` is idempotent and returns `RouterShutdownReport` (not `Result`). Concurrent callers MUST all observe the same cached report via `watch`. The CAS winner MUST spawn a runtime-owned drain task so leadership is cancel-safe if the first `shutdown()` future is dropped; every caller (including the winner) waits on `watch` for that report. In-flight waiting MUST use enable-before-check on `Notify`. Append drain uses one aggregate deadline (§5.9.3).
 
 ### 6.7 Connection reuse
 
@@ -1910,9 +1914,13 @@ This feature set intentionally recreates reqwest 0.13.4's useful defaults (`rust
 | --- | --- |
 | `reqwest` | First network client |
 | `url = "2.5.8"` | URL parse/loopback validation independent of `http-provider` |
+| `rustls` (direct pin) | `downcast_ref` TLS classification (§8.3.2); version matches reqwest 0.13.4 |
+| `scopeguard` | Panic-safe in-flight / append-pending decrement (§5.9.3) |
+| `zeroize` | Zero `SecretString` material on drop (no derive feature required) |
 | `wiremock` (dev) | Offline HTTP |
+| `rcgen` / `tokio-rustls` (dev) | Self-signed TLS classifier coverage (§8.3.2) |
 
-New runtime deps: `reqwest`, `url`, and a **direct** `rustls` pin matching reqwest 0.13.4’s transitive version (for `downcast_ref` in §8.3.2). Existing deps remain (`async-trait`, `serde`, `tokio`, `thiserror`, `tracing`, `toml`).
+New runtime deps: `reqwest`, `url`, `scopeguard`, `zeroize`, and a **direct** `rustls` pin matching reqwest 0.13.4’s transitive version (for `downcast_ref` in §8.3.2). Existing deps remain (`async-trait`, `serde`, `tokio`, `thiserror`, `tracing`, `toml`).
 
 ### 10.2.1 HTTP body and header safety
 
@@ -2045,7 +2053,7 @@ One test per §8.3 status mapping row.
 
 Normative automated test:
 
-1. Walk `crates/alloy-runtime/src/router/**/*.rs` and `crates/alloy-runtime/src/obs/**/*.rs`. For each file, scan only the prefix before the first line containing `#[cfg(test)]` (fixture asserts may name deny-list patterns).
+1. Walk `crates/alloy-runtime/src/router/**/*.rs` and `crates/alloy-runtime/src/obs/**/*.rs`. For each file, scan only the prefix before the trailing unit-test module (`#[cfg(test)] mod tests` / `mod tests {`) so `#[cfg(test)]` field attributes do not truncate production coverage.
 2. Fail if lowercase file contents contain any deny-list substring of known vendor model id patterns (e.g. `gpt-4`, `gpt-3.5`, `claude-3`, `claude-opus`, `gemini-`, `o1-`, `o3-`) as Rust string literals. Use plain case-insensitive substring search; do not add a regex dependency for this.
 3. Review checklist (not mechanically tested): no `match` on provider id/kind may select vendor model ids; `openai_compatible` is a protocol kind only.
 

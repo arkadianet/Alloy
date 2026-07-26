@@ -183,8 +183,14 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
 /// `source()` walk misses the certificate error (RFC-0007 §8.3.2).
 #[cfg(feature = "http-provider")]
 pub(crate) fn error_chain_contains_tls(err: &(dyn std::error::Error + 'static)) -> bool {
+    const MAX_DEPTH: usize = 16;
     let mut stack: Vec<&(dyn std::error::Error + 'static)> = vec![err];
+    let mut depth = 0usize;
     while let Some(current) = stack.pop() {
+        depth = depth.saturating_add(1);
+        if depth > MAX_DEPTH {
+            break;
+        }
         if current.downcast_ref::<rustls::Error>().is_some() {
             return true;
         }

@@ -294,25 +294,6 @@ impl RoutedModel {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new(
-        endpoint: ModelEndpoint,
-        tier: ModelTier,
-        req: &RoutingRequest,
-        capability_mapped: bool,
-        route_event_seq: Option<EventSeq>,
-        router_instance_id: u64,
-    ) -> Self {
-        Self::mint(
-            endpoint,
-            tier,
-            req,
-            capability_mapped,
-            route_event_seq,
-            router_instance_id,
-        )
-    }
-
     pub(crate) fn router_instance_id(&self) -> u64 {
         self.router_instance_id
     }
@@ -407,7 +388,7 @@ mod tests {
 
     #[test]
     fn cloned_routed_model_shares_ticket_and_hides_seals() {
-        let routed = RoutedModel::new(endpoint(), ModelTier::Standard, &request(), true, None, 42);
+        let routed = RoutedModel::mint(endpoint(), ModelTier::Standard, &request(), true, None, 42);
         let clone = routed.clone();
         assert!(routed.try_consume());
         assert!(!clone.try_consume());

@@ -634,3 +634,53 @@ async fn openai_tls_classified() {
         "expected Tls, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn openai_transport_connection_refused() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+
+    let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleSpec {
+        id: ProviderId::new("provider").expect("provider"),
+        base_url: format!("http://{addr}/v1/"),
+        api_key: SecretString::new("test-key"),
+        connect_timeout: Duration::from_secs(2),
+        request_timeout: Duration::from_secs(2),
+    })
+    .expect("provider");
+
+    let err = provider
+        .complete(&endpoint(), completion_request(ResponseFormat::Text))
+        .await
+        .expect_err("connection refused must fail");
+    assert!(
+        matches!(err, ProviderError::Transport(_)),
+        "expected Transport, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn openai_non_success_body_too_large() {
+    let server = MockServer::start().await;
+    let oversized = "x".repeat(1024 * 1024 + 1);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(oversized))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_secs(5));
+    let err = provider
+        .complete(&endpoint(), completion_request(ResponseFormat::Text))
+        .await
+        .expect_err("oversized error body");
+    match err {
+        ProviderError::HttpStatus { status, message } => {
+            assert_eq!(status, 500);
+            assert_eq!(message, "response body too large");
+        }
+        other => panic!("expected HttpStatus too-large, got {other:?}"),
+    }
+}

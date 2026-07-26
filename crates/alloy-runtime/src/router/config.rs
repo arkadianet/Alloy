@@ -405,9 +405,7 @@ pub(crate) fn validate_base_url(raw: &str) -> Result<Url, String> {
         return Err("base_url must not be empty".into());
     }
     let url = Url::parse(raw).map_err(|_| "base_url is not a valid URL".to_owned())?;
-    if url.username().is_empty() && url.password().is_none() {
-        // Valid: no userinfo.
-    } else {
+    if !url.username().is_empty() || url.password().is_some() {
         return Err("base_url must not contain userinfo".into());
     }
     if url.query().is_some() || url.fragment().is_some() {
