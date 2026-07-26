@@ -5,3 +5,4 @@ pub mod diagnostic;
 pub mod ids;
 pub mod metrics;
 pub mod permission;
+pub mod tools;

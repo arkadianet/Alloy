@@ -14,7 +14,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use alloy_runtime::{Digest, Grant, Timestamp};
+use alloy_runtime::{token_expired, Digest, Grant};
 use async_trait::async_trait;
 use globset::GlobSet;
 use uuid::Uuid;
@@ -122,10 +122,8 @@ impl NativeSandboxBroker {
         let run_id = req.perms.run_id;
 
         // Expiry is inclusive: `now == expires` is already expired.
-        if let Some(expires) = &req.perms.expires {
-            if Timestamp::now().0 >= expires.0 {
-                return Err(SandboxError::TokenExpired);
-            }
+        if token_expired(req.perms.expires.as_ref()) {
+            return Err(SandboxError::TokenExpired);
         }
 
         // Capabilities were cached at construction, but a runtime can be removed
@@ -471,10 +469,7 @@ fn argv0_basename(argv: &[String]) -> String {
 /// Test helper: token expiry boundary exactly as `exec` evaluates it.
 #[cfg(test)]
 pub(crate) fn token_is_expired(perms: &alloy_runtime::PermissionToken) -> bool {
-    match &perms.expires {
-        Some(expires) => Timestamp::now().0 >= expires.0,
-        None => false,
-    }
+    token_expired(perms.expires.as_ref())
 }
 
 #[cfg(test)]
@@ -499,7 +494,7 @@ mod tests {
 
     #[test]
     fn token_expired_compares_offsetdatetime() {
-        let now = Timestamp::now().0;
+        let now = alloy_runtime::Timestamp::now().0;
         let perms = PermissionToken {
             profile: ProfileId::new("default").unwrap(),
             grants: vec![Grant::Exec(ExecAllow {
@@ -507,13 +502,13 @@ mod tests {
                 args_glob: None,
             })],
             // Equality boundary: `now == expires` must count as expired.
-            expires: Some(Timestamp(now)),
+            expires: Some(alloy_runtime::Timestamp(now)),
             run_id: RunId::new(),
         };
         assert!(token_is_expired(&perms));
 
         let future = PermissionToken {
-            expires: Some(Timestamp(now + Duration::from_secs(3600))),
+            expires: Some(alloy_runtime::Timestamp(now + Duration::from_secs(3600))),
             ..perms
         };
         assert!(!token_is_expired(&future));

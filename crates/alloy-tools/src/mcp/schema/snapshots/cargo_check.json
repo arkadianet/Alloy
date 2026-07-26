@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "properties": {
+    "workspace_root": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "package": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "features": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096
+      }
+    },
+    "all_features": { "type": "boolean", "default": false },
+    "message_format": { "type": "string", "enum": ["json"], "default": "json" }
+  },
+  "required": ["workspace_root"],
+  "additionalProperties": false
+}

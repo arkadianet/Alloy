@@ -2,11 +2,12 @@
 //!
 //! This crate is the foundation defined by **RFC-0001**, extended by **RFC-0002**
 //! (durable storage, artifacts, session event log), **RFC-0003** (session manager
-//! and run controller), and **RFC-0004** (observability & cost metering).
+//! and run controller), **RFC-0004** (observability & cost metering), and tool IR
+//! from **RFC-0006**.
 //!
 //! # Crate map
 //!
-//! - [`types`] — IDs, budgets, diagnostics, permissions, metrics
+//! - [`types`] — IDs, budgets, diagnostics, permissions, metrics, tool IR (RFC-0006)
 //! - [`events`] — session event envelopes and [`EventSink`]
 //! - [`storage`] — SQLite event log, artifact CAS, handoff (RFC-0002)
 //! - [`runtime`] — [`AlloyRuntime`] host lifecycle
@@ -77,7 +78,11 @@ pub use types::diagnostic::{DiagnosticEvent, DiagnosticLevel, ErrorClass, Failur
 pub use types::ids::{
     ArtifactId, CapabilityId, CheckpointId, DagId, DiagnosticId, Digest, DigestError, EventSeq,
     GateId, GraphNodeId, GraphVersion, IdError, LanguageId, NodeId, ProfileId, ProviderId, RunId,
-    SessionId, Timestamp, TransactionId,
+    ServerId, SessionId, Timestamp, TransactionId,
 };
 pub use types::metrics::{RuntimeMetrics, WorkerMetrics};
 pub use types::permission::{ExecAllow, Glob, Grant, HostAllow, PermissionToken};
+pub use types::tools::{
+    token_expired, McpServerSpec, McpTransport, ToolCall, ToolError, ToolName, ToolResult,
+    ToolSelector, ToolView,
+};

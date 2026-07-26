@@ -129,6 +129,10 @@ uuid_id!(
     /// Diagnostic event identifier.
     DiagnosticId
 );
+uuid_id!(
+    /// Out-of-process MCP server identifier (RFC-0006).
+    ServerId
+);
 
 name_id!(
     /// Profile catalog id (`default`, `autonomous`, `readonly`).

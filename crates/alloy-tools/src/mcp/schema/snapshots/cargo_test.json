@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "workspace_root": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "package": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "test_name_filter": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "jobs": { "type": ["integer", "null"], "minimum": 1 }
+  },
+  "required": ["workspace_root"],
+  "additionalProperties": false
+}

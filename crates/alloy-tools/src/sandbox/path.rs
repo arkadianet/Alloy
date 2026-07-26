@@ -215,7 +215,7 @@ pub(crate) fn is_within(path: &Path, root: &Path) -> bool {
 /// introduces cannot make a path look like a literal deny pattern such as
 /// `.env`, and wildcard patterns such as `*.pem` still match, so matching stays
 /// conservative.
-fn relative_for_matching(canon: &Path, root: &Path) -> Result<String, SandboxError> {
+pub(crate) fn relative_for_matching(canon: &Path, root: &Path) -> Result<String, SandboxError> {
     let rel = canon
         .strip_prefix(root)
         .map_err(|_| SandboxError::Denied(DenialReason::PathDenied(canon.display().to_string())))?;

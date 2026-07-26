@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Draft |
+| **Status** | Implemented |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0005](./RFC-0005-sandbox-broker.md) (merged) |
@@ -539,7 +539,8 @@ Full variant semantics: §8.
 
 ```rust
 use alloy_runtime::{
-    McpServerSpec, PermissionToken, ServerId, ToolCall, ToolResult, ToolSelector, ToolView,
+    McpServerSpec, PermissionToken, ServerId, ToolCall, ToolName, ToolResult, ToolSelector,
+    ToolView,
 };
 use async_trait::async_trait;
 
@@ -553,6 +554,23 @@ pub trait McpPlatform: Send + Sync {
 
     /// Lazy disclosure — MUST obey §5.4.
     async fn tools_for(&self, selectors: &[ToolSelector]) -> Result<Vec<ToolView>, McpError>;
+
+    /// Whether `name` is in the disclosed set for `selectors`.
+    ///
+    /// Default implementation calls [`Self::tools_for`]. Hosts SHOULD override to
+    /// avoid cloning full [`ToolView`] schemas on the call hot path (e.g. name/tag
+    /// membership only). Empty `selectors` discloses nothing.
+    async fn discloses(
+        &self,
+        selectors: &[ToolSelector],
+        name: &ToolName,
+    ) -> Result<bool, McpError> {
+        Ok(self
+            .tools_for(selectors)
+            .await?
+            .iter()
+            .any(|view| &view.name == name))
+    }
 
     /// Invoke a tool under `perms`. Pipeline: §5.1.
     ///
@@ -1144,9 +1162,13 @@ Error exits also pass through DecisionLog rules in §9.2 (not shown as success).
 {
   "type": "object",
   "properties": {
-    "workspace_root": { "type": "string" },
-    "package": { "type": ["string", "null"] },
-    "features": { "type": "array", "items": { "type": "string" } },
+    "workspace_root": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "package": { "type": ["string", "null"], "minLength": 1, "maxLength": 4096 },
+    "features": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    },
     "all_features": { "type": "boolean", "default": false },
     "message_format": { "type": "string", "enum": ["json"], "default": "json" }
   },
@@ -1163,9 +1185,9 @@ Description (exact): `Run cargo check and return structured rustc messages`.
 {
   "type": "object",
   "properties": {
-    "workspace_root": { "type": "string" },
-    "package": { "type": ["string", "null"] },
-    "test_name_filter": { "type": ["string", "null"] },
+    "workspace_root": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "package": { "type": ["string", "null"], "minLength": 1, "maxLength": 4096 },
+    "test_name_filter": { "type": ["string", "null"], "minLength": 1, "maxLength": 4096 },
     "jobs": { "type": ["integer", "null"], "minimum": 1 }
   },
   "required": ["workspace_root"],
@@ -1176,6 +1198,7 @@ Description (exact): `Run cargo check and return structured rustc messages`.
 Description: `Run cargo test and return structured results`.
 
 **No `timeout_secs` field** — host `call_timeout` + broker `exec_timeout` own deadlines (avoids a schema knob that does nothing).
+`test_name_filter` values that begin with `-` are rejected at parse time (`InvalidArguments`) so libtest options cannot be smuggled after `--`.
 
 #### 5.3.3 `fs_read`
 
@@ -1183,7 +1206,7 @@ Description: `Run cargo test and return structured results`.
 {
   "type": "object",
   "properties": {
-    "path": { "type": "string" },
+    "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
     "max_bytes": { "type": "integer", "default": 262144, "minimum": 1, "maximum": 1048576 }
   },
   "required": ["path"],
@@ -1316,7 +1339,7 @@ MVP MUST NOT add a schema crate. Validators MUST enforce:
 | Any string field | ≤ `MAX_ARG_STRING_BYTES` (4096); NUL bytes forbidden |
 | `cargo_check.features` | ≤ `MAX_FEATURES` (64) entries |
 | `cargo_check` | `workspace_root` non-empty; `package` non-empty string **or** null/absent (**reject** `""`); `features` string array with **no empty entries** (reject `""`); `all_features` bool; `message_format` absent/`"json"` only |
-| `cargo_test` | `workspace_root` non-empty; `package` non-empty string **or** null/absent (**reject** `""`); `test_name_filter` non-empty string **or** null/absent (**reject** `""`); `jobs` integer ≥1 or null/absent |
+| `cargo_test` | `workspace_root` non-empty; `package` non-empty string **or** null/absent (**reject** `""`); `test_name_filter` non-empty string **or** null/absent (**reject** `""`); `test_name_filter` MUST NOT begin with `-`; `jobs` integer ≥1 or null/absent |
 | `fs_read` | `path` non-empty; `max_bytes` in `1..=1048576` (default 262144) |
 | `apply_patch` | `patch` present; `dry_run` bool (default false) |
 
@@ -1429,7 +1452,7 @@ args_glob subject (argv[1..], space-joined) =
 | Other IO | `Transient { code: "io", message: "fs_read io error" }` (no raw OS strings) |
 | Invalid UTF-8 interior to the returned buffer (see step 6) | `Permanent { code: "not_utf8", … }` with no body |
 
-5. Let `cap = min(max_bytes, 1_048_576)`. Read at most `cap` bytes via `tokio::fs`. Let `raw` be the bytes read. Let `capped = metadata().len() as usize > raw.len()` (same metadata call as the regular-file check) **or** equivalently `raw.len() == cap && file longer` — normative: `capped = (meta.len() as u64) > (raw.len() as u64)`.
+5. Let `cap = min(max_bytes, 1_048_576)`. Open the canonical path, confirm it is a regular file via the opened handle's metadata, then read at most `cap + 1` bytes via `tokio::fs`. Let `raw` be the first `min(n, cap)` bytes of the read. Let `capped = (bytes_read > cap)` — i.e. truncation is derived from the read itself (one-byte peek past the cap), not a pre-open size that can race with writers.
 6. **UTF-8 decode (normative):**
    1. Match `str::from_utf8(&raw)`:
    2. `Ok(text)` → success with that text; `truncated = capped`.
@@ -1463,7 +1486,7 @@ args_glob subject (argv[1..], space-joined) =
 | Field / error text | Rule |
 | --- | --- |
 | `files_touched` | Each entry MUST be jail-relative: non-empty, `/`-separated, no leading `/`, no `\\`, no `.` or `..` path segments, ≤ `MAX_ARG_STRING_BYTES`. On any violation → do **not** forward the outcome; return `Ok(ToolResult::err)` with `Permanent { code: "unsafe_backend_output", message: "files_touched failed validation" }` and content `{ "code": "unsafe_backend_output" }`. |
-| `message` | Run `sanitize_msg`: strip absolute path prefixes (`/`, drive letters), reject if length > 512 or contains NUL; on reject use fixed `"apply_patch completed"`. MUST NOT forward raw patch bodies. |
+| `message` | Run `sanitize_msg`: redact absolute path spans (`/…`, drive letters) unless the preceding character is path-ish (`[A-Za-z0-9._-]`); reject if length > 512 or contains NUL; on reject use fixed `"apply_patch completed"`. MUST NOT forward raw patch bodies. Relative mentions like `src/main.rs` stay intact; quoted/delimited forms like `"/home/…"` are redacted. |
 | Backend error strings | `Io`/`Internal` use fixed messages (§3.7.2). `Unsupported`/`InvalidPatch`/`Conflict` pass through `sanitize_msg` (max 512, no abs paths, no NUL); on reject use the fixed code-only message for that variant. |
 
 4. Map sanitized success/error per §3.7 / §8.4.

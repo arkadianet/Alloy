@@ -132,6 +132,33 @@ tokens.
 
 ---
 
+## MCP `fs_read` (RFC-0006)
+
+`fs_read` authorizes a path with `PathPolicy::authorize(.., Read)` and then opens
+the **canonical** `PathBuf` that authorize returned — never the raw argument.
+When that open races with concurrent filesystem replacement, deny-glob and jail
+membership protection are only as strong as the authorize snapshot: a symlink
+swap in the TOCTOU window can still redirect the read (see Residual below).
+Absent concurrent replacement, `..` segments and pre-existing symlinks cannot
+bypass deny-globs or jail membership, because authorize resolves them before
+open. MVP additionally refuses any path that resolves outside the jail, even a
+readable RO root, so the reported `path` is always jail-relative.
+
+**Residual:** a TOCTOU window remains between authorize and open. An attacker who
+can replace the canonical path with a symlink to a denied file in that window
+could redirect the read. MVP accepts this race: the host is a single trusted
+process, and anyone able to win it already has write access inside the jail.
+Revisit if multi-tenant hosts appear (RFC-0006 §15 open question 2).
+
+**Not a residual:** `truncated` is derived by reading one byte past `max_bytes`,
+not from a pre-open `metadata().len()`, so concurrent size changes cannot lie
+about whether the returned text was capped. Builtin reads never spawn a process,
+so no sandbox backend is involved and the byte cap (`max_bytes`, hard maximum
+1 MiB) bounds memory. Invalid UTF-8 interior to the buffer is refused rather than
+lossily trimmed, so a model never receives silently corrupted file content.
+
+---
+
 ## Scratch and bind concurrency
 
 Per-exec trees live under `<jail>/.alloy-sbx/<uuid>/`. Broker-owned bind and
