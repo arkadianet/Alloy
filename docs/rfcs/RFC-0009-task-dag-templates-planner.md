@@ -7,13 +7,14 @@
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0002](./RFC-0002-storage-artifacts-session-events.md) (merged) |
 | **Effort** | 4–6 person-days |
-| **Related RFCs** | [0003](./RFC-0003-session-manager-run-controller.md) `ReplanReason` / `RunController::request_replan` · [0004](./RFC-0004-observability-cost-metering.md) session event payloads · [0010](./RFC-0010-scheduler-runtime-adapters.md) scheduler execution · [0013](./RFC-0013-capability-registry-workers.md) capability workers · [0015](./RFC-0015-cli-profiles-config.md) `alloy run` |
+| **Related RFCs** | [0003](./RFC-0003-session-manager-run-controller.md) `RunGoalRecord.dag_id` / `ReplanReason` / `RunController::request_replan` · [0004](./RFC-0004-observability-cost-metering.md) session event payloads · [0010](./RFC-0010-scheduler-runtime-adapters.md) scheduler execution · [0013](./RFC-0013-capability-registry-workers.md) capability workers · [0015](./RFC-0015-cli-profiles-config.md) `alloy run` |
 | **Product** | Alloy — AI Engineering Runtime |
 | **Supersedes** | Draft outline of this filename (expanded to implementation grade) |
+| **Revision** | Post Phase-A engineering review (Opus + GPT) — binding contracts tightened |
 
 **Mental model (V2 §6 / ADR F-03 / F-16):** The Task DAG is explicit, durable, and singly-authored. `dag::types` already exists on `main`; this RFC gives those types **semantics**, **validation**, **persistence**, **templates**, and a **template planner**. RFC-0010 executes the DAG; RFC-0013 populates LLM nodes. The MVP scheduler is linear, but the DAG contract MUST remain correct under a future concurrent scheduler — or that upgrade becomes a breaking change.
 
-**Authority order (highest → lowest):** current `main` source → merged RFCs 0001–0007, 0016 → Architecture V2 → this draft → roadmaps. Never reshape a merged public API solely to match an older V2 sketch or this document’s prior outline. The `dag::types` module is **normative and unchanged**; extensions in this RFC are **additive only**.
+**Authority order (highest → lowest):** current `main` source → merged RFCs 0001–0007, 0016 → Architecture V2 → this draft → roadmaps. Never reshape a merged public API solely to match an older V2 sketch or this document’s prior outline. The `dag::types` **field shapes** are **normative and unchanged**; extensions in this RFC are **additive only** (new modules, traits, derives explicitly authorized here).
 
 ---
 
@@ -24,16 +25,16 @@
 Ship the MVP **Task DAG store, validator, template catalog, and planner** inside `alloy-runtime`:
 
 1. **Semantics** for the merged `TaskDag` / `TaskNode` / `NodeKind` / `NodeState` / `EdgeKind` / `RetryPolicy` / `CacheKey` / `ApprovalSpec` types.
-2. **Validation** — acyclicity, reachability, capability presence per kind, gate presence, Aggregate well-formedness, budget coherence, edge endpoint existence — each with a distinct error variant.
-3. **Persistence** over the reserved RFC-0002 `dag_blobs` table, with generation / replan overwrite semantics and event-log audit.
+2. **Validation** — acyclicity, single-root reachability, capability presence per kind, gate presence, Aggregate well-formedness, budget coherence, edge endpoint existence — each with a distinct error variant; first failure wins in published order.
+3. **Persistence** over the reserved RFC-0002 `dag_blobs` table, with generation / replan overwrite semantics, compare-and-set writes, and event-log + CAS audit.
 4. **Hardcoded DAG templates** (V2 MVP posture) and the template contract, including gate validation (V2 §10.2).
-5. **Planner** that selects and instantiates templates; LLM planner path is a **Stub** returning `PlanError::PlannerDisabled`.
+5. **Planner** that selects and instantiates templates using the **pre-minted** `DagId` from RFC-0003 `RunGoalRecord`; LLM planner path is a **Stub** (`DisabledLlmPlanService`) returning `PlanError::PlannerDisabled`.
 6. **Node data-flow contract** over the RFC-0002 artifact CAS (`input_ref` / `output_ref`).
-7. **Cache-key and retry/escalation declarations** owned by the DAG; execution owned by RFC-0010.
+7. **Cache-key builder** and retry/escalation **declarations**; day-1 templates leave `cache_key = None` (cache hits owned by RFC-0010 when keys are later set from final inputs).
 
 ### 1.2 Problem Statement
 
-RFC-0001 published `TaskDag` type sketches and a `NullScheduler`. RFC-0002 reserved `dag_blobs` (`dag_id` PRIMARY KEY) without CRUD behaviour. Architecture V2 §6 requires explicit DAGs, a single topology mutator (Planner/ReplanService), hardcoded repair templates, generation counters, and Appendix C node states. Without this RFC there is no validated DAG, no durable plan, no template, and no planner seam — RFC-0010 cannot schedule and RFC-0013 has no node contract to bind workers to.
+RFC-0001 published `TaskDag` type sketches and a `NullScheduler`. RFC-0002 reserved `dag_blobs` (`dag_id` PRIMARY KEY) without CRUD behaviour. RFC-0003 mints `RunGoalRecord.dag_id` at `submit_goal` before any DAG body exists. Architecture V2 §6 requires explicit DAGs, a single topology mutator (Planner/ReplanService), hardcoded repair templates, generation counters, and Appendix C node states. Without this RFC there is no validated DAG body bound to that id, no durable plan, no template, and no planner seam.
 
 ### 1.3 Scope
 
@@ -41,15 +42,15 @@ RFC-0001 published `TaskDag` type sketches and a `NullScheduler`. RFC-0002 reser
 | --- | --- |
 | Type semantics | Merged `dag::types` fields; agent vs adapter vs structural node contracts |
 | Validation | Full rule set + `DagValidationError` taxonomy (§8) |
-| Persistence | `DagStore` over `dag_blobs`; generation bump; overwrite semantics |
+| Persistence | `DagStore` over `dag_blobs`; `put_if_generation`; generation bump; overwrite semantics |
 | Templates | Closed MVP catalog; embedded manifests; gate-present contract |
 | Planner | `PlanService` select/instantiate/replan; LLM Stub |
 | Data-flow | Artifact I/O contract for `input_ref` / `output_ref` |
-| Cache declarations | `CacheKey` computation + `CachedHit` exposure rules |
+| Cache builder | `compute_cache_key`; day-1 templates disable cache |
 | Retry declarations | `RetryPolicy` field ownership boundary vs RFC-0010 |
 | Concurrency contract | What the DAG does and does **not** declare as concurrent-safe |
-| Observability | `PlanProduced` / replan provenance payloads; tracing spans |
-| Tests | Unit, golden topology, persistence round-trip, cross-subsystem SQLite |
+| Observability | Typed `PlanProduced` payload; tracing spans |
+| Tests | Unit, golden topology, persistence CAS, cross-subsystem SQLite |
 
 ### 1.4 Non-goals
 
@@ -60,6 +61,7 @@ RFC-0001 published `TaskDag` type sketches and a `NullScheduler`. RFC-0002 reser
 | LLM planner as default | Deferred / Production, eval-gated (V2 §0.7 / §19.3) |
 | `EdgeKind::Hint` semantics | Deferred (V2 kill list / §6.1) — inert here (§5.10) |
 | File leases / parallel-analyze policy | Deferred pending eval (V2 §6.1 / §6.3) |
+| Persistent cache map / applying `CachedHit` | **RFC-0010** |
 | `alloy run` CLI surface | **RFC-0015** |
 | Worker `follow_up_nodes` | **Eliminated** (ADR F-03) — MUST NOT reintroduce |
 | Sixth crate / Postgres / Temporal durability | Forbidden |
@@ -67,15 +69,17 @@ RFC-0001 published `TaskDag` type sketches and a `NullScheduler`. RFC-0002 reser
 
 ### 1.5 Day-1 MVP (normative)
 
-1. `DagValidator::validate(&TaskDag)` MUST enforce every rule in §5.4; each failure MUST map to exactly one `DagValidationError` variant.
-2. `SqliteDagStore` MUST implement `DagStore` over the existing `dag_blobs` table **without** a schema migration that changes the PRIMARY KEY; put/get/delete MUST work through `AlloyStorage`.
-3. Replan MUST bump `generation` by exactly one, overwrite the `dag_blobs` row for the same `dag_id`, and append a `PlanProduced` session event whose payload references a CAS artifact of the new DAG JSON (§5.6).
-4. Prior-generation rows in `dag_blobs` are **not** retained. Prior-generation recoverability MUST come from the session event log + CAS artifact referenced by `PlanProduced` (§5.6.3).
-5. The closed template catalog MUST ship exactly the templates in §5.7; day-1 required template is `repair_local_diagnostic` (Analyze → Edit → VerifyCompile → GateHuman).
-6. `TemplatePlanService` MUST select and instantiate a template from `PlanContext` without calling an LLM; `LlmPlanService` (or equivalent stub path) MUST return `PlanError::PlannerDisabled`.
-7. MVP templates MUST be **linear chains** under Sequence/Data edges such that, under the pred-satisfaction rules in §5.3, at most one node is Ready at a time. Concurrency safety of Ready siblings is **unmodelled**; a concurrent scheduler MUST NOT be built on this model until a later RFC adds an explicit mechanism (§6.5).
-8. `EdgeKind::Hint` MUST be accepted in serde and MUST NOT affect validation, scheduling readiness, or caching.
-9. Alloy MUST NEVER write `.env`.
+1. `DagValidator::validate(&TaskDag, ValidateOpts)` MUST enforce every rule in §5.4 in published order; each failure MUST map to exactly one `DagValidationError` variant; **first** violation wins.
+2. `SqliteDagStore` MUST implement `DagStore` over the existing `dag_blobs` table **without** changing the PRIMARY KEY; put/get/delete/`put_if_generation` MUST work through `AlloyStorage::dags()`.
+3. `PlanContext.dag_id` MUST be the id minted by RFC-0003 `submit_goal` (`RunGoalRecord.dag_id`). `plan` MUST NOT allocate a second `DagId`.
+4. Replan MUST bump `generation` by exactly one, CAS-overwrite the `dag_blobs` row for the same `dag_id` via `put_if_generation`, and append a `PlanProduced` session event whose payload references a CAS artifact of the new DAG JSON (§5.6).
+5. Prior-generation rows in `dag_blobs` are **not** retained. Prior-generation recoverability MUST come from the session event log + CAS artifact referenced by `PlanProduced` (§5.6.3). `TemplatePlanService` MUST take a **required** `Arc<dyn EventSink>` (not `Option`).
+6. The closed template catalog MUST ship exactly the templates in §5.7; day-1 required template is `repair_local_diagnostic` (Analyze → Edit → VerifyCompile → GateHuman). That template MUST pass validation with default `ValidateOpts` **including** its dual Data+Sequence edges (§5.4 V8/V15 as restated).
+7. `TemplatePlanService` MUST select and instantiate a template from `PlanContext` without calling an LLM; `DisabledLlmPlanService` MUST return `PlanError::PlannerDisabled` from every method. Day-1 production wiring MUST inject `TemplatePlanService`. `DisabledLlmPlanService` is constructed only in tests or behind an explicit future feature flag that is **off** by default.
+8. MVP templates MUST be **linear chains** under Sequence/Data edges such that, under §5.3.1, at most one node is Ready at a time. Concurrency safety of Ready siblings is **unmodelled**; a concurrent scheduler MUST NOT be built on this model until a later RFC adds an explicit mechanism (§6.5).
+9. Day-1 template nodes MUST set `enable_cache = false` and instantiate with `cache_key = None`. The cache-key builder still ships for RFC-0010 / future templates.
+10. `EdgeKind::Hint` MUST be accepted in serde and MUST NOT affect validation (beyond endpoint existence), scheduling readiness, or caching.
+11. Alloy MUST NEVER write `.env`.
 
 ---
 
@@ -85,43 +89,47 @@ RFC-0001 published `TaskDag` type sketches and a `NullScheduler`. RFC-0002 reser
 
 | V2 reference | Application |
 | --- | --- |
-| §3.3 Explicit state | If it isn’t in the session event log or DAG store, it didn’t happen — §5.6 binds both |
+| §3.3 Explicit state | Session event log + DAG store — §5.6 binds both; PlanProduced is mandatory |
 | §6.1 Why a DAG | Provenance, gates, retries, caching — not fake parallelism; ADR F-16 linear honesty |
 | §6.2 Task DAG | Types already on `main`; this RFC owns store, templates, planner, validation |
-| §6.2 Single topology mutator | Only `PlanService` mutates topology (plus scheduler cancel/skip of **existing** nodes — RFC-0010) |
+| §6.2 Single topology mutator | Only `PlanService` mutates topology (plus scheduler cancel/skip of **existing** nodes and same-generation checkpoints — RFC-0010) |
 | §6.4 Replanning | Workers return `FailureIr` only; `generation++`; no `follow_up_nodes` |
 | §6.5 Repair sequence | Template planner → DAG → scheduler (0010) |
-| §6.6 Cycle prevention | Acyclic validation at insert / replan |
+| §6.6 Cycle prevention | Acyclic validation at plan / replan (not at every store put — §6.3) |
 | §9.3 MVP catalog | Planning = template; LLM gated; Verify*/GateHuman are **not** LLM capabilities |
 | §10.2 PlanningWorker | Load template; **validate gates present** |
-| Appendix C | Node state machine — reconciled in §5.3 |
+| Appendix C | Node state machine — reconciled in §5.3.2 |
 | Appendix B | `max_parallel_*=1` — scheduler honesty (0010); DAG concurrency contract in §6.5 |
 
 ### 2.2 Relationship to RFC-0001
 
-Authoritative for: `TaskDag`, `TaskNode`, `NodeKind`, `NodeState`, `EdgeKind`, `DependencyEdge`, `RetryPolicy`, `Backoff`, `CacheKey`, `ApprovalSpec`, `Scheduler` / `DagState` / `DagOutcome`, IDs (`DagId`, `NodeId`, `GateId`, `CapabilityId`, …), `ModelTier`, `TokenBudget`, `ErrorClass`, `FailureIr`, `#![forbid(unsafe_code)]`, five-crate map.
+Authoritative for: `TaskDag`, `TaskNode`, `NodeKind`, `NodeState`, `EdgeKind`, `DependencyEdge`, `RetryPolicy`, `Backoff`, `CacheKey`, `ApprovalSpec`, `Scheduler` / `DagState` / `DagOutcome`, IDs, `ModelTier`, `TokenBudget`, `ErrorClass`, `FailureIr`, `#![forbid(unsafe_code)]`, five-crate map.
 
-**This RFC does not amend** those struct/enum shapes. Behaviour and ownership around them are specified here.
+**This RFC does not amend field shapes.** Behaviour and ownership around them are specified here.
+
+**Additive derive authorization (normative):** Implementation MAY add `PartialEq` (and `Eq` where sound) to `TaskDag`, `TaskNode`, `DependencyEdge`, `RetryPolicy`, `Backoff`, `ApprovalSpec`, and `CacheKey` for tests. This is not a field reshape.
 
 ### 2.3 Relationship to RFC-0002
 
-Authoritative for: `AlloyStorage`, `ArtifactStore` / CAS put semantics (always new `ArtifactId`), `EventStore` / session event append, reserved `dag_blobs` table, `StoreError`.
+Authoritative for: `AlloyStorage`, `ArtifactStore` / CAS put semantics (always new `ArtifactId`), `EventStore` / session event append, reserved `dag_blobs` table, `StoreError`, `StorageGate`, `spawn_db`.
 
 **This RFC owns** the first consumer of `dag_blobs` and the PlanProduced / replan audit payloads that reference CAS blobs.
 
+**Metrics amendment (normative):** `SqliteDagStore` MUST increment existing `busy_errors` on `StoreError::Busy` mapping. It MUST NOT add fields to public `StorageMetricsSnapshot` in this RFC.
+
 ### 2.4 Relationship to RFC-0003
 
-Authoritative for: `ReplanReason`, `RunController::request_replan` (records intent only; does **not** mutate the DAG), `RunControlState::ReplanRequested`.
+Authoritative for: `RunGoalRecord { goal, dag_id }` minted at `submit_goal`, `ReplanReason`, `RunController::request_replan` (records intent only; does **not** mutate the DAG), `RunControlState::ReplanRequested`.
 
-RFC-0009’s `PlanService::replan` is the topology mutator that RunController / scheduler invoke **after** a replan request is recorded. This RFC MUST NOT change `RunController` signatures.
+**Binding:** `PlanService::plan` / `replan` MUST use `PlanContext.dag_id == RunGoalRecord.dag_id` for that run. RFC-0009 MUST NOT change `RunController` signatures. The control-plane caller (0003 wiring / 0015 / PlanningWorker) supplies `PlanContext` after reading the run envelope.
 
 ### 2.5 Already implemented | Added by RFC-0009 | Deferred
 
 | Category | Contents |
 | --- | --- |
-| **Already implemented** | `dag::types` (`TaskDag`, `TaskNode`, …); `Scheduler` / `DagState` / `DagOutcome`; `NullScheduler`; `dag_blobs` table; `ArtifactStore`; session event types including `PlanProduced` / `ReplanRequested` / `NodeState`; `ReplanReason`; adapter traits (stubs) |
-| **Added by RFC-0009** | `DagStore` + `SqliteDagStore`; `DagValidator`; template catalog + manifests; `PlanService` + `TemplatePlanService` + LLM Stub; node I/O artifact envelopes; cache-key builder; validation / plan / store error taxonomies; `AlloyStorage::dags()`; PlanProduced payload schema; concurrency contract docs |
-| **Deferred** | Scheduler execution (0010); workers (0013); LLM planner default; Hint semantics; file leases; parallel Analyze; CLI (0015) |
+| **Already implemented** | `dag::types`; `Scheduler` / `DagState` / `DagOutcome`; `NullScheduler`; `dag_blobs` table; `ArtifactStore`; session event types including `PlanProduced` / `ReplanRequested` / `NodeState`; `ReplanReason`; `RunGoalRecord.dag_id`; adapter traits (stubs) |
+| **Added by RFC-0009** | `DagStore` + `put_if_generation` + `SqliteDagStore`; `DagValidator`; template catalog; `PlanService` + `TemplatePlanService` + `DisabledLlmPlanService`; envelopes; cache-key builder; error taxonomies; `AlloyStorage::dags()`; typed `PlanProducedPayload`; concurrency / writer contracts |
+| **Deferred** | Scheduler execution (0010); workers (0013); LLM planner default; Hint semantics; file leases; parallel Analyze; CLI (0015); applying cache hits |
 
 ### 2.6 Dependency boundaries
 
@@ -129,80 +137,66 @@ RFC-0009’s `PlanService::replan` is the topology mutator that RunController / 
 RunController / CLI (0015) / PlanningWorker (0013)
         │
         ▼
-alloy-runtime::planner  ──uses──►  alloy-runtime::dag::{validate, templates, types}
-        │                          alloy-runtime::storage::{DagStore, ArtifactStore, EventStore}
-        │
+alloy-runtime::planner  ──uses──►  alloy-runtime::dag::{validate, templates, cache, io, types}
+        │                          alloy-runtime::storage::{DagStore, ArtifactStore}
+        │                          alloy-runtime::events::EventSink  (required)
         ▼
-alloy-runtime::scheduler (0010) ──reads──► DagStore + validated TaskDag
-        │
+alloy-runtime::scheduler (0010) ──reads/writes──► DagStore (same-generation checkpoints)
+        │                      ──uses──► dag::io envelopes (NOT planner::*)
         ▼
 capability workers (0013) / adapters (0010) ──consume──► TaskNode contracts
 ```
 
-| Consumer | MAY rely on (after this RFC) | MUST NOT invent |
+| Consumer | MAY rely on | MUST NOT invent |
 | --- | --- | --- |
-| **RFC-0010** | Validated DAG shapes; node kind/capability invariants; data-flow contract; Ready-pred rules; RetryPolicy **declarations**; cache-hit exposure; Concurrent-safety contract §6.5 | Topology mutation; template selection; new edge kinds for fan-out |
-| **RFC-0013** | NodeKind ↔ capability presence table; `input_ref` envelope schema; PlanningWorker → `PlanService` seam | DAG store schema; validation rules; scheduler policy |
+| **RFC-0010** | Validated-at-plan DAG shapes; node contracts; data-flow; Ready-pred rules; RetryPolicy declarations; `put_if_generation` for checkpoints; §6.5 | Topology mutation; template selection; new edge kinds for fan-out; reading `planner::*` |
+| **RFC-0013** | NodeKind ↔ capability table; envelope schema; PlanningWorker → `PlanService` | DAG store schema; validation rules; scheduler policy |
 
 - `alloy-runtime` remains one of ≤5 crates. **No sixth crate.**
-- Planner / store / templates live under `alloy-runtime` only.
+- `scheduler` MUST NOT depend on `planner`. Shared types live in `dag::{types,io,cache,validate}`.
 
 ---
 
 ## 3. Public Rust API
 
-New items live under `alloy_runtime::dag` (store, validate, templates, cache) and `alloy_runtime::planner`, re-exported from the crate root where noted in §3.18. Merged `dag::types` items are **normative — unchanged**. `alloy-runtime` is `#![deny(missing_docs)]`; every new public item and public field MUST have rustdoc stating ownership and failure semantics.
+New items live under `alloy_runtime::dag` and `alloy_runtime::planner`, plus `storage/dags.rs` for the concrete store (re-exported). Merged `dag::types` field shapes are **normative — unchanged**. `alloy-runtime` is `#![deny(missing_docs)]`.
 
-### 3.1 Reused types (normative — unchanged)
+### 3.1 Reused types (normative — unchanged fields)
 
 | Type | Source | Notes |
 | --- | --- | --- |
-| `TaskDag` | `dag/types.rs` | `id`, `session_id`, `generation`, `nodes`, `edges`, `state` |
-| `TaskNode` | `dag/types.rs` | includes `capability: Option<CapabilityId>`, `input_ref`, `output_ref`, `retry`, `cache_key`, `budget`, `model_tier`, `approval`, `timeout_ms` |
-| `NodeKind` | `dag/types.rs` | Plan, Analyze, Edit, VerifyCompile, VerifyTest, Review, GateHuman, Aggregate |
-| `NodeState` | `dag/types.rs` | Pending … CachedHit (Appendix C) |
-| `EdgeKind` | `dag/types.rs` | Data, Sequence, Hint |
-| `DependencyEdge` | `dag/types.rs` | `from`, `to`, `kind` |
-| `RetryPolicy`, `Backoff` | `dag/types.rs` | Declarations; execution in 0010 |
-| `CacheKey` | `dag/types.rs` | `CacheKey(Digest)` |
-| `ApprovalSpec` | `dag/types.rs` | `gate: GateId`, `reason: String` |
-| `DagState`, `DagOutcome`, `Scheduler` | `scheduler` | Outcome types unchanged |
+| `TaskDag` … `ApprovalSpec` | `dag/types.rs` | Field shapes unchanged; `PartialEq` derive authorized (§2.2) |
+| `DagState`, `DagOutcome`, `Scheduler` | `scheduler` | Unchanged |
 | `ArtifactId`, `ArtifactStore`, `ArtifactPut`, `ArtifactKind` | `storage` | CAS |
-| `ReplanReason` | `session` | Replan input |
-| `CapabilityId`, `ModelTier`, `TokenBudget`, `GateId`, `DagId`, `NodeId`, `SessionId`, `RunId`, `Digest` | `types` | Shared IR |
+| `ReplanReason`, `RunGoalRecord` | `session` | Replan input; pre-minted `dag_id` |
+| `Goal`, `Constraint`, `CapabilityId`, `ModelTier`, `TokenBudget`, IDs, `Digest` | `types` | Shared IR |
 | `ErrorClass`, `FailureIr` | `types/diagnostic` | Retry admission inputs for 0010 |
-| `StoreError` | `storage` | Mapped at DagStore boundary |
-| `SessionEventType::{PlanProduced, ReplanRequested, NodeState}` | `events` | Lifecycle events |
+| `StoreError` | `storage` | Includes `Conflict`, `Corrupt`, `Busy`, `Closed` |
+| `EventSink`, `EventSinkError`, `NewSessionEvent` | `events` | Required plan audit path |
+| `SessionEventType::PlanProduced` | `events` | Lifecycle |
 
 ### 3.2 Additive extension — none to `TaskDag` / `TaskNode` fields
 
-**Normative:** This RFC MUST NOT add, remove, or rename fields on `TaskDag` or `TaskNode`. Semantics that do not fit existing fields MUST be expressed as:
-
-- validation invariants (§5.4),
-- artifact payload schemas (§5.5),
-- template manifest metadata outside the persisted DAG (§5.7),
-- or reported as an Open Question (§15) rather than a silent reshape.
-
-If a future need genuinely cannot be carried by the merged types, stop and amend via the Engineering Playbook — do not redefine `dag::types` in this RFC’s implementation PR.
+**Normative:** MUST NOT add, remove, or rename fields on `TaskDag` or `TaskNode`. Semantics that do not fit existing fields MUST be expressed as validation invariants, artifact schemas, template metadata, or Open Questions.
 
 ### 3.3 Node kind contract (normative)
 
-Every `TaskNode` MUST satisfy the capability / budget / model-tier contract for its `kind`. Validation enforces this (§5.4.4). Scheduler and workers MUST treat violations as impossible post-validate (fail closed if observed).
+Every `TaskNode` MUST satisfy the contract for its `kind`. Validation enforces the columns marked **validated**. Scheduler/workers MUST treat post-validate violations as impossible (fail closed — Appendix C).
 
-| `NodeKind` | Class | `capability` | `model_tier` meaningful? | `budget` meaningful? | `approval` | `cache_key` typical |
+| `NodeKind` | Class | `capability` (validated) | `budget` (validated) | `approval` (validated) | `cache_key` (validated) | `model_tier` |
 | --- | --- | --- | --- | --- | --- | --- |
-| `Plan` | LLM | MUST be `Some` with id `planning` | yes | yes | optional | optional |
-| `Analyze` | LLM | MUST be `Some` with id `repair` | yes | yes | optional | optional |
-| `Edit` | LLM | MUST be `Some` with id `edit` | yes | yes | optional | optional |
-| `Review` | LLM | MUST be `Some` with id `review` | yes | yes | optional | optional |
-| `VerifyCompile` | Adapter | MUST be `None` | **no** — MUST be ignored by executors | **no** — MUST be zeroed or ignored (§5.4.5) | MUST be `None` | MUST be `None` (wall-clock / tool flakiness) |
-| `VerifyTest` | Adapter | MUST be `None` | no | no | MUST be `None` | MUST be `None` |
-| `GateHuman` | Adapter | MUST be `None` | no | no | MUST be `Some` | MUST be `None` |
-| `Aggregate` | Structural | MUST be `None` | no | no | MUST be `None` | optional |
+| `Plan` | LLM | MUST be `Some("planning")` | ≥1 of max_input/max_output > 0 | MUST be `None` | optional | unrestricted by validator; meaningful to executors |
+| `Analyze` | LLM | MUST be `Some("repair")` | non-zero as above | MUST be `None` | optional | meaningful |
+| `Edit` | LLM | MUST be `Some("edit")` | non-zero | MUST be `None` | optional | meaningful |
+| `Review` | LLM | MUST be `Some("review")` | non-zero | MUST be `None` | optional | meaningful |
+| `VerifyCompile` | Adapter | MUST be `None` | MUST be `{0,0}` | MUST be `None` | MUST be `None` | **ignored by executors** (any bit pattern allowed in struct) |
+| `VerifyTest` | Adapter | MUST be `None` | `{0,0}` | MUST be `None` | MUST be `None` | ignored |
+| `GateHuman` | Adapter | MUST be `None` | `{0,0}` | MUST be `Some` (non-empty reason) | MUST be `None` | ignored |
+| `Aggregate` | Structural | MUST be `None` | `{0,0}` | MUST be `None` | optional | ignored |
 
-**Capability catalog ids** are lowercase `CapabilityId` strings matching V2 §9.3 / RFC-0001 name ids: `planning`, `repair`, `edit`, `review`.
+**Day-1 note:** Shipped template uses only `Analyze`, `Edit`, `VerifyCompile`, `GateHuman`. `Plan`, `Review`, `VerifyTest`, and `Aggregate` remain validatable kinds for fixtures and future templates; they are not instantiated by the day-1 catalog.
 
-**Normative clarification:** A DAG that can express “an adapter node with a model tier that executors honour” is forbidden. Adapter nodes MAY carry any `ModelTier` / `TokenBudget` bit pattern in the struct for serde simplicity, but validation MUST require adapter/structural budgets to be `{ max_input: 0, max_output: 0 }` and executors MUST NOT pass those fields to a model router.
+**Escalate fields:** On adapter/structural nodes, `retry.escalate_after` and `retry.escalate_to_tier` MUST both be `None` (validated).
 
 ### 3.4 `DagValidationError`
 
@@ -226,14 +220,17 @@ pub enum DagValidationError {
     #[error("cycle detected involving node {node}")]
     Cycle { node: NodeId },
 
-    #[error("node {node} is unreachable from roots")]
+    #[error("DAG must have exactly one root; found {count}")]
+    MultipleRoots { count: usize },
+
+    #[error("node {node} is unreachable from the unique root")]
     Unreachable { node: NodeId },
 
     #[error("node {node} kind {kind:?} requires capability {expected}, got {got:?}")]
     CapabilityRequired {
         node: NodeId,
         kind: NodeKind,
-        expected: &'static str,
+        expected: CapabilityId,
         got: Option<CapabilityId>,
     },
 
@@ -246,6 +243,9 @@ pub enum DagValidationError {
     #[error("node {node} kind {kind:?} MUST NOT carry approval")]
     ApprovalForbidden { node: NodeId, kind: NodeKind },
 
+    #[error("duplicate GateId {gate} on nodes {a} and {b}")]
+    DuplicateGateId { gate: GateId, a: NodeId, b: NodeId },
+
     #[error("node {node} kind {kind:?} MUST NOT carry cache_key")]
     CacheKeyForbidden { node: NodeId, kind: NodeKind },
 
@@ -255,8 +255,8 @@ pub enum DagValidationError {
     #[error("LLM node {node} budget must be non-zero on at least one side")]
     BudgetZero { node: NodeId },
 
-    #[error("retry policy on node {node} is incoherent: {reason}")]
-    RetryIncoherent { node: NodeId, reason: &'static str },
+    #[error("retry policy on node {node}: {reason:?}")]
+    RetryIncoherent { node: NodeId, reason: RetryIncoherence },
 
     #[error("template/gates: missing required GateHuman node")]
     GatesAbsent,
@@ -267,45 +267,50 @@ pub enum DagValidationError {
     #[error("Aggregate node {node} has no Data predecessors")]
     AggregateNoDataPreds { node: NodeId },
 
-    #[error("Aggregate node {node} has outgoing Data edge (forbidden)")]
-    AggregateDataOut { node: NodeId },
+    #[error("duplicate edge {kind:?} {from} -> {to}")]
+    DuplicateEdge { from: NodeId, to: NodeId, kind: EdgeKind },
 
-    #[error("duplicate Data/Sequence edge {from} -> {to}")]
-    DuplicateEdge { from: NodeId, to: NodeId },
-
-    #[error("MVP template linearity violated: nodes {a} and {b} are concurrent-ready siblings")]
+    #[error("MVP template linearity violated involving nodes {a} and {b}")]
     NonLinearTopology { a: NodeId, b: NodeId },
 
-    #[error("generation must be >= 1, got {got}")]
+    #[error("generation must be >= 1 and <= i64::MAX as u64, got {got}")]
     InvalidGeneration { got: u64 },
 
     #[error("timeout_ms must be > 0 for node {node}")]
     TimeoutZero { node: NodeId },
 }
-```
 
-**Visibility:** `pub` in `alloy_runtime::dag`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RetryIncoherence {
+    MaxAttemptsZero,
+    EscalateAfterOrder,
+    EscalateTierWithoutAfter,
+    EscalateAfterWithoutTier,
+    ExponentialFactorInvalid,
+    EscalateOnNonLlm,
+}
+```
 
 ### 3.5 `DagValidator`
 
 ```rust
-/// Pure validator. No I/O. `Send + Sync`.
+/// Pure validator. No I/O. Stateless. Not injected into services.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DagValidator;
 
 impl DagValidator {
-    /// Validate structural + contract rules (§5.4).
-    ///
-    /// `opts.enforce_linear_mvp` MUST be `true` for every template instantiation
-    /// and every replan that claims MVP template provenance.
+    /// Validate structural + contract rules (§5.4) in order V1…Vn.
+    /// Returns the **first** violation.
     pub fn validate(dag: &TaskDag, opts: ValidateOpts) -> Result<(), DagValidationError>;
 }
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ValidateOpts {
-    /// When true, reject DAGs that admit two simultaneously Ready nodes (§5.4.11).
+    /// When true, enforce unique-pred/succ linearity (§5.4 V15).
     pub enforce_linear_mvp: bool,
-    /// When true, require at least one `GateHuman` node (§5.4.8 / V2 §10.2).
+    /// When true, require ≥1 `GateHuman` (§5.4 / V2 §10.2).
     pub require_gates: bool,
 }
 
@@ -319,7 +324,7 @@ impl Default for ValidateOpts {
 }
 ```
 
-**Ownership:** Validator is stateless. Callers own the `TaskDag`.
+**Normative:** `enforce_linear_mvp: false` has no legitimate non-test caller in MVP. Services call `DagValidator::validate` as an associated function — there is no validator field on `TemplatePlanService`.
 
 ### 3.6 `DagStore`
 
@@ -327,24 +332,44 @@ impl Default for ValidateOpts {
 /// Durable DAG blob API over `dag_blobs`.
 #[async_trait]
 pub trait DagStore: Send + Sync {
-    /// Insert or overwrite the row keyed by `dag.id`.
+    /// Unconditional insert-or-overwrite by `dag.id`.
     ///
-    /// MUST set `generation` column = `dag.generation`.
-    /// MUST set `session_id` = `dag.session_id`.
-    /// MUST serialize `dag` as JSON into `blob_json`.
-    /// MUST update `updated_at` to now (RFC3339).
-    ///
-    /// Overwrite of an existing `dag_id` is **success**, not conflict — this is
-    /// the intentional replan semantic (§5.6).
+    /// MUST NOT run `DagValidator`. Used only where the caller has already
+    /// decided overwrite is correct (tests / admin). Production plan/replan
+    /// and scheduler checkpoints MUST use [`Self::put_if_generation`].
     async fn put(&self, dag: &TaskDag) -> Result<(), StoreError>;
 
+    /// Compare-and-set write inside a **single** `spawn_db` closure.
+    ///
+    /// - `expected = None` — insert only; if a row for `dag.id` exists →
+    ///   `Err(StoreError::Conflict(...))`.
+    /// - `expected = Some(g)` — update only if the stored `generation` column
+    ///   equals `g`; otherwise `Err(StoreError::Conflict(...))`.
+    ///   On success, store `dag.generation` (which may equal `g` for
+    ///   same-generation checkpoints, or `g+1` for replan).
+    ///
+    /// MUST set `session_id`, `blob_json`, `updated_at` as in §5.6.1.
+    /// MUST reject `dag.generation > i64::MAX as u64` with `StoreError::Internal`.
+    /// MUST NOT run `DagValidator`.
+    async fn put_if_generation(
+        &self,
+        dag: &TaskDag,
+        expected: Option<u64>,
+    ) -> Result<(), StoreError>;
+
     /// Load by primary key.
+    ///
+    /// Decode/`serde` failure or negative `generation` column →
+    /// `Err(StoreError::Corrupt(...))`. Does **not** run `DagValidator`.
+    /// Row/blob `dag_id` or `session_id` mismatch with columns → `Corrupt`.
     async fn get(&self, dag_id: DagId) -> Result<Option<TaskDag>, StoreError>;
 
     /// Delete by primary key. Missing row → `Ok(())` (idempotent).
+    /// Consumer: tests and explicit cleanup; not required on the plan path.
     async fn delete(&self, dag_id: DagId) -> Result<(), StoreError>;
 
     /// List dag ids for a session (order: `updated_at ASC, dag_id ASC`).
+    /// Unbounded in MVP (sessions have few DAGs). Consumer: diagnostics / 0015.
     async fn list_by_session(&self, session_id: SessionId) -> Result<Vec<DagId>, StoreError>;
 }
 ```
@@ -352,7 +377,7 @@ pub trait DagStore: Send + Sync {
 ### 3.7 `SqliteDagStore`
 
 ```rust
-/// SQLite-backed [`DagStore`] sharing `AlloyStorage`'s `DbHandle` + `StorageGate`.
+/// SQLite-backed [`DagStore`].
 pub struct SqliteDagStore { /* private */ }
 
 impl SqliteDagStore {
@@ -364,52 +389,55 @@ impl SqliteDagStore {
 }
 ```
 
-**Construction:** Only via `AlloyStorage::dags()` (§3.8). Not a freestanding public constructor.
+**Normative operational contract:**
+
+| Rule | Detail |
+| --- | --- |
+| Gate | Every method MUST `StorageGate::enter()` for the operation; after `AlloyStorage::close()` → `StoreError::Closed` |
+| Busy | Map SQLite busy identically to other stores; increment `busy_errors` |
+| Construction | Built **once** inside `AlloyStorage::open` (same pattern as `events` / `artifacts`); `dags()` clones the `Arc` |
+| Module location | Concrete type lives in `storage/dags.rs` using `pub(crate)` `DbHandle` / `StorageGate` / `StorageMetrics`. Trait + re-exports may live in `dag/store.rs` or `storage` — implementer picks one; **no** reaching into private modules across the old boundary without `pub(crate)` |
 
 ### 3.8 `AlloyStorage` additive API
 
 ```rust
 impl AlloyStorage {
-    /// Shared DAG store handle.
+    /// Shared DAG store handle (Arc clone of the open-time instance).
     #[must_use]
     pub fn dags(&self) -> Arc<SqliteDagStore>;
 }
 ```
 
-**Normative:** No schema version bump is required for day-1 if `dag_blobs` already exists at `CODE_SCHEMA_VERSION` (currently 3). If an index on `session_id` is added, it MUST be an additive migration (`CODE_SCHEMA_VERSION = 4`) with `CREATE INDEX IF NOT EXISTS idx_dag_blobs_session ON dag_blobs(session_id)` — playbook amendment, not a PK change.
+No PK change. Optional additive `idx_dag_blobs_session` is Open Question §15.1.
 
 ### 3.9 Template types
 
 ```rust
-/// Closed MVP template catalog name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TemplateId {
-    /// Analyze → Edit → VerifyCompile → GateHuman (V2 §6.2 / §6.5).
     RepairLocalDiagnostic,
 }
 
 impl TemplateId {
-    pub fn as_str(self) -> &'static str;
-    /// Parse catalog name; unknown → `None`.
+    pub fn as_str(self) -> &'static str; // "repair_local_diagnostic"
     pub fn parse(s: &str) -> Option<Self>;
 }
 
 /// Embedded template manifest (not the runtime `TaskDag`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Serialize` for golden tests. `Deserialize` only if embedded JSON is chosen (§7.3).
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(any(test, feature = "template-json"), derive(Deserialize))]
 pub struct TemplateManifest {
     pub id: TemplateId,
-    /// Human description.
     pub description: String,
-    /// Ordered node specs (linear for MVP).
     pub nodes: Vec<TemplateNodeSpec>,
-    /// Edges among template-local names.
     pub edges: Vec<TemplateEdgeSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(any(test, feature = "template-json"), derive(Deserialize))]
 pub struct TemplateNodeSpec {
-    /// Stable name within the template (`analyze`, `edit`, …).
     pub name: String,
     pub kind: NodeKind,
     pub capability: Option<CapabilityId>,
@@ -418,18 +446,18 @@ pub struct TemplateNodeSpec {
     pub model_tier: ModelTier,
     pub approval: Option<TemplateApprovalSpec>,
     pub timeout_ms: u64,
-    /// When true, instantiate with `cache_key = Some(computed)` at plan time
-    /// once `input_ref` is known; when false, `cache_key = None`.
+    /// Day-1 shipped templates MUST set `false` (§1.5 / §5.7).
     pub enable_cache: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(any(test, feature = "template-json"), derive(Deserialize))]
 pub struct TemplateApprovalSpec {
-    /// Reason string; `GateId` is allocated at instantiation.
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(any(test, feature = "template-json"), derive(Deserialize))]
 pub struct TemplateEdgeSpec {
     pub from: String,
     pub to: String,
@@ -440,121 +468,136 @@ pub struct TemplateEdgeSpec {
 ### 3.10 `TemplateCatalog`
 
 ```rust
-/// Closed catalog. Extending MVP requires a code change + RFC amendment.
 pub struct TemplateCatalog;
 
 impl TemplateCatalog {
-    /// All shipped templates.
+    /// All shipped templates. Backed by `std::sync::OnceLock` (or equivalent).
+    /// Panic on first use if embedded data cannot build `CapabilityId` — treated
+    /// as a crate bug; covered by `catalog_parses` test.
     pub fn all() -> &'static [TemplateManifest];
 
-    /// Lookup by id.
+    /// Infallible — `TemplateId` is closed.
     pub fn get(id: TemplateId) -> &'static TemplateManifest;
 
-    /// Lookup by name string.
     pub fn get_by_name(name: &str) -> Option<&'static TemplateManifest>;
 }
 ```
 
-**Extensibility (normative):** MVP catalog is a **closed set**. Runtime MUST NOT load operator-supplied template files. Adding a template is an additive RFC amendment + code change.
+**Extensibility:** Closed set. No operator-supplied template files.
 
 ### 3.11 Node I/O artifact envelopes
 
 ```rust
-/// JSON body stored in the artifact CAS for a node's `input_ref`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeInputEnvelope {
-    pub schema_version: u32, // MUST be 1 for this RFC
+    pub schema_version: u32, // MUST be 1
     pub dag_id: DagId,
     pub node_id: NodeId,
     pub kind: NodeKind,
     pub generation: u64,
-    /// Goal / diagnostic / predecessor outputs this node may read.
     pub payload: NodeInputPayload,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeInputPayload {
-    /// Root / first node: goal text + optional attachment artifact ids.
-    Goal {
-        text: String,
-        attachments: Vec<ArtifactId>,
-        constraints: Vec<Constraint>,
-    },
-    /// Successor: ordered predecessor outputs along Data edges.
-    FromPredecessors {
-        preds: Vec<PredecessorOutput>,
-    },
+    /// Root input — embeds the merged `Goal` type (no field duplication).
+    Goal(Goal),
+    FromPredecessors { preds: Vec<PredecessorOutput> },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PredecessorOutput {
     pub node_id: NodeId,
     pub kind: NodeKind,
     pub output_ref: ArtifactId,
 }
 
-/// JSON body written to CAS and stored in `output_ref` on success / cache hit.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Success / cache-hit output body. Failure logging artifacts are RFC-0010’s
+/// concern and MUST NOT be written into `TaskNode.output_ref` on failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeOutputEnvelope {
     pub schema_version: u32, // MUST be 1
     pub dag_id: DagId,
     pub node_id: NodeId,
     pub kind: NodeKind,
     pub generation: u64,
+    /// Attempt index starting at 1 for the producing attempt (writer: 0010).
     pub attempt: u32,
     pub payload: serde_json::Value,
-    pub failure: Option<FailureIr>,
 }
 ```
 
-**ArtifactKind:** Envelopes MUST be stored with `ArtifactKind::Blob` and `content_type: Some("application/json".into())` unless a later RFC defines a dedicated kind. Labels SHOULD include `"alloy.envelope": "node_input" | "node_output"` and `"alloy.dag_id"`.
+**ArtifactPut requirements (normative) for every plan-time put (inputs, pending placeholders, snapshots):**
+
+| Field | Value |
+| --- | --- |
+| `kind` | `ArtifactKind::Blob` |
+| `content_type` | `Some("application/json")` |
+| `session_id` | `Some(ctx.session_id)` |
+| `run_id` | `Some(ctx.run_id)` |
+| `labels` | MUST include `alloy.envelope` ∈ {`node_input`,`pending_pred`,`dag_snapshot`} and `alloy.dag_id` |
+
+Snapshot artifacts MUST NOT be soft-deleted by this RFC. RFC-0002 has no GC; recoverability assumes snapshot rows remain.
 
 ### 3.12 Cache key builder
 
 ```rust
-/// Materials hashed into [`CacheKey`].
 #[derive(Debug, Clone)]
 pub struct CacheKeyMaterials<'a> {
     pub kind: NodeKind,
     pub capability: Option<&'a CapabilityId>,
-    pub input_digest: &'a Digest,
-    /// Stable policy fingerprint (profile id + relevant budget ceilings).
+    /// Digest of **content-only** bytes (§5.8) — MUST NOT include dag_id/node_id/generation.
+    pub content_digest: &'a Digest,
     pub policy_hash: &'a Digest,
-    /// Tool/builtin version fingerprint; MVP may use a constant digest
-    /// documented in §5.8 until MCP exposes versions.
     pub tool_versions: &'a Digest,
-    /// Compiler/toolchain fingerprint; MVP constant until LanguageBackend lands.
     pub compiler_fingerprint: &'a Digest,
 }
 
-/// Compute `CacheKey(Digest::sha256(canonical_bytes))` (§5.8).
 pub fn compute_cache_key(m: CacheKeyMaterials<'_>) -> CacheKey;
+
+/// MVP fingerprint helpers (canonical constants).
+pub fn mvp_tool_versions_digest() -> Digest;      // sha256(b"alloy.mvp.tool_versions.v0")
+pub fn mvp_compiler_fingerprint_digest() -> Digest; // sha256(b"alloy.mvp.compiler_fingerprint.v0")
+pub fn mvp_policy_hash_digest() -> Digest;        // sha256(b"alloy.mvp.policy_hash.v0")
 ```
 
-### 3.13 `PlanContext` / `PlanResult`
+### 3.13 `PlanContext` / `PlanResult` / `PlanProducedPayload`
 
 ```rust
-/// Inputs that drive template selection and instantiation.
 #[derive(Debug, Clone)]
 pub struct PlanContext {
     pub session_id: SessionId,
     pub run_id: RunId,
+    /// Pre-minted by RFC-0003 `submit_goal` (`RunGoalRecord.dag_id`).
+    pub dag_id: DagId,
     pub goal: Goal,
-    /// Optional explicit template override (CLI/profile). When `None`, selector runs.
+    /// Optional explicit template. On **replan**, callers SHOULD pass
+    /// `Some(prior_template_id)` from the previous `PlanResult`.
     pub template_override: Option<TemplateId>,
     pub policy_hash: Digest,
     pub tool_versions: Digest,
     pub compiler_fingerprint: Digest,
 }
 
-/// Outcome of a successful plan or replan.
 #[derive(Debug, Clone)]
 pub struct PlanResult {
     pub dag: TaskDag,
     pub template_id: TemplateId,
-    /// CAS id of the serialized `TaskDag` JSON snapshot for audit (§5.6.3).
     pub snapshot_artifact: ArtifactId,
+}
+
+/// Typed PlanProduced payload (also the serde shape in session events).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanProducedPayload {
+    pub dag_id: DagId,
+    pub generation: u64,
+    pub template_id: TemplateId,
+    pub snapshot_artifact: ArtifactId,
+    /// Sorted ascending by `NodeId` display/`Ord` for determinism.
+    pub node_ids: Vec<NodeId>,
+    pub replan: bool,
+    pub reason: Option<ReplanReason>,
 }
 ```
 
@@ -577,10 +620,13 @@ pub enum PlanError {
     Validation(#[from] DagValidationError),
 
     #[error("store: {0}")]
-    Store(#[from] StoreError),
+    Store(StoreError),
 
     #[error("artifact: {0}")]
     Artifact(StoreError),
+
+    #[error("event sink: {0}")]
+    Event(#[from] EventSinkError),
 
     #[error("dag not found: {0}")]
     DagNotFound(DagId),
@@ -591,34 +637,42 @@ pub enum PlanError {
         context_session: SessionId,
     },
 
-    #[error("generation mismatch: expected {expected}, store has {actual}")]
-    GenerationMismatch { expected: u64, actual: u64 },
+    #[error("generation mismatch: expected {expected}, store has {actual:?}")]
+    GenerationMismatch {
+        expected: u64,
+        /// `None` if the conflict was insert-only (row already existed).
+        actual: Option<u64>,
+    },
+
+    #[error("dag busy in state {state:?}; replan not permitted")]
+    DagBusy { state: DagState },
+
+    #[error("generation overflow")]
+    GenerationOverflow,
 
     #[error("internal: {0}")]
     Internal(String),
 }
 ```
 
+**Normative:** There is **no** `#[from] StoreError` on `Store`. Call sites MUST `map_err(PlanError::Store)` vs `map_err(PlanError::Artifact)` explicitly. `Event` uses `#[from]` for `EventSinkError`.
+
 ### 3.15 `PlanService`
 
 ```rust
-/// Single topology mutator (V2 §6.2 / ADR F-03).
 #[async_trait]
 pub trait PlanService: Send + Sync {
-    /// Select a template (unless overridden), instantiate, validate, persist,
-    /// snapshot to CAS, and return the plan. Emits `PlanProduced` via the
-    /// injected event sink when configured (§9).
+    /// Instantiate + validate + CAS-insert generation 1 + snapshot + PlanProduced.
     async fn plan(&self, ctx: PlanContext) -> Result<PlanResult, PlanError>;
 
-    /// Load a named template and instantiate (no selection).
+    /// Instantiate a specific template (no selection). Ignores `ctx.template_override`.
     async fn load_template(
         &self,
-        name: &str,
+        id: TemplateId,
         ctx: PlanContext,
     ) -> Result<PlanResult, PlanError>;
 
-    /// Replan: load current DAG, bump generation, re-instantiate from the same
-    /// template (MVP) or reject LLM path, validate, overwrite store, snapshot.
+    /// Replan: CAS bump generation, re-instantiate, snapshot, PlanProduced.
     async fn replan(
         &self,
         dag_id: DagId,
@@ -628,33 +682,25 @@ pub trait PlanService: Send + Sync {
 }
 ```
 
-**Lifecycle:** `Arc<dyn PlanService>` injected into RunController / PlanningWorker callers. Planner MUST NOT be invoked from capability workers other than the Planning capability’s template path (RFC-0013).
+**Idempotency:** Calling `plan` twice for the same `dag_id` when generation 1 already exists MUST fail with `GenerationMismatch` (insert-only CAS). Callers that need a new topology use `replan`.
 
 ### 3.16 `TemplatePlanService`
 
 ```rust
-/// MVP planner: select + instantiate hardcoded templates. No LLM.
-pub struct TemplatePlanService {
-    // private: catalog, dag_store, artifacts, event_sink (optional), validator
-}
+pub struct TemplatePlanService { /* private: dags, artifacts, events */ }
 
 impl TemplatePlanService {
     pub fn new(
         dags: Arc<dyn DagStore>,
         artifacts: Arc<dyn ArtifactStore>,
-        events: Option<Arc<dyn EventSink>>,
+        events: Arc<dyn EventSink>,
     ) -> Self;
 }
-
-#[async_trait]
-impl PlanService for TemplatePlanService { /* §5.2 */ }
 ```
 
 ### 3.17 LLM planner Stub
 
 ```rust
-/// Stub stand-in for a future LLM planner. Every method returns
-/// `Err(PlanError::PlannerDisabled)`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DisabledLlmPlanService;
 
@@ -665,7 +711,7 @@ impl PlanService for DisabledLlmPlanService {
     }
     async fn load_template(
         &self,
-        _name: &str,
+        _id: TemplateId,
         _ctx: PlanContext,
     ) -> Result<PlanResult, PlanError> {
         Err(PlanError::PlannerDisabled)
@@ -681,34 +727,21 @@ impl PlanService for DisabledLlmPlanService {
 }
 ```
 
-**Substitution seam (normative):** Callers depend only on `Arc<dyn PlanService>`. A future LLM planner MUST implement the same trait, pass the same validator with appropriate `ValidateOpts`, and MUST remain the sole topology writer. MVP wiring MUST inject `TemplatePlanService`, not `DisabledLlmPlanService`, as the active planner. `DisabledLlmPlanService` exists so tests and future feature flags can fail closed when the LLM path is selected.
-
 ### 3.18 Crate-root re-exports
 
-The following MUST be re-exported from `alloy_runtime`:
+MUST re-export: `DagStore`, `SqliteDagStore`, `DagValidator`, `ValidateOpts`, `DagValidationError`, `RetryIncoherence`, `TemplateId`, `TemplateManifest`, `TemplateCatalog`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput`, `CacheKeyMaterials`, `compute_cache_key`, `mvp_*_digest`, `PlanService`, `PlanContext`, `PlanResult`, `PlanProducedPayload`, `PlanError`, `TemplatePlanService`, `DisabledLlmPlanService`.
 
-| Item |
-| --- |
-| `DagStore`, `SqliteDagStore` |
-| `DagValidator`, `ValidateOpts`, `DagValidationError` |
-| `TemplateId`, `TemplateManifest`, `TemplateCatalog` |
-| `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput` |
-| `CacheKeyMaterials`, `compute_cache_key` |
-| `PlanService`, `PlanContext`, `PlanResult`, `PlanError` |
-| `TemplatePlanService`, `DisabledLlmPlanService` |
-
-Merged dag types remain re-exported as today.
+Template DTO specs (`TemplateNodeSpec`, …) MAY stay module-public without crate-root re-export.
 
 ### 3.19 Visibility & construction summary
 
 | Item | Visibility | Construction |
 | --- | --- | --- |
-| `DagValidator` | pub | `Default` / unit struct |
+| `DagValidator` | pub | unit / associated fn |
 | `SqliteDagStore` | pub type; fields private | `AlloyStorage::dags()` only |
-| `TemplateCatalog` | pub | static methods only |
-| `TemplatePlanService` | pub | `new(dags, artifacts, events)` |
-| `DisabledLlmPlanService` | pub | unit / Default |
-| Template manifests | private static data | embedded in crate |
+| `TemplateCatalog` | pub | static / OnceLock |
+| `TemplatePlanService` | pub | `new(dags, artifacts, events)` — events required |
+| `DisabledLlmPlanService` | pub | unit; tests / future flag only |
 
 ---
 
@@ -719,125 +752,112 @@ Merged dag types remain re-exported as today.
 ```text
 crates/alloy-runtime/src/
   dag/
-    mod.rs              # re-exports types + validate + store + templates + cache + io
-    types.rs            # EXISTING — normative unchanged
-    validate.rs         # DagValidator, DagValidationError, ValidateOpts
-    store.rs            # DagStore trait + SqliteDagStore
-    templates.rs        # TemplateId, manifests, TemplateCatalog, instantiate()
-    cache.rs            # CacheKeyMaterials, compute_cache_key
-    io.rs               # NodeInputEnvelope / NodeOutputEnvelope helpers
+    mod.rs
+    types.rs            # EXISTING — field shapes unchanged
+    validate.rs
+    store.rs            # DagStore trait (+ optional re-export of SqliteDagStore)
+    templates.rs        # sync topology build from manifest (no I/O)
+    cache.rs
+    io.rs               # envelopes + encode helpers
   planner/
-    mod.rs              # PlanService, PlanContext, PlanResult, PlanError
-    template_service.rs # TemplatePlanService
-    llm_stub.rs         # DisabledLlmPlanService
+    mod.rs
+    template_service.rs # async artifact puts + validate + store + events
+    llm_stub.rs
   storage/
-    mod.rs              # Additive: dags() accessor
-    migrate.rs          # unchanged unless index migration approved
+    dags.rs             # SqliteDagStore concrete impl (pub(crate) deps)
+    mod.rs              # dags() accessor
 ```
 
 ### 4.2 Responsibilities
 
 | Module | MUST | MUST NOT |
 | --- | --- | --- |
-| `dag::types` | Remain serde-stable sketch types | Gain behaviour that belongs in validate/store |
 | `dag::validate` | Enforce §5.4 | Touch SQLite / artifacts |
-| `dag::store` | CRUD `dag_blobs` | Mutate topology beyond put of caller-supplied DAG |
-| `dag::templates` | Embed closed catalog; instantiate nodes/edges/ids | Call LLM; invent open plugin loading |
-| `dag::cache` | Hash materials → `CacheKey` | Decide cache hits at runtime (0010) |
-| `dag::io` | Encode/decode envelopes; put helpers | Execute nodes |
-| `planner::*` | Select, instantiate, validate, persist, snapshot, emit PlanProduced | Schedule nodes; invoke adapters; mutate after handoff except via `replan` |
+| `dag::templates` | Sync build of nodes/edges/ids from manifest | Artifact I/O; LLM |
+| `planner::*` | Artifact puts, validate, CAS persist, PlanProduced | Schedule nodes |
+| `storage/dags` | CRUD `dag_blobs` + CAS write | Run validator |
+| `dag::io` | Envelope types shared with 0010 | Belong to planner |
 
 ### 4.3 Dependency direction
 
 ```text
 planner → dag::{validate, templates, cache, io, types}
-planner → storage::{DagStore, ArtifactStore}
-planner → events::EventSink (optional)
-dag::store → storage internals (DbHandle, gate)
-dag::validate → dag::types only
-dag::templates → dag::types + dag::cache + dag::io
+planner → storage::DagStore + ArtifactStore
+planner → events::EventSink
+storage/dags → pub(crate) DbHandle, StorageGate, StorageMetrics
+dag::templates → dag::types only (sync)
+scheduler (0010) → DagStore + dag::io + dag::cache   (not planner)
 ```
-
-No cycles. `scheduler` MUST NOT depend on `planner` (0010 reads store only).
 
 ### 4.4 Injection points
 
 | Injected into | Dependency |
 | --- | --- |
-| `TemplatePlanService` | `Arc<dyn DagStore>`, `Arc<dyn ArtifactStore>`, `Option<Arc<dyn EventSink>>` |
-| Future PlanningWorker (0013) | `Arc<dyn PlanService>` |
-| RunController start path (wiring later / 0015) | `Arc<dyn PlanService>` then `Scheduler::run(dag_id)` |
+| `TemplatePlanService` | `Arc<dyn DagStore>`, `Arc<dyn ArtifactStore>`, `Arc<dyn EventSink>` |
+| PlanningWorker (0013) | `Arc<dyn PlanService>` |
+| Run start wiring | Build `PlanContext` from `RunGoalRecord` + goal; `plan` then `Scheduler::run(dag_id)` |
 
 ---
 
 ## 5. Execution Algorithm
 
-This section owns **planning**, not scheduling. RFC-0010 owns ready-queue execution.
-
 ### 5.1 Template selection
 
 ```text
 select(ctx) -> TemplateId:
-  if ctx.template_override is Some(id):
-      return id
-  # MVP closed selector:
-  if goal suggests local diagnostic repair (default for all goals in MVP):
-      return TemplateId::RepairLocalDiagnostic
-  else:
-      return Err(NoTemplateMatch)   # unreachable for day-1 defaulting selector
+  if ctx.template_override is Some(id): return id
+  return TemplateId::RepairLocalDiagnostic   # day-1 default
 ```
 
-**Normative day-1 selector:** When `template_override` is `None`, `TemplatePlanService` MUST select `RepairLocalDiagnostic`. A future selector MAY inspect `Goal.constraints` / attachments; until then, the default is unconditional. `NoTemplateMatch` remains in the error taxonomy for the open selector seam.
+`NoTemplateMatch` remains in the taxonomy for a future open selector; day-1 default never returns it.
 
 ### 5.2 Plan algorithm (`TemplatePlanService::plan`)
 
-1. `template_id ← select(ctx)` (§5.1).
+1. `template_id ← select(ctx)`.
 2. `manifest ← TemplateCatalog::get(template_id)`.
-3. `dag ← instantiate(manifest, ctx)` (§5.3).
-4. `DagValidator::validate(&dag, ValidateOpts { enforce_linear_mvp: true, require_gates: true })?`.
-5. `snapshot ← artifacts.put(TaskDag JSON)` (§5.6.3).
-6. `dags.put(&dag)?` (overwrite-or-insert).
-7. Emit `SessionEventType::PlanProduced` when `events` is `Some` (§9.2).
-8. Return `PlanResult { dag, template_id, snapshot_artifact }`.
+3. `skeleton ← templates::build_topology(manifest, ctx.dag_id, ctx.session_id)` (sync; all states `Pending`; `generation = 1`; no artifact ids yet).
+4. **Artifact pass (planner):** for each node, `put` input envelopes per §5.3.0; set `input_ref`; `output_ref = None`; `cache_key = None` when `!enable_cache` (day-1: all false). If `enable_cache` on a **root** node in a future template, compute key from **content digest** of `Goal` bytes (§5.8) — still identity-free.
+5. `DagValidator::validate(&dag, ValidateOpts::default())?`.
+6. `snapshot ← artifacts.put(TaskDag JSON)` with snapshot labels.
+7. `dags.put_if_generation(&dag, None).map_err(|e| map_conflict_insert(e))?`  
+   (`Conflict` → `GenerationMismatch { expected: 0 semantics via expected None, actual: Some(loaded) }` after optional get).
+8. Append `PlanProduced` with `NewSessionEvent { session_id, run_id: Some(ctx.run_id), type_: PlanProduced, payload: PlanProducedPayload { … replan: false, reason: None } }`.  
+   **If append fails after successful CAS insert:** return `PlanError::Event(...)`. The DAG row and snapshot remain durable. Caller MAY retry append-only recovery outside this RFC, or `replan` / operator inspect. Plan MUST NOT roll back the CAS insert (SQLite row and CAS blob have no distributed transaction).
+9. Return `PlanResult`.
 
-`load_template` skips step 1 and resolves `name` via `TemplateId::parse` / `TemplateCatalog::get_by_name`, else `UnknownTemplate`.
+`load_template(id, ctx)` uses `id` directly (ignores override) and follows the same steps.
 
-### 5.3 Instantiation algorithm
+### 5.3 Instantiation (sync topology + async artifact pass)
 
-Given `TemplateManifest` + `PlanContext`:
+**Sync (`dag::templates::build_topology`):** allocate node/gate ids; build edges; set kinds/retry/budget/tier/timeout/approval; all `Pending`; `generation` as argument; empty `input_ref` placeholder forbidden — artifact pass immediately follows in the same plan call before validate.
 
-1. Allocate `dag_id = DagId::new()` (replan: reuse existing id), `generation = 1` (replan: prior+1).
-2. Allocate a `NodeId` per `TemplateNodeSpec`. If `approval` is present, allocate `GateId::new()` and build `ApprovalSpec { gate, reason }`.
-3. Emit edges: map template-local names → `NodeId`; build `DependencyEdge` list from `TemplateEdgeSpec`.
-4. **Write `input_ref` artifacts** (§5.3.0), then construct each `TaskNode`:
-   - `state = Pending` for **all** nodes (readiness is owned exclusively by RFC-0010 using §5.3.1).
-   - `output_ref = None`.
-   - `cache_key = Some(compute_cache_key(...))` iff `enable_cache`, using the plan-time `input_ref` digest from `ArtifactStore::meta`; else `None`.
-5. Set `dag.state = DagState::Pending`.
-6. Return `TaskDag`.
+**Planner artifact pass:** §5.3.0.
 
 ### 5.3.0 Plan-time `input_ref` wiring (binding)
 
 | Node | Plan-time `input_ref` body |
 | --- | --- |
-| Root (no Data∪Sequence preds) | `NodeInputEnvelope` with `payload = Goal { text, attachments, constraints }` from `PlanContext.goal` |
-| Non-root | `NodeInputEnvelope` with `payload = FromPredecessors { preds }`, one `PredecessorOutput` per incoming **Data** edge |
+| Root (no Data∪Sequence preds) | `NodeInputEnvelope { payload: Goal(ctx.goal.clone()), … }` |
+| Non-root | `FromPredecessors` with one entry per incoming **Data** edge |
 
-For each non-root Data predecessor slot at plan time, `PredecessorOutput.output_ref` MUST point at a freshly `put` CAS blob with body `{"schema_version":1,"pending":true}`, labels `alloy.envelope = pending_pred`. This satisfies the required `ArtifactId` field without claiming a real predecessor output.
+Pending predecessor slots: `output_ref` points at a freshly put blob `{"schema_version":1,"pending":true}` with label `pending_pred`.
 
-**RFC-0010 obligation:** when every Data predecessor of a node reaches `Succeeded` or `CachedHit`, the scheduler MUST `put` a **new** `NodeInputEnvelope` whose `preds[].output_ref` values are the predecessors’ real `output_ref`s, then update that node’s `input_ref` in the stored DAG (same `generation`). Placeholder pending blobs are not reused as success outputs.
+**RFC-0010 obligation:** when all **Data** predecessors of a node are `Succeeded` or `CachedHit` with `output_ref = Some`, scheduler MUST put a new input envelope with real pred outputs and `put_if_generation` the DAG at the **same** generation. Scheduler owns `input_ref` updates. Placeholder blobs are not success outputs.
+
+**Cost note:** one pending blob per Data slot per plan; no GC in 0002. Acceptable for MVP linear chains (3 pending blobs).
 
 ### 5.3.1 Predecessor satisfaction (readiness rules — declarative)
 
-A node’s predecessors for readiness are edges with `kind ∈ {Data, Sequence}` **only**. `Hint` edges MUST be ignored.
+Edges with `kind ∈ {Data, Sequence}` participate. `Hint` ignored.
 
-Predecessor `from` is **satisfied** when `from.state ∈ {Succeeded, Skipped, CachedHit}`.
+| Edge kind | Predecessor satisfied when |
+| --- | --- |
+| `Sequence` | `state ∈ {Succeeded, Skipped, CachedHit}` |
+| `Data` | `state ∈ {Succeeded, CachedHit}` **and** `output_ref.is_some()` |
 
-Predecessor `from` is **failed-blocked** when `from.state ∈ {Failed, Cancelled}` and no retry will revive it (execution concern — 0010). While `from.state = Failed` and retries remain, successors MUST stay `Pending`.
+`Skipped` does **not** satisfy Data predecessors. A node with an unsatisfied Data pred MUST stay `Pending` (or fail/replan per 0010 policy) — it MUST NOT become Ready.
 
-A node MAY transition `Pending → Ready` iff every Data/Sequence predecessor is satisfied.
-
-**Multiple Ready nodes:** Graph-theoretically allowed when two nodes have disjoint satisfied pred sets. See §6.5 for the concurrency contract.
+A node MAY transition `Pending → Ready` iff every Data and Sequence predecessor is satisfied under the table above.
 
 ### 5.3.2 Node state machine (reconciled with V2 Appendix C)
 
@@ -848,8 +868,9 @@ stateDiagram-v2
   Ready --> WaitingApproval: GateHuman scheduled
   WaitingApproval --> Ready: approved
   WaitingApproval --> Cancelled: denied
+  WaitingApproval --> Failed: timeout (0010)
   Ready --> Running: scheduled
-  Ready --> CachedHit: cache hit
+  Ready --> CachedHit: cache hit (0010; requires cache_key)
   Running --> Succeeded: ok
   Running --> Failed: error
   Failed --> Ready: retry admitted
@@ -863,57 +884,53 @@ stateDiagram-v2
   Pending --> Cancelled: cancel before start
 ```
 
-| State | Meaning | Who writes |
-| --- | --- | --- |
-| `Pending` | Waiting on preds or not yet considered | Planner (initial); Scheduler |
-| `Ready` | Preds satisfied; eligible | Scheduler |
-| `Running` | Executing | Scheduler |
-| `Succeeded` | Terminal success; `output_ref = Some` | Scheduler / adapter / worker boundary |
-| `Failed` | Attempt failed; may retry | Scheduler |
-| `Skipped` | Not run; treated as satisfied for preds | Scheduler |
-| `Cancelled` | Terminal cancel | Scheduler |
-| `WaitingApproval` | GateHuman blocked | Scheduler / GateHuman adapter |
-| `CachedHit` | Skipped execution; exposes prior `output_ref` | Scheduler |
-
-**Skipped:** Present on `NodeState` and usable by RFC-0010; MVP templates do not require skip edges. Skipped counts as pred satisfaction (§5.3.1).
+| Invariant | Owner |
+| --- | --- |
+| `Succeeded \| CachedHit ⇒ output_ref.is_some()` | **RFC-0010** (fail closed) |
+| `Failed` successful-output: `output_ref` MUST NOT be treated as success | **RFC-0010** |
+| `WaitingApproval` only on `GateHuman` | **RFC-0010** |
+| `timeout_ms` on `GateHuman` | Enforced by **RFC-0010**; on expiry → `Failed` with `ErrorClass::Approval` (or `Cancelled` if cancel path) — diagram edge above |
+| Initial plan states | All `Pending` (planner) |
 
 ### 5.4 Validation rules (normative)
 
-Enforced by `DagValidator::validate`. Each rule → one variant (§3.4).
+Evaluate **in order V1…V17**. Return the **first** violation.
 
 | # | Rule | Error |
 | --- | --- | --- |
 | V1 | `nodes` non-empty | `Empty` |
-| V2 | For every `(k,n)` in `nodes`, `k == n.id` | `NodeIdMismatch` |
-| V3 | `generation >= 1` | `InvalidGeneration` |
-| V4 | Every edge `from`/`to` exists in `nodes` | `MissingEndpoint` |
-| V5 | No edge with `from == to` | `SelfLoop` |
-| V6 | Graph of Data∪Sequence edges is acyclic (Kahn/DFS) | `Cycle` |
-| V7 | Every node reachable from the set of roots (nodes with no Data∪Sequence preds) via Data∪Sequence edges | `Unreachable` |
-| V8 | No duplicate Data or Sequence edge with same `(from,to)` (Hint duplicates ignored for this rule) | `DuplicateEdge` |
-| V9 | Capability / approval / cache_key / budget per §3.3 | `CapabilityRequired` / `CapabilityForbidden` / `ApprovalRequired` / `ApprovalForbidden` / `CacheKeyForbidden` / `BudgetNotZero` / `BudgetZero` |
+| V2 | For every `(k,n)`, `k == n.id` | `NodeIdMismatch` |
+| V3 | `1 <= generation <= i64::MAX as u64` | `InvalidGeneration` |
+| V4 | Every edge endpoint exists | `MissingEndpoint` |
+| V5 | No `from == to` | `SelfLoop` |
+| V6 | Data∪Sequence graph acyclic | `Cycle` |
+| V7 | Exactly one root (zero Data∪Sequence preds); every node reachable from that root via Data∪Sequence | `MultipleRoots` / `Unreachable` |
+| V8 | Unique `(from, to, kind)` among **all** edges including Hint | `DuplicateEdge` |
+| V9 | Capability / approval / cache_key / budget / escalate-on-non-LLM per §3.3 | matching variants / `RetryIncoherent(EscalateOnNonLlm)` |
 | V10 | `GateHuman.approval.reason` non-empty after trim | `GateReasonEmpty` |
-| V11 | If `opts.require_gates`: ≥1 `GateHuman` node | `GatesAbsent` |
-| V12 | Each `Aggregate` has ≥1 incoming **Data** edge; Aggregate MUST NOT have outgoing **Data** edges (Sequence out allowed for ordering) | `AggregateNoDataPreds` / `AggregateDataOut` |
+| V11 | If `require_gates`: ≥1 GateHuman | `GatesAbsent` |
+| V12 | Each Aggregate has ≥1 incoming **Data** edge (outgoing Data **allowed**) | `AggregateNoDataPreds` |
 | V13 | `timeout_ms > 0` | `TimeoutZero` |
-| V14 | Retry coherence: `max_attempts >= 1`; if `escalate_after` is `Some(n)` then `n < max_attempts` and `escalate_to_tier` is `Some`; if `escalate_to_tier` is `Some` then `escalate_after` is `Some`; `Backoff::Exponential.factor` must be finite and `>= 1.0` | `RetryIncoherent` |
-| V15 | If `opts.enforce_linear_mvp`: under §5.3.1, the DAG MUST NOT admit two nodes that can be Ready simultaneously (exactly one root; every non-root has exactly one Data∪Sequence predecessor; out-degree of Data∪Sequence ≤ 1 per node) | `NonLinearTopology` |
-| V16 | `Hint` edges: endpoints MUST exist (V4 applies); Hint MUST NOT participate in V6/V7/V15; presence MUST NOT otherwise fail validation | — |
+| V14 | Retry coherence: `max_attempts >= 1`; escalate pair rules; `Exponential.factor` finite and `>= 1.0` | `RetryIncoherent{reason}` |
+| V15 | If `enforce_linear_mvp`: exactly one root; for every node, number of **distinct** Data∪Sequence predecessors ≤ 1; number of **distinct** Data∪Sequence successors ≤ 1 | `NonLinearTopology` |
+| V16 | All `GateId` values among nodes with approval are unique | `DuplicateGateId` |
+| V17 | Hint edges remain subject to V4/V8; Hint is excluded from V6, V7, and V15 graphs/counts | — (no dedicated variant) |
 
-**Hint inertness:** A DAG with Hint edges MUST validate identically to the same DAG with those Hint edges removed, except that missing Hint endpoints still fail V4.
+**V15 vs dual edges:** A hop with both Data and Sequence between the same `(a,b)` yields distinct-pred count 1 and distinct-succ count 1 — **valid**. V8 allows both because `kind` differs.
+
+**V7 procedure (normative):** (a) let `roots` = nodes with zero Data∪Sequence predecessors; if `|roots| != 1` → `MultipleRoots { count: roots.len() }`; (b) DFS/BFS from that unique root over Data∪Sequence successors; any unvisited node → `Unreachable`. Isolated extra nodes are additional roots, so `MultipleRoots` fires when a second component has no Data∪Sequence preds. Unit tests MUST cover `MultipleRoots` with an isolated second node; `Unreachable` MUST still be implemented for step (b).
 
 ### 5.5 Node data-flow contract (normative)
 
 | Topic | Rule |
 | --- | --- |
-| Who writes `input_ref` at plan | `PlanService` via `ArtifactStore::put` |
-| Who writes `output_ref` | Executor path (RFC-0010 worker/adapter) on success or cache hit |
-| Success | `state = Succeeded` or `CachedHit` ⇒ `output_ref` MUST be `Some` |
-| Failure | `state = Failed` ⇒ `output_ref` remains `None` (or prior attempt’s id MUST NOT be treated as success). Executor MUST put a `NodeOutputEnvelope` with `failure: Some` as a **log artifact** if desired, but MUST NOT set `TaskNode.output_ref` unless the node succeeded or cache-hit |
-| Retry | Each attempt that produces bytes MUST `ArtifactStore::put` a **new** `ArtifactId` (RFC-0002 always allocates new ids). On success, `output_ref` becomes that new id. Retries MUST NOT overwrite CAS bytes of prior artifacts |
-| Reading predecessors | Along incoming **Data** edges only. Sequence edges order execution but do not contribute `PredecessorOutput` entries |
-| Absent pred output | If a Data predecessor is `Failed`/`Cancelled` with `output_ref = None`, successors MUST NOT become Ready; scheduler fails or requests replan (0010) |
-| Aggregate | Consumes all incoming Data predecessors’ outputs; produces one combined `NodeOutputEnvelope` (payload shape owned by 0010/0013 when first used). MVP templates MUST NOT include Aggregate |
+| Plan writes `input_ref` | Planner via `ArtifactStore::put` |
+| Success `output_ref` | Executor (0010) on Succeeded/CachedHit |
+| Failure | MUST NOT set `TaskNode.output_ref` to a success envelope; optional separate log artifact is 0010 |
+| Retry | New `ArtifactId` per successful put (0002 semantics) |
+| Data reads | Incoming Data edges only |
+| Sequence | Ordering only |
+| Aggregate | Consumes Data preds; MAY emit Data to successors (V12). Not in day-1 templates |
 
 ### 5.6 Persistence & generations
 
@@ -923,120 +940,110 @@ Enforced by `DagValidator::validate`. Each rule → one variant (§3.4).
 | --- | --- |
 | `dag_id` | `TaskDag.id` (PK) |
 | `session_id` | `TaskDag.session_id` |
-| `generation` | `TaskDag.generation` |
+| `generation` | `TaskDag.generation` as SQLite `INTEGER` (i64) |
 | `blob_json` | `serde_json::to_string(TaskDag)` |
-| `updated_at` | RFC3339 UTC now on each put |
-
-**Overwrite:** `put` uses `INSERT ... ON CONFLICT(dag_id) DO UPDATE SET session_id=excluded.session_id, generation=excluded.generation, blob_json=excluded.blob_json, updated_at=excluded.updated_at`.
+| `updated_at` | RFC3339 UTC |
 
 #### 5.6.2 Replan algorithm
 
-1. `current ← dags.get(dag_id)?.ok_or(DagNotFound)?`.
-2. If `current.session_id != ctx.session_id` → `SessionMismatch`.
-3. Determine `template_id` from the prior `PlanProduced` payload for this `dag_id` (latest) if available; else `select(ctx)`. MVP replan MUST reuse the same template id when recorded in the last PlanProduced for this dag; if missing, fall back to `select(ctx)`.
-4. `next_gen ← current.generation.checked_add(1).ok_or(Internal)?`.
-5. Instantiate a fresh DAG **reusing `dag_id`**, setting `generation = next_gen`, new node ids, new gate ids, new input artifacts.
-6. Validate with linear + gates opts.
-7. Snapshot + `dags.put` (overwrite).
-8. Emit `PlanProduced` with replan provenance (§9.2).
+1. Require `ctx.dag_id == dag_id` else `Internal` / invalid.
+2. `current ← dags.get(dag_id)?.ok_or(DagNotFound)?`.
+3. If `current.session_id != ctx.session_id` → `SessionMismatch`.
+4. If `current.state == DagState::Running` → `DagBusy`  
+   Permitted states for replan: `Pending`, `Failed`, `ReplanRequired`, `WaitingApproval`, `Cancelled`, `Succeeded`.  
+   (Caller typically recorded `ReplanRequested` via 0003 first.)
+5. `template_id ← ctx.template_override.unwrap_or_else(|| select(ctx))`.  
+   **No EventStore scan.** Callers SHOULD pass the prior `PlanResult.template_id` as override.
+6. `next_gen ← current.generation.checked_add(1).ok_or(GenerationOverflow)?`.
+7. Build fresh topology reusing `dag_id`, `generation = next_gen`, new node/gate ids, new artifacts.
+8. Validate; snapshot; `put_if_generation(&dag, Some(current.generation))` mapping `Conflict` → `GenerationMismatch` (get actual).
+9. Append `PlanProduced` (`replan: true`, `reason: Some(reason)`, `run_id: Some(ctx.run_id)`). Same event-failure semantics as §5.2 step 8.
+10. Return `PlanResult`.
 
-**Optimistic concurrency (normative):** `replan` MUST re-read the store immediately before put and abort with `GenerationMismatch` if `generation` changed since step 1. (No SQL `WHERE generation=?` required if the read/put critical section is held under the storage gate’s single-flight DB mutex — which `spawn_db` already serializes. The check is still REQUIRED in service logic.)
-
-#### 5.6.3 Prior-generation recoverability (binding decision)
+#### 5.6.3 Prior-generation recoverability (binding)
 
 | Question | Decision |
 | --- | --- |
-| Does `dag_blobs` retain prior generations? | **No.** PK overwrite is intentional. |
-| Is that correct for V2 §3.3? | **Yes**, because the session event log + CAS carry audit. |
-| How is prior DAG recovered? | Each `PlanProduced` payload MUST include `snapshot_artifact: ArtifactId` pointing at an immutable CAS blob of the full `TaskDag` JSON for that generation. Prior generations are recovered by reading events, not `dag_blobs`. |
-| Schema change required? | **No** for MVP. Do **not** change `dag_blobs` PK. A future multi-version table would be a playbook amendment if event+CAS audit proves insufficient. |
+| Retain prior rows in `dag_blobs`? | **No** |
+| Audit path | Mandatory `PlanProduced` + `snapshot_artifact` CAS |
+| Schema change? | **No** for MVP |
 
 ### 5.7 Template catalog (day one)
 
 #### 5.7.1 Closed set
 
-| `TemplateId` | Name string | Shipped day one |
+| `TemplateId` | Name | Day one |
 | --- | --- | --- |
 | `RepairLocalDiagnostic` | `repair_local_diagnostic` | **Required** |
 
-No other templates ship on day one. Catalog API remains closed-enum extensible by amendment.
-
 #### 5.7.2 `repair_local_diagnostic` topology (normative)
 
-Nodes (order):
-
-| Name | Kind | Capability | Retry (MVP defaults) | Cache | Approval |
+| Name | Kind | Capability | Retry | Cache | Approval |
 | --- | --- | --- | --- | --- | --- |
-| `analyze` | `Analyze` | `repair` | `max_attempts=2`, Fixed 0ms, `retry_on=[Model]`, no escalate | enable | none |
-| `edit` | `Edit` | `edit` | `max_attempts=2`, Fixed 0ms, `retry_on=[Model]`, no escalate | enable | none |
-| `verify` | `VerifyCompile` | none | `max_attempts=1`, Fixed 0ms, `retry_on=[]` | **disabled** | none |
-| `gate` | `GateHuman` | none | `max_attempts=1` | disabled | reason: `"Approve repair diff before completion"` |
+| `analyze` | Analyze | repair | max_attempts=2, Fixed delay_ms=**1000**, retry_on=[Model], no escalate | **false** | none |
+| `edit` | Edit | edit | same | **false** | none |
+| `verify` | VerifyCompile | none | max_attempts=1, Fixed 0, retry_on=[] | false | none |
+| `gate` | GateHuman | none | max_attempts=1 | false | reason `"Approve repair diff before completion"` |
 
-Edges (all `Sequence` **and** `Data` between consecutive pairs — two edges per hop, or one edge with kind Data plus one Sequence; **normative:** emit **both** a Data and a Sequence edge for each hop `analyze→edit`, `edit→verify`, `verify→gate`):
+Edges — **both** Data and Sequence on each hop (normative; not optional):
 
 ```text
-analyze --Data--> edit --Data--> verify --Data--> gate
-analyze --Sequence--> edit --Sequence--> verify --Sequence--> gate
+analyze -Data-> edit -Data-> verify -Data-> gate
+analyze -Sequence-> edit -Sequence-> verify -Sequence-> gate
 ```
 
-**Why both:** Data carries I/O; Sequence forbids concurrent interpretation of sibling readiness under V15 (redundant on a chain but required so templates defensively express ordering even if Data rules evolve).
+Budgets: LLM `{ max_input: 32768, max_output: 8192 }`; adapters `{0,0}`.  
+`model_tier`: Analyze/Edit `Standard`; adapters `Economy` (ignored).  
+`timeout_ms`: Analyze/Edit `300_000`; Verify `600_000`; Gate `3_600_000` (enforced by 0010).
 
-Budgets (LLM nodes): `{ max_input: 32_768, max_output: 8_192 }` unless profile wiring overrides at instantiation via future amendment; MVP constants above. Adapter nodes: `{0,0}`. `model_tier`: Analyze/Edit `Standard`; adapters `Economy` (ignored). `timeout_ms`: Analyze/Edit `300_000`; Verify `600_000`; Gate `3_600_000`.
+This topology MUST pass `ValidateOpts::default()`.
 
-#### 5.7.3 Template contract (every template MUST)
+#### 5.7.3 Template contract
 
-1. Pass `DagValidator` with `enforce_linear_mvp=true`, `require_gates=true`.
-2. Include ≥1 `GateHuman` with non-empty reason (V2 §10.2).
-3. Use only catalog capability ids from §3.3.
-4. Remain a linear chain under V15.
-5. Set Verify*/GateHuman `cache_key` disabled / `None`.
-6. Never include `EdgeKind::Hint` in shipped manifests (Hint may appear only in fixtures testing inertness).
-7. Never include `Aggregate` on day one.
+1. Pass validator with linear + gates.
+2. ≥1 GateHuman with non-empty reason.
+3. Catalog capability ids only.
+4. Linear under V15 (distinct node degrees).
+5. Day-1: `enable_cache = false` on every node.
+6. No Hint edges in shipped manifests.
+7. No Aggregate on day one.
 
 ### 5.8 Cache-key computation (normative)
 
-Canonical byte sequence for `Digest::sha256`:
+Canonical bytes:
 
 ```text
 b"alloy.cache_key.v1" || 0x00 ||
-kind_snake_case_utf8 || 0x00 ||
-capability_or_empty || 0x00 ||
-input_digest.as_hex() || 0x00 ||
+kind_serde_snake_case || 0x00 ||   # e.g. verify_compile
+capability_as_str_or_empty || 0x00 ||
+content_digest.as_hex() || 0x00 ||
 policy_hash.as_hex() || 0x00 ||
 tool_versions.as_hex() || 0x00 ||
 compiler_fingerprint.as_hex()
 ```
 
-| Event | Behaviour |
-| --- | --- |
-| Cache hit (0010) | Node → `CachedHit`; `output_ref` MUST be set to the **cached artifact id** associated with that key in the scheduler’s cache map (0010 owns the map). RFC-0009 does not ship a persistent cache table. |
-| Cache miss | Normal execution |
-| Replan | New node ids + new input artifacts ⇒ new keys. Prior generation cache entries MUST NOT be reused across generations unless input digest and all materials match **and** the scheduler explicitly keys by digest (0010). PlanService MUST NOT copy `cache_key` values from the prior generation’s nodes. |
-| Stale artifact | Forbidden: cache hit MUST only return artifacts previously produced under the same `CacheKey` materials. |
+**Content digest (normative):**
 
-**MVP constants:** Until LanguageBackend / MCP version surfacing exists, `tool_versions` and `compiler_fingerprint` MUST be `Digest::sha256(b"alloy.mvp.tool_versions.v0")` and `Digest::sha256(b"alloy.mvp.compiler_fingerprint.v0")` respectively, passed through `PlanContext`.
+| Payload | Bytes hashed |
+| --- | --- |
+| `Goal` | `serde_json::to_vec` of the `Goal` value only |
+| `FromPredecessors` | For each pred in order: `node_id` bytes + `output_ref` artifact **meta.digest** hex (not pending placeholders) |
+
+Day-1 templates never set `cache_key`. When a future template sets `enable_cache` on a non-root, RFC-0010 MUST compute and persist `cache_key` only after final inputs are wired. Cross-generation reuse requires identical content digest + materials; identity fields are excluded so keys can collide meaningfully.
+
+Pin a golden expected digest in `cache_key_stable` tests for a fixed Goal fixture.
 
 ### 5.9 Retry & escalation ownership boundary
 
-| Concern | Owner | Notes |
-| --- | --- | --- |
-| Fields on `RetryPolicy` | **RFC-0009** (declaration) | Validated by V14 |
-| Whether to retry a failure | **RFC-0010** | Requires `FailureIr.retry == Retryable` **and** `error_class ∈ retry_on` (RFC-0007/0010 amendment) |
-| Backoff sleep | **RFC-0010** | Uses `Backoff` |
-| Tier escalation after N failures | **RFC-0010** | Reads `escalate_after` / `escalate_to_tier`; applies to LLM nodes only |
-| Declaring `retry_on` contents in templates | **RFC-0009** | Template manifests |
-| Replan vs retry | **RFC-0010** | Exhausted retries / policy → `DagState::ReplanRequired` / `request_replan`; topology change → **RFC-0009** `replan` |
-
-### 5.10 `EdgeKind::Hint` (inert reserved surface)
-
-| Surface | Rule |
+| Concern | Owner |
 | --- | --- |
-| Serde | Accepted |
-| Validation | Endpoints must exist; otherwise ignored (§5.4 V16) |
-| Readiness | MUST NOT affect |
-| Caching | MUST NOT affect |
-| Templates | MUST NOT ship Hint edges |
-| Future | Semantics require a new RFC |
+| `RetryPolicy` fields + V14 | **RFC-0009** |
+| Retry admission / backoff sleep / tier escalate execution | **RFC-0010** |
+| Replan vs retry exhaustion | **RFC-0010** requests; **RFC-0009** mutates |
+
+### 5.10 `EdgeKind::Hint` (inert)
+
+Accepted in serde; endpoints validated; excluded from readiness, cycle/reachability/linearity degree counts (but included in V8 uniqueness); MUST NOT affect caching; not shipped in templates.
 
 ---
 
@@ -1047,7 +1054,7 @@ compiler_fingerprint.as_hex()
 ```mermaid
 stateDiagram-v2
   [*] --> Planned: PlanService::plan
-  Planned --> Stored: DagStore::put
+  Planned --> Stored: put_if_generation insert
   Stored --> Running: Scheduler::run (0010)
   Running --> ReplanRequested: request_replan (0003)
   ReplanRequested --> Planned: PlanService::replan
@@ -1057,44 +1064,45 @@ stateDiagram-v2
 
 ### 6.2 Creation
 
-Only `PlanService` creates new topologies. Workers MUST NOT obtain a mutator API.
+Only `PlanService` creates topologies. Uses pre-minted `dag_id`.
 
-### 6.3 Load
+### 6.3 Load & validation trust boundary
 
-`DagStore::get` is read-only. Scheduler loads by `DagId`.
+| API | Validates? |
+| --- | --- |
+| `plan` / `replan` / `load_template` | Yes — before CAS write |
+| `DagStore::put` / `put_if_generation` / `get` | **No** |
+| Scheduler before execute | MUST treat missing validation as its problem: either trust plan path or call `DagValidator` itself (0010 choice). This RFC promises plan-path DAGs are validated; it does **not** promise every row in `dag_blobs` is valid |
 
 ### 6.4 Mutation
 
-| Mutation | Allowed actor |
-| --- | --- |
-| Topology (nodes/edges set) | `PlanService` only |
-| Node state / output_ref / attempt counters | Scheduler (0010) |
-| Cancel/skip existing nodes | Scheduler (0010) |
-| Generation bump | `PlanService::replan` only |
+| Mutation | Actor | Write API |
+| --- | --- | --- |
+| Topology / generation bump | `PlanService` | `put_if_generation` |
+| Node state / `output_ref` / `input_ref` rewrite | Scheduler (0010) | `put_if_generation(&dag, Some(dag.generation))` |
+| Cancel/skip existing nodes | Scheduler | same |
 
-Scheduler updates MUST `DagStore::put` the modified DAG blob (same `dag_id`, **same** `generation`) so crash-resume sees node states. **Normative:** generation changes only on replan; node-state checkpoints do not bump generation.
+**No attempt counter field exists on `TaskNode`.** RFC-0010 MUST keep attempt state outside the merged struct (process-local or side table); this RFC does not add fields.
 
 ### 6.5 Concurrency contract offered to a scheduler (binding)
 
-| Question | Normative answer |
+| Question | Answer |
 | --- | --- |
-| May a well-formed DAG contain two nodes that are Ready at the same time? | **Yes, graph-theoretically**, if V15 is disabled and the topology fans out. With MVP `enforce_linear_mvp=true`, validation **rejects** such topologies. |
-| What declares two nodes safe to run concurrently? | **Nothing in this model.** There is no fan-out edge, no file-lease field, no partition key. Concurrent safety is **unmodelled**. |
-| May a concurrent scheduler be built on this RFC alone? | **MUST NOT.** A later RFC MUST add an explicit concurrency-safety mechanism (e.g. leases) before `max_parallel_nodes > 1` is legal for non-trivial graphs. |
-| Is `EdgeKind::Sequence` the tool for forbidding concurrency? | Sequence enforces **ordering** along an edge (successor waits). It does **not** declare that unordered Ready siblings are safe. Templates MUST still use Sequence defensively on every MVP hop (§5.7.2). |
-| Role of `Aggregate` | Structural join over Data preds. Not required after fan-out until fan-out is permitted. MVP templates MUST omit it. When present, Ready only when all Data/Sequence preds are satisfied. |
+| May two nodes be Ready? | Graph-theoretically yes if V15 off; MVP templates reject that |
+| What declares concurrent safety? | **Nothing** — unmodelled |
+| Concurrent scheduler on this model alone? | **MUST NOT** |
+| Sequence role | Ordering along an edge; not a lease |
+| Aggregate | Structural Data join; optional Data out; omitted from day-1 templates |
 
-**Honesty statement (normative):** MVP templates are linear chains; concurrency safety is unmodelled; RFC-0010’s `max_parallel_*=1` is required by this contract, not merely a performance knob.
-
-### 6.6 Concurrent access to the store
+### 6.6 Concurrent access to the store (single-row writers)
 
 | Rule | Detail |
 | --- | --- |
-| DB serialization | Same as RFC-0002: `DbHandle` mutex via `spawn_db` |
-| Logical writers | Multiple tasks MAY call `put`; last writer wins on `blob_json` |
-| Replan safety | Generation check (§5.6.2) |
-| Read during write | SQLite read may see old or new row; callers MUST treat get as point-in-time |
-| `Send + Sync` | All public traits require both |
+| CAS | All production writes use `put_if_generation` |
+| Scheduler vs replan | Replan rejected while `DagState::Running` (`DagBusy`). Scheduler MUST stop checkpointing after observing `Conflict` (generation changed) |
+| Same-generation checkpoints | Scheduler updates node fields with `expected = Some(current.generation)` and `dag.generation` unchanged |
+| `spawn_db` | Serializes **one** closure; does **not** span read+write across awaits — hence CAS SQL is mandatory |
+| `Send + Sync` | Required on all public traits |
 
 ---
 
@@ -1102,15 +1110,15 @@ Scheduler updates MUST `DagStore::put` the modified DAG blob (same `dag_id`, **s
 
 ### 7.1 Runtime configuration
 
-No new `router.toml` or profile keys are required for day one. Template selection override MAY be plumbed later by RFC-0015 as a CLI flag mapped to `PlanContext.template_override`.
+No new profile keys required. CLI may later map flags to `PlanContext.template_override` (0015).
 
 ### 7.2 `example.env`
 
-No new environment variables. **MUST NOT** create or modify `.env`.
+No new keys. MUST NOT write `.env`.
 
 ### 7.3 Embedded manifests
 
-Templates are embedded (`include_str!` JSON or Rust consts). Changing topology requires a code change.
+Prefer Rust builders inside `OnceLock` (fallible `CapabilityId::new` at init). JSON `include_str!` permitted only with `Deserialize` behind test/feature. Malformed embed → panic at first `TemplateCatalog::all()`; `catalog_parses` test MUST catch.
 
 ---
 
@@ -1118,67 +1126,50 @@ Templates are embedded (`include_str!` JSON or Rust consts). Changing topology r
 
 ### 8.1 `DagValidationError` taxonomy
 
-| Variant | Producer | Meaning | Retryable? | Caller visibility |
-| --- | --- | --- | --- | --- |
-| `Empty` | validator | no nodes | no | yes |
-| `NodeIdMismatch` | validator | map key ≠ node.id | no | yes |
-| `MissingEndpoint` | validator | dangling edge | no | yes |
-| `SelfLoop` | validator | from=to | no | yes |
-| `Cycle` | validator | Data∪Sequence cycle | no | yes |
-| `Unreachable` | validator | disconnected node | no | yes |
-| `CapabilityRequired` | validator | LLM kind missing/wrong cap | no | yes |
-| `CapabilityForbidden` | validator | adapter/structural has cap | no | yes |
-| `ApprovalRequired` | validator | GateHuman w/o approval | no | yes |
-| `ApprovalForbidden` | validator | non-gate has approval | no | yes |
-| `CacheKeyForbidden` | validator | verify/gate has cache | no | yes |
-| `BudgetNotZero` | validator | adapter budget ≠ 0 | no | yes |
-| `BudgetZero` | validator | LLM budget both 0 | no | yes |
-| `RetryIncoherent` | validator | bad retry fields | no | yes |
-| `GatesAbsent` | validator | require_gates failed | no | yes |
-| `GateReasonEmpty` | validator | empty reason | no | yes |
-| `AggregateNoDataPreds` | validator | bad Aggregate | no | yes |
-| `AggregateDataOut` | validator | Aggregate Data out | no | yes |
-| `DuplicateEdge` | validator | dup Data/Sequence | no | yes |
-| `NonLinearTopology` | validator | MVP linearity | no | yes |
-| `InvalidGeneration` | validator | generation 0 | no | yes |
-| `TimeoutZero` | validator | timeout_ms == 0 | no | yes |
+| Variant | Producer | Retryable? | Visibility |
+| --- | --- | --- | --- |
+| All §3.4 variants | `DagValidator` | no | yes |
 
 ### 8.2 `PlanError` taxonomy
 
-| Variant | Producer | Meaning | Retryable? | Persist? | Caller visibility |
-| --- | --- | --- | --- | --- | --- |
-| `UnknownTemplate` | load_template | bad name | no | no | yes |
-| `NoTemplateMatch` | select | selector empty | no | no | yes |
-| `PlannerDisabled` | LLM stub | LLM path off | no | no | yes |
-| `Validation` | plan/replan | invalid DAG | no | no | yes |
-| `Store` | DagStore | sqlite/io | maybe Busy | no | yes |
-| `Artifact` | ArtifactStore | cas put/get | maybe Busy | no | yes |
-| `DagNotFound` | replan | missing row | no | no | yes |
-| `SessionMismatch` | replan | wrong session | no | no | yes |
-| `GenerationMismatch` | replan | lost race | yes (caller re-read) | no | yes |
-| `Internal` | anywhere | invariant | no | no | yes |
+| Variant | Producer | Retryable? | Notes |
+| --- | --- | --- | --- |
+| `UnknownTemplate` | load path if parse used at boundary | no | Prefer `TemplateId` API |
+| `NoTemplateMatch` | future selector | no | Unused day-1 |
+| `PlannerDisabled` | stub | no | |
+| `Validation` | plan/replan | no | |
+| `Store` | DagStore | Busy maybe | explicit map_err |
+| `Artifact` | ArtifactStore | Busy maybe | explicit map_err |
+| `Event` | EventSink after durable DAG | maybe Busy | DAG row retained |
+| `DagNotFound` | replan | no | |
+| `SessionMismatch` | replan | no | |
+| `GenerationMismatch` | CAS | yes — re-read | |
+| `DagBusy` | replan while Running | yes — wait | |
+| `GenerationOverflow` | u64 overflow | no | |
+| `Internal` | invariant | no | |
 
 ### 8.3 Store boundary mapping
 
-| `StoreError` | `PlanError` |
+| Condition | Error |
 | --- | --- |
-| `Busy` | `Store(Busy)` — caller MAY retry |
-| `NotFound` | context-dependent (`DagNotFound` when loading DAG) |
-| other | `Store(err)` or `Artifact(err)` |
+| CAS miss | `StoreError::Conflict` → `PlanError::GenerationMismatch` |
+| Bad JSON / negative generation | `StoreError::Corrupt` |
+| Closed | `StoreError::Closed` |
+| Busy | `StoreError::Busy` |
 
 ### 8.4 Boundary into session/run
 
-This RFC does not add `RunError` variants. Callers map `PlanError` to `RunError::Internal` or `SessionError::Invalid` at the 0003/0015 boundary until a dedicated variant is amended.
+No new `RunError` variants. Map at 0003/0015 boundary to `Internal` / `Invalid` until amended.
 
 ### 8.5 Recovery semantics
 
 | Failure | Recovery |
 | --- | --- |
-| Validation failure | Fix template/input; do not put |
-| `PlannerDisabled` | Use `TemplatePlanService` |
-| `GenerationMismatch` | Re-read DAG; retry replan once |
-| Store `Busy` | Retry with backoff at caller |
-| Partial plan (artifact put ok, dag put fail) | Orphan CAS blob allowed (RFC-0002 has no GC); retry plan allocates fresh ids |
+| Validation | Do not write |
+| CAS Conflict on insert | Do not invent new dag_id; use `replan` or fix caller |
+| Event append after CAS | Return `Event`; row+snapshot durable; retry append or inspect |
+| Artifact put before CAS | Orphan CAS blob OK (no GC); retry plan fails insert if row exists |
+| `DagBusy` | Wait until not Running; then replan |
 
 ---
 
@@ -1186,31 +1177,26 @@ This RFC does not add `RunError` variants. Callers map `PlanError` to `RunError:
 
 ### 9.1 Tracing spans
 
-| Span name | Fields |
+| Span | Fields |
 | --- | --- |
 | `dag.validate` | `dag_id`, `node_count`, `edge_count` |
-| `dag.store_put` | `dag_id`, `generation`, `session_id` |
-| `dag.store_get` | `dag_id` |
-| `planner.plan` | `session_id`, `run_id`, `template` |
-| `planner.replan` | `dag_id`, `generation_from`, `generation_to`, `reason` |
-| `planner.instantiate` | `template`, `node_count` |
-
-Level: `info` for plan/replan; `debug` for validate/store.
+| `dag.store_put_cas` | `dag_id`, `expected`, `generation` |
+| `planner.plan` | `session_id`, `run_id`, `dag_id`, `template` |
+| `planner.replan` | `dag_id`, `generation_from`, `generation_to`, `reason_variant` only |
 
 ### 9.2 Session events
 
-| Event | When | Payload (JSON) |
+| Event | When | Envelope |
 | --- | --- | --- |
-| `PlanProduced` | After successful plan/replan put | `{ "dag_id", "generation", "template_id", "snapshot_artifact", "node_ids": [...], "replan": bool, "reason": <ReplanReason\|null> }` |
-| `ReplanRequested` | Owned by RFC-0003 | unchanged |
-| `NodeState` | Owned by RFC-0010 on transitions | not emitted by this RFC |
+| `PlanProduced` | After successful CAS | `NewSessionEvent.run_id = Some(ctx.run_id)`; payload = `PlanProducedPayload` |
+| `ReplanRequested` | RFC-0003 | unchanged |
+| `NodeState` | RFC-0010 | not emitted here |
 
-**Normative:** `PlanService` emits `PlanProduced` only. It MUST NOT emit `NodeState`.
+**Run → DAG resolution:** the DAG for a run is `RunGoalRecord.dag_id`. Latest `PlanProduced` for that `run_id` names the active generation’s snapshot.
 
 ### 9.3 Logging
 
-On plan/replan success: `info!(dag_id, generation, template_id, "plan produced")`.  
-On validation failure: `warn!(error = %err, "dag validation failed")`.
+`info` on plan/replan success; `warn` on validation failure and event-append failure after CAS.
 
 ---
 
@@ -1218,152 +1204,108 @@ On validation failure: `warn!(error = %err, "dag validation failed")`.
 
 ### 10.1 New dependencies
 
-**None required.** Implementation uses existing `serde`, `serde_json`, `async_trait`, `thiserror`, `rusqlite`, `tokio`, `tracing`, `uuid`, `time`, `sha2` / `Digest::sha256`.
+**None.**
 
-### 10.2 Justification table
+### 10.2 Justification
 
-| Crate | Status |
-| --- | --- |
-| Existing workspace deps | Reuse only |
-| New crates | **Forbidden** without amendment |
+Reuse existing workspace crates only.
 
 ### 10.3 `unsafe`
 
-`alloy-runtime` remains `#![forbid(unsafe_code)]`. This RFC introduces no `unsafe`.
+`#![forbid(unsafe_code)]` preserved.
 
 ### 10.4 Feature flags
 
-No new features. DAG store compiles with default features.
+Optional `template-json` only if JSON embeds are used; default off.
 
 ---
 
 ## 11. Testing Strategy
 
-### 11.1 Unit — validation (one test per rule)
+### 11.1 Validation (one test per variant)
 
-| Test | Asserts |
-| --- | --- |
-| `validate_empty_dag` | `Empty` |
-| `validate_node_id_mismatch` | `NodeIdMismatch` |
-| `validate_missing_endpoint` | `MissingEndpoint` |
-| `validate_self_loop` | `SelfLoop` |
-| `validate_cycle` | `Cycle` |
-| `validate_unreachable` | `Unreachable` |
-| `validate_capability_required_*` | each LLM kind |
-| `validate_capability_forbidden_*` | adapter/structural |
-| `validate_approval_rules` | GateHuman / others |
-| `validate_cache_key_forbidden` | Verify*/Gate |
-| `validate_budget_rules` | zero / non-zero |
-| `validate_retry_incoherent` | escalate mismatch / factor |
-| `validate_gates_absent` | `GatesAbsent` |
-| `validate_aggregate_*` | Aggregate rules |
-| `validate_duplicate_edge` | `DuplicateEdge` |
-| `validate_non_linear` | diamond topology → `NonLinearTopology` |
-| `validate_hint_inert` | Hint-only extras still pass when chain valid |
-| `validate_timeout_zero` | `TimeoutZero` |
-| `validate_generation_zero` | `InvalidGeneration` |
+Including: `MultipleRoots`, `DuplicateGateId`, `DuplicateEdge` with kind, `RetryIncoherence` each reason, `NonLinearTopology` diamond, dual-edge chain **passes**, Hint missing endpoint → `MissingEndpoint`, Hint-only extras on valid chain pass.
 
 ### 11.2 Template golden tests
 
-| Test | Asserts |
-| --- | --- |
-| `repair_local_diagnostic_topology` | 4 nodes, kinds order, both Data+Sequence edges, gate present |
-| `repair_local_diagnostic_validates` | `validate` Ok with default opts |
-| `catalog_closed` | `TemplateId` parse rejects unknown names |
+`repair_local_diagnostic_topology`, `repair_local_diagnostic_validates` (default opts), `catalog_parses`, unknown name parse.
 
 ### 11.3 Persistence
 
-| Test | Asserts |
-| --- | --- |
-| `dag_put_get_round_trip` | serde equality on fields |
-| `dag_put_overwrite_same_id` | generation 2 replaces generation 1 in `get` |
-| `dag_delete_idempotent` | second delete Ok |
-| `list_by_session_order` | ordering contract |
+Round-trip with `PartialEq` or canonical JSON; `put_if_generation` insert/update/conflict; overwrite generation; corrupt JSON → `Corrupt`; `Closed` after close; negative generation column → `Corrupt`.
 
 ### 11.4 Planner
 
-| Test | Asserts |
-| --- | --- |
-| `plan_selects_repair_local_diagnostic` | default selection |
-| `load_template_unknown` | `UnknownTemplate` |
-| `llm_stub_disabled` | all methods → `PlannerDisabled` |
-| `replan_bumps_generation` | g→g+1, same dag_id, new node ids |
-| `replan_generation_mismatch` | concurrent put detected |
-| `plan_emits_plan_produced` | event payload has snapshot_artifact |
-| `snapshot_artifact_round_trip` | CAS get deserializes TaskDag |
+Plan uses pre-minted `dag_id`; second plan → `GenerationMismatch`; replan bumps; `DagBusy` when Running; event failure after CAS returns `Event` leaving row; stub disabled; PlanProduced has `run_id` + sorted `node_ids`; snapshot round-trip.
+
+**Test doubles:** crate-private in-memory `DagStore`/`ArtifactStore`/`EventSink` permitted under `#[cfg(test)]` inside `alloy-runtime`. Integration tests use real `AlloyStorage` tempdirs.
 
 ### 11.5 Cache
 
-| Test | Asserts |
-| --- | --- |
-| `cache_key_stable` | same materials → same key |
-| `cache_key_changes_with_input` | different input digest → different key |
-| `replan_does_not_copy_old_cache_keys` | new keys after replan |
+`cache_key_stable` golden digest; content-only (identity fields excluded); day-1 template nodes have `cache_key.is_none()`.
 
-### 11.6 Negative DAG shapes
+### 11.6 Readiness fixtures (unit, pure)
 
-Fixtures for: diamond fan-out, Aggregate without Data preds, adapter with capability, GateHuman without approval, cycle of 3, Hint to missing node.
+Skipped satisfies Sequence not Data; Data requires output_ref.
 
-### 11.7 Cross-subsystem (SQLite)
+### 11.7 Cross-subsystem SQLite
 
-Follow `crates/alloy-tools/tests/cross_subsystem.rs` precedent: open real `AlloyStorage`, `TemplatePlanService::plan`, `dags().get`, reopen storage, `get` again, fetch `snapshot_artifact` via `artifacts().get`, parse events for `PlanProduced`. Prefer `crates/alloy-runtime/tests/dag_persistence.rs` or an extension under `alloy-tools/tests/` if multi-crate wiring is needed — **normative location:** `crates/alloy-runtime/tests/dag_store_sqlite.rs` plus a note that a tools-level cross test MAY be added when 0010 lands.
+`crates/alloy-runtime/tests/dag_store_sqlite.rs`: open storage, plan, get, reopen, get, fetch snapshot, read PlanProduced. Optional race: concurrent `put_if_generation` conflicts.
 
 ---
 
 ## 12. MVP vs Deferred
 
-### 12.1 MVP (this RFC)
+### 12.1 MVP
 
-- Semantics + validation + `DagStore` + closed templates + `TemplatePlanService` + LLM Stub  
-- Linear-MVP enforcement  
-- PlanProduced + CAS snapshot audit  
-- Cache-key builder (no persistent cache map)  
-- Retry **declarations** only  
+Semantics, validation, CAS store, closed template, `TemplatePlanService`, stub, mandatory PlanProduced, linear honesty, cache builder without day-1 hits.
 
 ### 12.2 Deferred
 
 | Item | Owner |
 | --- | --- |
-| Ready-queue execution, retries sleep, adapters | **RFC-0010** |
-| Persistent cache map / CachedHit application | **RFC-0010** |
-| Capability workers / prompts | **RFC-0013** |
-| LLM planner default | Production / eval gate (V2) |
-| Hint edge semantics | Future RFC |
-| File leases / parallel Analyze | Future RFC after eval |
-| CLI template override UX | **RFC-0015** |
-| Multi-version `dag_blobs` history table | Playbook amendment if needed |
-| Additional templates beyond `repair_local_diagnostic` | Amendment to this RFC |
+| Execution / adapters / cache hit apply | **RFC-0010** |
+| Workers | **RFC-0013** |
+| LLM planner default | Production / eval |
+| Hint semantics / leases / parallel Analyze | Future |
+| CLI | **RFC-0015** |
+| Extra templates | Amendment |
 
 ---
 
 ## 13. Acceptance Criteria
 
-Every criterion is independently testable.
+Every criterion is independently testable by a named test or mechanical check.
 
-| # | Criterion | Test / proof |
+| # | Criterion | Proof |
 | --- | --- | --- |
-| 1 | Merged `dag::types` unchanged (no field reshape) | diff + compile |
-| 2 | `DagValidator` covers V1–V16 with distinct variants | §11.1 |
-| 3 | Adapter nodes reject `Some(capability)` | unit |
-| 4 | LLM nodes require correct capability ids | unit |
-| 5 | GateHuman requires approval; verify nodes forbid cache_key | unit |
-| 6 | `repair_local_diagnostic` golden topology | golden test |
-| 7 | Catalog closed; unknown name → `UnknownTemplate` | unit |
-| 8 | `TemplatePlanService::plan` persists DAG and CAS snapshot | sqlite test |
-| 9 | Replan overwrites `dag_blobs`, bumps generation, emits PlanProduced | unit/integration |
-| 10 | Prior generation recoverable via PlanProduced → CAS, not via dag_blobs | integration |
-| 11 | `DisabledLlmPlanService` returns `PlannerDisabled` | unit |
-| 12 | Hint edges inert under validation | unit |
-| 13 | Linear diamond rejected when `enforce_linear_mvp` | unit |
-| 14 | Concurrency-safety section states unmodelled + MUST NOT concurrent-sched | doc review §6.5 |
-| 15 | Cache key stable/deterministic | unit |
-| 16 | RetryPolicy validated; execution not implemented here | unit + code ownership |
-| 17 | `AlloyStorage::dags()` returns working store | sqlite test |
-| 18 | No new crate; `forbid(unsafe_code)` preserved | Cargo.toml + attrs |
-| 19 | Never writes `.env` | review |
-| 20 | Cross-subsystem persist/reload through real SQLite | §11.7 |
-| 21 | `PlanService` is the sole topology mutator API shipped | API review |
-| 22 | Data-flow contract documented; retries allocate new artifact ids | §5.5 + 0002 put semantics |
+| 1 | `dag::types` field shapes unchanged | diff |
+| 2 | Validator implements V1–V16 with distinct variants (V17 is Hint exclusion, no variant); first error wins | unit suite |
+| 3 | Adapter rejects capability; LLM requires Appendix A ids | unit |
+| 4 | Non-gate approval forbidden; gates unique | unit |
+| 5 | `repair_local_diagnostic` golden + **validates with dual edges** | golden |
+| 6 | Catalog closed; `OnceLock` parses | `catalog_parses` |
+| 7 | `plan` uses `PlanContext.dag_id` (no second mint) | unit |
+| 8 | Insert-only second plan → `GenerationMismatch` | unit |
+| 9 | Replan CAS bump + PlanProduced | unit |
+| 10 | Prior gen via snapshot artifact, not dag_blobs history | integration |
+| 11 | Events required; append failure → `PlanError::Event` with row retained | unit |
+| 12 | `DisabledLlmPlanService` → `PlannerDisabled` | unit |
+| 13 | Hint inert; dual-kind edges allowed by V8/V15 | unit |
+| 14 | Diamond → `NonLinearTopology` | unit |
+| 15 | `put_if_generation` conflict under concurrency | sqlite test |
+| 16 | `DagBusy` when replan while Running | unit |
+| 17 | Corrupt blob → `Corrupt` | unit |
+| 18 | `Closed` after `AlloyStorage::close` | unit |
+| 19 | Day-1 `cache_key` all `None` | golden |
+| 20 | Content-digest cache golden | unit |
+| 21 | Skipped ≠ Data satisfaction | unit |
+| 22 | `PlanProducedPayload.run` via `NewSessionEvent.run_id` | unit |
+| 23 | No `.env` writes in planner/dag modules | `rg` CI check |
+| 24 | `forbid(unsafe_code)`; no sixth crate | attrs / Cargo.toml |
+| 25 | Cross-subsystem persist/reload | §11.7 |
+| 26 | `StorageMetricsSnapshot` fields unchanged | type compile / diff |
+| 27 | Scheduler write contract documented (`put_if_generation`) | §6.4–6.6 present |
 
 ---
 
@@ -1386,10 +1328,8 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 
 ## 15. Open Questions
 
-Only genuine unresolved implementation questions. Settled decisions are not reopened.
-
-1. **Optional `idx_dag_blobs_session` migration:** Day-1 `list_by_session` MAY full-scan. If profiling shows need, ship additive schema v4 index in the implementation PR (playbook-compatible) — track in the PR description if added.
-2. **Profile-driven budget overrides at instantiate:** MVP uses template constants (§5.7.2). Wiring `BudgetPolicy` → per-node budgets may land with RFC-0015; until then constants stand.
+1. **Optional `idx_dag_blobs_session`:** additive schema v4 if `list_by_session` profiling requires it.
+2. **Profile-driven per-node budgets:** MVP constants in §5.7.2 until 0015 wires overrides.
 
 ---
 
@@ -1399,45 +1339,44 @@ Only genuine unresolved implementation questions. Settled decisions are not reop
 
 | Slice | Work | Effort |
 | --- | --- | --- |
-| A | `DagValidationError` + `DagValidator` + unit tests per rule | 0.75–1.0 pd |
-| B | `DagStore` / `SqliteDagStore` + `AlloyStorage::dags` + round-trip tests | 0.75–1.0 pd |
-| C | Templates + catalog + instantiate + golden topology | 0.75–1.0 pd |
-| D | Envelopes + cache-key builder + I/O helpers | 0.5–0.75 pd |
-| E | `PlanService` / `TemplatePlanService` / LLM Stub + replan + PlanProduced | 1.0–1.5 pd |
-| F | Cross-subsystem SQLite test + docs polish | 0.5–0.75 pd |
+| A | Validator + error enums + ordered rules + tests | 1.0–1.25 pd |
+| B | `SqliteDagStore` + `put_if_generation` + AlloyStorage wiring | 1.0–1.25 pd |
+| C | Templates + catalog OnceLock + golden | 0.5–0.75 pd |
+| D | Envelopes + cache helpers | 0.5 pd |
+| E | `TemplatePlanService` + stub + PlanProduced + CAS/event failure paths | 1.25–1.75 pd |
+| F | Cross-subsystem + polish | 0.5–0.75 pd |
 
 ### 16.2 Expected effort
 
-**4–6 person-days** total (matches index).
+**4–6 person-days** (upper end if CAS/event paths expand tests).
 
 ### 16.3 Dependencies / sequencing
 
-1. Merged RFC-0001 + RFC-0002 on `main` (satisfied). `ReplanReason` / event sink from merged 0003 are available on `main` for planner emission.
-2. Implement A→B→C→D→E→F; C may overlap B after A.
-3. RFC-0010 may start against validated DAG fixtures once A+C land.
-4. RFC-0013 PlanningWorker binds to `PlanService` after E.
+1. Merged 0001–0003 on `main` (satisfied) — especially `RunGoalRecord.dag_id`.
+2. A→B→C→D→E→F.
+3. 0010 may start against fixtures after A+C.
 
 ### 16.4 Risk notes
 
 | Risk | Mitigation |
 | --- | --- |
-| Overwrite semantics surprise auditors | §5.6.3 CAS snapshot + PlanProduced mandatory |
-| Concurrent scheduler assumed safe | §6.5 explicit MUST NOT + V15 linear enforcement |
-| Adapter nodes carrying model tiers | §3.3 + validation BudgetNotZero / CapabilityForbidden |
-| Dual ownership of Ready | Planner leaves Pending; 0010 owns Ready (§5.3) |
+| Scheduler/replan clobber | `DagBusy` + `put_if_generation` |
+| Audit gap | Required EventSink + Event error after CAS |
+| Dual-edge vs linearity | V15 counts distinct nodes |
+| Cache footgun | Day-1 enable_cache false |
 
 ---
 
 ## Appendix A — Capability id constants (normative)
 
-| Constant string | Used by `NodeKind` |
+| String | `NodeKind` |
 | --- | --- |
 | `planning` | `Plan` |
 | `repair` | `Analyze` |
 | `edit` | `Edit` |
 | `review` | `Review` |
 
-## Appendix B — `PlanProduced` payload schema (normative)
+## Appendix B — `PlanProducedPayload` wire example
 
 ```json
 {
@@ -1451,20 +1390,25 @@ Only genuine unresolved implementation questions. Settled decisions are not reop
 }
 ```
 
-On replan, `replan: true` and `reason` is the serialized `ReplanReason`.
+Replan: `"replan": true`, `"reason": { "user_requested": null }` or tagged `failure_ir` per `ReplanReason` serde (`snake_case`, externally tagged).
 
-## Appendix C — What RFC-0010 may assume (checklist)
+## Appendix C — What RFC-0010 may assume / MUST do
 
-- DAG passed validator with linear+gates opts for MVP templates  
-- At most one Ready under MVP topologies when pred rules applied  
-- `RetryPolicy` / `cache_key` / `approval` fields populated per §3.3 / §5.7  
-- `input_ref` always present; `output_ref` set only on success/cache-hit  
-- Hint edges ignorable  
-- Concurrent multi-node execution **not** authorized by RFC-0009  
+**May assume:** plan-path DAGs validated; MVP linear templates; contracts in §3.3; Hint ignorable; concurrent multi-node exec **not** authorized.
 
-## Appendix D — What RFC-0013 may assume (checklist)
+**MUST:**
 
-- Analyze/Edit/Review/Plan capability presence table (§3.3)  
-- `NodeInputEnvelope` / `NodeOutputEnvelope` schema_version = 1  
-- Planning path calls `PlanService`, not a second topology API  
-- No `follow_up_nodes` channel exists or will be added here  
+- Use `put_if_generation(..., Some(generation))` for checkpoints
+- Stop on `Conflict` after replan
+- Rewrite final `input_ref` per §5.3.0
+- Enforce output_ref invariants on Succeeded/CachedHit
+- Enforce GateHuman timeout using `timeout_ms`
+- Apply Data vs Sequence satisfaction per §5.3.1
+- Ignore `model_tier` / budgets on adapter nodes for routing
+
+## Appendix D — What RFC-0013 may assume
+
+- Capability presence table §3.3 / Appendix A  
+- Envelope schema_version = 1; `Goal` embedded  
+- Planning calls `PlanService` with `RunGoalRecord.dag_id` in `PlanContext`  
+- No `follow_up_nodes`  
