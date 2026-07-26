@@ -45,7 +45,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | [RFC-0003](./RFC-0003-session-manager-run-controller.md) | Session Manager & RunController | Implemented | 3–5 pd | 0001, 0002 | **Yes** |
 | [RFC-0004](./RFC-0004-observability-cost-metering.md) | Observability & Cost Metering | Implemented | 2–4 pd | 0001, 0002 | **Yes** |
 | [RFC-0005](./RFC-0005-sandbox-broker.md) | Sandbox Broker | Implemented | 5–8 pd | 0001 | **Yes** |
-| [RFC-0006](./RFC-0006-mcp-host-builtins.md) | MCP Host & In-Process Builtins | Draft | 5–8 pd | 0001, 0005 | **Yes** |
+| [RFC-0006](./RFC-0006-mcp-host-builtins.md) | MCP Host & In-Process Builtins | Draft | 8–9.5 pd | 0001, 0005 | **Yes** |
 | [RFC-0007](./RFC-0007-model-router-provider.md) | Model Router & Provider | Draft | 4–6 pd | 0001, 0004 | **Yes** |
 | [RFC-0008](./RFC-0008-edit-engine.md) | EditEngine (TextPatch + Git Checkpoint) | Draft | 4–6 pd | 0001, 0005, 0006 | **Yes** |
 | [RFC-0009](./RFC-0009-task-dag-templates-planner.md) | Task DAG, Templates & Planner | Draft | 4–6 pd | 0001, 0002 | **Yes** |
