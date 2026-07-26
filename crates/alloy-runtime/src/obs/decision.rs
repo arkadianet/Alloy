@@ -16,7 +16,7 @@ use crate::runtime::RuntimeHandle;
 use crate::storage::{AlloyStorage, SessionRows};
 use crate::types::budget::ModelTier;
 use crate::types::diagnostic::ErrorClass;
-use crate::types::ids::{Digest, EventSeq, NodeId, ProviderId, RunId, SessionId};
+use crate::types::ids::{Digest, EndpointId, EventSeq, NodeId, ProviderId, RunId, SessionId};
 
 /// Kind of attributable decision (wire: snake_case / externally tagged Custom).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,8 +57,23 @@ pub struct DecisionRecord {
     pub prompt_body: Option<String>,
 }
 
+/// Provenance of a recorded USD amount on a model call (RFC-0007 amendment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelUsdSource {
+    /// Provider reported dollars (reserved; MVP openai-compatible does not use).
+    ProviderReported,
+    /// Operator price table × known tokens (RFC-0007 §5.8).
+    OperatorPriceTable,
+}
+
 /// In-memory model-call record.
+///
+/// Additive attribution fields (`endpoint_id`, `model`, …) are RFC-0007.
+/// Marked `#[non_exhaustive]` so later additive fields do not break consumers;
+/// construct via [`ModelCallRecord::new`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ModelCallRecord {
     /// Session.
     pub session: SessionId,
@@ -86,6 +101,152 @@ pub struct ModelCallRecord {
     pub content_hash: Option<Digest>,
     /// Optional prompt body.
     pub prompt_body: Option<String>,
+    /// Endpoint catalog id that served the call (RFC-0007).
+    pub endpoint_id: Option<EndpointId>,
+    /// Operator-configured wire model id (BYOM; never a core constant).
+    pub model: Option<String>,
+    /// Event seq of the successful route decision, when recorded.
+    pub route_event_seq: Option<EventSeq>,
+    /// USD provenance when `usd` is `Some`.
+    pub usd_source: Option<ModelUsdSource>,
+    /// Provider finish reason (redacted/truncated at router boundary).
+    pub finish_reason: Option<String>,
+    /// Provider request id (redacted/truncated at router boundary).
+    pub provider_request_id: Option<String>,
+}
+
+impl ModelCallRecord {
+    /// Required identity fields; all other fields start as `None` / defaults.
+    #[must_use]
+    pub fn new(session: SessionId, provider_id: ProviderId, model_tier: ModelTier) -> Self {
+        Self {
+            session,
+            run: None,
+            node: None,
+            provider_id,
+            model_tier,
+            input_tokens: None,
+            output_tokens: None,
+            usd: None,
+            duration_ms: None,
+            confidence: None,
+            error_class: None,
+            content_hash: None,
+            prompt_body: None,
+            endpoint_id: None,
+            model: None,
+            route_event_seq: None,
+            usd_source: None,
+            finish_reason: None,
+            provider_request_id: None,
+        }
+    }
+
+    /// Set the optional run id.
+    #[must_use]
+    pub fn run(mut self, run: RunId) -> Self {
+        self.run = Some(run);
+        self
+    }
+
+    /// Set the optional node id.
+    #[must_use]
+    pub fn node(mut self, node: NodeId) -> Self {
+        self.node = Some(node);
+        self
+    }
+
+    /// Set token counts (`None` means unknown — never fabricate zeros).
+    #[must_use]
+    pub fn tokens(mut self, input: Option<u64>, output: Option<u64>) -> Self {
+        self.input_tokens = input;
+        self.output_tokens = output;
+        self
+    }
+
+    /// Set optional USD.
+    #[must_use]
+    pub fn usd(mut self, usd: Option<f64>) -> Self {
+        self.usd = usd;
+        self
+    }
+
+    /// Set optional duration in milliseconds.
+    #[must_use]
+    pub fn duration_ms(mut self, ms: Option<u64>) -> Self {
+        self.duration_ms = ms;
+        self
+    }
+
+    /// Set optional confidence.
+    #[must_use]
+    pub fn confidence(mut self, c: Option<f32>) -> Self {
+        self.confidence = c;
+        self
+    }
+
+    /// Set optional error class.
+    #[must_use]
+    pub fn error_class(mut self, c: Option<ErrorClass>) -> Self {
+        self.error_class = c;
+        self
+    }
+
+    /// Set optional content hash.
+    #[must_use]
+    pub fn content_hash(mut self, h: Option<Digest>) -> Self {
+        self.content_hash = h;
+        self
+    }
+
+    /// Set optional prompt body.
+    #[must_use]
+    pub fn prompt_body(mut self, body: Option<String>) -> Self {
+        self.prompt_body = body;
+        self
+    }
+
+    /// Set optional endpoint id.
+    #[must_use]
+    pub fn endpoint_id(mut self, id: Option<EndpointId>) -> Self {
+        self.endpoint_id = id;
+        self
+    }
+
+    /// Set optional wire model id.
+    #[must_use]
+    pub fn model(mut self, model: Option<String>) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Set optional route decision event seq.
+    #[must_use]
+    pub fn route_event_seq(mut self, seq: Option<EventSeq>) -> Self {
+        self.route_event_seq = seq;
+        self
+    }
+
+    /// Set optional USD provenance.
+    #[must_use]
+    pub fn usd_source(mut self, source: Option<ModelUsdSource>) -> Self {
+        self.usd_source = source;
+        self
+    }
+
+    /// Set optional finish reason.
+    #[must_use]
+    pub fn finish_reason(mut self, reason: Option<String>) -> Self {
+        self.finish_reason = reason;
+        self
+    }
+
+    /// Set optional provider request id.
+    #[must_use]
+    pub fn provider_request_id(mut self, id: Option<String>) -> Self {
+        self.provider_request_id = id;
+        self
+    }
 }
 
 /// In-memory tool-call record.
@@ -205,6 +366,18 @@ pub(crate) struct ModelCallPayload {
     pub(crate) error_class: Option<ErrorClass>,
     pub(crate) content_hash: Option<Digest>,
     pub(crate) prompt_body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) endpoint_id: Option<EndpointId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) route_event_seq: Option<EventSeq>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) usd_source: Option<ModelUsdSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_request_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -354,6 +527,12 @@ fn model_to_payload(rec: ModelCallRecord) -> Result<serde_json::Value, ObsError>
         error_class: rec.error_class,
         content_hash: rec.content_hash,
         prompt_body: rec.prompt_body,
+        endpoint_id: rec.endpoint_id,
+        model: rec.model,
+        route_event_seq: rec.route_event_seq,
+        usd_source: rec.usd_source,
+        finish_reason: rec.finish_reason,
+        provider_request_id: rec.provider_request_id,
     };
     serde_json::to_value(payload).map_err(|e| ObsError::Internal(e.to_string()))
 }
@@ -587,45 +766,41 @@ mod tests {
 
     #[test]
     fn record_model_call_rejects_non_finite_usd() {
-        let rec = ModelCallRecord {
-            session: SessionId::new(),
-            run: None,
-            node: None,
-            provider_id: ProviderId::new("p").unwrap(),
-            model_tier: ModelTier::Standard,
-            input_tokens: Some(1),
-            output_tokens: Some(1),
-            usd: Some(f64::NAN),
-            duration_ms: None,
-            confidence: None,
-            error_class: None,
-            content_hash: None,
-            prompt_body: None,
-        };
+        let rec = ModelCallRecord::new(
+            SessionId::new(),
+            ProviderId::new("p").unwrap(),
+            ModelTier::Standard,
+        )
+        .tokens(Some(1), Some(1))
+        .usd(Some(f64::NAN));
         let err = prepare_model_call(rec, RetentionPolicy::defaults()).unwrap_err();
         assert!(matches!(err, ObsError::Invalid(msg) if msg.contains("usd")));
     }
 
     #[test]
     fn worker_metrics_confidence_option() {
-        let rec = ModelCallRecord {
-            session: SessionId::new(),
-            run: None,
-            node: None,
-            provider_id: ProviderId::new("p").unwrap(),
-            model_tier: ModelTier::Standard,
-            input_tokens: Some(1),
-            output_tokens: Some(1),
-            usd: None,
-            duration_ms: None,
-            confidence: None,
-            error_class: None,
-            content_hash: None,
-            prompt_body: None,
-        };
+        let rec = ModelCallRecord::new(
+            SessionId::new(),
+            ProviderId::new("p").unwrap(),
+            ModelTier::Standard,
+        )
+        .tokens(Some(1), Some(1));
         let v = model_to_payload(rec).unwrap();
         assert!(v.get("confidence").is_none() || v["confidence"].is_null());
         let parsed: ModelCallPayload = serde_json::from_value(v).unwrap();
         assert!(parsed.confidence.is_none());
+    }
+
+    #[test]
+    fn model_call_payload_omits_new_fields_when_none() {
+        let rec = ModelCallRecord::new(
+            SessionId::new(),
+            ProviderId::new("p").unwrap(),
+            ModelTier::Standard,
+        );
+        let v = model_to_payload(rec).unwrap();
+        assert!(v.get("endpoint_id").is_none());
+        assert!(v.get("model").is_none());
+        assert!(v.get("usd_source").is_none());
     }
 }

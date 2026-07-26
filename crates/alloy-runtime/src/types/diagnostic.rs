@@ -80,6 +80,20 @@ pub enum ErrorClass {
     Cancelled,
 }
 
+/// Whether RFC-0010 may admit a backoff retry for this failure (RFC-0007 §8.4.1).
+///
+/// Lives with [`ErrorClass`] / [`FailureIr`]. Router `classify_*` helpers return it;
+/// they do not own the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryDisposition {
+    /// Eligible for scheduler retry when also listed in `retry_on`.
+    Retryable,
+    /// Must not be retried by default.
+    #[default]
+    NonRetryable,
+}
+
 /// Structured node failure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FailureIr {
@@ -87,6 +101,9 @@ pub struct FailureIr {
     pub node: NodeId,
     /// Error class.
     pub error_class: ErrorClass,
+    /// Retry disposition for RFC-0010 admission (default [`RetryDisposition::NonRetryable`]).
+    #[serde(default)]
+    pub retry: RetryDisposition,
     /// Related diagnostics.
     pub diagnostics: Vec<DiagnosticEvent>,
     /// Free-form notes.

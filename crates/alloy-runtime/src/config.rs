@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::RuntimeError;
+use crate::types::budget::BudgetPolicy;
 
 /// Paths consulted by [`RuntimeConfig::load`].
 #[derive(Debug, Clone)]
@@ -88,17 +89,19 @@ pub struct RuntimeConfig {
     pub retain_tool_bodies: bool,
     /// Default run timeout.
     pub run_timeout: Duration,
+    /// From profile `[budgets]`, or [`BudgetPolicy::default`] when the table is absent (RFC-0007 §7.6).
+    pub budget_policy: BudgetPolicy,
 }
 
 #[derive(Debug, Deserialize)]
 struct ProfileFile {
     #[serde(default)]
-    budgets: BudgetsSection,
+    budgets: Option<BudgetsSection>,
     #[serde(default)]
     observability: ObservabilitySection,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct BudgetsSection {
     #[serde(default = "default_usd")]
     max_usd_per_run: f64,
@@ -112,18 +115,6 @@ struct ObservabilitySection {
     retain_full_prompts: bool,
     #[serde(default)]
     retain_tool_bodies: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct RouterFile {
-    #[serde(default)]
-    provider: std::collections::BTreeMap<String, ProviderSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProviderSection {
-    #[serde(default)]
-    api_key_env: Option<String>,
 }
 
 fn default_usd() -> f64 {
@@ -144,6 +135,9 @@ impl RuntimeConfig {
     ///
     /// Profile/router path overrides (`ALLOY_PROFILE`, `ALLOY_ROUTER`) are applied when
     /// constructing paths via [`ConfigPaths::for_workspace`], not by parsing `.env` files.
+    ///
+    /// Router file existence is required; full `router.toml` schema ownership is RFC-0007
+    /// ([`crate::router::RouterConfig`]). This loader does **not** parse `[provider.*]`.
     pub fn load(paths: ConfigPaths) -> Result<Self, RuntimeError> {
         if !paths.profile.is_file() {
             return Err(RuntimeError::Config(format!(
@@ -166,33 +160,22 @@ impl RuntimeConfig {
                 paths.example_env.display()
             )));
         }
-        let router_raw = std::fs::read_to_string(&paths.router).map_err(|e| {
-            RuntimeError::Config(format!("read router {}: {e}", paths.router.display()))
+        // Existence only — schema validation is `RouterConfig::load` (RFC-0007).
+        let _ = std::fs::metadata(&paths.router).map_err(|e| {
+            RuntimeError::Config(format!("stat router {}: {e}", paths.router.display()))
         })?;
-        let router: RouterFile = toml::from_str(&router_raw).map_err(|e| {
-            RuntimeError::Config(format!("parse router {}: {e}", paths.router.display()))
-        })?;
-
-        for (name, provider) in &router.provider {
-            if let Some(key) = &provider.api_key_env {
-                match std::env::var(key) {
-                    Ok(v) if !v.is_empty() => {}
-                    _ => {
-                        tracing::warn!(
-                            provider = %name,
-                            env_key = %key,
-                            hint = %paths.example_env.display(),
-                            "router api_key_env is unset; provider calls will fail later (RFC-0007). Alloy never writes .env"
-                        );
-                    }
-                }
-            }
-        }
 
         let (data_dir, data_dir_rule) = resolve_data_dir(&paths)?;
 
-        let _ = profile.budgets.max_usd_per_run;
-        let _ = profile.budgets.max_tokens_per_run;
+        let budget_policy = match profile.budgets {
+            Some(b) => {
+                let mut policy = BudgetPolicy::default();
+                policy.max_usd_per_run = b.max_usd_per_run;
+                policy.max_tokens_per_run = b.max_tokens_per_run;
+                policy
+            }
+            None => BudgetPolicy::default(),
+        };
 
         Ok(Self {
             data_dir,
@@ -203,6 +186,7 @@ impl RuntimeConfig {
             retain_full_prompts: profile.observability.retain_full_prompts,
             retain_tool_bodies: profile.observability.retain_tool_bodies,
             run_timeout: Duration::from_secs(60 * 30),
+            budget_policy,
         })
     }
 }
@@ -264,9 +248,26 @@ retain_tool_bodies = false
         fs::write(
             &router,
             r#"
-[provider.default]
+[policy]
+default_tier = "standard"
+
+[[providers]]
+id = "openai-compatible-main"
 kind = "openai_compatible"
+base_url = "https://api.example.com/v1/"
 api_key_env = "ALLOY_API_KEY"
+
+[[providers.endpoints]]
+id = "team-workhorse"
+display_name = "Workhorse"
+model = "REPLACE_ME"
+tiers = ["standard"]
+max_context = 200000
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
+
+[capability_tiers]
+repair = "standard"
 "#,
         )
         .unwrap();
@@ -291,7 +292,58 @@ api_key_env = "ALLOY_API_KEY"
         })
         .unwrap();
         assert_eq!(cfg.data_dir_rule, "<workspace>/.alloy");
+        assert_eq!(cfg.budget_policy.max_usd_per_run, 1.0);
+        assert_eq!(cfg.budget_policy.max_tokens_per_run, 100);
+        assert_eq!(cfg.budget_policy.max_parallel_nodes, 1);
         assert_eq!(fs::read_to_string(&dotenv).unwrap(), "SENTINEL=1\n");
+    }
+
+    #[test]
+    fn load_does_not_parse_provider_peek() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
+        // Garbage that would fail a provisional [provider.*] schema is fine —
+        // load only requires the file to exist.
+        fs::write(&router, "# not parsed by RuntimeConfig::load\n").unwrap();
+        let cfg = RuntimeConfig::load(ConfigPaths {
+            profile,
+            router,
+            example_env: example,
+            data_dir: None,
+            workspace_root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap();
+        assert!(cfg.router_path.is_file());
+    }
+
+    #[test]
+    fn absent_budgets_uses_policy_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profiles/default.toml");
+        fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        fs::write(
+            &profile,
+            r#"
+[profile]
+id = "default"
+[observability]
+retain_full_prompts = false
+"#,
+        )
+        .unwrap();
+        let router = dir.path().join("router.toml");
+        fs::write(&router, "# exists\n").unwrap();
+        let example = dir.path().join("example.env");
+        fs::write(&example, "ALLOY_API_KEY=\n").unwrap();
+        let cfg = RuntimeConfig::load(ConfigPaths {
+            profile,
+            router,
+            example_env: example,
+            data_dir: None,
+            workspace_root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap();
+        assert_eq!(cfg.budget_policy, BudgetPolicy::default());
     }
 
     #[test]
