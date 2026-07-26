@@ -23,3 +23,6 @@ predicates = { workspace = true }
 tempfile = { workspace = true }
 alloy-runtime = { workspace = true }
 tokio = { workspace = true }
+# host_e2e only: SIGTERM the real binary without `unsafe`
+# (Child::kill sends SIGKILL and would skip the drain path under test).
+rustix = { workspace = true }
