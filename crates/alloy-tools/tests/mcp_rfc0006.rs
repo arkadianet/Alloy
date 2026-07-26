@@ -40,12 +40,46 @@ struct Fixture {
     profile: SandboxProfile,
 }
 
+/// Ensures a permissive `tracing` default is installed globally exactly once
+/// per process, before any test can race to be the first caller of a given
+/// `tracing` callsite.
+///
+/// Background: `tracing-core` caches each callsite's `Interest` (its "is
+/// anyone listening" decision) the first time that callsite ever fires,
+/// process-wide, and reuses the cached answer forever after -- it is not
+/// re-evaluated per test or per thread. All `#[tokio::test]`s in this binary
+/// run concurrently (each on its own OS thread, current-thread runtime) and
+/// share that one process-wide cache. If some *other* test is the first to
+/// reach a `tracing::warn!` call site while it has no subscriber installed
+/// (the common case -- only `permission_deny_warns_prepare_and_broker`
+/// installs one), that callsite's `Interest` latches to "never" for the rest
+/// of the process, and `permission_deny_warns_prepare_and_broker`'s own
+/// later `warn!` calls at the same call site are silently dropped before
+/// they ever reach its capturing layer, regardless of the thread-local
+/// subscriber it installs. Installing a permissive (always-interested)
+/// global default here -- before any test body can reach a call site --
+/// wins that race deterministically instead of leaving it to the OS
+/// scheduler, without touching product code or product-visible behaviour
+/// (this default is a no-op sink; it never delivers events anywhere).
+fn ensure_permissive_global_tracing_default() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // An empty `Registry` unconditionally returns `Interest::always()`
+        // for every callsite (see `tracing_subscriber::registry::Registry`)
+        // and its `event()` is a no-op, so this only widens the cached
+        // interest -- it never observes or alters what any test's own
+        // subscriber sees.
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 impl Fixture {
     fn new() -> Self {
         Self::with_profile(|_| {})
     }
 
     fn with_profile(tweak: impl FnOnce(&mut SandboxProfile)) -> Self {
+        ensure_permissive_global_tracing_default();
         let root = tempfile::tempdir().unwrap();
         let jail = root.path().join("jail");
         std::fs::create_dir_all(&jail).unwrap();
