@@ -184,7 +184,6 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
 #[cfg(feature = "http-provider")]
 pub(crate) fn error_chain_contains_tls(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut stack: Vec<&(dyn std::error::Error + 'static)> = vec![err];
-    let mut certificate_debug_signal = false;
     while let Some(current) = stack.pop() {
         if current.downcast_ref::<rustls::Error>().is_some() {
             return true;
@@ -197,11 +196,8 @@ pub(crate) fn error_chain_contains_tls(err: &(dyn std::error::Error + 'static)) 
         if let Some(src) = current.source() {
             stack.push(src);
         }
-        let debug = format!("{current:?}");
-        certificate_debug_signal |=
-            debug.contains("InvalidCertificate") || debug.contains("UnknownIssuer");
     }
-    certificate_debug_signal
+    false
 }
 
 impl From<RouterError> for RuntimeError {

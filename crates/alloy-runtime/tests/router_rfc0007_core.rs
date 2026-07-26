@@ -188,11 +188,11 @@ async fn complete_budget_recheck_denies() {
     let budget = decisions.last().expect("completion budget decision");
     assert_eq!(budget.kind, DecisionKind::Budget);
     assert_eq!(budget.metadata["budget_check"], "tokens_exhausted");
-    assert!(budget.metadata.get("in_flight_at_complete").is_some());
-    assert!(budget.metadata.get("in_flight_at_route").is_none());
+    assert!(budget.metadata.get("in_flight_at_route").is_some());
     let metrics = router.metrics();
     assert_eq!(metrics.routes_ok, 1);
-    assert_eq!(metrics.completes_err, 0);
+    // BudgetDenied + AlreadyCompleted both return Err from complete (§9.3).
+    assert_eq!(metrics.completes_err, 2);
     assert_eq!(metrics.in_flight, 0);
 }
 
@@ -291,7 +291,16 @@ async fn no_endpoint_records_model_route() {
         .expect("no endpoint decision");
     assert_eq!(decision.kind, DecisionKind::ModelRoute);
     assert_eq!(decision.metadata["error"], "no_endpoint");
+    assert_eq!(decision.metadata["capability"], "repair");
+    assert_eq!(decision.metadata["capability_mapped"], true);
+    assert_eq!(decision.metadata["tier"], "standard");
+    assert_eq!(decision.metadata["tier_source"], "capability_map");
+    assert_eq!(decision.metadata["provider_id"], "provider");
+    assert_eq!(decision.metadata["requires_tools"], true);
+    assert_eq!(decision.metadata["requires_structured_output"], true);
+    assert!(decision.metadata.get("in_flight_at_route").is_some());
     assert!(decision.metadata.get("endpoint_id").is_none());
+    assert!(decision.metadata.get("model").is_none());
     assert_eq!(router.metrics().routes_no_endpoint, 1);
 }
 
@@ -471,6 +480,13 @@ async fn host_cancel_returns_cancelled() {
     let routed = router.route(route_request(run)).await.expect("route");
 
     cancellation.cancel();
+    assert!(matches!(
+        router.complete(&routed, prompt()).await,
+        Err(RouterError::Cancelled)
+    ));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    // Pre-cancel rejects before ticket consume, so a second attempt is still
+    // Cancelled (not AlreadyCompleted).
     assert!(matches!(
         router.complete(&routed, prompt()).await,
         Err(RouterError::Cancelled)

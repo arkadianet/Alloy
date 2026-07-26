@@ -647,10 +647,11 @@ impl ModelRouter for TomlModelRouter {
             Ok(_) => {
                 self.metrics.completes_ok.fetch_add(1, Ordering::Relaxed);
             }
-            Err(RouterError::Provider(_) | RouterError::Internal(_)) => {
+            Err(_) => {
+                // §9.3: every returned complete Err increments completes_err
+                // (not future drops — those never reach this match).
                 self.metrics.completes_err.fetch_add(1, Ordering::Relaxed);
             }
-            Err(_) => {}
         }
         result
     }

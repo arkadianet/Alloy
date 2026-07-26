@@ -80,6 +80,14 @@ pub struct CapabilityRegistry {
 }
 ```
 
+**RFC-0007 amendment (error / metering ownership):** when a worker surfaces a
+router/provider failure, it MUST map through `classify_router_error` (or
+`classify_provider_error`) into `FailureIr { error_class, retry, … }` so RFC-0010
+preserves retry disposition. `TomlModelRouter` is the sole producer of
+`DecisionLog::record_model_call` and `SharedCostMeter::add_model_usage` for LLM
+completions it owns; workers MUST NOT also call `add_model_usage` /
+`add_worker_metrics` / `record_model_call` for that same completion.
+
 MVP catalog (V2 §9.3): Planning, Repair, Edit, Review (optional).
 
 ## Internal architecture

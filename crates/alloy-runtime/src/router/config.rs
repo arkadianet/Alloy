@@ -511,4 +511,20 @@ Repair = "standard"
         );
         assert!(RouterConfig::from_str("test", &zero).is_err());
     }
+
+    #[test]
+    fn toml_rejects_duplicate_provider_endpoint_ids() {
+        let duplicate = sample("https://example.com").replace(
+            "id = \"endpoint\"\ndisplay_name = \"Endpoint\"\nmodel = \"configured-model\"\ntiers = [\"standard\"]\nmax_context = 1024",
+            "id = \"endpoint\"\ndisplay_name = \"Endpoint\"\nmodel = \"configured-model\"\ntiers = [\"standard\"]\nmax_context = 1024\n\n[[providers.endpoints]]\nid = \"endpoint\"\ndisplay_name = \"Dup\"\nmodel = \"other\"\ntiers = [\"economy\"]\nmax_context = 1024",
+        );
+        assert!(RouterConfig::from_str("test", &duplicate).is_err());
+    }
+
+    #[test]
+    fn toml_rejects_empty_model() {
+        let empty_model =
+            sample("https://example.com").replace("model = \"configured-model\"", "model = \"\"");
+        assert!(RouterConfig::from_str("test", &empty_model).is_err());
+    }
 }
