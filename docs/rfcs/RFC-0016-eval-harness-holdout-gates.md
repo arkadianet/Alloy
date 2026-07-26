@@ -189,7 +189,8 @@ NOT appear in `alloy-eval` imports.
 | `ModelEndpoint`, `Health`, `PromptPack`, `ChatMessage`, `ChatRole`, `ToolChoice`, `ResponseFormat` | `alloy_runtime::{...}` | Unchanged; also reachable as `alloy_runtime::router::{...}` |
 | `ProviderId`, `CapabilityId`, `NodeId`, `EndpointId`, `Digest` | `alloy_runtime::{ProviderId, CapabilityId, NodeId, EndpointId, Digest}` | Fingerprints / attribution |
 | `ProviderError`, `RouterError`, `classify_provider_error` | `alloy_runtime::{ProviderError, RouterError, classify_provider_error}` | Scripted error outcomes and trajectory classification |
-| `CostMeter`, `CostSnapshot`, `ModelCallRecord`, `ModelUsdSource`, `RetentionPolicy` | `alloy_runtime::{CostMeter, CostSnapshot, ModelCallRecord, ModelUsdSource, RetentionPolicy}` | Internal cost aggregation and RFC-0004-shaped trajectory metadata |
+| `CostMeter`, `CostSnapshot`, `ModelUsdSource` | `alloy_runtime::{CostMeter, CostSnapshot, ModelUsdSource}` | Internal cost aggregation and trajectory USD attribution |
+| `ModelCallRecord`, `RetentionPolicy` | `alloy_runtime::{ModelCallRecord, RetentionPolicy}` | Posture/reference only for Day-1; eval constructs neither type |
 | `ModelTier` | `alloy_runtime::ModelTier` | Optional attribution in reports |
 | `DiagnosticEvent`, `ErrorClass` | `alloy_runtime::{DiagnosticEvent, ErrorClass}` | Outcome classification helpers |
 | `hash_prompt`, `Digest::sha256` | `alloy_runtime::hash_prompt`, `alloy_runtime::Digest` | Fingerprint construction |
@@ -702,7 +703,9 @@ For a non-Error run, `model_calls` is the number of
 `ModelProvider::complete` invocations attempted, whether each invocation
 returned `Ok` or `Err`; increment with `saturating_add(1)` on `u32`. A
 pre-call request mismatch does not increment it because no invocation was
-attempted.
+attempted. For cancellation races, "attempted" is exactly the §3.16 dispatch
+boundary: entering the complete-racing `tokio::select!`, whether or not the
+complete future is polled.
 
 For each successful `Ok(ModelResponse)`, add each present usage side to that
 side's running `u64` total with `saturating_add`. If any successful response
@@ -1481,6 +1484,9 @@ impl EvalHarness {
     ) -> Result<LoadedFixture, EvalError>;
 
     /// Run one fixture to a terminal outcome.
+    ///
+    /// This public convenience API does not return trajectories; use a batch
+    /// report (and optional artifacts) when trajectory retention is required.
     pub async fn run_fixture(&self, fixture: &mut LoadedFixture) -> FixtureOutcome;
 
     /// Run all fixtures in `set` with isolation + bounded concurrency.
@@ -1525,6 +1531,32 @@ impl LoadedFixture {
     pub fn post_repair(&self) -> &CargoJsonRecording;
 }
 ```
+
+The trajectory-carrying result is crate-private and has this exact shape:
+
+```rust
+pub(crate) struct FixtureRunOutput {
+    pub outcome: FixtureOutcome,
+    pub trajectories: Vec<EvalTrajectoryRecord>,
+}
+
+impl EvalHarness {
+    pub(crate) async fn run_fixture_collect(
+        &self,
+        fixture: &mut LoadedFixture,
+    ) -> FixtureRunOutput;
+}
+```
+
+The public `run_fixture` signature MUST remain
+`-> FixtureOutcome`; it MAY implement the convenience path by awaiting
+`run_fixture_collect`, returning `.outcome`, and discarding `.trajectories`.
+It does not expose trajectory retention to its caller. Retention is exposed
+through `run_batch` / `run_holdout_with_naive` reports and, when configured,
+their optional artifacts. The internal batch path MUST use
+`run_fixture_collect`: `run_batch` concatenates every returned
+`.trajectories` vector, and the control and naive paths do the same
+independently for `run_holdout_with_naive`.
 
 `EvalHarnessConfig` MUST NOT implement `Default` because `fixture_root` is
 required. Both constructors set `max_concurrency = 4`,
@@ -1719,9 +1751,10 @@ The fixture-local pending representation MAY defer `fixture_status` and
 values. `request_content_hash` MUST equal
 `request_fingerprint.as_digest().clone()` — the SHA-256 of the exact canonical
 `CompletionRequest` JSON from §3.3 — and MUST NOT be recomputed from a
-different message-only encoding. `duration_ms` MUST contain the observed
-elapsed wall time for the attempt (saturating at `u64::MAX` when converting
-from a wider duration).
+different message-only encoding. Before any determinism scrub, every Day-1
+retained row MUST set `duration_ms = Some(elapsed_ms)`, where `elapsed_ms` is
+the observed wall time for that attempt, saturating at `u64::MAX` when
+converting from a wider duration.
 
 Eval-local ownership is mandatory because Day-1 offline CI MUST NOT require
 session/storage bring-up, synthetic eval sessions must not pollute production
@@ -1732,20 +1765,33 @@ The retention posture is the RFC-0004 `RetentionPolicy::defaults()` posture:
 
 - `EvalTrajectoryRecord` MUST NOT have a `prompt_body` field. Prompt and
   request bodies MUST NOT appear under another field name.
-- Response text and structured response bodies MUST NOT be retained. On
-  success, only status, usage, duration, and a finite derived USD value are
-  eligible.
-- On provider `Err`, token and USD fields are `None`, `complete_ok = false`,
-  and `error_class = Some(classify_provider_error(&error).class)`. On `Ok`,
-  `complete_ok = true` and `error_class = None`. If cancellation wins after
-  dispatch but before a result, the attempted call is retained with
-  `complete_ok = false`, unknown token/USD fields, and
-  `error_class = Some(ErrorClass::Cancelled)`.
-- `usd_source` MUST be `Some(ModelUsdSource::OperatorPriceTable)` exactly when
-  `usd` is `Some`, otherwise `None`. Trajectory USD is uncalibrated analysis
-  input and MUST NOT be published as a claim; ADR F-08 and §3.8 still apply.
+- Response text and structured response bodies MUST NOT be retained.
+- Population of result-dependent fields MUST follow this exact table:
+
+| Path | `input_tokens` / `output_tokens` | `usd` / `usd_source` | `complete_ok` | `error_class` |
+| --- | --- | --- | --- | --- |
+| `Ok(ModelResponse)` | That response's usage sides (`None` stays `None`) | Derive via the §3.8 inline formula on the bound endpoint; if the result is `Some(finite)`, set `usd_source = Some(ModelUsdSource::OperatorPriceTable)`, otherwise set both to `None` | `true` | `None` |
+| Provider `Err` | `None` / `None` | `None` / `None` | `false` | `Some(classify_provider_error(&err).class)` |
+| Cancel after dispatch | `None` / `None` | `None` / `None` | `false` | `Some(ErrorClass::Cancelled)` — **not** via `classify_provider_error` |
+
+Trajectory USD therefore uses the exact uncalibrated derivation and validity
+rules in §3.8. To prevent fixture and trajectory arithmetic from drifting,
+`trajectory` or `cost_claim` MAY expose a shared
+`pub(crate) fn derive_eval_usd(...)`; it MUST NOT be publicly re-exported.
+
 - Day-1 MUST set `model_tier = ModelTier::Standard` and `confidence = None`.
   It MUST NOT infer routing policy from endpoint tier lists.
+
+**Dispatch boundary (normative):** Entering the `tokio::select!` that races the
+`complete` future against cancellation counts as dispatch, even if the
+`complete` future has not yet been polled when the cancellation branch wins.
+At entry, the driver MUST increment `model_calls` with `saturating_add(1)` and
+start the attempt timer. If cancellation wins that select, it MUST emit exactly
+one Cancelled row with the table shape above and
+`duration_ms = Some(elapsed_ms)`, drop the complete future, and not await or
+perform further fixture work. If cancellation wins at any checkpoint before
+that select is entered, the turn was not dispatched: there is no
+`model_calls` increment and no trajectory row for that turn.
 
 `EvalReport.trajectories` and `naive_trajectories` are intentionally unbounded
 relative to the current batch. This is acceptable for the MVP corpus of
@@ -2163,10 +2209,14 @@ normally and receive their own results.
    for that turn. Subsequent turns MUST NOT run; no candidate exists, so the
    patch oracle MUST NOT run and execution continues through the missing
    repair text and criterion paths.
-3. The driver MUST call `provider.complete(&bound_endpoint, request).await`.
-   The exact bound endpoint id is mandatory. It MUST start an observational
-   timer immediately before dispatch and append one fixture-local
-   `EvalTrajectoryRecord` after the attempt resolves, including `Err`.
+3. The driver MUST construct
+   `provider.complete(&bound_endpoint, request)` with the exact bound endpoint
+   id, start an observational timer, and enter the `tokio::select!` that races
+   that future with cancellation. Entry into this select is dispatch under
+   §3.16: increment `model_calls` there, even if cancellation wins before the
+   complete future's first poll. Append exactly one fixture-local
+   `EvalTrajectoryRecord` after `Ok`, provider `Err`, or post-dispatch
+   cancellation. A pre-select cancellation checkpoint appends none.
 4. Every `ProviderError` returned by `complete` is that turn’s `Err`; it MUST
    not be silently converted into an empty response.
 5. A `ProviderError::Internal` whose message (before §5.2.3 bounding of any
@@ -2217,11 +2267,14 @@ provider error before repair, missing repair text, wrong repair text, patch
 mismatch, or criterion miss is `Fail`. All criteria passing without a harness
 fault is `Pass`.
 
-Every invocation counted by `FixtureOutcome.model_calls` MUST have exactly one
-fixture-local trajectory row; a pre-call request mismatch has neither. A
-cancellation that wins after dispatch is still an attempted invocation and
-MUST retain the cancelled row described in §3.16. The driver buffers these
-rows until the fixture reaches `Pass | Fail | Error`, then stamps that final
+Every dispatched invocation MUST have exactly one fixture-local trajectory
+row; a pre-call request mismatch and a cancellation that wins before the
+dispatch select have neither. On finalization,
+`FixtureOutcome.model_calls` MUST equal the fixture trajectory row count
+converted to `u32` with saturation. A cancellation that wins after dispatch
+is still an attempted invocation and MUST retain the cancelled row described
+in §3.16. The driver buffers these rows in `FixtureRunOutput.trajectories`
+until the fixture reaches `Pass | Fail | Error`, then stamps that final
 `fixture_status` and `compile_clean` onto every row for the fixture. Response
 text MUST be discarded after the existing repair candidate logic consumes it;
 it MUST NOT enter the trajectory buffer.
@@ -2525,8 +2578,12 @@ non-Error outcome contains exactly the manifest-listed criteria in manifest
 order.
 
 Aggregation MUST also concatenate, not discard, the finalized fixture-local
-trajectory buffers. `EvalReport.trajectories` is sorted by `fixture_id` and
-then `turn_id.ordinal`; ties preserve validated manifest order.
+trajectory buffers returned by `run_fixture_collect`.
+`EvalReport.trajectories` MUST use a stable sort by
+`fixture_id.as_str()` ascending, then `turn_id.ordinal` ascending. Ties are
+broken by manifest turn declaration order through that stable sort. The
+implementation MUST compare `FixtureId::as_str()` and MUST NOT require or add
+an `Ord` implementation on `FixtureId`.
 `run_holdout_with_naive` applies the same rule independently to
 `naive_trajectories`. Aggregate metric computation MUST NOT consume, filter,
 or mutate either trajectory vector.
@@ -2541,7 +2598,7 @@ The normative determinism comparison MUST deep-clone reports and scrub:
 
 - `run_id`;
 - every control and naive fixture’s `wall_ms`;
-- every control and naive trajectory’s `duration_ms`;
+- set every control and naive trajectory’s `duration_ms = None`;
 - `metrics.latency_p50_ms` and `metrics.latency_p95_ms`;
 - the same two fields inside both sides of `naive_comparison`.
 
@@ -2641,7 +2698,7 @@ It MUST NOT silently skip.
 | Isolation | One mutable, one-shot `LoadedFixture` + one `ScriptedProvider` + one outcome per task |
 | Concurrency | `tokio::spawn` up to `max_concurrency` via a semaphore |
 | Shared state | Harness config is read-only/`Clone`; no shared provider across fixtures |
-| Ordering | Report `fixtures` sorted by `fixture_id.as_str()`; trajectories sorted by fixture id then turn ordinal (§5.7) |
+| Ordering | Report `fixtures` sorted by `fixture_id.as_str()`; trajectories use the stable key `fixture_id.as_str()` ascending, then `turn_id.ordinal` ascending, with manifest declaration order breaking ties (§5.7) |
 | Cancellation | If config has a token, `tokio::select!` observes it at every checkpoint below. A cancelled fixture is `Error` with `ReportError { kind: "cancelled", message: "fixture cancelled" }`, never Fail. |
 | Join/panic | Every `JoinError`, including a task panic, becomes that fixture’s `Error` with `ReportError.kind == "join_failed"` and a bounded message. Batch siblings continue. |
 | Empty set | Successful enumeration with zero fixtures returns `Ok(EvalReport)` with empty vectors, report toolchain versions `"none"`, rate metrics `Unmeasured(EmptySample)`, and `gate = Some(failed result)`. |
@@ -2666,6 +2723,12 @@ outcome under §3.7.1: criteria and measurement option fields are cleared,
 while `model_calls` preserves the saturated number of complete invocations
 already attempted. No further script install, complete, patch, or criterion
 work may continue after cancellation wins.
+
+For the complete race, "attempted" is pinned to the §3.16 dispatch boundary:
+the pre-select checkpoint winning means no call increment and no row; once the
+select is entered, `model_calls` is incremented and cancellation winning emits
+one finalized Cancelled trajectory row even when the complete future was never
+polled. The losing future is dropped and MUST NOT be awaited further.
 
 The harness MUST retain fixture identity beside each `JoinHandle`, so a join
 failure can be attributed without losing report ordering. Panic payload debug
@@ -2862,11 +2925,15 @@ When configured, the layout is:
 ```
 
 `<run_id>` is the report's internally generated UUID v4 string. The JSONL file
-contains `report.trajectories` in report order, one serialized
-`EvalTrajectoryRecord` JSON object per line. Comparison-run
-`naive_trajectories` remain separately embedded in `EvalReport`; the single
-artifact file does not flatten the two sides and thereby lose side identity.
-No prompt or response body may appear in the file.
+is control-only: it contains `report.trajectories` in report order and MUST
+NOT contain any row from `naive_trajectories`. An empty control vector creates
+a zero-byte empty file. Otherwise, each line is exactly one serialized
+`EvalTrajectoryRecord` JSON object followed by one `\n`, including the final
+line. A serde serialization failure maps to `EvalError::Json`; directory,
+file, and write failures map to `EvalError::Io`. Comparison-run
+`naive_trajectories` remain separately embedded in `EvalReport`; the artifact
+does not flatten the two sides and thereby lose side identity. No prompt or
+response body may appear in the file.
 
 `max_retained_runs` is a `u32`, defaults to `32`, and MUST be at least `1`
 even when `artifact_dir` is `None`. After successfully writing the current
@@ -2900,7 +2967,7 @@ eval sessions must not pollute production event stores.
 | `NetworkRequired` | harness | Offline violation | no | pub | fixture/batch `Error` |
 | `FixtureNotFound` | harness | Missing `<set>/<id>` directory or its `manifest.toml` | no | pub | `load_fixture` / batch `Err` |
 | `Io` | fs / trajectory artifact writer | OS I/O | no | pub | fixture `Error` or batch `Err` |
-| `Json` | serde | Parse | no | pub | `Error` |
+| `Json` | serde | Parse or trajectory serialization | no | pub | `Error` |
 | `Stub` | control_plane driver | Deferred surface invoked | no | pub | fixture `Error` |
 | `Internal` | miscellaneous | Invariant | no | pub | `Error` |
 
@@ -3250,7 +3317,9 @@ non-hex input specifically with `EvalError::Manifest`.
 | `wall_latency_remain_observational` | Unscrubbed wall/latency may differ and are still populated for operators |
 | `trajectories_survive_batch_and_group` | Golden batch retains one control row per attempted model call; `group_trajectories_by` works for fixture id and model tier; row count matches the sum of `model_calls` |
 | `trajectories_omit_prompt_and_response_bodies` | Serialized trajectories contain no `prompt_body` or response-body key and no sentinel prompt/response text; the struct exposes no `prompt_body` field |
-| `trajectory_disk_rotation` | With `artifact_dir = Some(tempdir)` and `max_retained_runs = 2`, a third successful run deletes the oldest sibling by mtime, retains the new run, and writes valid one-row-per-line JSONL |
+| `trajectory_sort_key_is_pinned` | Control and naive rows use a stable `fixture_id.as_str()` ascending, then `turn_id.ordinal` ascending sort; equal keys retain manifest declaration order without requiring `FixtureId: Ord` |
+| `trajectory_jsonl_contract` | Empty control rows produce a zero-byte file; every non-empty line is one object plus `\n`; naive rows are excluded; serde failures map to `Json` and filesystem/write failures to `Io` |
+| `trajectory_disk_rotation` | With `artifact_dir = Some(tempdir)` and `max_retained_runs = 2`, a third successful run deletes the oldest sibling by mtime, retains the new run, and writes valid one-row-per-line control-only JSONL |
 | `trajectory_duration_is_scrubbed` | Full determinism scrub clears `duration_ms` in both control and naive trajectory vectors |
 
 ### 11.5 Gate and naive comparison
@@ -3295,6 +3364,7 @@ non-hex input specifically with `EvalError::Manifest`.
 | `run_holdout_with_naive_requires_holdout_thresholds` | A `Train` threshold set returns the exact `EvalError::Manifest` message before any enumeration, load, or model call, and produces no partial report |
 | `loaded_fixture_is_one_shot` | Immutable getters expose validated data; second mutable run returns `fixture_already_run` Error |
 | `cancel_checkpoints_cover_driver` | Cancellation before loop/each complete/patch/criteria produces canonical cancelled Error |
+| `cancel_after_dispatch_retains_exact_row` | In-`src/` harness test forces cancellation to win after the complete-racing select is entered but before the complete future is polled: `model_calls == 1`, exactly one row exists, token and USD/source fields are `None`, `complete_ok == false`, `error_class == Some(ErrorClass::Cancelled)` without provider classification, `duration_ms` is `Some`, `fixture_status == Error`, and `compile_clean == None`; a pre-select cancellation produces zero calls and rows |
 
 ### 11.7 Offline CI job
 
@@ -3443,10 +3513,12 @@ Every criterion is independently testable.
 | 78 | Dogfood unlock additionally requires every control fixture in the green holdout run to use `FixtureDriverKind::ControlPlane`; Day-1 cannot satisfy it because the Stub `Error` fires `FixtureErrorsPresent` | Appendix B; §5.9 Stub test |
 | 79 | The Day-1 naive comparison is documented as gate-arithmetic verification only and is not citable as thesis evidence | §12.1 review |
 | 80 | Direct scripted execution is documented as bypassing the router meter/decision bridges and therefore producing no automatic `DecisionLog` model-call records | §2.3 review; source-path review |
-| 81 | Every attempted Day-1 complete, including provider Err and post-dispatch cancellation, survives as one finalized eval-local trajectory; control and naive vectors remain separate and groupable | `trajectories_survive_batch_and_group`; cancellation tests |
+| 81 | Every attempted Day-1 complete on a report-producing batch path, including provider Err and post-dispatch cancellation, survives as one finalized eval-local trajectory; control and naive vectors remain separate and groupable | `trajectories_survive_batch_and_group`; cancellation tests |
 | 82 | Trajectory report and JSONL serialization retain only metadata, request digest, and outcome measurements; prompt and response bodies are structurally absent | `trajectories_omit_prompt_and_response_bodies`; public API review |
 | 83 | `artifact_dir = None` is report-only; configured artifact failures return `EvalError::Io`; successful writes retain at most `max_retained_runs >= 1` by mtime without deleting the current run | `trajectory_disk_rotation`; config validation tests |
 | 84 | Trajectory durations are observational and both control and naive values are included in the normative determinism scrub | `trajectory_duration_is_scrubbed`; determinism tests |
+| 85 | Cancellation after dispatch increments `model_calls` and emits exactly one row with unknown token/USD/source fields, `complete_ok = false`, direct `ErrorClass::Cancelled`, `duration_ms = Some`, final `fixture_status = Error`, and `compile_clean = None`; cancellation before the dispatch select increments neither, and finalized row count matches saturated `model_calls` | `cancel_after_dispatch_retains_exact_row` |
+| 86 | Control and naive trajectories are each stably sorted by `fixture_id.as_str()` ascending and then `turn_id.ordinal` ascending, with manifest declaration order breaking ties and no `FixtureId: Ord` requirement | `trajectory_sort_key_is_pinned` |
 
 ---
 
@@ -3494,8 +3566,11 @@ notes, not permission to vary this RFC:
 | B | Manifest schema/loader, license, fixture layout, recordings types | 1–1.25 pd |
 | C | SkeletonReplay + NaiveBaseline drivers, goldens (train+holdout) | 1–1.5 pd |
 | D | Metrics aggregator, cost claim envelope, gate + naive math | 0.75–1 pd |
-| E | Batch harness, concurrency/determinism tests, offline CI + tree lint | 0.75–1 pd |
+| E | Batch harness, trajectory retention + JSONL/rotation, concurrency/determinism tests, offline CI + tree lint | 1–1.5 pd |
 | F | Holdout hygiene workflow, docs polish, Stub control-plane surface | 0.5–0.75 pd |
+
+The trajectory carrier, population/cancellation matrix, stable sorting, and
+control-only artifact tests add approximately **0.25–0.5 pd** to slice E.
 
 ### 16.2 Expected effort
 
