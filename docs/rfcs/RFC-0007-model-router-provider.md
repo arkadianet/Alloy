@@ -1112,11 +1112,13 @@ type AppendNotify = Result<(), ObsError>; // oneshot payload
 // 3. If meter present: add_model_usage synchronously (no .await before this).
 // 4. let (tx, rx) = oneshot::channel::<AppendNotify>();
 // 5. supervisor.pending.fetch_add(1, SeqCst);
+//    let _pending_guard = scopeguard/Drop that fetch_sub+notify if not disarmed
+//    (panic-safe: append-task unwind MUST still decrement pending);
 // 6. tokio::spawn({
 //        let res = decision_log.record_model_call(rec).await;
 //        if res.is_err() { obs_record_errors.fetch_add(1, Relaxed); }
 //        let _ = tx.send(res.map(|_| ()));
-//        supervisor.pending.fetch_sub(1, SeqCst);
+//        disarm guard / pending.fetch_sub(1, SeqCst);
 //        supervisor.done_notify.notify_waiters();
 //    });
 //    // Runtime owns the task; supervisor does NOT hold JoinHandle.
