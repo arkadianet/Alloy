@@ -2103,7 +2103,7 @@ Every criterion is independently testable.
 | 6 | No `match` on vendor brands for model selection | §11.6 |
 | 7 | Route records `DecisionKind::ModelRoute` | integration |
 | 8 | Complete records `ModelCall` with honest Option tokens | integration |
-| 9 | Omitted/malformed provider usage → token fields None; query invariant holds | `usage_unknown_roundtrip_query` / `malformed_usage_keeps_completion` |
+| 9 | Omitted/malformed provider usage → token fields None; query invariant holds | `usage_unknown_roundtrip_query` / `maps_content_parts_refusal_and_malformed_usage` |
 | 10 | `add_model_usage` called on complete outcomes when meter injected | unit/integration |
 | 11 | USD only when prices + tokens known; else None; `usd_source` set only for derived USD | price + ModelCall tests |
 | 12 | No cost marketing strings in router module | grep / review |
@@ -2137,16 +2137,16 @@ Every criterion is independently testable.
 
 Merge only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
 
-- [ ] Architecture compliance: **PASS**
-- [ ] RFC acceptance criteria: **100% satisfied**
-- [ ] Unit tests: **passing**
-- [ ] Integration tests: **passing** (if applicable)
-- [ ] Documentation: **complete**
-- [ ] Public APIs: **reviewed and stable**
-- [ ] Clippy: **clean**
-- [ ] Formatting: **clean**
-- [ ] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
-- [ ] Code review: **approved**
+- [x] Architecture compliance: **PASS**
+- [x] RFC acceptance criteria: **100% satisfied**
+- [x] Unit tests: **passing**
+- [x] Integration tests: **passing** (if applicable)
+- [x] Documentation: **complete**
+- [x] Public APIs: **reviewed and stable**
+- [x] Clippy: **clean**
+- [x] Formatting: **clean**
+- [x] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
+- [x] Code review: **approved**
 
 ---
 
