@@ -298,7 +298,7 @@ impl TryFrom<ProviderFile> for ProviderConfig {
             id,
             kind,
             base_url: file.base_url,
-            api_key_env: file.api_key_env,
+            api_key_env: file.api_key_env.trim().to_owned(),
             endpoints,
         })
     }
@@ -362,7 +362,7 @@ fn validate_provider(provider: &ProviderConfig) -> Result<(), RouterError> {
     if provider.api_key_env.trim().is_empty() {
         return Err(config_error("api_key_env must not be empty"));
     }
-    if !is_valid_env_var_name(&provider.api_key_env) {
+    if !is_valid_env_var_name(provider.api_key_env.trim()) {
         return Err(config_error(
             "api_key_env must not contain '=' or NUL (std::env::var would panic)",
         ));
@@ -373,9 +373,9 @@ fn validate_provider(provider: &ProviderConfig) -> Result<(), RouterError> {
     Ok(())
 }
 
-/// Reject names that panic inside `std::env::var` on Unix (`=` or NUL bytes).
+/// Reject names that panic inside `std::env::var` (`=` or NUL bytes).
 fn is_valid_env_var_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains('=') && !name.contains('\0')
+    !name.contains('=') && !name.contains('\0')
 }
 
 fn validate_endpoint(endpoint: &EndpointConfig) -> Result<(), RouterError> {
@@ -516,6 +516,7 @@ Repair = "standard"
         let bad_key = sample("https://example.com")
             .replace("api_key_env = \"MODEL_KEY\"", "api_key_env = \"BAD=NAME\"");
         assert!(RouterConfig::from_str("test", &bad_key).is_err());
+        assert!(!is_valid_env_var_name("BAD\0NAME"));
 
         let zero = sample("https://example.com").replace(
             "default_tier = \"standard\"",

@@ -350,6 +350,19 @@ pub(crate) fn redact_and_truncate(value: &str, max_bytes: usize) -> String {
     truncate_utf8_bytes(&redact_secrets(value), max_bytes)
 }
 
+/// Replace an exact API-key substring before pattern redaction / truncation.
+pub(crate) fn scrub_exact_secret(value: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        value.to_owned()
+    } else {
+        value.replace(secret, "[REDACTED]")
+    }
+}
+
+pub(crate) fn scrub_redact_and_truncate(value: &str, secret: &str, max_bytes: usize) -> String {
+    redact_and_truncate(&scrub_exact_secret(value, secret), max_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

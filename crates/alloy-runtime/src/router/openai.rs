@@ -18,8 +18,8 @@ use super::http_client::ValidatedHttpClient;
 use super::secret::SecretString;
 use super::traits::ModelProvider;
 use super::types::{
-    redact_and_truncate, ChatMessage, CompletionRequest, Health, ModelEndpoint, ModelResponse,
-    ResponseFormat, Usage,
+    redact_and_truncate, scrub_exact_secret, scrub_redact_and_truncate, ChatMessage,
+    CompletionRequest, Health, ModelEndpoint, ModelResponse, ResponseFormat, Usage,
 };
 
 const RESPONSE_BODY_MAX_BYTES: usize = 1024 * 1024;
@@ -136,7 +136,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
         if !status.is_success() {
             return Err(map_status(status.as_u16(), &bytes, self.api_key.expose()));
         }
-        map_success(&bytes, &request.response_format)
+        map_success(&bytes, &request.response_format, self.api_key.expose())
     }
 
     async fn health(&self) -> Health {
@@ -182,6 +182,7 @@ struct WireResponseFormat {
 #[derive(Deserialize)]
 pub(crate) struct WireResponse {
     id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_choices")]
     choices: Option<Vec<WireChoice>>,
     #[serde(default, deserialize_with = "deserialize_optional_usage")]
     usage: Option<WireUsage>,
@@ -190,6 +191,7 @@ pub(crate) struct WireResponse {
 
 #[derive(Deserialize)]
 pub(crate) struct WireChoice {
+    #[serde(default, deserialize_with = "deserialize_optional_object")]
     message: Option<WireMessage>,
     finish_reason: Option<String>,
 }
@@ -255,6 +257,47 @@ where
     }))
 }
 
+fn deserialize_optional_choices<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<WireChoice>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            let mut choices = Vec::with_capacity(items.len());
+            for item in items {
+                if !item.is_object() {
+                    return Err(serde::de::Error::custom("choice entries must be objects"));
+                }
+                choices.push(
+                    serde_json::from_value(item)
+                        .map_err(|error| serde::de::Error::custom(error.to_string()))?,
+                );
+            }
+            Ok(Some(choices))
+        }
+        Some(_) => Err(serde::de::Error::custom("choices must be an array")),
+    }
+}
+
+fn deserialize_optional_object<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) if value.is_object() => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|error| serde::de::Error::custom(error.to_string())),
+        Some(_) => Err(serde::de::Error::custom("field must be a JSON object")),
+    }
+}
+
 enum BodyReadError {
     TooLarge,
     Request(reqwest::Error),
@@ -277,27 +320,15 @@ fn map_status(status: u16, body: &[u8], api_key: &str) -> ProviderError {
         429 => ProviderError::RateLimit,
         400 if context_length_signal(body) => ProviderError::ContextLength,
         _ => {
-            // Bound work before scrubbing; final message is ≤512 UTF-8 bytes.
-            let prefix = utf8_prefix(body, 4 * 1024);
-            let body = String::from_utf8_lossy(prefix);
-            let scrubbed = if api_key.is_empty() {
-                body.into_owned()
-            } else {
-                body.replace(api_key, "[REDACTED]")
-            };
+            // Scrub the exact key against the full capped body first so a key
+            // longer than any display prefix cannot leak via truncation.
+            let body = String::from_utf8_lossy(body);
+            let scrubbed = scrub_exact_secret(&body, api_key);
             ProviderError::HttpStatus {
                 status,
                 message: redact_and_truncate(&scrubbed, 512),
             }
         }
-    }
-}
-
-fn utf8_prefix(bytes: &[u8], max_bytes: usize) -> &[u8] {
-    let end = max_bytes.min(bytes.len());
-    match std::str::from_utf8(&bytes[..end]) {
-        Ok(_) => &bytes[..end],
-        Err(error) => &bytes[..error.valid_up_to()],
     }
 }
 
@@ -324,18 +355,31 @@ fn context_length_signal(body: &[u8]) -> bool {
     .any(|signal| lowercase.contains(signal))
 }
 
-fn map_success(body: &[u8], format: &ResponseFormat) -> Result<ModelResponse, ProviderError> {
+fn map_success(
+    body: &[u8],
+    format: &ResponseFormat,
+    api_key: &str,
+) -> Result<ModelResponse, ProviderError> {
     let root_value: Value = serde_json::from_slice(body).map_err(|error| {
-        ProviderError::MalformedResponse(redact_and_truncate(&error.to_string(), 512))
+        ProviderError::MalformedResponse(scrub_redact_and_truncate(
+            &error.to_string(),
+            api_key,
+            512,
+        ))
     })?;
-    if !root_value.is_object() {
+    let Some(root_object) = root_value.as_object() else {
         return Err(ProviderError::MalformedResponse(
             "response root must be a JSON object".into(),
         ));
-    }
-    let root: WireResponse = serde_json::from_value(root_value).map_err(|error| {
-        ProviderError::MalformedResponse(redact_and_truncate(&error.to_string(), 512))
-    })?;
+    };
+    let root: WireResponse =
+        serde_json::from_value(Value::Object(root_object.clone())).map_err(|error| {
+            ProviderError::MalformedResponse(scrub_redact_and_truncate(
+                &error.to_string(),
+                api_key,
+                512,
+            ))
+        })?;
     if root.error.is_some_and(|value| value.is_object()) {
         return Err(ProviderError::MalformedResponse(
             "successful response contains an error object".into(),
@@ -358,7 +402,7 @@ fn map_success(body: &[u8], format: &ResponseFormat) -> Result<ModelResponse, Pr
         choice
             .finish_reason
             .as_deref()
-            .map(|value| redact_and_truncate(value, 128))
+            .map(|value| scrub_redact_and_truncate(value, api_key, 128))
     };
     let structured = if matches!(format, ResponseFormat::JsonObject) {
         text.as_deref()
@@ -384,7 +428,7 @@ fn map_success(body: &[u8], format: &ResponseFormat) -> Result<ModelResponse, Pr
         provider_request_id: root
             .id
             .as_deref()
-            .map(|value| redact_and_truncate(value, 256)),
+            .map(|value| scrub_redact_and_truncate(value, api_key, 256)),
         finish_reason,
     })
 }
@@ -453,7 +497,7 @@ mod tests {
             "choices":[{"message":{"content":[{"text":"a"},{"kind":"ignored"},{"text":"b"}]},"finish_reason":"stop"}],
             "usage":{"prompt_tokens":-1,"completion_tokens":1.5}
         }"#;
-        let response = map_success(parts, &ResponseFormat::Text).unwrap();
+        let response = map_success(parts, &ResponseFormat::Text, "").unwrap();
         assert_eq!(response.text.as_deref(), Some("ab"));
         assert_eq!(response.usage.input_tokens, None);
         assert_eq!(response.usage.output_tokens, None);
@@ -462,7 +506,7 @@ mod tests {
             "choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
             "usage":"not-an-object"
         }"#;
-        let response = map_success(bad_usage_container, &ResponseFormat::Text).unwrap();
+        let response = map_success(bad_usage_container, &ResponseFormat::Text, "").unwrap();
         assert_eq!(response.text.as_deref(), Some("ok"));
         assert_eq!(response.usage.input_tokens, None);
         assert_eq!(response.usage.output_tokens, None);
@@ -471,26 +515,26 @@ mod tests {
             "choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
             "usage":[1,2]
         }"#;
-        let response = map_success(usage_array, &ResponseFormat::Text).unwrap();
+        let response = map_success(usage_array, &ResponseFormat::Text, "").unwrap();
         assert_eq!(response.usage.input_tokens, None);
 
         let refusal =
             br#"{"choices":[{"message":{"content":null,"refusal":"no"},"finish_reason":"stop"}]}"#;
-        let response = map_success(refusal, &ResponseFormat::Text).unwrap();
+        let response = map_success(refusal, &ResponseFormat::Text, "").unwrap();
         assert_eq!(response.text, None);
         assert_eq!(response.finish_reason.as_deref(), Some("refusal"));
 
         let invalid_content =
             br#"{"choices":[{"message":{"content":123},"finish_reason":"stop"}]}"#;
         assert!(matches!(
-            map_success(invalid_content, &ResponseFormat::Text),
+            map_success(invalid_content, &ResponseFormat::Text, ""),
             Err(ProviderError::MalformedResponse(_))
         ));
 
         let array_root =
             br#"[null,[{"message":{"content":"x"},"finish_reason":"stop"}],null,null]"#;
         assert!(matches!(
-            map_success(array_root, &ResponseFormat::Text),
+            map_success(array_root, &ResponseFormat::Text, ""),
             Err(ProviderError::MalformedResponse(_))
         ));
     }
@@ -515,7 +559,7 @@ mod tests {
         ));
         let body =
             br#"{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}"#;
-        assert!(map_success(body, &ResponseFormat::JsonObject)
+        assert!(map_success(body, &ResponseFormat::JsonObject, "")
             .unwrap()
             .structured
             .is_some());
@@ -533,5 +577,36 @@ mod tests {
         };
         assert!(!message.contains("exact-secret-value"));
         assert!(message.contains("[REDACTED]"));
+
+        let long_key = "k".repeat(5000);
+        let mut body = b"prefix-".to_vec();
+        body.extend_from_slice(long_key.as_bytes());
+        body.extend_from_slice(b"-suffix");
+        let error = map_status(500, &body, &long_key);
+        let ProviderError::HttpStatus { message, .. } = error else {
+            panic!("unexpected status mapping");
+        };
+        assert!(!message.contains('k') || !message.contains(&"k".repeat(32)));
+        assert!(message.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn success_metadata_scrubs_exact_api_key() {
+        let key = "exact-success-secret";
+        let body = format!(
+            r#"{{"id":"echo-{key}","choices":[{{"message":{{"content":"ok"}},"finish_reason":"stop-{key}"}}]}}"#
+        );
+        let response = map_success(body.as_bytes(), &ResponseFormat::Text, key).unwrap();
+        assert!(!response.provider_request_id.unwrap().contains(key));
+        assert!(!response.finish_reason.unwrap().contains(key));
+    }
+
+    #[test]
+    fn nested_choice_arrays_are_rejected() {
+        let nested = br#"{"choices":[[{"content":"x"},"stop"]]}"#;
+        assert!(matches!(
+            map_success(nested, &ResponseFormat::Text, ""),
+            Err(ProviderError::MalformedResponse(_))
+        ));
     }
 }
