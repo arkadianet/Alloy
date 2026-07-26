@@ -168,12 +168,11 @@ impl RuntimeConfig {
         let (data_dir, data_dir_rule) = resolve_data_dir(&paths)?;
 
         let budget_policy = match profile.budgets {
-            Some(b) => {
-                let mut policy = BudgetPolicy::default();
-                policy.max_usd_per_run = b.max_usd_per_run;
-                policy.max_tokens_per_run = b.max_tokens_per_run;
-                policy
-            }
+            Some(b) => BudgetPolicy {
+                max_usd_per_run: b.max_usd_per_run,
+                max_tokens_per_run: b.max_tokens_per_run,
+                ..BudgetPolicy::default()
+            },
             None => BudgetPolicy::default(),
         };
 

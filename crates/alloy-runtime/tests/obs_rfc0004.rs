@@ -173,11 +173,15 @@ async fn model_call_and_tool_call_round_trip() {
     let session = h.create_session().await;
     let log = h.log();
     log.record_model_call(
-        ModelCallRecord::new(session, ProviderId::new("default").unwrap(), ModelTier::Standard)
-            .tokens(Some(10), Some(5))
-            .usd(Some(0.02))
-            .duration_ms(Some(12))
-            .prompt_body(Some("hi".into())),
+        ModelCallRecord::new(
+            session,
+            ProviderId::new("default").unwrap(),
+            ModelTier::Standard,
+        )
+        .tokens(Some(10), Some(5))
+        .usd(Some(0.02))
+        .duration_ms(Some(12))
+        .prompt_body(Some("hi".into())),
     )
     .await
     .unwrap();
