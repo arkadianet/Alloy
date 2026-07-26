@@ -251,7 +251,9 @@ permitted. Day-1 fixture requests MUST have `tools = []`.
 
 The normative byte strings and SHA-256 outputs are fixed in §11.1.1.
 `RequestFingerprint::from_hex` remains fallible and MUST accept exactly 64
-lowercase hexadecimal characters.
+lowercase hexadecimal characters. Wrong length, uppercase, or any non-hex
+character MUST return `Err(EvalError::Manifest(...))`; it MUST NOT panic and
+MUST NOT use `Json`, `Internal`, or a provider error for malformed input.
 
 **Manifest identity vs provider key:** Fixture turns also carry a human
 `FixtureTurnId` (§3.5). The provider has one bound endpoint and keys queues
@@ -270,8 +272,10 @@ pub struct ScriptedProvider { /* private */ }
 
 impl ScriptedProvider {
     /// Empty provider bound to exactly one endpoint.
-    #[must_use]
-    pub fn new(id: ProviderId, endpoint: ModelEndpoint) -> Self;
+    pub fn new(
+        id: ProviderId,
+        endpoint: ModelEndpoint,
+    ) -> Result<Self, EvalError>;
 
     /// Append one outcome to the FIFO queue for `key`.
     pub fn insert(
@@ -413,6 +417,11 @@ parallel manifest outcome API and no second response-construction path.
 
 **Send + Sync:** `ScriptedProvider: Send + Sync`. Share with `Arc<ScriptedProvider>` / `Arc<dyn ModelProvider>`.
 
+**Constructor invariant:** `ScriptedProvider::new` MUST require
+`endpoint.provider == id`. A mismatch returns exactly
+`Err(EvalError::Manifest("scripted provider id must match endpoint.provider".into()))`.
+Construction performs no I/O and MUST NOT repair or overwrite either id.
+
 **Lifecycle:** Drop is ordinary; no drain protocol. Unconsumed keys at fixture end → fixture `Fail` with reason `UnconsumedScripts` when the manifest sets `require_consume_all = true` (default **true**).
 
 ### 3.5 Fixture turn identity (manifest)
@@ -491,7 +500,7 @@ pub struct EvalMetrics {
 | Field | Who populates | When Measured | Skeleton default |
 | --- | --- | --- | --- |
 | `success_rate` | `MetricsAggregator` | After batch: `passes / (passes+fails)` over fixtures that are not `Error` | **Measured** from fixture outcomes |
-| `compile_success_rate` | `MetricsAggregator` | `compile_clean == Some(true)` / all non-Error fixtures; `None` is false and emits detail | **Measured** when denominator non-empty |
+| `compile_success_rate` | `MetricsAggregator` | `compile_clean == Some(true)` / all non-Error fixtures; `Some(false)` or `None` is false; aggregation never mutates criteria | **Measured** when denominator non-empty |
 | `token_efficiency` | `MetricsAggregator` | `(successful_fixtures) / max(1, total_input_tokens + total_output_tokens)` when all token samples known | **Unmeasured(`EmptySample` or `CostInputsIncomplete`)** unless scripts include usage |
 | `latency_p50_ms` | `MetricsAggregator` | p50 of non-Error fixture wall times | **Measured** observational wall clock; scrub in determinism tests |
 | `latency_p95_ms` | `MetricsAggregator` | p95 of non-Error fixture wall times | **Measured** observational wall clock; scrub in determinism tests |
@@ -617,7 +626,68 @@ pub struct EvalReport {
     pub gate: Option<GateResult>,
     pub naive_comparison: Option<NaiveComparisonResult>,
 }
+
+impl EvalReport {
+    /// Render the exact line-oriented CI format in §9.3.
+    #[must_use]
+    pub fn render_ci_summary(&self) -> String;
+}
+
+impl std::fmt::Display for EvalReport {
+    /// Delegates exactly to `render_ci_summary`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result;
+}
 ```
+
+#### 3.7.1 Outcome accounting (normative)
+
+For a non-Error run, `model_calls` is the number of
+`ModelProvider::complete` invocations attempted, whether each invocation
+returned `Ok` or `Err`; increment with `saturating_add(1)` on `u32`. A
+pre-call request mismatch does not increment it because no invocation was
+attempted.
+
+For each successful `Ok(ModelResponse)`, add each present usage side to that
+side's running `u64` total with `saturating_add`. If any successful response
+has `usage.input_tokens == None`, final `tokens_in` MUST be `None`; likewise,
+any `usage.output_tokens == None` makes final `tokens_out` `None`. Provider
+`Err` responses contribute no tokens and do not by themselves make a side
+incomplete. With no successful responses, both token totals are `None`.
+
+`cost_usd` is `Some` only when the bound endpoint has both prices, at least
+one response succeeded, and both token sides are complete across every
+successful response. It uses the RFC-0007 price formula over the saturated
+totals. If either price or token side is absent, `cost_usd` MUST be `None`.
+
+Every terminal `Error` outcome, whether produced during load, cancellation,
+join, or execution, MUST have `criteria = vec![]`, `tokens_in = None`,
+`tokens_out = None`, `cost_usd = None`, `compile_clean = None`,
+`unsafe_introduced = None`, `retry_count = None`, and
+`human_interventions = None`. Its `wall_ms` remains observational.
+For load/cancel/join Errors, `model_calls` is `0` for every load failure, join
+failure, and pre-run cancellation; cancellation after work began instead
+preserves the number of complete invocations attempted so far. Other in-task
+execution Errors follow the general attempted-invocation definition because
+their count is known.
+`error` MUST be `Some(ReportError)`.
+
+#### 3.7.2 Report toolchain assembly (normative)
+
+`EvalReport.toolchain.channel` MUST always equal
+`EvalHarnessConfig.pin_toolchain_channel`. Its `rustc_version` and
+`cargo_version` MUST equal the unique pair from the manifests of all
+non-Error outcomes in the logical report. The batch implementation retains a
+crate-private `(FixtureId, ToolchainRecord)` sidecar from validated loaded
+fixtures; `FixtureOutcome` does not expose or duplicate this metadata.
+
+Batch preflight MUST ensure every successfully loaded fixture has the same
+complete manifest toolchain triplet as the first successfully loaded fixture
+in sorted fixture-id order. A differing fixture is a load-time `Error`, so
+non-Error outcomes cannot disagree. Report assembly MUST nevertheless check
+the invariant; disagreement among non-Error fixtures is
+`Err(EvalError::Internal(...))`, never an arbitrary first-value choice. If
+there are zero non-Error outcomes, including an empty batch or an all-Error
+batch, both version fields MUST be the exact string `"none"`.
 
 ### 3.8 Cost claim envelope (ADR F-08)
 
@@ -686,7 +756,7 @@ pub const FIXTURE_MANIFEST_VERSION: u32 = 1;
 pub struct FixtureId(String);
 
 impl FixtureId {
-    /// Non-empty, ≤128 bytes, `[a-z0-9_.-]+`.
+    /// Non-empty, ≤128 bytes, `[a-z0-9_.-]+`, but never `.` or `..`.
     pub fn new(s: impl Into<String>) -> Result<Self, EvalError>;
     pub fn as_str(&self) -> &str;
 }
@@ -855,6 +925,11 @@ unknown values MUST fail TOML deserialization. Endpoint prices MUST be finite
 and non-negative when present. They configure only internal uncalibrated cost
 accounting and MUST NOT be presented as marketing cost.
 
+`FixtureId::new` MUST reject empty input, more than 128 UTF-8 bytes, any
+character outside `[a-z0-9_.-]`, and the exact path components `"."` and
+`".."`. Every such rejection is `Err(EvalError::Manifest(...))`, never an
+`Io` error or panic.
+
 `success_criteria` MUST be non-empty and contain no duplicate enum value.
 Train and holdout goldens used by the skeleton/milestone gates MUST include
 `CompileClean`, `ExpectedDiagnosticsCleared`, `ScriptTurnsConsumed`, and
@@ -862,6 +937,55 @@ Train and holdout goldens used by the skeleton/milestone gates MUST include
 error fixtures MAY select a non-empty subset. `expected_diagnostics` MUST be
 non-empty for Day-1 repair fixtures, and every entry MUST have a non-empty code
 and non-empty `message_contains`.
+
+#### 3.9.1 Manifest-only request and usage DTOs
+
+The loader MUST NOT deserialize manifest request or usage tables directly
+into the reused runtime `CompletionRequest`, `ChatMessage`, or `Usage` types.
+Those merged runtime types do not declare `#[serde(deny_unknown_fields)]`, and
+this RFC MUST NOT claim that they do or modify them solely for fixture
+strictness.
+
+Day-1 MUST deserialize through crate-private wire DTOs equivalent to:
+
+```rust
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestCompletionRequest {
+    messages: Vec<ManifestChatMessage>,
+    #[serde(default)]
+    tools: Vec<serde_json::Value>,
+    #[serde(default)]
+    tool_choice: ToolChoice,
+    #[serde(default)]
+    response_format: ResponseFormat,
+    temperature: Option<f32>,
+    max_output_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestChatMessage {
+    role: ChatRole,
+    content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+```
+
+The crate-private manifest turn/outcome wire structs MUST use
+`ManifestCompletionRequest` and `ManifestUsage`, and MUST themselves use
+`#[serde(deny_unknown_fields)]`. Only after strict TOML deserialization and
+validation may the loader convert them into the public runtime-backed
+`ScriptTurn`, `CompletionRequest`, `ChatMessage`, and `Usage` values. Nested
+message unknown keys and usage unknown keys are therefore rejected as
+`EvalError::Manifest`. Day-1 still validates `tools.is_empty()` after
+conversion.
 
 ### 3.10 Recorded cargo JSON
 
@@ -927,10 +1051,8 @@ the code MUST equal `ExpectedDiagnostic.code` and the message MUST contain
 `message_contains`. Missing expected data is `RecordingInvalid` and produces a
 fixture `Error`, never a thesis `Fail`.
 
-Live re-capture is a developer utility behind the non-default `recapture`
-feature. Day-1 harness instances are offline by construction, so the public
-method returns `NetworkRequired`; a feature-gated developer binary MAY share
-the recording encoder but is outside the harness execution path (§3.12).
+Creating or refreshing recordings is outside the public harness API and is
+deferred in §12.2. Day-1 harness execution only loads committed recordings.
 
 ### 3.11 Gate types and naive baseline
 
@@ -997,6 +1119,15 @@ pub enum GateFailure {
     UnsafeIntroducedRate { actual: String, maximum: String },
     LostToNaiveBaseline { control: String, naive: String, epsilon: String },
     MetricUnmeasured { field: String, reason: UnmeasuredReason },
+    InvalidMeasuredMetric { field: String, detail: String },
+    SetMismatch {
+        source: String,
+        fixture_id: FixtureId,
+        expected: FixtureSet,
+        actual: FixtureSet,
+    },
+    InconsistentNaiveComparison { field: String },
+    MissingNaiveComparison,
     FixtureErrorsPresent { count: u32 },
     InvalidThreshold { message: String },
 }
@@ -1040,20 +1171,60 @@ Unmeasured dependency produces `MetricUnmeasured`, including unsafe. Skeleton
 goldens MUST include `NoNewUnsafe`, so `skeleton_defaults` remains measurable
 with `max_unsafe_introduced_rate = 0.0`.
 
+Every `MetricField::Measured(f64)` rate that the gate would use MUST be finite
+and within `0.0..=1.0`. This applies to
+`report.metrics.compile_success_rate`, `report.metrics.success_rate`,
+`report.metrics.unsafe_introduced_rate`, and, when naive comparison is
+required, `report.naive_comparison.naive.compile_success_rate`. An invalid
+value appends `InvalidMeasuredMetric { field, detail }`; that metric MUST NOT
+be compared numerically. `detail` states either `"rate is non-finite"` or
+`"rate is outside 0.0..=1.0"` without embedding an unstable float spelling.
+`evaluate_gate` is pure and reports this validation failure in `GateResult`;
+it MUST set `passed = false` through the ordinary
+`failures.is_empty()` rule, MUST NOT return `EvalError`, and MUST never panic.
+
+The canonical control metric source for every threshold and naive comparison
+is ALWAYS `report.metrics`. When `report.naive_comparison` is present, each
+corresponding `MetricField` in `naive_comparison.control` MUST be byte-equal
+to the field in `report.metrics`. For integer fields and enum states this
+means exact equality; measured `f64` payloads are compared by `to_bits()` so
+`-0.0`, NaN payloads, and infinities cannot hide a mismatch. Append one
+`InconsistentNaiveComparison { field }` per mismatched field in `EvalMetrics`
+declaration order. The gate MUST NOT substitute the comparison copy for
+`report.metrics`, and it recomputes the meets-or-beats result rather than
+trusting `control_meets_or_beats_naive`.
+
+`thresholds.set` MUST equal `set` for every outcome in `report.fixtures` and,
+when present, every outcome in `report.naive_fixtures`. Each mismatch appends
+`SetMismatch`, with `source` exactly `"control"` or `"naive"`, and fails the
+gate. Validation covers all outcomes, including `Error` outcomes. Empty
+vectors satisfy this structural check vacuously.
+
 `evaluate_gate` MUST append failures in this stable order:
 
 1. `InvalidThreshold` if validation fails, then return a failed result without
    comparing non-finite data.
-2. One `FixtureErrorsPresent` with the saturating `u32` count of control plus
+2. `SetMismatch` entries for control then naive outcomes, each side sorted by
+   `fixture_id`.
+3. One `FixtureErrorsPresent` with the saturating `u32` count of control plus
    naive `Error` outcomes.
-3. Compile success: `MetricUnmeasured`, or `CompileSuccessRate` when measured
-   below the minimum.
-4. Success: `MetricUnmeasured`, or `SuccessRate` when measured below minimum.
-5. Unsafe: `MetricUnmeasured`, or `UnsafeIntroducedRate` when measured above
+4. `InconsistentNaiveComparison` entries, when a comparison is present, in
+   `EvalMetrics` declaration order.
+5. Compile success from `report.metrics`: `MetricUnmeasured`,
+   `InvalidMeasuredMetric`, or `CompileSuccessRate` when valid and below the
+   minimum.
+6. Success from `report.metrics`: `MetricUnmeasured`,
+   `InvalidMeasuredMetric`, or `SuccessRate` when valid and below minimum.
+7. Unsafe from `report.metrics`: `MetricUnmeasured`,
+   `InvalidMeasuredMetric`, or `UnsafeIntroducedRate` when valid and above
    maximum.
-6. When naive comparison is required, require both comparison metrics
-   Measured. Missing report/comparison data yields `MetricUnmeasured`; an
-   adjusted control value below naive yields `LostToNaiveBaseline`.
+8. When naive comparison is required, `MissingNaiveComparison` if
+   `report.naive_comparison` is `None`; otherwise validate the naive compile
+   rate as Measured and valid. Append `MetricUnmeasured`,
+   `InvalidMeasuredMetric`, or `LostToNaiveBaseline` as applicable, comparing
+   canonical `report.metrics.compile_success_rate` with
+   `naive_comparison.naive.compile_success_rate` only when both are valid
+   Measured rates. A canonical control failure from step 5 is not duplicated.
 
 The returned thresholds MUST be a clone of the argument. `passed` MUST equal
 `failures.is_empty()`. The function MUST not mutate the report, read clocks,
@@ -1080,14 +1251,23 @@ meets_or_beats  = control_compile + naive_epsilon >= naive_compile
 
 Equality is a pass. If either metric is `Unmeasured`, the gate MUST fail with
 `GateFailure::MetricUnmeasured` and set
-`control_meets_or_beats_naive = false` (fail closed — do not skip).
+`control_meets_or_beats_naive = false` (fail closed — do not skip). An invalid
+Measured rate likewise sets the comparison field false and yields
+`InvalidMeasuredMetric`.
 
 `FixtureErrorsPresent` MUST count `Error` outcomes from both `report.fixtures`
 and `report.naive_fixtures`. A report without `naive_fixtures` while
-`require_beat_naive` is true MUST fail closed with `MetricUnmeasured` for
-`naive.compile_success_rate`.
+`require_beat_naive` is true will ordinarily also have no comparison:
+`evaluate_gate` MUST emit `MissingNaiveComparison` when
+`naive_comparison` is absent. If a comparison is present despite absent naive
+fixtures, its naive metric remains subject to the same fail-closed metric
+validation and the inconsistent report is already visible in the report
+shape; normal harness assembly never creates that combination.
 
-**Control-plane run (full gate):** Same fixtures with `FixtureDriverKind::ControlPlane`. Day-1 skeleton uses `SkeletonReplay` for the “control” side of unit tests that assert comparison arithmetic; M7 wires the real driver.
+**Control run:** Each fixture uses its manifest `driver`.
+Holdout goldens use `SkeletonReplay` in Day-1 and `ControlPlane` at M7. A
+holdout manifest whose driver is `NaiveBaseline` is invalid as a control
+fixture under §5.8.
 
 ### 3.12 Harness API
 
@@ -1127,7 +1307,7 @@ impl EvalHarness {
     ) -> Result<LoadedFixture, EvalError>;
 
     /// Run one fixture to a terminal outcome.
-    pub async fn run_fixture(&self, fixture: &LoadedFixture) -> FixtureOutcome;
+    pub async fn run_fixture(&self, fixture: &mut LoadedFixture) -> FixtureOutcome;
 
     /// Run all fixtures in `set` with isolation + bounded concurrency.
     pub async fn run_batch(&self, set: FixtureSet) -> Result<EvalReport, EvalError>;
@@ -1138,17 +1318,9 @@ impl EvalHarness {
 
     /// Run control batch + naive batch on holdout and compare (§5.8).
     pub async fn run_holdout_with_naive(&self) -> Result<EvalReport, EvalError>;
-
-    /// Developer-only recapture entry point. Day-1 harnesses are offline, so
-    /// this returns NetworkRequired before process creation.
-    #[cfg(feature = "recapture")]
-    pub async fn recapture_cargo(
-        &self,
-        fixture: &LoadedFixture,
-        which: CargoRecordingKind,
-    ) -> Result<CargoJsonRecording, EvalError>;
 }
 
+/// Pre- or post-repair recording side marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CargoRecordingKind {
     PreRepair,
@@ -1156,11 +1328,26 @@ pub enum CargoRecordingKind {
 }
 
 pub struct LoadedFixture {
-    pub manifest: FixtureManifest,
-    pub root: PathBuf,
-    pub pre_repair: CargoJsonRecording,
-    pub post_repair: CargoJsonRecording,
-    // private: source files, naive target path, etc.
+    // private: validated manifest/artifacts, source files, endpoint
+    // ordered script entries, and scripts: Option<Arc<ScriptedProvider>>
+}
+
+impl LoadedFixture {
+    /// Validated manifest; callers cannot mutate it after load.
+    #[must_use]
+    pub fn manifest(&self) -> &FixtureManifest;
+
+    /// Canonical fixture root.
+    #[must_use]
+    pub fn root(&self) -> &Path;
+
+    /// Validated failing pre-repair recording.
+    #[must_use]
+    pub fn pre_repair(&self) -> &CargoJsonRecording;
+
+    /// Validated passing post-repair recording.
+    #[must_use]
+    pub fn post_repair(&self) -> &CargoJsonRecording;
 }
 ```
 
@@ -1169,7 +1356,11 @@ required. Both constructors set `max_concurrency = 4`,
 `pin_toolchain_channel = "1.97.1"`, and `cancel = None`; they differ only in
 their threshold constructors. Numeric defaults therefore live in explicit
 root-taking constructors. `EvalHarness::new` MUST reject
-`max_concurrency == 0`, an empty pin, or invalid thresholds.
+`max_concurrency == 0`, an empty pin, or invalid thresholds with
+`EvalError::Manifest`. It MUST call `config.thresholds.validate()`. It MUST
+also inspect `fixture_root`: metadata/read failures return `EvalError::Io`,
+while a path that exists but is not a directory returns
+`EvalError::Manifest`. No harness is constructed after any failed validation.
 
 Offline is not a configurable policy in Day-1. Every harness is offline by
 construction, and every report MUST set `offline = true`. There is no
@@ -1177,15 +1368,24 @@ public policy enum, provider-mode enum, live-provider constructor, provider
 URL, provider secret, or live-provider cargo feature in the Day-1 surface.
 Any future live eval path belongs to M7 and requires a new RFC/API revision.
 
-The non-default `recapture` cargo feature only compiles developer recording
-utilities. Even with that feature, `EvalHarness::recapture_cargo` MUST return
-`EvalError::NetworkRequired("cargo recapture is forbidden by the offline eval harness".into())`.
-Host-process toolchain access is forbidden in offline CI independently of
-provider networking. A separate developer binary may perform capture when
-explicitly invoked outside CI; it MUST NOT weaken harness construction.
+`LoadedFixture` is one-shot for scripted execution. Its validated fields are
+private and exposed only by immutable getters; callers cannot mutate the
+manifest, recordings, root, endpoint, or installed scripts after load. The
+loader stores the provider as `scripts: Option<Arc<ScriptedProvider>>`.
+`run_fixture` takes it at the beginning of the first run. A second call on the
+same value returns an `Error` outcome with empty criteria and exact
+`ReportError { kind: "fixture_already_run", message: "fixture already run" }`;
+it MUST NOT panic, reinstall, or reuse consumed queues.
 
 `EvalHarness::evaluate_gate` MUST contain no gate logic; it delegates exactly
 to `gate::evaluate_gate(&self.config.thresholds, report)`.
+
+`run_batch` MUST first assemble the complete report with `gate = None`, then
+set `gate = Some(evaluate_gate(&config.thresholds, &report_without_gate))`
+before returning `Ok`, including for empty and all-Error batches.
+`run_holdout_with_naive` MUST do the same after attaching both fixture vectors
+and `naive_comparison`; it also always returns `gate = Some(...)` on a
+successfully assembled report.
 
 **Async boundary:** All `run_*` methods are `async` and MUST be `.await`ed on a Tokio runtime. Fingerprint / load / gate evaluation MAY be sync. `ScriptedProvider::complete` is async to match `ModelProvider` but MUST NOT perform I/O.
 
@@ -1227,25 +1427,38 @@ miss/exhaustion, or a scripted provider error. Report storage always uses
 
 ### 3.14 Crate-root re-exports
 
-`alloy_eval` MUST re-export at least:
+`alloy_eval` MUST re-export every public RFC-0016 item. The complete Day-1
+list is:
 
-`ScriptedProvider`, `ScriptOutcome`, `ScriptTurnOutcome`,
-`ScriptedProviderError`, `RequestFingerprint`, `FixtureTurnId`, `FixtureId`,
-`FixtureSet`, `FixtureManifest`, `FixtureStatus`, `FixtureOutcome`,
-`ReportError`, `EvalMetrics`, `MetricField`, `UnmeasuredReason`, `EvalReport`,
-`EvalHarness`, `EvalHarnessConfig`, `GateThresholds`, `GateResult`,
-`GateFailure`, `NaiveComparisonResult`, `CargoJsonRecording`, `EvalError`,
-`evaluate_gate`, `COST_DISCLAIMER`, `NAIVE_BASELINE_LABEL`,
-`PERMITTED_SPDX`, `FIXTURE_MANIFEST_VERSION`, and
-`CARGO_RECORDING_FORMAT_VERSION`.
+- provider/fingerprint: `RequestFingerprint`, `ScriptedProvider`,
+  `ScriptOutcome`, `ScriptTurnOutcome`, `ScriptedProviderError`, and
+  `ScriptedInvocation`;
+- manifest: `FixtureTurnId`, `FixtureId`, `FixtureSet`, `FixtureManifest`,
+  `LicenseClass`, `LicenseMeta`, `ToolchainRecord`, `WorkspaceRef`,
+  `NaivePatchMode`, `EndpointPrices`, `ExpectedDiagnostic`, `ScriptTurn`,
+  `CargoRecordingRefs`, `SuccessCriterion`, and `FixtureDriverKind`;
+- recording: `CargoJsonRecording`, `RecordedDiagnostic`, and
+  `CargoRecordingKind`;
+- outcomes/reporting: `FixtureStatus`, `FixtureOutcome`, `CriterionResult`,
+  `ReportError`, `EvalMetrics`, `MetricField`, `UnmeasuredReason`,
+  `EvalReport`, `CostClaimGrade`, and `CostClaimEnvelope`;
+- harness/gate/error: `LoadedFixture`, `EvalHarness`, `EvalHarnessConfig`,
+  `GateThresholds`, `GateResult`, `GateFailure`, `NaiveComparisonResult`,
+  `EvalError`, and the function `evaluate_gate`;
+- constants: `COST_DISCLAIMER`, `NAIVE_BASELINE_LABEL`, `PERMITTED_SPDX`,
+  `FIXTURE_MANIFEST_VERSION`, and `CARGO_RECORDING_FORMAT_VERSION`.
+
+The crate-private manifest DTOs in §3.9.1 and internal driver/aggregation
+types MUST NOT be re-exported.
 
 ### 3.15 Visibility & construction summary
 
 | Item | Visibility | Constructors |
 | --- | --- | --- |
-| `ScriptedProvider` | `pub` | `new`, `insert`, `push`, `extend` |
+| `ScriptedProvider` | `pub` | fallible `new`, then `insert`, `push`, `extend` |
 | `EvalHarness` | `pub` | `new(config)` |
 | `EvalHarnessConfig` | `pub` | `skeleton(root)`, `milestone_holdout(root)`; no `Default` |
+| `LoadedFixture` | `pub`, private fields | constructed only by `load_fixture`; immutable getters |
 | `GateThresholds` | `pub` | `milestone_holdout_defaults`, `skeleton_defaults`, struct update |
 | `gate::evaluate_gate` | `pub` pure function | no stateful evaluator type |
 | Internal modules (`driver`, `aggregate`, …) | `pub(crate)` | — |
@@ -1368,9 +1581,11 @@ The loader MUST perform these steps in order:
 2. Require the fixture directory’s final component to equal `manifest.id` and
    its immediate parent’s final component to equal `manifest.set`. Also require
    the caller’s `set`, manifest `set`, and physical parent to agree.
-3. Parse TOML with unknown fields denied on all schema structs. Require
-   `manifest_version == 1`, non-empty turns, non-empty expected diagnostics,
-   and the criterion rules in §3.9.
+3. Parse TOML through the crate-private manifest wire graph. Deny unknown
+   fields on every manifest-owned DTO, including the request, nested message,
+   and usage DTOs in §3.9.1; do not rely on deny attributes on reused runtime
+   types. Require `manifest_version == 1`, non-empty turns, non-empty expected
+   diagnostics, and the criterion rules in §3.9.
 4. Validate every `FixtureTurnId`. The complete `(capability, node, ordinal)`
    tuple MUST be unique. Independently, ordinals MUST be unique within each
    `(capability, node)` group. Duplicate request fingerprints are valid because
@@ -1389,10 +1604,12 @@ The loader MUST perform these steps in order:
    toolchain check in §3.10 before executing any turn.
 10. Build the fixture-local endpoint from §6.3 and manifest
     `endpoint_prices`, then construct exactly one
-    `ScriptedProvider::new(provider_id, endpoint)`.
+    `ScriptedProvider::new(provider_id, endpoint)?`.
 11. Iterate turns in manifest order. Convert each
-    `ScriptTurnOutcome` to `ScriptOutcome`, then append it to the queue under
-    `RequestFingerprint::of(&turn.request)`. Same-key declaration order is FIFO.
+    `ScriptTurnOutcome` to `ScriptOutcome` and retain the validated ordered
+    `(RequestFingerprint, ScriptOutcome)` entries privately on
+    `LoadedFixture`. First execution installs them into the one-shot provider
+    after the cancellation checkpoint. Same-key declaration order is FIFO.
 
 #### 5.2.1 Path containment (normative)
 
@@ -1411,10 +1628,34 @@ the same containment check. A missing path, canonicalization failure, absolute
 path, `..`, or symlink escape is `EvalError::Manifest` with a bounded path
 description.
 
-The fixture set directories themselves are enumerated without following
-directory symlinks. An I/O failure while opening or enumerating the selected
-set is a batch-level `Err(EvalError::Io(...))`; it is not converted to one
-fixture outcome because no trustworthy fixture id is available.
+Directory enumeration first validates each entry name as UTF-8, then inspects
+its type. A non-UTF-8 name MUST produce an `Error` outcome with
+`ReportError.kind == "invalid_fixture_name"`; because it cannot inhabit
+`FixtureId`, its report id is the deterministic valid id
+`invalid-path-<lowercase-hex-sha256(OsStr::as_encoded_bytes())>`.
+The message MUST be bounded and MUST NOT use a lossy path as identity.
+
+After name validation, enumeration skips only entries whose followed metadata
+proves they are not directories. It MUST NOT silently skip a directory whose
+UTF-8 name matches the `FixtureId` character/length rules: missing or invalid
+manifest content becomes that id's `Error` outcome. A directory with a name
+that fails `FixtureId::new`, including `.` or `..` if encountered through an
+entry API, also becomes an `Error` outcome with `ReportError`, not a silent
+skip.
+
+For a symlink whose target is a directory, canonicalize the target before
+load and require it to remain under canonical `fixture_root`. An escaping
+directory symlink becomes that entry's `Error` outcome with a `Manifest` path
+error converted through `ReportError::from_eval` (or `LicenseForbidden` when
+the escape is specifically the fixture `LICENSE` path); it MUST NOT be
+followed outside the root or skipped. An in-root directory symlink continues
+through all ordinary id/set/path checks. Broken symlinks and metadata failures
+for an identified fixture-like entry likewise become fixture `Error`
+outcomes.
+
+An I/O failure while opening or enumerating the selected set itself is a
+batch-level `Err(EvalError::Io(...))`; it is not converted to one fixture
+outcome because no trustworthy entry identity is available.
 
 #### 5.2.2 License and provenance (R17, normative)
 
@@ -1438,6 +1679,11 @@ Class/spdx failure returns `EvalError::LicenseForbidden`.
 contain valid UTF-8, and contain at least one non-whitespace character. An
 empty, whitespace-only, missing, non-UTF-8, symlink-escaping, or non-file
 license is `LicenseForbidden`.
+
+As a Recommended honour check, a standard SPDX fixture SHOULD carry license
+text corresponding to `license.spdx`; reviewers SHOULD correct a mismatch.
+Day-1 does not claim a complete legal-text matcher, so content correspondence
+beyond the required integrity checks is not a load-time hard failure.
 
 `license.source_note` records provenance and MUST contain at least one
 non-whitespace character. An empty source note is inconsistent provenance and
@@ -1466,19 +1712,26 @@ rule.
    returned `Internal`. Wrong driver text is part of the evaluated thesis;
    disappearance of a correctly installed map entry is harness integrity.
 8. A declared `ScriptTurnOutcome::Error` maps through
-   `ScriptedProviderError`. For `SkeletonReplay`, any such `Err` before the
-   first successful response containing `Some(text)` causes a criterion
-   `Fail`. A declared final error after repair text MAY be consumed without
-   invalidating that prior candidate. The rare intentional last error-only
-   fixture is permitted only for direct provider-contract coverage; it is not
-   a passing `SkeletonReplay` fixture. If executed by `SkeletonReplay`, it
-   still fails the mandatory repair-text rule below.
+   `ScriptedProviderError`. For `SkeletonReplay`, any provider `Err` before
+   the first successful response containing `Some(text)` causes a criterion
+   `Fail`, sets `compile_clean = Some(false)`, and records detail
+   `"provider error before repair text"`. If `CompileClean` is listed, that
+   result carries the detail; otherwise the first listed criterion carries
+   it. The driver MUST NOT auto-add `CompileClean`. The only exceptions are an
+   error message beginning with `"scripted miss"` (including the provider's
+   `"scripted miss:"` form) or exactly `"scripted wrong endpoint"`; those
+   indicate install/map desynchronization and are fixture `Error`. A declared
+   final error after repair text MAY be consumed without invalidating that
+   prior candidate. The rare intentional last error-only fixture is permitted
+   only for direct provider-contract coverage; it is not a passing
+   `SkeletonReplay` fixture.
 
 `SkeletonReplay` MUST observe at least one successful `Response` with
 `text: Some(...)` among executed turns. If it observes none, it MUST produce a
-failed `CompileClean`/repair criterion with exact detail
-`"missing repair text"`. It MUST NOT panic or classify that absence as a
-harness error.
+failed manifest-listed repair criterion with exact detail
+`"missing repair text"`: `CompileClean` when listed, otherwise the first
+listed criterion. It MUST NOT add a criterion, panic, or classify that absence
+as a harness error.
 
 **Classification rule:** Manifest/load/recording/provider-map/harness bugs are
 `Error`. A request produced incorrectly by the evaluated driver, a scripted
@@ -1530,10 +1783,21 @@ For a fixture with `driver = SkeletonReplay`:
    and trailing whitespace all affect equality.
 7. Only when the patch oracle passes may the post-repair recording act as the
    candidate compile oracle. A patch mismatch MUST set
-   `compile_clean = Some(false)` and fail `CompileClean`; it is not permitted
-   to claim compilation from an unrelated golden.
-8. Evaluate every manifest criterion exactly once and preserve manifest order
-   in `FixtureOutcome.criteria`.
+   `compile_clean = Some(false)` and fail `CompileClean` when listed;
+   otherwise it fails the first listed criterion with `"patch oracle failed"`.
+   It is not permitted to add a criterion or claim compilation from an
+   unrelated golden.
+8. Evaluate exactly the criteria listed in `manifest.success_criteria`, each
+   exactly once, and preserve manifest order in `FixtureOutcome.criteria`.
+   The driver MUST NOT auto-add, remove, or reorder a criterion.
+
+`SkeletonReplay` and `NaiveBaseline` MUST always populate
+`compile_clean = Some(true|false)` on every non-Error outcome, even when
+`CompileClean` is not listed. This independent observation feeds
+`compile_success_rate` for narrow fixtures. More generally, a driver MUST set
+`compile_clean = Some(...)` whenever `CompileClean` is listed. Criterion
+subsections below define results only when that criterion is listed; they do
+not authorize adding it.
 
 #### 5.5.1 `CompileClean`
 
@@ -1544,15 +1808,16 @@ sets `Some(false)`. `Err` is a fixture `Error`.
 A declared provider error observed before the first successful repair text is
 sticky: even if a later candidate byte-matches and the compile oracle is clean,
 `CompileClean` MUST be recorded as a failed workflow criterion with detail
-`"provider error before repair text"`. `compile_clean` MAY remain `Some(true)`
-to report the compile observation, but overall fixture status is `Fail`.
+`"provider error before repair text"` when that criterion is listed.
+`compile_clean` MUST remain `Some(false)` and overall fixture status is
+`Fail`. When `CompileClean` is not listed, the first listed criterion receives
+the same failed detail as specified in §5.3, without adding a criterion.
 
 If patch equality failed or repair text was missing, this criterion MUST fail,
 set `compile_clean = Some(false)`, and state `"patch oracle failed"` or
-`"missing repair text"` respectively. A non-Error outcome with
-`compile_clean = None` is tolerated by report deserialization but MUST count as
-not clean in aggregation and MUST gain the detail
-`"compile result missing; treated as not clean"`.
+`"missing repair text"` respectively. A deserialized non-Error outcome with
+`compile_clean = None` is tolerated for wire compatibility but counts as not
+clean in aggregation. Aggregation MUST NOT alter its criteria.
 
 #### 5.5.2 `NoNewUnsafe`
 
@@ -1585,7 +1850,7 @@ Set `FixtureOutcome.unsafe_introduced = Some(introduced)`.
 `NoNewUnsafe` passes iff `introduced == false`. Missing candidate text fails
 the criterion and sets `unsafe_introduced = Some(false)` only when there is no
 candidate to have introduced bytes; the missing repair already fails
-`CompileClean`.
+the manifest-listed repair criterion under §5.5.
 
 #### 5.5.3 `ExpectedDiagnosticsCleared`
 
@@ -1647,10 +1912,10 @@ Input: `&[FixtureOutcome]` for one logical run (control or naive).
    `FixtureStatus::Pass`.
 3. `compile_success_rate` denominator is all non-Error fixtures; numerator is
    only `compile_clean == Some(true)`. `Some(false)` and `None` both count as
-   not clean. A non-Error `None` MUST cause the aggregator/report finalizer to
-   add a failed `CompileClean` detail
-   `"compile result missing; treated as not clean"` if it is not already
-   present. This prevents absent data from inflating compile success.
+   not clean. This prevents absent data from inflating compile success.
+   SkeletonReplay and NaiveBaseline populate `Some` even for narrow manifests
+   without `CompileClean`; `None` remains fail-closed compatibility handling
+   for externally deserialized outcomes.
 4. Latency samples are `wall_ms` from non-Error fixtures only. Sort ascending
    and apply nearest-rank §3.6.1 for p50/p95. Error fixtures never contribute.
 5. Token totals use `saturating_add` for every input and output sample. The
@@ -1674,6 +1939,12 @@ Input: `&[FixtureOutcome]` for one logical run (control or naive).
     `NoNewUnsafe`, it is `Unmeasured(NotApplicable)`. Because
     `max_unsafe_introduced_rate` is always configured, either state makes
     `evaluate_gate` fail with `MetricUnmeasured`.
+
+Aggregation is read-only over outcomes. It MUST NOT add, remove, reorder, or
+rewrite `FixtureOutcome.criteria`, change status, or synthesize criterion
+details. Criteria are finalized only by the selected driver, and every
+non-Error outcome contains exactly the manifest-listed criteria in manifest
+order.
 
 #### 5.7.1 Observational fields and deterministic equality
 
@@ -1710,9 +1981,14 @@ sequenceDiagram
 
 1. Enumerate holdout once into a sorted list of `(FixtureId, path)`. Load the
    control and naive view of each exact fixture.
-2. The control run uses the manifest driver (`SkeletonReplay` in Day-1;
-   `ControlPlane` at M7). The naive run overrides only execution behavior, not
-   manifest identity or artifacts.
+2. The control run MUST use each fixture's manifest driver
+   (`SkeletonReplay` for Day-1 holdout goldens; `ControlPlane` at M7). If
+   `manifest.driver == NaiveBaseline`, control load for that fixture MUST
+   produce `Error` from
+   `EvalError::Manifest("holdout control fixture must not use naive_baseline driver".into())`.
+   The harness MUST NOT silently reinterpret it as a control driver. The naive
+   run always forces the `NaiveBaseline` install/execution path regardless of
+   the manifest driver, while retaining manifest identity and artifacts.
 3. Select the unique turn with `capability == "repair"` and `ordinal == 0`.
    The node field is irrelevant because uniqueness is mandatory. If it is
    missing or ambiguous, emit an `Error` outcome for that fixture.
@@ -1729,7 +2005,9 @@ sequenceDiagram
 7. Store control outcomes in `EvalReport.fixtures` and naive outcomes in
    `EvalReport.naive_fixtures = Some(...)`.
 8. Aggregate control and naive metrics separately. Store both in
-   `NaiveComparisonResult`, calculate
+   `NaiveComparisonResult`, setting `EvalReport.metrics` to the control
+   aggregate and `NaiveComparisonResult.control` to its exact clone (never a
+   second aggregation). Calculate
    `control_meets_or_beats_naive`, and include
    `NAIVE_BASELINE_LABEL` in its detail.
 9. Call the single pure `gate::evaluate_gate` function. It evaluates control
@@ -1738,7 +2016,9 @@ sequenceDiagram
 
 An ordinary `run_batch` report MUST set `naive_fixtures = None` and
 `naive_comparison = None`. `run_holdout_with_naive` MUST set both to `Some`.
-The latter MUST reject config whose threshold set is not `Holdout`.
+The latter MUST reject config whose threshold set is not `Holdout`. Both
+successful assembly paths always attach `gate = Some(...)` as specified in
+§3.12.
 
 ### 5.9 ControlPlane driver (**Stub**)
 
@@ -1757,15 +2037,15 @@ It MUST NOT silently skip.
 
 | Rule | Normative behaviour |
 | --- | --- |
-| Isolation | One `LoadedFixture` + one `ScriptedProvider` + one outcome per task |
+| Isolation | One mutable, one-shot `LoadedFixture` + one `ScriptedProvider` + one outcome per task |
 | Concurrency | `tokio::spawn` up to `max_concurrency` via a semaphore |
 | Shared state | Harness config is read-only/`Clone`; no shared provider across fixtures |
 | Ordering | Report `fixtures` sorted by `fixture_id.as_str()` ascending for determinism |
-| Cancellation | If config has a token, `tokio::select!` observes it before and during fixture execution. A cancelled fixture is `Error` with `ReportError { kind: "cancelled", message: "fixture cancelled" }`, never Fail. |
+| Cancellation | If config has a token, `tokio::select!` observes it at every checkpoint below. A cancelled fixture is `Error` with `ReportError { kind: "cancelled", message: "fixture cancelled" }`, never Fail. |
 | Join/panic | Every `JoinError`, including a task panic, becomes that fixture’s `Error` with `ReportError.kind == "join_failed"` and a bounded message. Batch siblings continue. |
-| Empty set | Successful enumeration with zero fixtures returns `Ok(EvalReport)` with empty vectors and rate metrics `Unmeasured(EmptySample)`. Gate evaluation fails each depended-on field with `MetricUnmeasured`. |
+| Empty set | Successful enumeration with zero fixtures returns `Ok(EvalReport)` with empty vectors, report toolchain versions `"none"`, rate metrics `Unmeasured(EmptySample)`, and `gate = Some(failed result)`. |
 | Directory failure | Failure opening or enumerating the set directory returns `Err(EvalError::Io(...))` (or `Manifest` for an invalid root shape). |
-| Bad fixture | Once a directory entry identifies a fixture id, malformed TOML/artifacts produce one fixture `Error`; batch continues and returns `Ok(report)`. |
+| Bad fixture | Once an entry is identified, malformed names, escaping directory symlinks, TOML, or artifacts produce one fixture `Error`; batch continues and returns `Ok(report)`. |
 | Determinism | Identical inputs + recordings + scripts → identical statuses, criteria, non-time metrics, fingerprints, and scrubbed reports (§5.7.1). |
 
 Cancellation is cooperative. If cancellation is already set before scheduling,
@@ -1774,6 +2054,17 @@ fixture without spawning model work. If it arrives while tasks are running,
 the harness MUST stop launching new work, convert queued fixtures to cancelled
 outcomes, await already spawned tasks, and prefer a completed outcome only if
 the fixture completed before cancellation won its `select!` branch.
+
+Within `run_fixture`, cancellation checkpoints are mandatory (1) after taking
+the one-shot provider but before installing any script and before each entry
+is installed, (2) before entering the complete loop, before every
+`ModelProvider::complete` invocation, and in the `select!` around its await,
+(3) before the patch oracle, and (4) before criteria evaluation. Cancellation
+at any checkpoint immediately produces the canonical cancelled `Error`
+outcome under §3.7.1: criteria and measurement option fields are cleared,
+while `model_calls` preserves the saturated number of complete invocations
+already attempted. No further script install, complete, patch, or criterion
+work may continue after cancellation wins.
 
 The harness MUST retain fixture identity beside each `JoinHandle`, so a join
 failure can be attributed without losing report ordering. Panic payload debug
@@ -1792,9 +2083,10 @@ serialized `EvalReport` after the complete §5.7.1 scrub. Clearing only
 Day-1 constructs:
 
 ```rust
-ModelEndpoint {
+let provider_id = ProviderId::new("eval-script").unwrap();
+let endpoint = ModelEndpoint {
     id: EndpointId::new("eval-script").unwrap(),
-    provider: provider.id(),
+    provider: provider_id.clone(),
     display_name: "eval-script".into(),
     model: "scripted".into(), // NOT a vendor id used for branching; eval-only label
     tiers: vec![ModelTier::Standard],
@@ -1807,11 +2099,15 @@ ModelEndpoint {
     output_usd_per_mtok: manifest.endpoint_prices
         .as_ref()
         .and_then(|p| p.output_usd_per_mtok),
-}
+};
+let provider = ScriptedProvider::new(provider_id, endpoint)?;
 ```
 
-This endpoint is constructed once per loaded fixture and moved into
-`ScriptedProvider::new`. Every driver call MUST use that endpoint id.
+The provider id MUST be created first and copied into
+`ModelEndpoint.provider`; only then is the fallible
+`ScriptedProvider::new(provider_id, endpoint)?` called. This endpoint is
+constructed once per loaded fixture. Every driver call MUST use that endpoint
+id.
 Manifest endpoint prices are optional; no separate endpoint configuration file
 exists. The eval-only strings are confined to `alloy-eval` fixtures/tests and
 MUST NOT be introduced into `alloy-runtime` router core (RFC-0007
@@ -1880,9 +2176,12 @@ MUST equal `manifest.id`. Id uniqueness is per set, so
 | `driver` | enum | yes | `skeleton_replay` / `naive_baseline` / `control_plane` |
 
 All path fields are subject to lexical and canonical containment checks in
-§5.2.1. All schema structs MUST use `#[serde(deny_unknown_fields)]`. TOML parse
-errors are `EvalError::Manifest`; JSON parsing is reserved for cargo recording
-lines and report serialization, not manifests.
+§5.2.1. All manifest-owned wire DTOs MUST use
+`#[serde(deny_unknown_fields)]`, including the crate-private request, nested
+message, and usage DTOs in §3.9.1. Reused runtime types do not carry that
+attribute and MUST NOT be the direct manifest deserialization target. TOML
+parse errors are `EvalError::Manifest`; JSON parsing is reserved for cargo
+recording lines and report serialization, not manifests.
 
 ### 7.3 Gate configuration
 
@@ -1921,23 +2220,16 @@ No environment key is read by Day-1 eval. CI MUST explicitly
 write, truncate, or modify `.env`; this RFC requires no `example.env` change.
 Future live-provider documentation belongs to M7.
 
-### 7.6 Cargo recording capture procedure (developer)
+### 7.6 Committed recording provenance
 
-1. Use toolchain `1.97.1` (`rustup show` must match channel).
-2. In the fixture workspace, run  
-   `cargo check -p <package> --message-format=json > recordings/pre_repair.stdout`.
-3. Wrap into `CargoJsonRecording` via the non-default
-   `#[cfg(feature = "recapture")]` developer binary, filling versions from
-   `rustc -V` / `cargo -V`, `exit_code`, format version, and digest.
-4. Apply golden post repair; recapture `post_repair`.
-5. Commit JSON recordings; never commit secrets.
+Committed pre/post recording JSON MUST include the actual pinned channel,
+`rustc -V`, `cargo -V`, exit code, format version, and digest from capture.
+Fixture history MUST preserve the source and golden state corresponding to
+those recordings, and recordings MUST contain no secrets.
 
-**Stale handling:** If `toolchain.channel != pin`,
-`validate_against_pin` returns `RecordingStale`. Offline CI MUST fail the
-fixture as `Error`, not skip. `EvalHarness::recapture_cargo`, when compiled,
-still returns `NetworkRequired`; the developer binary is deliberately
-separate. Recapture is host-process toolchain access and is forbidden in
-offline CI even though it is not provider network traffic.
+If `toolchain.channel != pin`, `validate_against_pin` returns
+`RecordingStale`. Offline CI MUST fail the fixture as `Error`, not skip.
+Generating new recordings is outside the harness execution path (§12.2).
 
 ---
 
@@ -1995,7 +2287,26 @@ Missed key and wrong endpoint mappings use `ProviderError::Internal`, not
 `EvalError`. The driver applies §5.3 to distinguish a correct-request map
 desynchronization (`Error`) from driver-built wrong request text (`Fail`).
 
-### 8.4 Recovery semantics
+### 8.4 `GateFailure` fail-closed table
+
+| Variant | Trigger |
+| --- | --- |
+| `CompileSuccessRate` | Valid measured canonical compile rate is below minimum |
+| `SuccessRate` | Valid measured canonical success rate is below minimum |
+| `UnsafeIntroducedRate` | Valid measured canonical unsafe rate is above maximum |
+| `LostToNaiveBaseline` | Valid canonical control compile rate plus epsilon is below valid naive compile rate |
+| `MetricUnmeasured` | A required rate is explicitly Unmeasured |
+| `InvalidMeasuredMetric` | A threshold-dependent Measured rate is non-finite or outside `0.0..=1.0` |
+| `SetMismatch` | Any control or naive outcome set differs from `thresholds.set` |
+| `InconsistentNaiveComparison` | Any `naive_comparison.control` field is not byte-equal to canonical `report.metrics` |
+| `MissingNaiveComparison` | `require_beat_naive` is true and `naive_comparison` is absent |
+| `FixtureErrorsPresent` | At least one control or naive fixture is `Error` |
+| `InvalidThreshold` | Standalone evaluation received thresholds that fail `validate` |
+
+All variants are report data from the pure evaluator. None authorizes a
+panic, report mutation, fallback metric source, or passing result.
+
+### 8.5 Recovery semantics
 
 Eval does **not** invent retries. Retry loops are RFC-0010’s concern and appear
 only in full-gate control-plane runs when that stack exists. Day-1 fixtures MAY
@@ -2027,8 +2338,34 @@ semantics. Fail closed, record the outcome, and continue batch siblings.
 
 ### 9.3 What the harness reports (MVP)
 
-- `EvalReport` JSON to stdout in tests that opt in via helper `report.render_ci_summary()` — **no** bare USD marketing numbers.
-- CI summary lines: fixture counts by status; Measured compile/success rates; `cost: uncalibrated`; gate pass/fail.
+`EvalReport::render_ci_summary(&self) -> String` MUST return exactly these
+eight newline-separated lines, in this order, with no trailing newline:
+
+```text
+alloy-eval run_id=<run_id>
+offline=<true|false>
+control pass=<count> fail=<count> error=<count>
+naive <absent|pass=<count> fail=<count> error=<count>>
+metrics compile_success_rate=<metric> success_rate=<metric> unsafe_introduced_rate=<metric>
+cost=uncalibrated
+gate=<pass|fail|absent> failures=<count>
+cost_disclaimer=internal-only
+```
+
+Counts are base-10 integers. A measured rate renders as exactly six decimal
+places. An unmeasured rate renders
+`unmeasured:<snake_case UnmeasuredReason>`. The naive line is exactly
+`naive absent` when `naive_fixtures` is `None`; otherwise it contains the
+three counts in the shown order. The gate failure count is
+`gate.failures.len()` when present and `0` when absent. No failure detail,
+fixture source, token count, price, `$` sign, or numeric USD amount appears.
+The cost and disclaimer lines are literal, regardless of internal cost data.
+
+`Display for EvalReport` MUST delegate exactly to
+`self.render_ci_summary()` (equivalent to
+`f.write_str(&self.render_ci_summary())`) and MUST add no prefix, suffix, or
+trailing newline. JSON report serialization remains available through serde
+but is not `Display`.
 
 ---
 
@@ -2057,7 +2394,6 @@ Feature posture:
 
 | Feature | Day-1 declaration | Purpose / rule |
 | --- | --- | --- |
-| `recapture` | optional, off | Compiles developer recording utilities; harness method still returns `NetworkRequired`; forbidden in CI |
 | `live-provider` | **must not exist** | Deferred to M7; forbidden Day-1 |
 | `stack-driver` | **must not exist** | Deferred to M7; `ControlPlane` remains explicit **Stub** |
 
@@ -2075,9 +2411,7 @@ Feature posture:
    provider type is re-exported.
 6. `alloy_eval_does_not_link_reqwest` (build script or
    `cargo tree -p alloy-eval -e normal`) MUST find no package named `reqwest`.
-7. Recapture is host-process toolchain access and is also forbidden in CI;
-   enabling its feature does not create a network or process escape through
-   `EvalHarness`.
+7. No public `EvalHarness` method may spawn a toolchain process.
 8. No code in this RFC may write `.env`.
 
 ### 10.3 `unsafe`
@@ -2099,6 +2433,7 @@ Harness self-tests are distinct from the product thesis the harness measures.
 | `scripted_per_key_fifo_retries` | Two inserts for one fingerprint append and two identical requests pop first then second |
 | `scripted_extend_preserves_per_key_order` | Interleaved keys remain independent; order within each key is declaration order |
 | `scripted_wrong_endpoint_rejected` | Different endpoint id returns exactly `Internal("scripted wrong endpoint")`, records nothing, consumes nothing |
+| `scripted_constructor_provider_match` | Matching `endpoint.provider` constructs; mismatch returns exact `EvalError::Manifest` text |
 | `scripted_same_endpoint_hit` | Bound endpoint id succeeds and invocation stores endpoint/request/fingerprint |
 | `script_turn_outcome_conversion` | Response conversion sets `tool_calls == vec![]`; Error conversion preserves mapping |
 | `scripted_health_healthy` | `Health::Healthy` |
@@ -2119,7 +2454,7 @@ field-order change fails visibly. `fingerprint_exact_utf8_no_normalization`
 MUST also prove that canonically equivalent but byte-distinct Unicode strings
 produce distinct fingerprints and that leading/trailing whitespace is hashed.
 `fingerprint_from_hex_validation` MUST reject uppercase, wrong length, and
-non-hex input.
+non-hex input specifically with `EvalError::Manifest`.
 
 ### 11.2 Loader, schema, license, and recording tests
 
@@ -2127,11 +2462,14 @@ non-hex input.
 | --- | --- |
 | `load_fixture_is_set_qualified` | `load_fixture(Train, id)` and `load_fixture(Holdout, id)` may load distinct same-id fixtures |
 | `load_fixture_rejects_set_or_directory_mismatch` | Caller set, parent directory, manifest set, directory name, and manifest id must agree |
+| `fixture_id_rejects_dot_components` | `FixtureId::new` returns Manifest for `"."`, `".."`, bad charset/length, and empty input |
 | `manifest_toml_only` | `manifest.toml` loads; JSON-only fixture is not discovered |
+| `manifest_request_usage_dtos_deny_unknown` | Unknown request, nested message, and usage keys fail through crate-private DTOs; runtime types are not direct targets |
 | `manifest_turn_identity_validation` | Duplicate `FixtureTurnId`, duplicate group ordinal, missing/ambiguous repair ordinal 0 rejected |
 | `manifest_criteria_validation` | Empty and duplicate criteria rejected; required Day-1 criteria present in goldens |
 | `manifest_fingerprint_validation` | Optional stored fingerprint must match infallible computed fingerprint |
 | `path_rejects_absolute_parent_and_symlink_escape` | Every path class fails closed under absolute, `..`, and escaping symlink cases |
+| `enumeration_reports_invalid_fixture_entries` | Non-UTF-8 names and escaping directory symlinks produce Error outcomes; fixture-like malformed directories are not skipped |
 | `license_exact_allowlist` | Exactly five SPDX strings pass only with class permitted |
 | `license_rejects_forbidden_or_unknown` | Forbidden class always fails; aliases/case/whitespace/unknown SPDX fail |
 | `license_file_integrity` | Missing, empty, whitespace, non-UTF-8, non-file, and escaping LICENSE rejected |
@@ -2150,6 +2488,7 @@ non-hex input.
 | --- | --- |
 | `golden_skeleton_pass` | SkeletonReplay passes train fixture offline |
 | `provider_error_before_repair_fails` | Scripted turn Err before repair produces Fail, not Error |
+| `provider_error_before_repair_sets_compile_false` | Ordinary provider Err records criterion detail and `compile_clean=Some(false)`; scripted miss/wrong endpoint is Error |
 | `missing_repair_text_fails` | No successful `Some(text)` yields exact `"missing repair text"` detail |
 | `correct_request_missing_map_is_error` | Correct manifest request plus provider miss is map-desync Error |
 | `wrong_driver_request_is_script_miss_fail` | Pre-call request mismatch is Fail with `"script miss"` |
@@ -2160,6 +2499,8 @@ non-hex input.
 | `script_turns_consumed_skeleton` | All queues/outcomes required when configured |
 | `script_turns_consumed_naive_installed_only` | Extra control turns are not installed and do not fail naive consumption |
 | `naive_selects_unique_repair_zero` | Capability must equal repair and ordinal 0; node does not create fallback |
+| `criteria_exactly_manifest_list` | Skeleton and naive never auto-add criteria and preserve manifest order |
+| `narrow_driver_still_records_compile` | Skeleton/naive set compile Some even when CompileClean is not listed |
 
 ### 11.4 Reports, metrics, and determinism
 
@@ -2167,10 +2508,15 @@ non-hex input.
 | --- | --- |
 | `report_serde_round_trip` | Full report with `ReportError`, naive fixtures, metrics, gate, and cost envelope round-trips and is equal |
 | `report_error_io_mapping` | Io maps to kind `"io"` and inner `io::Error::to_string()` |
+| `report_ci_summary_exact` | Exact eight lines, six-place rates, Display delegation, no trailing newline or numeric USD |
+| `public_reexports_complete` | Every item listed in §3.14, including constants and function, compiles from crate root |
 | `cost_disclaimer_default_and_constructor` | Both paths own `String` equal to `COST_DISCLAIMER`; no static ref in serde struct |
-| `compile_rate_none_is_false` | Non-Error `compile_clean=None` is denominator failure and emits detail |
+| `compile_rate_none_is_false` | Non-Error `compile_clean=None` is denominator failure and aggregation does not mutate criteria |
 | `latency_excludes_errors` | Error wall times do not enter p50/p95 |
 | `token_sums_saturate` | Input, output, and combined totals never wrap |
+| `outcome_usage_accounting` | Calls count attempts; Ok usage incompleteness is side-specific; Err adds no tokens; USD requires both prices and complete sides |
+| `error_outcome_fields_canonical` | Load/cancel/join Error outcomes clear criteria and optional measurements; mid-run cancellation retains call count |
+| `report_toolchain_assembly` | Channel is config pin; unique non-Error version pair is used; zero non-Error uses exact `"none"` pair |
 | `unsafe_population_is_criterion_scoped` | Only NoNewUnsafe fixtures sampled; absent sample is Unmeasured |
 | `empty_metrics_are_unmeasured` | Empty logical run uses EmptySample, never numeric zeros |
 | `determinism_same_input_same_output` | Two serial runs equal after full §5.7.1 scrub |
@@ -2185,10 +2531,15 @@ non-hex input.
 | `threshold_validate_rejects_non_finite` | NaN and infinities rejected for every f64 field |
 | `threshold_validate_rejects_ranges` | Rates outside 0..=1 and negative epsilon rejected |
 | `gate_unmeasured_dependencies_fail` | Compile, success, unsafe, and required naive Unmeasured each yield MetricUnmeasured |
+| `gate_invalid_measured_rates_fail` | NaN, infinities, and out-of-range threshold-dependent Measured rates yield InvalidMeasuredMetric without panic |
+| `gate_rejects_fixture_set_mismatch` | Every control/naive set is checked against thresholds and yields SetMismatch |
+| `gate_uses_canonical_report_metrics` | Thresholds always use report.metrics; any comparison control field mismatch yields InconsistentNaiveComparison |
+| `gate_requires_naive_comparison` | Required absent comparison yields MissingNaiveComparison |
 | `gate_numeric_strings_fixed_six` | Every f64 in a failure uses six decimal places |
 | `naive_tie_meets_or_beats` | `control + epsilon == naive` passes and renamed field is true |
 | `naive_loss_fails` | Strictly smaller adjusted control fires LostToNaiveBaseline |
 | `naive_fixture_id_mismatch_is_batch_error` | Missing/extra/duplicate ids return Internal, no partial report |
+| `holdout_control_rejects_naive_driver` | Control uses manifest driver and NaiveBaseline manifest produces exact load-time Manifest Error; naive side forces NaiveBaseline |
 | `naive_side_errors_fail_gate` | FixtureErrorsPresent counts control and naive Error outcomes |
 | `e2e_holdout_with_naive` | Same holdout ids, both vectors stored, metrics compared, pure gate result attached |
 | `unmeasured_cost_not_marketed` | `marketing_cost_claim()` is `None` |
@@ -2199,13 +2550,16 @@ non-hex input.
 | Test | Asserts |
 | --- | --- |
 | `empty_batch_returns_report` | Empty existing set returns Ok, empty fixtures, EmptySample metrics, failing gate |
+| `reports_always_attach_gate` | `run_batch` and `run_holdout_with_naive`, including empty/all-Error reports, attach `Some(evaluate_gate(...))` |
 | `directory_enumeration_failure_is_batch_error` | Root/read failure returns Err |
 | `malformed_fixture_does_not_abort_siblings` | One Error outcome and valid sibling outcomes in Ok report |
 | `cancel_before_batch_marks_all` | Every enumerated fixture Error kind cancelled; no model calls |
 | `cancel_during_batch_marks_pending` | Pending work cancelled; completed work retained per select order |
 | `join_failure_is_reported` | Task panic/join error becomes fixture Error kind join_failed |
 | `config_requires_root_constructor` | No Default impl; skeleton/milestone constructors set numeric defaults |
-| `config_rejects_zero_concurrency` | `new` rejects 0 and accepts 1 |
+| `config_validation_is_complete` | `new` rejects zero concurrency, invalid thresholds, empty pin, non-directory root, and propagates root metadata I/O |
+| `loaded_fixture_is_one_shot` | Immutable getters expose validated data; second mutable run returns `fixture_already_run` Error |
+| `cancel_checkpoints_cover_driver` | Cancellation before loop/each complete/patch/criteria produces canonical cancelled Error |
 
 ### 11.7 Offline CI job
 
@@ -2217,8 +2571,9 @@ cargo tree -p alloy-eval -e normal --prefix none | must_not_contain reqwest
 
 CI MUST additionally prove there is no Day-1 offline-policy type,
 provider-mode type, live provider constructor, `live-provider` feature, or
-public network configuration. `recapture` MUST be off. A source scan MUST find
-no `.env` write path and no Unicode-normalization dependency.
+public network configuration. A source scan MUST find no `.env` write path,
+no public harness toolchain-spawn method, and no Unicode-normalization
+dependency.
 
 ### 11.8 Holdout hygiene lint
 
@@ -2250,6 +2605,7 @@ CI script fails when diff intersects holdout fixtures and prompt/template paths 
 | CLI `alloy eval` UX | **RFC-0015** | `cargo test -p alloy-eval` |
 | ControlPlane driver execution | 0008–0015 (M7) | `EvalError::Stub` |
 | Live BYOM dual-report vs scripted | **RFC-0007** + M7 | no Day-1 API or feature |
+| Developer recording utility | Eval follow-up | optional non-default `recapture` feature; separate binary only, no public `EvalHarness::recapture_cargo` |
 | Calibrated marketing cost | Post-holdout calibration RFC | enum reserved; emission locked Uncalibrated |
 | Lifetime-heavy fixtures | V2 stretch | absent |
 | Public leaderboard | V2 deferred | absent |
@@ -2268,13 +2624,13 @@ Every criterion is independently testable.
 | 3 | Request-only keys own FIFO queues; same-fingerprint insert/push appends and repeated request pops in order | `scripted_per_key_fifo_retries` |
 | 4 | Manifest has only `ScriptTurnOutcome`; load converts once to `ScriptOutcome`, defaulting response tool calls empty | `script_turn_outcome_conversion` |
 | 5 | `RequestFingerprint::of` is infallible exact-serde hashing with no Unicode/text normalization | API compile test; exact UTF-8 test |
-| 6 | Both normative fingerprint vectors have exact bytes and SHA-256; `from_hex` remains fallible | §11.1.1 tests |
+| 6 | Both normative fingerprint vectors have exact bytes and SHA-256; malformed `from_hex` returns `EvalError::Manifest` | §11.1.1 tests |
 | 7 | Reports use serializable `ReportError`, not `EvalError`; report serde round-trip is equal; Io mapping uses inner message | `report_serde_round_trip`, `report_error_io_mapping` |
 | 8 | Deserialize structs own strings; cost disclaimer defaults/constructs from constant; naive baseline uses only `NAIVE_BASELINE_LABEL` | serde/API compile tests |
 | 9 | TOML is the only manifest format and embeds naive path/mode and optional prices; no helper path or endpoint file | fixture layout/schema tests |
 | 10 | `load_fixture(set, id)` is set-qualified; ids unique per set and may repeat across train/holdout | `load_fixture_is_set_qualified` |
 | 11 | Turn ids/group ordinals and criteria validate uniqueness/non-empty requirements; unique repair ordinal-0 turn required | manifest validation tests |
-| 12 | Absolute, parent, and symlink-escape paths are rejected; directory/id/set agreement enforced | path and set tests |
+| 12 | Absolute, parent, and symlink-escape paths are rejected; directory/id/set agreement enforced | path, enumeration, and set tests |
 | 13 | R17 exact five-item SPDX allowlist, permitted class, non-empty UTF-8 LICENSE, and non-empty provenance are enforced | license matrix tests |
 | 14 | Recording file/ref versions, digest, required exit code, manifest/recording toolchains, and pin all validate | recording integrity tests |
 | 15 | `compile_clean` returns `Result<bool, EvalError>` and parses diagnostics before classification | `compile_clean_parses_before_classifying` |
@@ -2284,7 +2640,7 @@ Every criterion is independently testable.
 | 19 | `NoNewUnsafe` uses the exact line regex and candidate-versus-pre source rule | unsafe criterion tests |
 | 20 | `ExpectedDiagnosticsCleared` requires patch pass and absence of every expected code | diagnostics criterion test |
 | 21 | `ScriptTurnsConsumed` checks all skeleton queues and only installed naive keys | consumption tests |
-| 22 | Metrics exclude Errors from rates/latency; compile None is false with detail; token sums saturate | metrics tests |
+| 22 | Metrics exclude Errors from rates/latency; compile None is false without mutating criteria; token sums saturate | metrics tests |
 | 23 | Unsafe rate samples only NoNewUnsafe fixtures and is Unmeasured with no sample | unsafe population test |
 | 24 | Wall and latency remain observed but full determinism scrub yields serial/concurrent equality | determinism tests |
 | 25 | `GateThresholds::validate` rejects non-finite/out-of-range rates and invalid epsilon | threshold validation tests |
@@ -2296,12 +2652,30 @@ Every criterion is independently testable.
 | 31 | Config uses root-taking skeleton/holdout constructors, no Default, max concurrency validation, optional cancellation | config/lifecycle tests |
 | 32 | Empty set returns Ok with EmptySample and failing gate; enumeration fails batch; malformed fixture does not abort siblings | batch lifecycle tests |
 | 33 | Cancellation and join/panic become Error with kinds `cancelled` and `join_failed` | cancellation/join tests |
-| 34 | Day-1 is offline by construction with no live provider API/feature, no reqwest, recapture off, and `ALLOY_API_KEY` unset | offline CI §11.7 |
+| 34 | Day-1 is offline by construction with no live provider API/feature, no reqwest, no harness process-spawn method, and `ALLOY_API_KEY` unset | offline CI §11.7 |
 | 35 | Cost grade emission is only `UncalibratedInternal`; numeric marketing claim remains absent | cost tests |
 | 36 | ≥1 train and ≥1 holdout golden pass schema/recording/criteria requirements | golden fixture tests |
 | 37 | Holdout hygiene lint and owner discipline are present | workflow/CODEOWNERS review |
 | 38 | ControlPlane is explicit Stub Error; dogfood ban remains | unit test; crate rustdoc; Appendix B |
 | 39 | `#![forbid(unsafe_code)]`, ≤5 crates, and no `.env` writes remain invariant | crate attr, workspace review, CI scan |
+| 40 | `ScriptedProvider::new` is fallible and requires `endpoint.provider == id` with the exact Manifest error; endpoint construction creates the id first | `scripted_constructor_provider_match`; §6.3 compile test |
+| 41 | `FixtureId::new` rejects `"."`/`".."` and all invalid forms with Manifest; fingerprint bad hex also uses Manifest | constructor validation tests |
+| 42 | Manifest request, nested message, and usage tables deserialize through deny-unknown crate-private DTOs before runtime conversion | `manifest_request_usage_dtos_deny_unknown` |
+| 43 | Enumeration skips only proven non-directories; non-UTF-8 names, escaping directory symlinks, and invalid fixture-like directories become Error outcomes | `enumeration_reports_invalid_fixture_entries` |
+| 44 | `LoadedFixture` validated state is getter-only and its provider is one-shot; a second mutable run returns exact `fixture_already_run` Error | `loaded_fixture_is_one_shot` |
+| 45 | Cancellation checkpoints precede the loop, every complete, patch oracle, and criteria; cancellation clears canonical Error fields while preserving attempted calls mid-run | cancellation checkpoint/accounting tests |
+| 46 | Calls count attempted completes with saturation; successful usage has side-specific completeness; token sums saturate; USD requires both prices and complete token sides | `outcome_usage_accounting`, `token_sums_saturate` |
+| 47 | All load/cancel/join Errors have empty criteria and cleared optional measurements; criteria are driver-finalized and aggregation never mutates them | `error_outcome_fields_canonical`, `criteria_exactly_manifest_list` |
+| 48 | Compile rate counts only `Some(true)`; skeleton/naive always set compile Some even for manifests without CompileClean; ordinary pre-repair provider Err is Fail/false while scripted miss/wrong endpoint is Error | compile/provider criterion tests |
+| 49 | Holdout control uses each manifest driver and rejects a NaiveBaseline control manifest with exact load-time error; naive execution always forces NaiveBaseline | `holdout_control_rejects_naive_driver` |
+| 50 | Gate rejects every non-finite/out-of-range Measured threshold rate with `InvalidMeasuredMetric`, never panic | `gate_invalid_measured_rates_fail` |
+| 51 | Gate checks every control and naive fixture set against `thresholds.set` and emits `SetMismatch` | `gate_rejects_fixture_set_mismatch` |
+| 52 | `report.metrics` is the sole control threshold source; comparison control fields must be byte-equal or emit `InconsistentNaiveComparison`; required absence emits `MissingNaiveComparison` | canonical/missing naive gate tests |
+| 53 | Report toolchain channel is the configured pin; versions are the unique non-Error manifest pair or exact `"none"`/`"none"` when no non-Error fixture exists | `report_toolchain_assembly` |
+| 54 | `run_batch` and `run_holdout_with_naive` always attach `Some(evaluate_gate(...))`, including empty and all-Error reports | `reports_always_attach_gate` |
+| 55 | Crate root re-exports the complete §3.14 list; `EvalHarness::new` validates concurrency, thresholds, pin, and root directory | public API/config compile tests |
+| 56 | `render_ci_summary` and `Display` emit the exact §9.3 eight-line format with no trailing newline or numeric USD | `report_ci_summary_exact` |
+| 57 | LICENSE text/SPDX correspondence remains a Recommended honour check, while required integrity and allowlist checks remain fail-closed | license review; `license_file_integrity` |
 
 ---
 
