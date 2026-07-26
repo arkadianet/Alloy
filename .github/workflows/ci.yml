@@ -44,7 +44,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests (DoD 3, 4)
-        run: cargo test --workspace
+        run: |
+          unset ALLOY_API_KEY
+          cargo test --workspace
+
+      - name: Eval offline (RFC-0016 §11.7)
+        run: |
+          unset ALLOY_API_KEY
+          cargo test -p alloy-eval --locked
+          if cargo tree -p alloy-eval -e normal --prefix none | grep -E '^reqwest '; then
+            echo "alloy-eval must not link reqwest" >&2
+            exit 1
+          fi
 
       - name: Router without HTTP feature (RFC-0007 §11.7)
         run: cargo test -p alloy-runtime --no-default-features --locked
