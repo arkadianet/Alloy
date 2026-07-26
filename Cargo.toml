@@ -51,3 +51,4 @@ scopeguard = "1"
 rcgen = "0.13"
 tokio-rustls = "0.26"
 zeroize = { version = "1" }
+regex = "1"

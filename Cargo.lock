@@ -40,6 +40,20 @@ dependencies = [
 [[package]]
 name = "alloy-eval"
 version = "0.1.0"
+dependencies = [
+ "alloy-runtime",
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "alloy-index"
