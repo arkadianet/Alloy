@@ -33,13 +33,20 @@ impl ConfigPaths {
     /// Never reads or writes a `.env` file — only process environment.
     #[must_use]
     pub fn for_workspace(workspace_root: PathBuf) -> Self {
-        let profile = env_path_or("ALLOY_PROFILE", || {
-            workspace_root.join("profiles/default.toml")
-        });
-        let router = env_path_or("ALLOY_ROUTER", || workspace_root.join("router.toml"));
+        // Only env overrides need resolving against the root; the defaults below are
+        // already workspace-joined and must not be joined twice (that turned a relative
+        // `--workspace ws` into `ws/ws/profiles/default.toml`).
+        let profile = match env_path("ALLOY_PROFILE") {
+            Some(p) => resolve_against(&workspace_root, p),
+            None => workspace_root.join("profiles/default.toml"),
+        };
+        let router = match env_path("ALLOY_ROUTER") {
+            Some(p) => resolve_against(&workspace_root, p),
+            None => workspace_root.join("router.toml"),
+        };
         Self {
-            profile: resolve_against(&workspace_root, profile),
-            router: resolve_against(&workspace_root, router),
+            profile,
+            router,
             example_env: workspace_root.join("example.env"),
             data_dir: None,
             workspace_root: Some(workspace_root),
@@ -47,12 +54,11 @@ impl ConfigPaths {
     }
 }
 
-fn env_path_or(key: &str, default: impl FnOnce() -> PathBuf) -> PathBuf {
+fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var(key)
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(default)
 }
 
 fn resolve_against(workspace_root: &Path, path: PathBuf) -> PathBuf {
@@ -312,5 +318,16 @@ api_key_env = "ALLOY_API_KEY"
         assert_eq!(paths.router, dir.path().join("router.toml"));
         assert_eq!(paths.profile, dir.path().join("profiles/default.toml"));
         assert_eq!(paths.example_env, dir.path().join("example.env"));
+    }
+
+    /// Defaults are already workspace-joined; they must not be joined a second
+    /// time. Only an absolute `workspace_root` hid this — a relative root such as
+    /// `--workspace alloy` yielded `alloy/alloy/profiles/default.toml`.
+    #[test]
+    fn for_workspace_does_not_double_join_relative_root() {
+        let paths = ConfigPaths::for_workspace(PathBuf::from("ws"));
+        assert_eq!(paths.profile, PathBuf::from("ws/profiles/default.toml"));
+        assert_eq!(paths.router, PathBuf::from("ws/router.toml"));
+        assert_eq!(paths.example_env, PathBuf::from("ws/example.env"));
     }
 }
