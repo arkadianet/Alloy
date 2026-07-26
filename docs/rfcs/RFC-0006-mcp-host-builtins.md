@@ -298,15 +298,19 @@ impl ToolView {
 }
 
 /// Successful or tool-level-failed invocation payload.
+///
+/// `is_error` / `error` are **private** so callers cannot break
+/// `is_error == error.is_some()` by field assignment. Use constructors + accessors.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct ToolResult {
     pub name: ToolName,
     pub call_id: Option<String>,
     pub content: Value,
-    /// MUST equal `error.is_some()` — enforced by constructors and `Deserialize`.
-    pub is_error: bool,
-    pub error: Option<ToolError>,
+    /// Private — MUST equal `error.is_some()`.
+    is_error: bool,
+    /// Private — paired with `is_error`.
+    error: Option<ToolError>,
     pub duration_ms: u64,
 }
 
@@ -320,6 +324,16 @@ impl ToolResult {
     #[must_use]
     pub fn with_call_id(mut self, id: Option<String>) -> Self {
         self.call_id = id;
+        self
+    }
+    #[must_use]
+    pub fn is_error(&self) -> bool { self.is_error }
+    #[must_use]
+    pub fn error(&self) -> Option<&ToolError> { self.error.as_ref() }
+    /// Replace content while preserving the ok/err discriminant.
+    #[must_use]
+    pub fn with_content(mut self, content: Value) -> Self {
+        self.content = content;
         self
     }
 }
@@ -1420,8 +1434,11 @@ args_glob subject (argv[1..], space-joined) =
    1. Match `str::from_utf8(&raw)`:
    2. `Ok(text)` → success with that text; `truncated = capped`.
    3. `Err(e)` let `v = e.valid_up_to()`:
-      - **Cap-induced incomplete suffix only:** if `capped` **and** the invalid sequence reaches the buffer end (`e.error_len().is_none()`, i.e. unexpected end / incomplete code point at end) **and** `v > 0`: keep `text = &raw[..v]` (lossy-trim trailing incomplete code point only); `truncated = true`.
-      - **Otherwise** (interior invalid bytes, or invalid at end when not capped, or `v == 0` with non-empty `raw`): `Permanent { code: "not_utf8", … }` with no body — do **not** silently trim interior corruption.
+      - **Cap-induced incomplete code point at end** (`capped` **and** `e.error_len().is_none()`):
+        - if `v > 0`: success with `text = &raw[..v]` (trim trailing incomplete sequence); `truncated = true`.
+        - if `v == 0` and `raw` is non-empty: success with **empty** `text` (`""`); `truncated = true`
+          (entire buffer is an incomplete leading multibyte sequence clipped by `max_bytes`).
+      - **Otherwise** (interior invalid bytes — `error_len().is_some()`, or incomplete/invalid at end when **not** capped): `Permanent { code: "not_utf8", … }` with no body — do **not** silently trim interior corruption.
 7. Success content:
 
 ```json
@@ -1445,7 +1462,7 @@ args_glob subject (argv[1..], space-joined) =
 
 | Field / error text | Rule |
 | --- | --- |
-| `files_touched` | Each entry MUST be jail-relative: non-empty, `/`-separated, no leading `/`, no `\`, no `.` or `..` path segments, ≤ `MAX_ARG_STRING_BYTES`. On violation → replace entire `files_touched` with `vec![]` and append `" (files_touched redacted)"` to sanitized message **or** map to `ToolError::Permanent { code: "unsafe_backend_output", message: "files_touched failed validation" }` with empty content files list — **normative MVP:** reject the outcome as `Permanent { code: "unsafe_backend_output", … }` (fail closed; do not forward bad paths). |
+| `files_touched` | Each entry MUST be jail-relative: non-empty, `/`-separated, no leading `/`, no `\\`, no `.` or `..` path segments, ≤ `MAX_ARG_STRING_BYTES`. On any violation → do **not** forward the outcome; return `Ok(ToolResult::err)` with `Permanent { code: "unsafe_backend_output", message: "files_touched failed validation" }` and content `{ "code": "unsafe_backend_output" }`. |
 | `message` | Run `sanitize_msg`: strip absolute path prefixes (`/`, drive letters), reject if length > 512 or contains NUL; on reject use fixed `"apply_patch completed"`. MUST NOT forward raw patch bodies. |
 | Backend error strings | `Io`/`Internal` use fixed messages (§3.7.2). `Unsupported`/`InvalidPatch`/`Conflict` pass through `sanitize_msg` (max 512, no abs paths, no NUL); on reject use the fixed code-only message for that variant. |
 
@@ -1535,17 +1552,33 @@ stateDiagram-v2
 
 Observable via `phase()`.
 
-**`Drop` for `InProcessMcpHost` (normative):** `cancel.cancel()` MUST run when the host value is dropped (including when the last `Arc<InProcessMcpHost>` is dropped if the host is stored as `Arc` — implement by wrapping inner state so `Drop` on the allocation fires, e.g. store `Arc<Inner>` where `Inner: Drop` calls `cancel.cancel()`, **or** document that callers hold `InProcessMcpHost` by value / the outer type’s `Drop` cancels). Normative MVP shape:
+**`Drop` for `InProcessMcpHost` (normative):** cancellation ownership is a **host-owned drop guard**, not shared inside `Arc` state and not delegated to callers.
 
 ```rust
-struct Inner { cancel: CancellationToken, /* … */ }
-impl Drop for Inner {
-    fn drop(&mut self) { self.cancel.cancel(); }
+struct CancelOnDrop(CancellationToken);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) { self.0.cancel(); }
 }
-// InProcessMcpHost holds Arc<Inner> (and optionally other handles)
+
+struct HostState { /* phase, registry, broker, trusted_path, … — NO Drop cancel */ }
+
+pub struct InProcessMcpHost {
+    state: Arc<HostState>,
+    /// Unique to this host value — MUST NOT live inside `state`.
+    cancel_guard: CancelOnDrop,
+}
 ```
 
-This ensures outstanding `select!` waiters on `cancel` receive cancellation when the host is destroyed. There is **no** `Running → Stopped` phase transition observed after destruction (phase atomics die with the allocation). Drain-step cancellation (§6.4 step 3) is unchanged.
+Rules:
+1. `InProcessMcpHost` is **not** `Clone`. Callers share it as `Arc<InProcessMcpHost>` (or a single owner).
+2. When the last `Arc<InProcessMcpHost>` (or the by-value owner) is dropped, `CancelOnDrop` runs and cancels the token.
+3. `cancellation()` returns `self.cancel_guard.0.clone()` — clones are **waiters only**; retaining a cloned token MUST NOT keep the host alive and MUST NOT prevent cancel-on-drop.
+4. After host-owner destruction, any still-alive waiter on a cloned token MUST observe cancellation (tokio `CancellationToken` broadcast).
+5. In-flight `call` / `drain` use the **same** token (`cancel_guard.0`); do **not** store a second independent `CancellationToken` in `HostState`.
+
+There is **no** `Running → Stopped` phase transition after destruction. Drain-step cancellation (§6.4 step 3) calls `cancel_guard.0.cancel()` (same token) and is otherwise unchanged.
+
+**Test:** `host_drop_cancels_cloned_waiter` — spawn a task waiting on `host.cancellation().cloned()`; drop the host owner; waiter completes as cancelled within a short timeout.
 
 ### 6.2 Startup
 
@@ -1834,11 +1867,13 @@ Hand-rolled validators only — **no** `jsonschema` crate.
 | `map_sandbox_error_table` | §8.3 rows including default |
 | `arguments_too_large` | InvalidArguments |
 | `tool_result_invariant` | constructors keep invariant; deserialize rejects both inconsistent combos |
+| `tool_result_fields_not_publicly_mutable` | `is_error`/`error` not `pub`; only accessors; compile-fail or API surface test |
 | `construction_rejects_zero_in_flight` | Internal |
 | `construction_call_timeout_default_ok` | `None` timeout succeeds even if exec_timeout > 1860 |
 | `construction_explicit_timeout_too_small` | Internal |
 | `signal_execution_failed` | `ExecutionFailed { signal: Some(_), … }` |
-| `fs_read_utf8_trim_on_truncate` | capped read ending mid-codepoint → trim suffix, truncated=true |
+| `fs_read_utf8_trim_on_truncate` | capped read ending mid-codepoint with `v > 0` → trim suffix, truncated=true |
+| `fs_read_utf8_cap_splits_leading_multibyte` | file starts with multibyte UTF-8; `max_bytes=1` → empty text, truncated=true, not not_utf8 |
 | `fs_read_utf8_interior_invalid` | uncapped/interior bad bytes → Permanent not_utf8 |
 | `fs_read_not_found_code` | Permanent not_found |
 | `no_abs_paths_in_mcp_errors` | Sandbox/PermissionDenied Display has no `/home` style paths |
@@ -1858,6 +1893,7 @@ Hand-rolled validators only — **no** `jsonschema` crate.
 | `drain_rejects_new_calls` | ShuttingDown |
 | `drain_grace_then_cancel` | in-flight cancelled after grace |
 | `drain_idempotent_concurrent_followers` | two concurrent drain → both Ok, Stopped; under timeout |
+| `host_drop_cancels_cloned_waiter` | drop host while cloned token waiter alive → waiter cancelled |
 | `host_timeout_fs_read` | Timeout without sandbox |
 | `metrics_snapshot_counts` | ok/error/denial counters |
 
@@ -1937,7 +1973,7 @@ Tool IR; `McpPlatform` + host; four builtins; lazy disclosure; permission gate w
 | 24 | Construction rejects `max_in_flight == 0`; rejects explicit `call_timeout < exec_timeout`; defaults `None` → exec+60s | unit |
 | 25 | PathPolicy built from broker profile (no injectable divergent policy); `OperatorHomes` injected | API + unit |
 | 26 | `map_sandbox_error` maps all `DenialReason` to `PermissionDenied`; redacts host paths in `Sandbox` | `map_sandbox_error_table` + `no_abs_paths_in_mcp_errors` |
-| 27 | `fs_read` cap-suffix UTF-8 trim vs interior not_utf8; open/read error codes | unit |
+| 27 | `fs_read` cap-suffix UTF-8 trim (including `v==0` empty text) vs interior not_utf8; open/read codes | unit |
 | 28 | `McpServerSpec::new` constructible; `start_server` Unsupported | unit |
 | 29 | Drain CAS+Notify; follower wait; 5s post-cancel bound | `drain_grace_then_cancel` |
 | 30 | Series Definition of Done below | checklist |
