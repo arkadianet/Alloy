@@ -34,10 +34,20 @@ tiers = ["standard"]
 supports_tools = true
 supports_structured_output = true
 max_context = 200000
-# Optional USD per 1_000_000 tokens for metering (RFC-0004 / RFC-0007).
-# Omit both to leave ModelCallRecord.usd as null (never invent prices).
-# input_usd_per_mtok = 0.0
-# output_usd_per_mtok = 0.0
+# Under default profile max_usd_per_run > 0, both price fields are REQUIRED.
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
+
+[[providers.endpoints]]
+id = "team-economy"
+display_name = "Economy"
+model = "REPLACE_ME_ECONOMY"
+tiers = ["economy"]
+supports_tools = false
+supports_structured_output = false
+max_context = 128000
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
 
 [capability_tiers]
 repair = "standard"
