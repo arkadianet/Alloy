@@ -184,8 +184,9 @@ fn has_drive_prefix(s: &str) -> bool {
 /// Strip absolute-path spans and enforce the length / NUL limits.
 ///
 /// Absolute Unix paths (`/…`) and Windows drive paths (`C:\…` / `C:/…`) are
-/// replaced with `<path>` wherever they appear — including after `=` — so
-/// messages like `at path=/home/op/x` do not leak operator layout.
+/// replaced with `<path>` when they begin at a path boundary (start of string,
+/// whitespace, or `=`), so messages like `at path=/home/op/x` do not leak
+/// operator layout while relative mentions like `src/main.rs` stay intact.
 ///
 /// `None` means the caller must substitute a fixed message.
 fn sanitize_msg(msg: &str) -> Option<String> {
@@ -194,21 +195,27 @@ fn sanitize_msg(msg: &str) -> Option<String> {
     }
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
+    let mut at_boundary = true;
     while !rest.is_empty() {
-        if rest.starts_with('/') {
+        if at_boundary && rest.starts_with('/') {
             out.push_str("<path>");
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
             rest = &rest[end..];
+            at_boundary = false;
             continue;
         }
-        if let Some(stripped) = strip_drive_path_prefix(rest) {
-            out.push_str("<path>");
-            rest = stripped;
-            continue;
+        if at_boundary {
+            if let Some(stripped) = strip_drive_path_prefix(rest) {
+                out.push_str("<path>");
+                rest = stripped;
+                at_boundary = false;
+                continue;
+            }
         }
         let ch = rest.chars().next().expect("rest non-empty");
         out.push(ch);
         rest = &rest[ch.len_utf8()..];
+        at_boundary = ch.is_whitespace() || ch == '=';
     }
     Some(out.split_whitespace().collect::<Vec<_>>().join(" "))
 }
@@ -360,6 +367,10 @@ mod tests {
             0,
         );
         assert_eq!(embedded.content["message"], "at path=<path> on <path>");
+
+        // Relative path mentions must not be chewed by the `/` scanner.
+        let relative = map_outcome(Ok(outcome(vec!["a.rs"], "wrote src/main.rs ok")), false, 0);
+        assert_eq!(relative.content["message"], "wrote src/main.rs ok");
     }
 
     #[test]

@@ -442,18 +442,21 @@ impl InProcessMcpHost {
         };
 
         // Parse + derive + grant, all before any spawn or file open.
-        let prepared = builtins::prepare(id, &ctx, call, &perms)?;
-
-        let dispatch = builtins::execute(&ctx, prepared, perms);
-        let outcome = tokio::select! {
-            () = state.cancel.cancelled() => Err(McpError::Cancelled),
-            result = tokio::time::timeout(state.call_timeout, dispatch) => match result {
-                Ok(inner) => inner,
-                Err(_) => Err(McpError::Timeout(state.call_timeout)),
-            },
+        let outcome = match builtins::prepare(id, &ctx, call, &perms) {
+            Err(err) => Err(err),
+            Ok(prepared) => {
+                let dispatch = builtins::execute(&ctx, prepared, perms);
+                tokio::select! {
+                    () = state.cancel.cancelled() => Err(McpError::Cancelled),
+                    result = tokio::time::timeout(state.call_timeout, dispatch) => match result {
+                        Ok(inner) => inner,
+                        Err(_) => Err(McpError::Timeout(state.call_timeout)),
+                    },
+                }
+            }
         };
 
-        // §9.1: warn on every PermissionDenied, including broker-mapped denials.
+        // §9.1: warn on every PermissionDenied — prepare-time and broker-mapped.
         match &outcome {
             Err(McpError::PermissionDenied(reason)) => {
                 tracing::warn!(tool = %call.name, %reason, "mcp permission denied");

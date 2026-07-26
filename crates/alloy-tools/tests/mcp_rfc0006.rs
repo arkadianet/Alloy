@@ -28,6 +28,7 @@ use alloy_tools::{
 use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
+use tracing_subscriber::prelude::*;
 
 // --- fixtures ---------------------------------------------------------------
 
@@ -1339,6 +1340,85 @@ async fn denied_flag_on_quarantine() {
         McpError::PermissionDenied(PermissionDenial::MissingGrant(ref k)) if k == "quarantine"
     ));
     assert!(log.recorded_tool_calls()[0].denied);
+}
+
+/// Captures `mcp permission denied` warn targets so §9.1 coverage is asserted
+/// for both prepare-time and broker-mapped denials.
+struct DenyWarnCapture {
+    msgs: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl<S> tracing_subscriber::Layer<S> for DenyWarnCapture
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut message = String::new();
+        event.record(&mut MessageVisitor(&mut message));
+        if message.contains("mcp permission denied") {
+            self.msgs.lock().unwrap().push(message);
+        }
+    }
+}
+
+struct MessageVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for MessageVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+}
+
+#[tokio::test]
+async fn permission_deny_warns_prepare_and_broker() {
+    let msgs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(DenyWarnCapture {
+        msgs: Arc::clone(&msgs),
+    });
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let fx = Fixture::new();
+    fx.write(".env", b"SECRET=1");
+
+    // Prepare-time: PathPolicy deny on `.env` before any open.
+    let host = fx.host(fx.broker());
+    let prep_err = host
+        .call(
+            call("fs_read", json!({ "path": ".env" })),
+            token(vec![Grant::FsRead(Glob(".env".into()))]),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(prep_err, McpError::PermissionDenied(_)));
+
+    // Broker-mapped: quarantine denial after dispatch starts exec.
+    let broker = fx.broker();
+    broker.push(Err(SandboxError::Denied(
+        alloy_tools::DenialReason::QuarantineBlocked("fetch".into()),
+    )));
+    let host = fx.host(Arc::clone(&broker));
+    let broker_err = host
+        .call(
+            call("cargo_check", json!({ "workspace_root": "." })),
+            token(vec![cargo_grant(None)]),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(broker_err, McpError::PermissionDenied(_)));
+
+    let captured = msgs.lock().unwrap().clone();
+    assert!(
+        captured.len() >= 2,
+        "expected prepare-time and broker-mapped deny warns, got {captured:?}"
+    );
 }
 
 #[tokio::test]

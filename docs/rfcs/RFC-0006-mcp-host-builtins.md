@@ -539,7 +539,8 @@ Full variant semantics: §8.
 
 ```rust
 use alloy_runtime::{
-    McpServerSpec, PermissionToken, ServerId, ToolCall, ToolResult, ToolSelector, ToolView,
+    McpServerSpec, PermissionToken, ServerId, ToolCall, ToolName, ToolResult, ToolSelector,
+    ToolView,
 };
 use async_trait::async_trait;
 
@@ -553,6 +554,23 @@ pub trait McpPlatform: Send + Sync {
 
     /// Lazy disclosure — MUST obey §5.4.
     async fn tools_for(&self, selectors: &[ToolSelector]) -> Result<Vec<ToolView>, McpError>;
+
+    /// Whether `name` is in the disclosed set for `selectors`.
+    ///
+    /// Default implementation calls [`Self::tools_for`]. Hosts SHOULD override to
+    /// avoid cloning full [`ToolView`] schemas on the call hot path (e.g. name/tag
+    /// membership only). Empty `selectors` discloses nothing.
+    async fn discloses(
+        &self,
+        selectors: &[ToolSelector],
+        name: &ToolName,
+    ) -> Result<bool, McpError> {
+        Ok(self
+            .tools_for(selectors)
+            .await?
+            .iter()
+            .any(|view| &view.name == name))
+    }
 
     /// Invoke a tool under `perms`. Pipeline: §5.1.
     ///
