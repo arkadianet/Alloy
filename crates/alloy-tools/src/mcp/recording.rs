@@ -10,13 +10,14 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use alloy_runtime::{
-    McpServerSpec, PermissionToken, ServerId, ToolCall, ToolResult, ToolSelector, ToolView,
+    McpServerSpec, PermissionToken, ServerId, ToolCall, ToolName, ToolResult, ToolSelector,
+    ToolView,
 };
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::mcp::builtins::BuiltinToolId;
-use crate::mcp::disclose::disclose;
+use crate::mcp::disclose::{disclose, discloses_name};
 use crate::mcp::error::McpError;
 use crate::mcp::platform::McpPlatform;
 
@@ -95,6 +96,14 @@ impl McpPlatform for RecordingMcpPlatform {
 
     async fn tools_for(&self, selectors: &[ToolSelector]) -> Result<Vec<ToolView>, McpError> {
         Ok(disclose(&self.views, selectors).0)
+    }
+
+    async fn discloses(
+        &self,
+        selectors: &[ToolSelector],
+        name: &ToolName,
+    ) -> Result<bool, McpError> {
+        Ok(discloses_name(&self.views, selectors, name))
     }
 
     async fn call(&self, call: ToolCall, perms: PermissionToken) -> Result<ToolResult, McpError> {

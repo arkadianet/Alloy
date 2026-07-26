@@ -15,8 +15,8 @@ pub(crate) mod cargo_check;
 pub(crate) mod cargo_test;
 pub(crate) mod fs_read;
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
 use alloy_runtime::{PermissionToken, ToolCall, ToolError, ToolName, ToolResult};
@@ -89,10 +89,10 @@ impl BuiltinToolId {
 /// trusted exec roots, and the injected patch backend. Deliberately no handle,
 /// no registry, no obs.
 pub(crate) struct BuiltinCtx<'a> {
-    pub(crate) broker: &'a Arc<dyn SandboxBroker>,
+    pub(crate) broker: &'a dyn SandboxBroker,
     pub(crate) path_policy: &'a PathPolicy,
     pub(crate) trusted_path: &'a [PathBuf],
-    pub(crate) patch_backend: &'a Arc<dyn PatchApplyBackend>,
+    pub(crate) patch_backend: &'a dyn PatchApplyBackend,
 }
 
 /// A parsed, derived, and authorized call ready for dispatch.
@@ -246,10 +246,21 @@ pub(crate) fn object_args<'a>(
     arguments: &'a Value,
     allowed: &[&str],
 ) -> Result<&'a Map<String, Value>, McpError> {
-    let bytes = serde_json::to_vec(arguments)
-        .map_err(|e| McpError::InvalidArguments(format!("arguments not serializable: {e}")))?;
-    if bytes.len() > MAX_ARGUMENT_BYTES {
-        return Err(McpError::InvalidArguments("arguments too large".into()));
+    // Count serialized size without buffering the whole payload.
+    let mut counter = CapWriter {
+        used: 0,
+        cap: MAX_ARGUMENT_BYTES,
+    };
+    match serde_json::to_writer(&mut counter, arguments) {
+        Ok(()) => {}
+        Err(_) if counter.used > MAX_ARGUMENT_BYTES => {
+            return Err(McpError::InvalidArguments("arguments too large".into()));
+        }
+        Err(e) => {
+            return Err(McpError::InvalidArguments(format!(
+                "arguments not serializable: {e}"
+            )));
+        }
     }
     let obj = arguments
         .as_object()
@@ -262,6 +273,26 @@ pub(crate) fn object_args<'a>(
         }
     }
     Ok(obj)
+}
+
+/// Counts JSON bytes and errors once the host argument cap is exceeded.
+struct CapWriter {
+    used: usize,
+    cap: usize,
+}
+
+impl Write for CapWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.used = self.used.saturating_add(buf.len());
+        if self.used > self.cap {
+            return Err(io::Error::other("arguments too large"));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn check_string(field: &str, s: &str) -> Result<(), McpError> {

@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use alloy_runtime::{token_expired, Grant, PermissionToken};
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSetBuilder};
 
 use crate::mcp::error::{map_sandbox_error, McpError, PermissionDenial};
 use crate::sandbox::grant::match_exec_grant;
@@ -40,21 +40,30 @@ pub(crate) fn authorize_exec(
 }
 
 /// Require at least one `Grant::FsRead` glob covering `rel` (jail-relative).
+///
+/// All `FsRead` grant patterns are compiled into a single [`GlobSet`] so a
+/// token with N grants pays one `build()`, not N, and an uncompilable pattern
+/// fails independently of grant order.
 pub(crate) fn authorize_fs_read(perms: &PermissionToken, rel: &str) -> Result<(), McpError> {
+    let mut builder = GlobSetBuilder::new();
     let mut saw_grant = false;
     for grant in &perms.grants {
         let Grant::FsRead(glob) = grant else {
             continue;
         };
         saw_grant = true;
-        if compile_fs_read_glob(&glob.0)?.is_match(rel) {
-            return Ok(());
-        }
+        add_fs_read_patterns(&mut builder, &glob.0)?;
     }
     if !saw_grant {
         return Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(
             "fs_read".into(),
         )));
+    }
+    let set = builder
+        .build()
+        .map_err(|e| McpError::InvalidToken(format!("grant glob: {e}")))?;
+    if set.is_match(rel) {
+        return Ok(());
     }
     // `rel` is jail-relative, so echoing it leaks no operator layout.
     Err(McpError::PermissionDenied(
@@ -75,24 +84,21 @@ pub(crate) fn authorize_fs_write(perms: &PermissionToken) -> Result<(), McpError
     )))
 }
 
-/// Compile one `FsRead` grant glob under the RFC-0006 §5.5 dialect.
+/// Expand one `FsRead` grant glob under the RFC-0006 §5.5 dialect into `builder`.
 ///
 /// Expansion mirrors the RFC-0005 deny-glob expansion so a grant and a deny
 /// pattern spelled the same way cover the same jail-relative paths.
-fn compile_fs_read_glob(pattern: &str) -> Result<GlobSet, McpError> {
-    let mut builder = GlobSetBuilder::new();
+fn add_fs_read_patterns(builder: &mut GlobSetBuilder, pattern: &str) -> Result<(), McpError> {
     if pattern.contains('/') {
-        add_glob(&mut builder, pattern)?;
+        add_glob(builder, pattern)?;
         if !pattern.starts_with("**/") {
-            add_glob(&mut builder, &format!("**/{pattern}"))?;
+            add_glob(builder, &format!("**/{pattern}"))?;
         }
     } else {
-        add_glob(&mut builder, pattern)?;
-        add_glob(&mut builder, &format!("**/{pattern}"))?;
+        add_glob(builder, pattern)?;
+        add_glob(builder, &format!("**/{pattern}"))?;
     }
-    builder
-        .build()
-        .map_err(|e| McpError::InvalidToken(format!("grant glob: {e}")))
+    Ok(())
 }
 
 fn add_glob(builder: &mut GlobSetBuilder, pattern: &str) -> Result<(), McpError> {
@@ -150,6 +156,14 @@ mod tests {
             let got = authorize_fs_read(&t, rel).is_ok();
             assert_eq!(got, *expect, "glob={pattern:?} rel={rel:?}");
         }
+        // §5.5 final row: grant glob `.env` covers the relative path, but
+        // PathPolicy deny globs win first in the fs_read pipeline (integration:
+        // `fs_read_dotenv_denied_integration`).
+        let dotenv = token(vec![Grant::FsRead(Glob(".env".into()))]);
+        assert!(
+            authorize_fs_read(&dotenv, ".env").is_ok(),
+            "grant alone would cover .env; PathPolicy deny is earlier in the pipeline"
+        );
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! Author: arkadianet
 
 use alloy_runtime::{
-    McpServerSpec, PermissionToken, ServerId, ToolCall, ToolResult, ToolSelector, ToolView,
+    McpServerSpec, PermissionToken, ServerId, ToolCall, ToolName, ToolResult, ToolSelector,
+    ToolView,
 };
 use async_trait::async_trait;
 
@@ -27,6 +28,22 @@ pub trait McpPlatform: Send + Sync {
     /// Empty `selectors` means "disclose nothing", never "disclose the
     /// catalogue" (RFC-0006 §5.4).
     async fn tools_for(&self, selectors: &[ToolSelector]) -> Result<Vec<ToolView>, McpError>;
+
+    /// Whether `name` is in the disclosed set for `selectors`.
+    ///
+    /// Default calls [`Self::tools_for`]; hosts should override to avoid
+    /// cloning full [`ToolView`] schemas on the call hot path.
+    async fn discloses(
+        &self,
+        selectors: &[ToolSelector],
+        name: &ToolName,
+    ) -> Result<bool, McpError> {
+        Ok(self
+            .tools_for(selectors)
+            .await?
+            .iter()
+            .any(|view| &view.name == name))
+    }
 
     /// Invoke a tool under `perms` following the RFC-0006 §5.1 pipeline.
     ///

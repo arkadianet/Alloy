@@ -181,24 +181,55 @@ fn has_drive_prefix(s: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
-/// Strip absolute-path tokens and enforce the length / NUL limits.
+/// Strip absolute-path spans and enforce the length / NUL limits.
+///
+/// Absolute Unix paths (`/…`) and Windows drive paths (`C:\…` / `C:/…`) are
+/// replaced with `<path>` wherever they appear — including after `=` — so
+/// messages like `at path=/home/op/x` do not leak operator layout.
 ///
 /// `None` means the caller must substitute a fixed message.
 fn sanitize_msg(msg: &str) -> Option<String> {
     if msg.len() > MAX_BACKEND_MESSAGE_BYTES || msg.contains('\0') {
         return None;
     }
-    let redacted: Vec<&str> = msg
-        .split_whitespace()
-        .map(|token| {
-            if token.starts_with('/') || has_drive_prefix(token) {
-                "<path>"
-            } else {
-                token
-            }
-        })
-        .collect();
-    Some(redacted.join(" "))
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while !rest.is_empty() {
+        if rest.starts_with('/') {
+            out.push_str("<path>");
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            rest = &rest[end..];
+            continue;
+        }
+        if let Some(stripped) = strip_drive_path_prefix(rest) {
+            out.push_str("<path>");
+            rest = stripped;
+            continue;
+        }
+        let ch = rest.chars().next().expect("rest non-empty");
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    Some(out.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// If `s` begins with a Windows drive path (`X:\` or `X:/`), return the
+/// remainder after the non-whitespace path span.
+fn strip_drive_path_prefix(s: &str) -> Option<&str> {
+    let mut chars = s.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    if chars.next() != Some(':') {
+        return None;
+    }
+    match chars.next() {
+        Some('\\' | '/') => {}
+        _ => return None,
+    }
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    Some(&s[end..])
 }
 
 #[cfg(test)]
@@ -319,6 +350,16 @@ mod tests {
         assert!(!result.is_error());
         assert_eq!(result.content["message"], "wrote <path>");
         assert_eq!(result.content["files_touched"][0], "src/main.rs");
+
+        let embedded = map_outcome(
+            Ok(outcome(
+                vec!["a.rs"],
+                "at path=/home/op/x on C:\\Users\\op\\y",
+            )),
+            false,
+            0,
+        );
+        assert_eq!(embedded.content["message"], "at path=<path> on <path>");
     }
 
     #[test]

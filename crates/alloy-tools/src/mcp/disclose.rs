@@ -48,6 +48,30 @@ pub(crate) fn disclose(views: &[ToolView], selectors: &[ToolSelector]) -> (Vec<T
     (disclosed, false)
 }
 
+/// Whether `name` would be included in [`disclose`] for `selectors`.
+///
+/// Membership only — does not clone schemas. Empty selectors disclose nothing.
+pub(crate) fn discloses_name(
+    views: &[ToolView],
+    selectors: &[ToolSelector],
+    name: &ToolName,
+) -> bool {
+    if selectors.is_empty() {
+        return false;
+    }
+    let Some(view) = views.iter().find(|v| &v.name == name) else {
+        return false;
+    };
+    for selector in selectors {
+        match selector {
+            ToolSelector::Name { name: selected } if selected == name => return true,
+            ToolSelector::Tag { tag } if view.tags.iter().any(|t| t == tag) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +154,30 @@ mod tests {
         // Sorted ascending, so the cap keeps the lexicographically first 32.
         assert_eq!(out[0].name.as_str(), "tool_000");
         assert_eq!(out[31].name.as_str(), "tool_031");
+    }
+
+    #[test]
+    fn discloses_name_matches_disclose_membership() {
+        let views = builtin_views();
+        assert!(!discloses_name(
+            &views,
+            &[],
+            &ToolName::new("fs_read").unwrap()
+        ));
+        assert!(discloses_name(
+            &views,
+            &[ToolSelector::tag("sel.fs")],
+            &ToolName::new("fs_read").unwrap()
+        ));
+        assert!(!discloses_name(
+            &views,
+            &[ToolSelector::tag("sel.fs")],
+            &ToolName::new("cargo_check").unwrap()
+        ));
+        assert!(discloses_name(
+            &views,
+            &[ToolSelector::name(ToolName::new("cargo_check").unwrap())],
+            &ToolName::new("cargo_check").unwrap()
+        ));
     }
 }

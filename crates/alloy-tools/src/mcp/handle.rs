@@ -58,8 +58,7 @@ impl ToolHandle {
         call: ToolCall,
         perms: PermissionToken,
     ) -> Result<ToolResult, McpError> {
-        let disclosed = self.platform.tools_for(&self.selectors).await?;
-        if !disclosed.iter().any(|view| view.name == call.name) {
+        if !self.platform.discloses(&self.selectors, &call.name).await? {
             return Err(McpError::PermissionDenied(PermissionDenial::NotDisclosed));
         }
         self.platform.call(call, perms).await
