@@ -53,8 +53,9 @@ pub enum McpError {
 
     /// Broker / path-policy error that did not map to a more specific variant.
     ///
-    /// Construct **only** via [`map_sandbox_error`]; messages are redacted
-    /// there so operator filesystem layout never reaches a model.
+    /// Construct **only** via the crate-private `map_sandbox_error` helper;
+    /// messages are redacted there so operator filesystem layout never reaches
+    /// a model.
     #[error("sandbox: {0}")]
     Sandbox(SandboxError),
 
