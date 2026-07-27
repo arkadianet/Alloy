@@ -67,3 +67,7 @@ harness = false
 [[bench]]
 name = "router_select"
 harness = false
+
+[[bench]]
+name = "dag_validate"
+harness = false

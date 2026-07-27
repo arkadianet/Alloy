@@ -12,9 +12,7 @@ use crate::dag::types::{
 use crate::scheduler::DagState;
 use crate::types::budget::{ModelTier, TokenBudget};
 use crate::types::diagnostic::ErrorClass;
-use crate::types::ids::{
-    ArtifactId, CapabilityId, DagId, GateId, NodeId, SessionId,
-};
+use crate::types::ids::{ArtifactId, CapabilityId, DagId, GateId, NodeId, SessionId};
 
 /// Closed MVP template identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
@@ -450,11 +448,8 @@ mod tests {
         });
 
         // Reverse map node id → template name
-        let name_of: BTreeMap<NodeId, &str> = ids
-            .nodes
-            .iter()
-            .map(|(n, id)| (*id, n.as_str()))
-            .collect();
+        let name_of: BTreeMap<NodeId, &str> =
+            ids.nodes.iter().map(|(n, id)| (*id, n.as_str())).collect();
 
         let kinds: BTreeMap<&str, NodeKind> = dag
             .nodes

@@ -37,7 +37,10 @@ impl PlanService for DisabledLlmPlanService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::{mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest, TemplateId};
+    use crate::dag::{
+        mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest,
+        TemplateId,
+    };
     use crate::types::budget::Goal;
     use crate::types::ids::{DagId, RunId, SessionId};
 

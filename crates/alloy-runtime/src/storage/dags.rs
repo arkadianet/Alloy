@@ -469,9 +469,7 @@ impl DagStore for SqliteDagStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::{
-        ApprovalSpec, Backoff, EdgeKind, NodeKind, NodeState, RetryPolicy, TaskNode,
-    };
+    use crate::dag::{ApprovalSpec, Backoff, EdgeKind, NodeKind, NodeState, RetryPolicy, TaskNode};
     use crate::storage::{AlloyStorage, StorageOpenOptions};
     use crate::types::budget::{ModelTier, TokenBudget};
     use crate::types::diagnostic::ErrorClass;
@@ -512,7 +510,11 @@ mod tests {
             },
         );
         // Minimal single-node dag for store tests (validator not required).
-        let _ = (CapabilityId::new("repair"), EdgeKind::Data, ErrorClass::Model);
+        let _ = (
+            CapabilityId::new("repair"),
+            EdgeKind::Data,
+            ErrorClass::Model,
+        );
         TaskDag {
             id: DagId::new(),
             session_id: session,

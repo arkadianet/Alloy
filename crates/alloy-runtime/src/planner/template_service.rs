@@ -8,9 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::dag::{
     allocate_ids, build_topology, encode_json, BuildTopology, DagValidationError, DagValidator,
-    EdgeKind, NodeInputEnvelope, NodeInputPayload, NodeKind, PendingPredPlaceholder,
-    PredecessorOutput, TaskDag, TemplateCatalog, TemplateId, TemplateIdMap, TemplateManifest,
-    ValidateOpts,
+    EdgeKind, NodeInputEnvelope, NodeInputPayload, PendingPredPlaceholder, PredecessorOutput,
+    TaskDag, TemplateCatalog, TemplateId, TemplateIdMap, TemplateManifest, ValidateOpts,
 };
 use crate::events::{EventSink, EventSinkError, NewSessionEvent, SessionEventType};
 use crate::scheduler::DagState;
@@ -156,11 +155,8 @@ pub trait PlanService: Send + Sync {
     ) -> Result<PlanResult, PlanError>;
 
     /// Replan: atomic replace, re-instantiate, snapshot, PlanProduced.
-    async fn replan(
-        &self,
-        reason: ReplanReason,
-        ctx: PlanContext,
-    ) -> Result<PlanResult, PlanError>;
+    async fn replan(&self, reason: ReplanReason, ctx: PlanContext)
+        -> Result<PlanResult, PlanError>;
 }
 
 /// Template-backed planner (day-1 production wiring).
@@ -241,42 +237,34 @@ impl TemplatePlanService {
         let snapshot_bytes = serde_json::to_vec(&dag)
             .map_err(|e| PlanError::Internal(format!("dag snapshot serde: {e}")))?;
         let snapshot_artifact = self
-            .put_labeled(
-                snapshot_bytes,
-                ctx,
-                "dag_snapshot",
-            )
+            .put_labeled(snapshot_bytes, ctx, "dag_snapshot")
             .await?;
 
         // Persist
         match expected_for_cas {
-            CasExpected::InsertOnly => {
-                match self.dags.put_if_generation(&dag, None).await {
-                    Ok(()) => {}
-                    Err(StoreError::Conflict(_)) => {
-                        let existing = self
-                            .dags
-                            .get(ctx.dag_id)
-                            .await
-                            .map_err(PlanError::Store)?;
-                        match existing {
-                            Some(e) => {
-                                return Err(PlanError::GenerationMismatch {
-                                    expected: 0,
-                                    actual: e.generation,
-                                });
-                            }
-                            None => {
-                                return Err(PlanError::Internal(
-                                    "conflict on insert but get returned None".into(),
-                                ));
-                            }
+            CasExpected::InsertOnly => match self.dags.put_if_generation(&dag, None).await {
+                Ok(()) => {}
+                Err(StoreError::Conflict(_)) => {
+                    let existing = self.dags.get(ctx.dag_id).await.map_err(PlanError::Store)?;
+                    match existing {
+                        Some(e) => {
+                            return Err(PlanError::GenerationMismatch {
+                                expected: 0,
+                                actual: e.generation,
+                            });
+                        }
+                        None => {
+                            return Err(PlanError::Internal(
+                                "conflict on insert but get returned None".into(),
+                            ));
                         }
                     }
-                    Err(e) => return Err(PlanError::Store(e)),
                 }
-            }
-            CasExpected::Replan { expected_generation } => {
+                Err(e) => return Err(PlanError::Store(e)),
+            },
+            CasExpected::Replan {
+                expected_generation,
+            } => {
                 match self
                     .dags
                     .replace_for_replan(&dag, expected_generation)
@@ -383,7 +371,10 @@ impl TemplatePlanService {
         let mut data_preds: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for e in &manifest.edges {
             if e.kind == EdgeKind::Data {
-                data_preds.entry(e.to.as_str()).or_default().push(e.from.as_str());
+                data_preds
+                    .entry(e.to.as_str())
+                    .or_default()
+                    .push(e.from.as_str());
             }
         }
 
@@ -393,7 +384,10 @@ impl TemplatePlanService {
                 .nodes
                 .get(&spec.name)
                 .ok_or_else(|| PlanError::Internal(format!("missing id for {}", spec.name)))?;
-            let preds = data_preds.get(spec.name.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+            let preds = data_preds
+                .get(spec.name.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
 
             let payload = if preds.is_empty() {
                 // Root (no Data∪Sequence preds for readiness; plan uses Data preds only for
@@ -424,9 +418,7 @@ impl TemplatePlanService {
                         })?;
                     let pending_bytes = encode_json(&PendingPredPlaceholder::new())
                         .map_err(|e| PlanError::Internal(e.to_string()))?;
-                    let pending_id = self
-                        .put_labeled(pending_bytes, ctx, "pending_pred")
-                        .await?;
+                    let pending_id = self.put_labeled(pending_bytes, ctx, "pending_pred").await?;
                     pred_outs.push(PredecessorOutput {
                         node_id: from_id,
                         kind: from_kind,
@@ -479,15 +471,8 @@ impl PlanService for TemplatePlanService {
     async fn plan(&self, ctx: PlanContext) -> Result<PlanResult, PlanError> {
         let template_id = Self::select(&ctx);
         tracing::Span::current().record("template", template_id.as_str());
-        self.instantiate_and_persist(
-            template_id,
-            &ctx,
-            1,
-            false,
-            None,
-            CasExpected::InsertOnly,
-        )
-        .await
+        self.instantiate_and_persist(template_id, &ctx, 1, false, None, CasExpected::InsertOnly)
+            .await
     }
 
     async fn load_template(
@@ -547,9 +532,7 @@ impl PlanService for TemplatePlanService {
         tracing::Span::current().record("generation_from", probe.generation);
         tracing::Span::current().record("generation_to", next_gen);
 
-        let template_id = ctx
-            .template_override
-            .unwrap_or_else(|| Self::select(&ctx));
+        let template_id = ctx.template_override.unwrap_or_else(|| Self::select(&ctx));
 
         self.instantiate_and_persist(
             template_id,
@@ -570,6 +553,7 @@ impl PlanService for TemplatePlanService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dag::NodeKind;
     use crate::dag::{
         mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest,
     };
@@ -603,7 +587,12 @@ mod tests {
         }
     }
 
-    async fn service() -> (tempfile::TempDir, AlloyStorage, TemplatePlanService, Arc<InMemoryEventSink>) {
+    async fn service() -> (
+        tempfile::TempDir,
+        AlloyStorage,
+        TemplatePlanService,
+        Arc<InMemoryEventSink>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
             .await
@@ -647,11 +636,18 @@ mod tests {
             let blob = storage.artifacts().get(node.input_ref).await.unwrap();
             assert_eq!(blob.meta.content_type.as_deref(), Some("application/json"));
             assert_eq!(
-                blob.meta.labels.get("alloy.envelope").and_then(|v| v.as_str()),
+                blob.meta
+                    .labels
+                    .get("alloy.envelope")
+                    .and_then(|v| v.as_str()),
                 Some("node_input")
             );
         }
-        let snap = storage.artifacts().get(result.snapshot_artifact).await.unwrap();
+        let snap = storage
+            .artifacts()
+            .get(result.snapshot_artifact)
+            .await
+            .unwrap();
         let round: TaskDag = serde_json::from_slice(&snap.bytes).unwrap();
         assert_eq!(round.id, dag_id);
     }
@@ -706,7 +702,13 @@ mod tests {
 
         // Prior gen only via snapshot, not dag_blobs history
         assert_eq!(
-            storage.dags().get(dag_id).await.unwrap().unwrap().generation,
+            storage
+                .dags()
+                .get(dag_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
             2
         );
         let old_snap = storage

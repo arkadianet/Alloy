@@ -306,9 +306,7 @@ impl DagValidator {
             .filter(|n| preds.get(n).map(|s| s.is_empty()).unwrap_or(true))
             .collect();
         if roots.len() != 1 {
-            return Err(DagValidationError::MultipleRoots {
-                count: roots.len(),
-            });
+            return Err(DagValidationError::MultipleRoots { count: roots.len() });
         }
         let root = roots[0];
         let reachable = bfs_reachable(root, &succs);
@@ -381,10 +379,7 @@ impl DagValidator {
         // V14 — retry coherence (excluding EscalateOnNonLlm already checked in V9)
         for (id, node) in &dag.nodes {
             if let Some(reason) = retry_coherence(&node.retry) {
-                return Err(DagValidationError::RetryIncoherent {
-                    node: *id,
-                    reason,
-                });
+                return Err(DagValidationError::RetryIncoherent { node: *id, reason });
             }
         }
 
@@ -401,11 +396,7 @@ impl DagValidator {
             for (id, node) in &dag.nodes {
                 if let Some(approval) = &node.approval {
                     if let Some(prev) = by_gate.insert(approval.gate, *id) {
-                        let (a, b) = if prev < *id {
-                            (prev, *id)
-                        } else {
-                            (*id, prev)
-                        };
+                        let (a, b) = if prev < *id { (prev, *id) } else { (*id, prev) };
                         return Err(DagValidationError::DuplicateGateId {
                             gate: approval.gate,
                             a,
@@ -560,10 +551,7 @@ fn bfs_reachable(root: NodeId, succs: &HashMap<NodeId, BTreeSet<NodeId>>) -> Has
 
 /// DFS cycle detection: start from each unvisited node in ascending id order.
 /// Returns `to` of the first back-edge discovered.
-fn detect_cycle(
-    nodes: &BTreeMap<NodeId, TaskNode>,
-    edges: &[&DependencyEdge],
-) -> Option<NodeId> {
+fn detect_cycle(nodes: &BTreeMap<NodeId, TaskNode>, edges: &[&DependencyEdge]) -> Option<NodeId> {
     let (_, succs) = build_adj(edges);
     let mut color: HashMap<NodeId, u8> = HashMap::new(); // 0 white, 1 gray, 2 black
     for id in nodes.keys() {
@@ -627,7 +615,11 @@ fn check_linear(
 ///
 /// Edges with `kind ∈ {Data, Sequence}` participate; `Hint` is ignored.
 /// A node MAY become Ready iff every such predecessor is satisfied.
+///
+/// Runtime Ready transitions remain RFC-0010; this helper ships for unit tests
+/// and for the scheduler to reuse without inventing a second rule set.
 #[must_use]
+#[allow(dead_code)] // exercised in unit tests; consumed by RFC-0010
 pub(crate) fn preds_satisfied(dag: &TaskDag, node: NodeId) -> bool {
     for edge in &dag.edges {
         if edge.to != node {
@@ -740,10 +732,7 @@ mod tests {
         n
     }
 
-    fn dag_from(
-        nodes: BTreeMap<NodeId, TaskNode>,
-        edges: Vec<DependencyEdge>,
-    ) -> TaskDag {
+    fn dag_from(nodes: BTreeMap<NodeId, TaskNode>, edges: Vec<DependencyEdge>) -> TaskDag {
         TaskDag {
             id: DagId::new(),
             session_id: SessionId::new(),
@@ -818,19 +807,20 @@ mod tests {
         nodes.insert(gid, g);
         // Need edge so we don't fail earlier for other reasons — actually Empty is fine,
         // but we have two nodes. Without edges: MultipleRoots. Fix: connect them.
-        let edges = vec![
-            DependencyEdge {
-                from: a,
-                to: gid,
-                kind: EdgeKind::Sequence,
-            },
-        ];
+        let edges = vec![DependencyEdge {
+            from: a,
+            to: gid,
+            kind: EdgeKind::Sequence,
+        }];
         let dag = dag_from(nodes, edges);
         assert!(matches!(
-            DagValidator::validate(&dag, ValidateOpts {
-                require_gates: false,
-                ..Default::default()
-            }),
+            DagValidator::validate(
+                &dag,
+                ValidateOpts {
+                    require_gates: false,
+                    ..Default::default()
+                }
+            ),
             Err(DagValidationError::NodeIdMismatch { .. })
         ));
     }
@@ -955,8 +945,7 @@ mod tests {
     #[test]
     fn capability_forbidden() {
         let (mut dag, _, _, g) = valid_chain();
-        dag.nodes.get_mut(&g).unwrap().capability =
-            Some(CapabilityId::new("repair").unwrap());
+        dag.nodes.get_mut(&g).unwrap().capability = Some(CapabilityId::new("repair").unwrap());
         assert!(matches!(
             DagValidator::validate(&dag, ValidateOpts::default()),
             Err(DagValidationError::CapabilityForbidden { .. })
@@ -989,8 +978,7 @@ mod tests {
     #[test]
     fn cache_key_forbidden() {
         let (mut dag, _, _, g) = valid_chain();
-        dag.nodes.get_mut(&g).unwrap().cache_key =
-            Some(CacheKey(Digest::sha256(b"x")));
+        dag.nodes.get_mut(&g).unwrap().cache_key = Some(CacheKey(Digest::sha256(b"x")));
         assert!(matches!(
             DagValidator::validate(&dag, ValidateOpts::default()),
             Err(DagValidationError::CacheKeyForbidden { .. })
@@ -1035,7 +1023,13 @@ mod tests {
     #[test]
     fn gate_reason_empty() {
         let (mut dag, _, _, g) = valid_chain();
-        dag.nodes.get_mut(&g).unwrap().approval.as_mut().unwrap().reason = "   ".into();
+        dag.nodes
+            .get_mut(&g)
+            .unwrap()
+            .approval
+            .as_mut()
+            .unwrap()
+            .reason = "   ".into();
         assert!(matches!(
             DagValidator::validate(&dag, ValidateOpts::default()),
             Err(DagValidationError::GateReasonEmpty { .. })
