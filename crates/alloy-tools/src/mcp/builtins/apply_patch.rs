@@ -21,6 +21,7 @@ use crate::mcp::patch::{
     ApplyPatchArgs, ApplyPatchOutcome, PatchApplyError, EDIT_ENGINE_UNWIRED_CODE,
     EDIT_ENGINE_UNWIRED_MESSAGE,
 };
+use crate::redact::redact_abs_paths;
 
 /// Max length of any message forwarded from the backend.
 const MAX_BACKEND_MESSAGE_BYTES: usize = 512;
@@ -43,13 +44,16 @@ pub(crate) fn parse(arguments: &Value) -> Result<ApplyPatchArgs, McpError> {
     })
 }
 
-/// Parse then require at least one `FsWrite` grant.
+/// Parse then require FsWrite; GitWrite when mutating (RFC-0008 §3.8.4).
 pub(crate) fn prepare(
     arguments: &Value,
     perms: &PermissionToken,
 ) -> Result<ApplyPatchArgs, McpError> {
     let args = parse(arguments)?;
     authz::authorize_fs_write(perms)?;
+    if !args.dry_run {
+        authz::authorize_git_write(perms)?;
+    }
     Ok(args)
 }
 
@@ -57,12 +61,32 @@ pub(crate) fn prepare(
 pub(crate) async fn execute(
     ctx: &BuiltinCtx<'_>,
     args: ApplyPatchArgs,
+    perms: PermissionToken,
+    session: Option<alloy_runtime::SessionId>,
+    run: Option<alloy_runtime::RunId>,
 ) -> Result<ToolResult, McpError> {
     let started = Instant::now();
     let dry_run = args.dry_run;
-    let outcome = ctx.patch_backend.apply(args).await;
+    let outcome = ctx.patch_backend.apply(args, &perms, session, run).await;
     let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Ok(map_outcome(outcome, dry_run, elapsed))
+    match outcome {
+        Err(PatchApplyError::PermissionDenied(d)) => Err(McpError::PermissionDenied(d)),
+        Err(PatchApplyError::TokenExpired) => Err(McpError::TokenExpired),
+        Ok(outcome) => {
+            // Fine-grained path authorization belongs to the backend (RFC-0008
+            // §3.8.3), so a reported path outside the FsWrite grant means the
+            // backend broke its contract: re-check it here rather than forward
+            // it (RFC-0006 §5.9). Paths that are not even jail-relative are the
+            // output boundary's own business — `map_outcome` rejects those as
+            // unsafe backend output. Runs once per tool call, after the patch
+            // already applied, so the per-path grant compile is not hot.
+            if outcome.files_touched.iter().all(|p| is_jail_relative(p)) {
+                authz::authorize_fs_write_paths(&perms, &outcome.files_touched)?;
+            }
+            Ok(map_outcome(Ok(outcome), dry_run, elapsed))
+        }
+        other => Ok(map_outcome(other, dry_run, elapsed)),
+    }
 }
 
 fn map_outcome(
@@ -145,6 +169,21 @@ fn map_backend_error(err: PatchApplyError) -> (&'static str, ToolError) {
                 message: "apply_patch internal error".into(),
             },
         ),
+        // Elevated in `execute` — defensive only if map_outcome sees them.
+        PatchApplyError::PermissionDenied(_) => (
+            "permission_denied",
+            ToolError::Permanent {
+                code: "permission_denied".into(),
+                message: "permission denied".into(),
+            },
+        ),
+        PatchApplyError::TokenExpired => (
+            "token_expired",
+            ToolError::Permanent {
+                code: "token_expired".into(),
+                message: "token expired".into(),
+            },
+        ),
     }
 }
 
@@ -181,80 +220,20 @@ fn has_drive_prefix(s: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
-/// Strip absolute-path spans and enforce the length / NUL limits.
-///
-/// Absolute Unix paths (`/…`) and Windows drive paths (`C:\…` / `C:/…`) are
-/// replaced with `<path>` unless the preceding character is path-ish
-/// (alphanumeric, `.`, `-`, `_`). That keeps relative mentions like
-/// `src/main.rs` intact while redacting quoted and delimited forms such as
-/// `"/home/op/x"`, `path=/home/op/x`, and `(C:\Users\op\y)`.
+/// Strip absolute-path spans (see [`crate::redact`]) and enforce the length /
+/// NUL limits.
 ///
 /// `None` means the caller must substitute a fixed message.
 fn sanitize_msg(msg: &str) -> Option<String> {
     if msg.len() > MAX_BACKEND_MESSAGE_BYTES || msg.contains('\0') {
         return None;
     }
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
-    let mut prev_pathish = false;
-    while !rest.is_empty() {
-        if !prev_pathish && rest.starts_with('/') {
-            out.push_str("<path>");
-            let end = path_span_end(rest);
-            rest = &rest[end..];
-            prev_pathish = false;
-            continue;
-        }
-        if !prev_pathish {
-            if let Some(stripped) = strip_drive_path_prefix(rest) {
-                out.push_str("<path>");
-                rest = stripped;
-                prev_pathish = false;
-                continue;
-            }
-        }
-        let ch = rest.chars().next().expect("rest non-empty");
-        out.push(ch);
-        rest = &rest[ch.len_utf8()..];
-        prev_pathish = is_path_continuation(ch);
-    }
-    Some(out.split_whitespace().collect::<Vec<_>>().join(" "))
-}
-
-fn is_path_continuation(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')
-}
-
-/// End index of an absolute-path span starting at `s` (which begins with `/`
-/// or a drive path). Stops before whitespace and before message delimiters so
-/// closing quotes/parens are not swallowed into the redaction.
-fn path_span_end(s: &str) -> usize {
-    s.char_indices()
-        .find(|&(_, ch)| ch.is_whitespace() || is_path_terminator(ch))
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
-}
-
-fn is_path_terminator(ch: char) -> bool {
-    matches!(ch, '"' | '\'' | ')' | ']' | '}' | ',' | ';' | '<' | '>')
-}
-
-/// If `s` begins with a Windows drive path (`X:\` or `X:/`), return the
-/// remainder after the path span.
-fn strip_drive_path_prefix(s: &str) -> Option<&str> {
-    let mut chars = s.chars();
-    let drive = chars.next()?;
-    if !drive.is_ascii_alphabetic() {
-        return None;
-    }
-    if chars.next() != Some(':') {
-        return None;
-    }
-    match chars.next() {
-        Some('\\' | '/') => {}
-        _ => return None,
-    }
-    Some(&s[path_span_end(s)..])
+    Some(
+        redact_abs_paths(msg)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 #[cfg(test)]

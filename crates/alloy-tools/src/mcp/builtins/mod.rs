@@ -149,12 +149,14 @@ pub(crate) async fn execute(
     ctx: &BuiltinCtx<'_>,
     prepared: Prepared,
     perms: PermissionToken,
+    session: Option<alloy_runtime::SessionId>,
+    run: Option<alloy_runtime::RunId>,
 ) -> Result<ToolResult, McpError> {
     match prepared {
         Prepared::CargoCheck(p) => cargo_check::execute(ctx, p, perms).await,
         Prepared::CargoTest(p) => cargo_test::execute(ctx, p, perms).await,
         Prepared::FsRead(p) => fs_read::execute(p).await,
-        Prepared::ApplyPatch(args) => apply_patch::execute(ctx, args).await,
+        Prepared::ApplyPatch(args) => apply_patch::execute(ctx, args, perms, session, run).await,
     }
 }
 

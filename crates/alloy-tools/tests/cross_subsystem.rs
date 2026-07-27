@@ -21,16 +21,18 @@ use alloy_runtime::obs::{parse_tool_call_event, EventDecisionLog, RetentionPolic
 use alloy_runtime::session::SessionPlane;
 use alloy_runtime::storage::{EventStore, StorageOpenOptions};
 use alloy_runtime::{
-    install_sqlite_event_sink, AlloyRuntime, AlloyStorage, BudgetPolicy, ConfigPaths,
-    CreateSession, ExecAllow, Glob, Grant, LanguageId, PermissionToken, ProfileId, RunId,
-    RuntimeConfig, SessionEventType, SessionId, ToolCall, ToolName, ToolSelector,
+    install_sqlite_event_sink, AlloyRuntime, AlloyStorage, ArtifactId, ArtifactKind, ArtifactStore,
+    BudgetPolicy, ConfigPaths, CreateSession, EditContext, EditEngine, ExecAllow, Glob, Grant,
+    LanguageId, PermissionToken, ProfileId, RunId, RuntimeConfig, SessionEventType, SessionId,
+    ToolCall, ToolName, ToolSelector, TransactionId,
 };
 use alloy_tools::mcp::{
-    InProcessMcpHost, McpError, McpHostConfig, McpPlatform, PermissionDenial,
-    StubPatchApplyBackend, ToolHandle,
+    InProcessMcpHost, McpError, McpHostConfig, McpPlatform, PermissionDenial, ToolHandle,
 };
 use alloy_tools::{
-    BackendStatus, NativeSandboxBroker, OperatorHomes, SandboxBroker, SandboxError, SandboxProfile,
+    trusted_exec_path, BackendStatus, EditEnginePatchBackend, ExecClass, GitEditEngine,
+    GitEditEngineConfig, NativeSandboxBroker, OperatorHomes, PathPolicy, SandboxBroker,
+    SandboxError, SandboxExecRequest, SandboxProfile,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -43,6 +45,8 @@ struct Stack {
     _root: TempDir,
     storage: Arc<AlloyStorage>,
     host: Arc<InProcessMcpHost>,
+    engine: Arc<GitEditEngine>,
+    broker: Arc<NativeSandboxBroker>,
     jail: PathBuf,
     plane: SessionPlane,
     workspace: PathBuf,
@@ -90,7 +94,9 @@ impl Stack {
         let profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
         // A skip past this point must still close the runtime and storage it
         // already opened, or the process warns about dropping them un-closed.
-        let broker = match NativeSandboxBroker::with_operator_homes(profile, homes.clone()).await {
+        let broker = match NativeSandboxBroker::with_operator_homes(profile.clone(), homes.clone())
+            .await
+        {
             Ok(b) => match check_backend_status(&b) {
                 BackendStatus::Available { .. } => b,
                 BackendStatus::Unavailable { reason } => {
@@ -105,6 +111,8 @@ impl Stack {
             }
             Err(e) => panic!("broker construction failed: {e}"),
         };
+        let broker = Arc::new(broker);
+        init_git_repo(&broker, &jail).await;
 
         // --- RFC-0004 durable decision log + RFC-0006 MCP host ---
         let decision_log = Arc::new(EventDecisionLog::new(
@@ -112,11 +120,30 @@ impl Stack {
             Arc::clone(&storage),
             RetentionPolicy::defaults(),
         ));
+        // RFC-0008 §3.10: engine and host MUST share one `read_only_roots`
+        // value. The jail is never an RO root — RO roots are the allowlisted
+        // cargo/rustup subtrees outside it — or the engine's own writes would be
+        // refused as writes into a read-only root.
+        let read_only_roots: Vec<PathBuf> = Vec::new();
+        let path_policy = PathPolicy::from_profile(&profile, read_only_roots.clone()).unwrap();
+        let engine = Arc::new(
+            GitEditEngine::new(GitEditEngineConfig::new(
+                broker.clone() as Arc<dyn SandboxBroker>,
+                path_policy,
+                trusted_exec_path(&homes),
+                storage.artifacts() as Arc<dyn ArtifactStore>,
+                storage.events(),
+            ))
+            .unwrap(),
+        );
+        let patch_backend = Arc::new(EditEnginePatchBackend::new(
+            engine.clone() as Arc<dyn EditEngine>
+        ));
         let host = InProcessMcpHost::new(
-            Arc::new(broker),
+            broker.clone(),
             homes,
-            vec![jail.clone()],
-            Arc::new(StubPatchApplyBackend),
+            read_only_roots,
+            patch_backend,
             McpHostConfig::new(),
         )
         .unwrap()
@@ -131,6 +158,8 @@ impl Stack {
             _root: root,
             storage,
             host,
+            engine,
+            broker: broker.clone(),
             jail,
             plane,
             workspace,
@@ -257,6 +286,55 @@ fn token(grants: Vec<Grant>) -> PermissionToken {
     }
 }
 
+fn git_token() -> PermissionToken {
+    token(vec![Grant::Exec(ExecAllow {
+        binary: "git".into(),
+        args_glob: None,
+    })])
+}
+
+async fn run_git(broker: &Arc<NativeSandboxBroker>, jail: &Path, args: &[&str]) -> String {
+    let mut argv = vec!["git".to_string()];
+    argv.extend(args.iter().map(|s| (*s).to_string()));
+    let result = broker
+        .exec(SandboxExecRequest::new(
+            argv,
+            jail.to_path_buf(),
+            git_token(),
+            ExecClass::Check,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "git {:?} stderr={}",
+        args,
+        String::from_utf8_lossy(&result.stderr)
+    );
+    String::from_utf8(result.stdout).unwrap()
+}
+
+async fn init_git_repo(broker: &Arc<NativeSandboxBroker>, jail: &Path) {
+    run_git(broker, jail, &["init"]).await;
+    std::fs::write(jail.join("edit.txt"), "before\n").unwrap();
+    run_git(broker, jail, &["add", "."]).await;
+    run_git(
+        broker,
+        jail,
+        &[
+            "-c",
+            "user.name=alloy",
+            "-c",
+            "user.email=alloy@localhost",
+            "commit",
+            "-m",
+            "init",
+        ],
+    )
+    .await;
+}
+
 fn exec_token(jail: &Path) -> PermissionToken {
     token(vec![
         Grant::Exec(ExecAllow {
@@ -278,6 +356,17 @@ fn session_call(name: &str, session: SessionId, arguments: serde_json::Value) ->
 /// authorization, so a denial test must still pass a schema-valid payload.
 fn cargo_check_call(session: SessionId) -> ToolCall {
     session_call("cargo_check", session, json!({ "workspace_root": "." }))
+}
+
+fn edit_token() -> PermissionToken {
+    token(vec![
+        Grant::FsWrite(Glob("**".into())),
+        Grant::GitWrite,
+        Grant::Exec(ExecAllow {
+            binary: "git".into(),
+            args_glob: None,
+        }),
+    ])
 }
 
 // --- the tests --------------------------------------------------------------
@@ -395,6 +484,90 @@ async fn undisclosed_tool_is_not_callable_through_a_scoped_handle() {
     assert!(
         !stack.jail.join(RAN_MARKER).exists(),
         "an undisclosed tool must not reach the sandbox"
+    );
+
+    stack.shutdown().await;
+}
+
+/// RFC-0008 reference constructor: MCP apply_patch uses EditEnginePatchBackend,
+/// mutates a real git workspace, records EditApplied durably, and can roll back.
+#[tokio::test]
+async fn apply_patch_edit_engine_cross_subsystem_records_edit_applied() {
+    let Some(stack) = Stack::build().await else {
+        return;
+    };
+    let session = stack.new_session().await;
+    let run = RunId::new();
+    let perms = PermissionToken {
+        run_id: run,
+        ..edit_token()
+    };
+    let head_before = run_git(&stack.broker, &stack.jail, &["rev-parse", "HEAD"]).await;
+    let diff = "--- a/edit.txt\n+++ b/edit.txt\n@@ -1,1 +1,1 @@\n-before\n+after\n";
+    let result = stack
+        .host
+        .call(
+            session_call(
+                "apply_patch",
+                session,
+                json!({ "patch": diff, "dry_run": false }),
+            ),
+            perms.clone(),
+        )
+        .await
+        .expect("apply_patch dispatch");
+    assert!(!result.is_error(), "apply_patch should succeed: {result:?}");
+    assert_eq!(
+        std::fs::read_to_string(stack.jail.join("edit.txt")).unwrap(),
+        "after\n"
+    );
+    let tx_id: TransactionId =
+        serde_json::from_value(result.content["transaction_id"].clone()).unwrap();
+    let refs = run_git(
+        &stack.broker,
+        &stack.jail,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/alloy/checkpoints",
+        ],
+    )
+    .await;
+    assert!(!refs.trim().is_empty(), "checkpoint ref should exist");
+    let head_after = run_git(&stack.broker, &stack.jail, &["rev-parse", "HEAD"]).await;
+    assert_eq!(head_after, head_before);
+
+    let events = stack
+        .storage
+        .events()
+        .list_session_events(session, None, 128)
+        .await
+        .unwrap();
+    let edit_event = events
+        .iter()
+        .find(|e| e.type_ == SessionEventType::EditApplied)
+        .expect("EditApplied event");
+    assert_eq!(edit_event.run_id, Some(run));
+    let artifact_id: ArtifactId =
+        serde_json::from_value(edit_event.payload["patch_artifact_id"].clone()).unwrap();
+    let meta = stack.storage.artifacts().meta(artifact_id).await.unwrap();
+    assert_eq!(meta.kind, ArtifactKind::Patch);
+
+    stack
+        .engine
+        .rollback(
+            tx_id,
+            &EditContext {
+                session_id: Some(session),
+                run_id: Some(run),
+                perms,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(stack.jail.join("edit.txt")).unwrap(),
+        "before\n"
     );
 
     stack.shutdown().await;

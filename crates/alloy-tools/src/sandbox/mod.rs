@@ -28,6 +28,7 @@ mod types;
 pub use broker::NativeSandboxBroker;
 pub use env::OperatorHomes;
 pub use glob::default_deny_globs;
+pub use grant::trusted_exec_path;
 pub use path::{PathAccess, PathPolicy};
 pub use profile::{load_sandbox_profile, SandboxProfile};
 pub use recording::RecordingSandboxBroker;

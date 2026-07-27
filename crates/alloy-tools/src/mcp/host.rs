@@ -30,7 +30,7 @@ use crate::mcp::metrics::{McpMetrics, McpMetricsSnapshot};
 use crate::mcp::patch::PatchApplyBackend;
 use crate::mcp::platform::McpPlatform;
 use crate::mcp::registry::Registry;
-use crate::sandbox::grant::{trusted_path_dirs, trusted_roots};
+use crate::sandbox::grant::trusted_exec_path;
 use crate::sandbox::{OperatorHomes, PathPolicy, SandboxBroker};
 
 /// Tool server name recorded in the [`DecisionLog`].
@@ -212,14 +212,8 @@ impl InProcessMcpHost {
             Some(d) => d,
         };
 
-        // Same union the broker builds per exec: PATH search dirs first, then
-        // the broader membership roots.
-        let mut trusted_path = trusted_path_dirs(Some(&homes.cargo_home), Some(&homes.rustup_home));
-        for root in trusted_roots(Some(&homes.cargo_home), Some(&homes.rustup_home)) {
-            if !trusted_path.contains(&root) {
-                trusted_path.push(root);
-            }
-        }
+        // Same trusted-exec boundary GitEditEngine uses (RFC-0008 §3.7).
+        let trusted_path = trusted_exec_path(&homes);
 
         let path_policy = PathPolicy::from_profile(broker.profile(), read_only_roots)
             .map_err(crate::mcp::error::map_sandbox_error)?;
@@ -442,7 +436,7 @@ impl InProcessMcpHost {
         let outcome = match builtins::prepare(id, &ctx, call, &perms) {
             Err(err) => Err(err),
             Ok(prepared) => {
-                let dispatch = builtins::execute(&ctx, prepared, perms);
+                let dispatch = builtins::execute(&ctx, prepared, perms, call.session, call.run);
                 tokio::select! {
                     () = self.cancel_guard.0.cancelled() => Err(McpError::Cancelled),
                     result = tokio::time::timeout(state.call_timeout, dispatch) => match result {
