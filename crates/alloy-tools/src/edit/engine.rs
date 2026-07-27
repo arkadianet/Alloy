@@ -33,6 +33,13 @@ use crate::sandbox::{ExecClass, PathPolicy, SandboxBroker};
 const DEFAULT_MAX_DIGEST_FILES: u64 = 50_000;
 const DEFAULT_MAX_DIGEST_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Committed / rolled-back transactions retained per state (RFC-0008 §5.11).
+///
+/// Rollback eligibility only ever looks at the newest transaction in a state, so
+/// the history is a bounded convenience: a long-lived session must not grow the
+/// map for the whole process lifetime.
+const MAX_RETAINED_TXS_PER_STATE: usize = 32;
+
 /// Concrete MVP EditEngine: PathPolicy writes + sandboxed git checkpoints.
 pub struct GitEditEngine {
     broker: Arc<dyn SandboxBroker>,
@@ -896,8 +903,10 @@ impl GitEditEngine {
         record.created_paths = file_out.created_paths.clone();
         record.temp_paths = file_out.temp_paths.clone();
         record.created_dirs = file_out.created_dirs.clone();
+        let committed = Self::record_to_tx(record);
+        prune_closed_txs(&mut txs);
         *slot = None;
-        Ok(Self::record_to_tx(record))
+        Ok(committed)
     }
 
     /// Restore the checkpoint after a mutation failed, then return the error.
@@ -1041,6 +1050,30 @@ fn newest_tx_with_state(
         .filter(|r| r.state == state)
         .max_by(|a, b| (a.created_at.0, *a.id.as_uuid()).cmp(&(b.created_at.0, *b.id.as_uuid())))
         .map(|r| r.id)
+}
+
+/// Drop all but the newest [`MAX_RETAINED_TXS_PER_STATE`] closed transactions.
+///
+/// `Open` records are never dropped: one of them may be the abandon target that
+/// reconcile still has to restore. The bound is applied per closed state so a
+/// burst of rollbacks cannot evict the newest `Committed` record, which is the
+/// only one eligible for rollback (RFC-0008 §5.11).
+fn prune_closed_txs(txs: &mut HashMap<TransactionId, TxRecord>) {
+    for state in [TxState::Committed, TxState::RolledBack] {
+        let mut in_state: Vec<_> = txs
+            .values()
+            .filter(|r| r.state == state)
+            .map(|r| (r.created_at.0, *r.id.as_uuid(), r.id))
+            .collect();
+        if in_state.len() <= MAX_RETAINED_TXS_PER_STATE {
+            continue;
+        }
+        // Newest first, same order as `newest_tx_with_state`.
+        in_state.sort_by_key(|(created_at, uuid, _)| std::cmp::Reverse((*created_at, *uuid)));
+        for (_, _, id) in in_state.into_iter().skip(MAX_RETAINED_TXS_PER_STATE) {
+            txs.remove(&id);
+        }
+    }
 }
 
 /// Refuse to restore while a deny-glob path is tracked (V17 / RFC §5.11).
@@ -1285,6 +1318,47 @@ mod tests {
         assert_eq!(
             newest_tx_with_state(&txs, TxState::Committed),
             Some(committed.id)
+        );
+    }
+
+    #[test]
+    fn pruning_bounds_closed_txs_per_state_and_keeps_open() {
+        let digest = WorkspaceDigest {
+            tree: Digest::sha256(b""),
+            file_count: 0,
+            total_bytes: 0,
+        };
+        let mut txs = HashMap::new();
+        let open = tx_record(TxState::Open, digest.clone());
+        txs.insert(open.id, open.clone());
+        let mut newest_committed = None;
+        for i in 0..MAX_RETAINED_TXS_PER_STATE * 2 {
+            for state in [TxState::Committed, TxState::RolledBack] {
+                let mut record = tx_record(state, digest.clone());
+                record.created_at = Timestamp(
+                    Timestamp::now().0 + std::time::Duration::from_secs(u64::try_from(i).unwrap()),
+                );
+                if state == TxState::Committed {
+                    newest_committed = Some(record.id);
+                }
+                txs.insert(record.id, record);
+            }
+        }
+
+        prune_closed_txs(&mut txs);
+
+        for state in [TxState::Committed, TxState::RolledBack] {
+            assert_eq!(
+                txs.values().filter(|r| r.state == state).count(),
+                MAX_RETAINED_TXS_PER_STATE,
+                "{state:?} history must be bounded"
+            );
+        }
+        assert!(txs.contains_key(&open.id), "Open records are never pruned");
+        assert_eq!(
+            newest_tx_with_state(&txs, TxState::Committed),
+            newest_committed,
+            "the rollback-eligible transaction must survive pruning"
         );
     }
 
