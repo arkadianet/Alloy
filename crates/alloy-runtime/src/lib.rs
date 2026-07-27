@@ -45,10 +45,12 @@ pub mod storage;
 pub mod types;
 
 pub use adapters::{
-    Approval, CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityOutcome,
-    GateHumanAdapter, NodeExecContext, NodeExecRef, UnavailableCapabilityExecutor,
-    UnavailableGateHuman, UnavailableVerifyCompile, UnavailableVerifyTest, VerifyCompileAdapter,
-    VerifyOutcome, VerifyTestAdapter,
+    diagnostic_fingerprint, parse_rustc_diagnostics, Approval, CapabilityExecContext,
+    CapabilityExecError, CapabilityExecutor, CapabilityOutcome, GateHumanAdapter,
+    McpVerifyCompileAdapter, McpVerifyTestAdapter, NodeExecContext, NodeExecRef,
+    SessionVerifyPermissions, ToolCaller, ToolCallerError, UnavailableCapabilityExecutor,
+    UnavailableGateHuman, UnavailableVerifyCompile, UnavailableVerifyTest, VerifyClass,
+    VerifyCompileAdapter, VerifyOutcome, VerifyPermissions, VerifyTestAdapter,
 };
 pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
 pub use dag::{

@@ -1,11 +1,19 @@
 //! Runtime node adapters (Verify*/GateHuman) — stubs until RFC-0010/0006.
 
 mod capability;
+mod diagnostics;
+mod perms;
+mod tool_caller;
+mod verify;
 
 pub use capability::{
     CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityOutcome,
     UnavailableCapabilityExecutor,
 };
+pub use diagnostics::{diagnostic_fingerprint, parse_rustc_diagnostics};
+pub use perms::{SessionVerifyPermissions, VerifyClass, VerifyPermissions};
+pub use tool_caller::{ToolCaller, ToolCallerError};
+pub use verify::{McpVerifyCompileAdapter, McpVerifyTestAdapter};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
