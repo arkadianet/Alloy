@@ -382,7 +382,8 @@ fn protected_segment_reason(segment: &str) -> Option<&'static str> {
 /// True when any path segment is protected (`.git` / `.alloy-sbx`, any casing).
 #[must_use]
 pub(crate) fn has_protected_segment(path: &str) -> bool {
-    path.split('/').any(|segment| protected_segment_reason(segment).is_some())
+    path.split('/')
+        .any(|segment| protected_segment_reason(segment).is_some())
 }
 
 /// True when a path is excluded from WorkspaceDigest.
