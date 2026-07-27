@@ -972,7 +972,10 @@ impl Checkpoint {
 
     /// Page every `NodeState` event for `(session, node)` filtered to
     /// `payload.generation == generation` (§5.3.1's normative scan rule).
-    async fn list_node_state_events(
+    ///
+    /// `pub(super)`: also used by [`Self::recover_failure_ir`]'s FO1/FO2 scan
+    /// from `loop_.rs`'s R9 fast path.
+    pub(super) async fn list_node_state_events(
         &self,
         dag_id: DagId,
         session_id: SessionId,
@@ -1010,6 +1013,79 @@ impl Checkpoint {
             }
         }
         Ok(out)
+    }
+
+    /// FO1/FO2/FO3 (§5.18): recover the `FailureIr` for a node the caller
+    /// has already confirmed is durably `NodeState::Failed`, for the R9
+    /// already-terminal fast path (`assemble_already_terminal_outcome`) —
+    /// the in-memory `FailureIr` a live `terminal_failed`/`c9c_gate_deny`
+    /// call would have doesn't exist across a process restart, so this
+    /// reconstructs it from what's durable. Read-only: no checkpoint/CAS.
+    ///
+    /// Ladder, each rung only reached if the one above fails:
+    /// 1. FO1 — the `failure_ref` artifact named on the failing `NodeState`
+    ///    event, parsed back into a `FailureIr`.
+    /// 2. FO2 — no artifact (missing/corrupt/unparseable): degrade to a
+    ///    `FailureIr` built from that same event's `error_class`/`retry`
+    ///    fields, `notes: "failure detail unavailable"`.
+    /// 3. FO3 — no matching event at all: synthetic `Internal` /
+    ///    `NonRetryable`, `notes: "failure detail unavailable; event missing"`.
+    pub(super) async fn recover_failure_ir(
+        &self,
+        dag_id: DagId,
+        session_id: SessionId,
+        node_id: NodeId,
+        generation: u64,
+    ) -> Result<FailureIr, SchedError> {
+        let events = self
+            .list_node_state_events(dag_id, session_id, node_id, generation)
+            .await?;
+        // Most-recent match wins: a node that failed, retried (C8's own
+        // best-effort `to:failed` waypoint), and failed again durably has
+        // more than one `to:failed` event for the same generation, and only
+        // the last one is the terminal one.
+        let Some(ev) = events.iter().rev().find(|ev| {
+            ev.payload.get("to").and_then(Value::as_str) == Some(state_str(NodeState::Failed))
+        }) else {
+            // FO3 floor: no matching event survived at all.
+            return Ok(FailureIr {
+                node: node_id,
+                error_class: ErrorClass::Internal,
+                retry: RetryDisposition::NonRetryable,
+                diagnostics: vec![],
+                notes: "failure detail unavailable; event missing".into(),
+            });
+        };
+
+        // FO1: the durable failure_ref artifact, when present and parseable.
+        if let Some(failure_ref) = ev.payload.get("failure_ref").and_then(Value::as_str) {
+            if let Ok(id) = ArtifactId::parse(failure_ref) {
+                if let Ok(blob) = self.artifacts.get(id).await {
+                    if let Ok(failure) = serde_json::from_slice::<FailureIr>(&blob.bytes) {
+                        return Ok(failure);
+                    }
+                }
+            }
+        }
+
+        // FO2: degrade to the event's own fields.
+        let error_class = ev
+            .payload
+            .get("error_class")
+            .and_then(|v| serde_json::from_value::<ErrorClass>(v.clone()).ok())
+            .unwrap_or(ErrorClass::Internal);
+        let retry = ev
+            .payload
+            .get("retry")
+            .and_then(|v| serde_json::from_value::<RetryDisposition>(v.clone()).ok())
+            .unwrap_or(RetryDisposition::NonRetryable);
+        Ok(FailureIr {
+            node: node_id,
+            error_class,
+            retry,
+            diagnostics: vec![],
+            notes: "failure detail unavailable".into(),
+        })
     }
 
     // -------------------------------------------------------------

@@ -6,6 +6,79 @@
 //! (`.github/workflows/ci.yml`'s "Tests (DoD 3, 4)" step), so no new CI
 //! config is needed, and a violation is caught locally on `cargo test` too,
 //! not just in CI.
+//!
+//! # RFC-0010 §13 acceptance-criteria sweep — known test-coverage gaps
+//!
+//! A manual pass over all 95 ACs (cross-referencing test names, then
+//! reading source where names were ambiguous) found the following with no
+//! dedicated test today. None of these are known *implementation* bugs
+//! (the one that was — AC 66/89's FO6 violation in
+//! `assemble_already_terminal_outcome` — was fixed and given its own
+//! `fo1_r9_*`/`fo2_r9_*`/`fo3_r9_*` tests in `scheduler/linear/loop_.rs`
+//! immediately, not left on this list). Also tracked as RFC-0010 §15 Q8.
+//! Numbers are RFC-0010 §13 AC numbers.
+//!
+//! - **AC 12**: `run` on a DAG with no bound run row returns
+//!   `RunBindingMissing` — the code path exists, no test calls it directly.
+//! - **AC 13**: `run` with `validate_on_load` on an invalid blob returns
+//!   `Invariant` with no CAS issued — no dedicated test.
+//! - **AC 22**: checkpoint write order (artifacts → CAS → events) is
+//!   correct by code inspection for every `cN_*` method but untested via a
+//!   call-order-tracking store double, unlike the RFC's own suggested
+//!   "Recorded store" mechanism.
+//! - **AC 23/24**: `repair_node_state` (RF3, general non-gate crash repair)
+//!   is unit-tested in isolation but never called from `loop_.rs` — only
+//!   `repair_approval_requested` (gate-specific) is wired in, as of P7.
+//!   `adopt_running` (R13, crash-mid-`Running` adoption) has no dedicated
+//!   end-to-end test exercising `run()` on a pre-seeded `Running` node.
+//! - **AC 26**: restart with a `Ready` node + one recorded failed attempt
+//!   waiting the full remaining backoff (paused clock) before C3 — backoff
+//!   computation and live-run interruption are both tested; this specific
+//!   fresh-process restart scenario isn't.
+//! - **AC 33**: gate-allow resume is tested from one intermediate crash
+//!   point, not "each" per the AC's plural wording.
+//! - **AC 35/36**: resume-with-`WaitingApproval`-and-no-resolution
+//!   (re-register only, no double `ApprovalRequested`/CAS) and
+//!   resume-with-durable-`expired` (terminalizes, `expire_gate` not called
+//!   again) both lack dedicated tests.
+//! - **AC 38**: the scheduler never emits `ModelCall`/`ToolCall` (true by
+//!   construction — nothing in `scheduler::` calls anything that would)
+//!   and cost-sum-no-double-counting have no regression test.
+//! - **AC 39**: `gate.rs`'s closed-receiver `RunControlState` classification
+//!   (§5.7.9) has zero dedicated tests — `gate.rs`'s own test module only
+//!   covers its pure helpers (`parse_gate_resolution` etc.), not this state
+//!   machine.
+//! - **AC 49**: `OwnedGuard::drop` releasing ownership when the run body
+//!   itself panics (not just cancels/errors) has no dedicated test.
+//! - **AC 62**: `reaccumulate_cost_from_events` has its own RFC-0004 test;
+//!   the scheduler-level "a resumed run's meter total doesn't double" isn't
+//!   independently tested at this layer.
+//! - **AC 64**: stall detection (DS4: unsatisfiable Data predecessor forces
+//!   a bulk-`Skipped` re-derive) has no dedicated test.
+//! - **AC 65** (partial): the general run-timeout path is tested; T7's
+//!   node-vs-run tie-break and T8's no-`Running`-node attribution fallback
+//!   chain aren't isolated in their own tests.
+//! - **AC 71**: `GateHuman` never reaching C3 while unresolved is true by
+//!   construction (`gate.rs` routes before `dispatch_node`) but untested as
+//!   a regression.
+//! - **AC 76**: Appendix F's multi-run-row tie-break (RB6 `Running`
+//!   preference, then RB5 `created_at`/`run_id` ordering) has no test with
+//!   more than one candidate row.
+//! - **AC 79**: a stale-generation `ApprovalResolved` being ignored by
+//!   `scan_gate_resolution`'s generation filter has no dedicated test.
+//! - **AC 80**: `expire_gate`'s `Err(other)` retry-up-to-`EXPIRE_RETRY_MAX`
+//!   loop is only exercised via its happy path (`gate_expiry_terminalizes_*`
+//!   in `loop_.rs`); the retry-then-exhaust behavior isn't.
+//! - **AC 82**: BE4 (`ObsError`/`DecisionLog` failure logged-not-aborted
+//!   after a committed CAS, mapped to `Store` before one) has no dedicated
+//!   scheduler-level test.
+//! - **AC 88**: R4b's re-load observing a concurrent unowned-cancel's
+//!   terminal write (short-circuiting at R9 instead of overwriting) has no
+//!   dedicated race test.
+//!
+//! None of these block AC 57/73/83 (this file) or the sweep's own
+//! conclusion that P1-P9 collectively deliver the RFC's normative behavior;
+//! they're coverage debt, prioritized here for whoever picks this up next.
 
 use std::path::{Path, PathBuf};
 

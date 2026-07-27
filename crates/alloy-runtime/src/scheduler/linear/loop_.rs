@@ -297,7 +297,9 @@ impl LinearScheduler {
             dag.state,
             DagState::Succeeded | DagState::Failed | DagState::Cancelled
         ) {
-            return self.assemble_already_terminal_outcome(&dag, run_id).await;
+            return self
+                .assemble_already_terminal_outcome(checkpoint, &dag, run_id)
+                .await;
         }
         // R10
         if dag.state == DagState::ReplanRequired {
@@ -467,11 +469,13 @@ impl LinearScheduler {
     /// R9: the DAG is already durably terminal; assemble the outcome from
     /// the persisted blob without any CAS (§5.18 FO1-FO6, simplified: P4
     /// handles the `Succeeded`/plain-`Cancelled` cases in full; a durable
-    /// `Failed` blob's `failed_node` is resolved via FN1 over the node map
-    /// (the durable event/failure_ref reconstruction in FO1/FO2 is P7/P8
-    /// territory — gate-origin `Cancelled+Approval` reconciliation, RF7).
+    /// `Failed` blob's `failed_node` is resolved via FN1 over the node map;
+    /// `failure` is recovered per FO1/FO2/FO3 when `failed_node` is `Some(_)`
+    /// (FO6) — `None` stays `None` (FO4: D8 all-`Skipped` / RC4-RC6 bare-CAS
+    /// reconcile never had a `Failed` node to begin with).
     async fn assemble_already_terminal_outcome(
         &self,
+        checkpoint: &Checkpoint,
         dag: &TaskDag,
         _run_id: RunId,
     ) -> Result<DagOutcome, SchedError> {
@@ -497,12 +501,20 @@ impl LinearScheduler {
                     .iter()
                     .find(|(_, n)| n.state == NodeState::Failed)
                     .map(|(id, _)| *id);
+                let failure = match failed_node {
+                    Some(node_id) => Some(
+                        checkpoint
+                            .recover_failure_ir(dag.id, dag.session_id, node_id, dag.generation)
+                            .await?,
+                    ),
+                    None => None, // FO4(i)/(ii): nothing to recover.
+                };
                 Ok(DagOutcome {
                     dag_id: dag.id,
                     generation: dag.generation,
                     state: DagState::Failed,
                     failed_node,
-                    failure: None, // FO1/FO2 durable reconstruction deferred.
+                    failure,
                 })
             }
             other => Err(SchedError::Invariant(format!(
@@ -2453,6 +2465,142 @@ mod tests {
         let outcome = sched.run(dag_id).await.unwrap();
         assert_eq!(outcome.state, DagState::Succeeded);
         assert_eq!(outcome.failed_node, None);
+        fx.close().await;
+    }
+
+    /// FO1/FO2/FO3 fixture: a durably `Failed` single-node DAG, with the
+    /// node's own `NodeState` event and artifact left to each test to seed
+    /// (or not) below `Fixture::put_goal_envelope`'s placeholder input.
+    async fn seed_failed_single_node(fx: &Fixture, session: SessionId, dag_id: DagId) -> NodeId {
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.state = NodeState::Failed;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Failed,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "failed").await;
+        a
+    }
+
+    #[tokio::test]
+    async fn fo1_r9_recovers_failure_from_the_durable_artifact() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let node_id = seed_failed_single_node(&fx, session, dag_id).await;
+
+        let original = FailureIr {
+            node: node_id,
+            error_class: ErrorClass::Compile,
+            retry: RetryDisposition::NonRetryable,
+            diagnostics: vec![],
+            notes: "cargo check exited 101".into(),
+        };
+        let artifact_id = fx
+            .storage
+            .artifacts()
+            .put(crate::storage::ArtifactPut {
+                bytes: serde_json::to_vec(&original).unwrap(),
+                kind: crate::storage::ArtifactKind::Blob,
+                content_type: Some("application/json".into()),
+                session_id: Some(session),
+                run_id: None,
+                labels: serde_json::Map::new(),
+            })
+            .await
+            .unwrap();
+        fx.storage
+            .events()
+            .append_session(crate::events::NewSessionEvent {
+                session_id: session,
+                run_id: None,
+                type_: crate::events::SessionEventType::NodeState,
+                payload: serde_json::json!({
+                    "node_id": node_id.to_string(),
+                    "from": "running",
+                    "to": "failed",
+                    "generation": 1u64,
+                    "failure_ref": artifact_id.to_string(),
+                    "error_class": "compile",
+                    "retry": "non_retryable",
+                }),
+            })
+            .await
+            .unwrap();
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(node_id));
+        assert_eq!(outcome.failure, Some(original));
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn fo2_r9_degrades_to_event_fields_when_artifact_is_missing() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let node_id = seed_failed_single_node(&fx, session, dag_id).await;
+
+        // A NodeState event with error_class/retry but no failure_ref at all.
+        fx.storage
+            .events()
+            .append_session(crate::events::NewSessionEvent {
+                session_id: session,
+                run_id: None,
+                type_: crate::events::SessionEventType::NodeState,
+                payload: serde_json::json!({
+                    "node_id": node_id.to_string(),
+                    "from": "running",
+                    "to": "failed",
+                    "generation": 1u64,
+                    "error_class": "test",
+                    "retry": "retryable",
+                }),
+            })
+            .await
+            .unwrap();
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(node_id));
+        let failure = outcome.failure.unwrap();
+        assert_eq!(failure.node, node_id);
+        assert_eq!(failure.error_class, ErrorClass::Test);
+        assert_eq!(failure.retry, RetryDisposition::Retryable);
+        assert_eq!(failure.notes, "failure detail unavailable");
+        assert!(failure.diagnostics.is_empty());
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn fo3_r9_synthesizes_internal_failure_when_no_event_exists() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        // No NodeState event appended at all — durable state is Failed
+        // (e.g. a very old generation whose events aged out, or a corrupted
+        // write) but there's nothing to recover from.
+        let node_id = seed_failed_single_node(&fx, session, dag_id).await;
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(node_id));
+        let failure = outcome.failure.unwrap();
+        assert_eq!(failure.node, node_id);
+        assert_eq!(failure.error_class, ErrorClass::Internal);
+        assert_eq!(failure.retry, RetryDisposition::NonRetryable);
+        assert_eq!(failure.notes, "failure detail unavailable; event missing");
         fx.close().await;
     }
 
