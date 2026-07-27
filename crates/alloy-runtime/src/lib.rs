@@ -3,20 +3,22 @@
 //! This crate is the foundation defined by **RFC-0001**, extended by **RFC-0002**
 //! (durable storage, artifacts, session event log), **RFC-0003** (session manager
 //! and run controller), **RFC-0004** (observability & cost metering), tool IR
-//! from **RFC-0006**, and model routing/provider support from **RFC-0007**.
+//! from **RFC-0006**, model routing/provider support from **RFC-0007**, and
+//! Task DAG store/templates/planner from **RFC-0009**.
 //!
 //! # Crate map
 //!
 //! - [`types`] — IDs, budgets, diagnostics, permissions, metrics, tool IR (RFC-0006)
 //! - [`events`] — session event envelopes and [`EventSink`]
-//! - [`storage`] — SQLite event log, artifact CAS, handoff (RFC-0002)
+//! - [`storage`] — SQLite event log, artifact CAS, DAG blobs, handoff (RFC-0002/0009)
 //! - [`runtime`] — [`AlloyRuntime`] host lifecycle
 //! - [`scheduler`] — [`Scheduler`] trait + [`NullScheduler`]
 //! - [`adapters`] — Verify*/GateHuman stub traits
 //! - [`session`] — [`SessionPlane`] control plane: Session/RunController (RFC-0003)
 //! - [`obs`] — DecisionLog, CostMeter, redaction/query helpers (RFC-0004)
 //! - [`router`] — sealed model routing, provider traits, and HTTP provider (RFC-0007)
-//! - [`dag`] — TaskDag type sketches (store in RFC-0009)
+//! - [`dag`] — TaskDag types, validation, templates, cache, I/O envelopes (RFC-0009)
+//! - [`planner`] — [`PlanService`] / [`TemplatePlanService`] (RFC-0009)
 //! - [`config`] — TOML + env load (never writes `.env`)
 //!
 //! Author: arkadianet
@@ -31,6 +33,7 @@ pub mod error;
 pub mod events;
 pub mod logging;
 pub mod obs;
+pub mod planner;
 pub mod router;
 pub mod runtime;
 pub mod scheduler;
@@ -45,8 +48,12 @@ pub use adapters::{
 };
 pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
 pub use dag::{
-    ApprovalSpec, Backoff, CacheKey, DependencyEdge, EdgeKind, NodeKind, NodeState, RetryPolicy,
-    TaskDag, TaskNode,
+    allocate_ids, build_topology, compute_cache_key, mvp_compiler_fingerprint_digest,
+    mvp_policy_hash_digest, mvp_tool_versions_digest, ApprovalSpec, Backoff, BuildTopology,
+    CacheKey, CacheKeyMaterials, DagValidationError, DagValidator, DependencyEdge, EdgeKind,
+    NodeInputEnvelope, NodeInputPayload, NodeKind, NodeOutputEnvelope, NodeState,
+    PredecessorOutput, RetryIncoherence, RetryPolicy, TaskDag, TaskNode, TemplateCatalog,
+    TemplateId, TemplateIdMap, TemplateManifest, ValidateOpts,
 };
 pub use error::{AdapterError, RunError, RuntimeError, SchedError, SessionError};
 pub use events::{
@@ -61,6 +68,10 @@ pub use obs::{
     DecisionKind, DecisionLog, DecisionPage, DecisionRecord, EventDecisionLog, ModelCallRecord,
     ModelUsdSource, ObsError, RecordingDecisionLog, RetentionPolicy, SharedCostMeter, TierCost,
     ToolCallRecord,
+};
+pub use planner::{
+    DisabledLlmPlanService, PlanContext, PlanError, PlanProducedPayload, PlanResult, PlanService,
+    TemplatePlanService,
 };
 pub use router::{
     classify_provider_error, classify_router_error, ChatMessage, ChatRole, Citation,
@@ -80,9 +91,9 @@ pub use session::{
 };
 pub use storage::{
     install_sqlite_event_sink, store_to_runtime, store_to_session, AlloyStorage, ArtifactBlob,
-    ArtifactKind, ArtifactMeta, ArtifactPut, ArtifactStore, EventStore, FsArtifactStore, RunRow,
-    SessionRows, SqliteEventStore, SqliteSessionRows, SqliteSynchronous, StorageLayout,
-    StorageMetricsSnapshot, StorageOpenOptions, StoreError,
+    ArtifactKind, ArtifactMeta, ArtifactPut, ArtifactStore, DagStore, EventStore, FsArtifactStore,
+    ReplanReplaceError, RunRow, SessionRows, SqliteDagStore, SqliteEventStore, SqliteSessionRows,
+    SqliteSynchronous, StorageLayout, StorageMetricsSnapshot, StorageOpenOptions, StoreError,
 };
 pub use types::budget::{
     BudgetPolicy, BudgetSnapshot, Constraint, CreateSession, Goal, ModelTier, TokenBudget,

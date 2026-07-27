@@ -11,6 +11,8 @@ rust-version.workspace = true
 default = ["http-provider"]
 # OpenAI-compatible HTTP provider (reqwest + rustls). Traits/recording compile without it.
 http-provider = ["dep:reqwest", "dep:rustls"]
+# Optional Deserialize on template manifests for JSON embeds (RFC-0009 §7.3 / §10.4).
+template-json = []
 
 [dependencies]
 async-trait = { workspace = true }

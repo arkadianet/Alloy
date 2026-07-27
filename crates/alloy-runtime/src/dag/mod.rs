@@ -2,8 +2,28 @@
 //!
 //! Persistence lives in [`crate::storage::DagStore`]; planning in [`crate::planner`].
 
+mod cache;
+mod io;
+mod templates;
 mod types;
 mod validate;
 
+pub use cache::{
+    compute_cache_key, goal_content_digest, mvp_compiler_fingerprint_digest,
+    mvp_policy_hash_digest, mvp_tool_versions_digest, CacheKeyMaterials,
+};
+pub use io::{
+    encode_json, NodeInputEnvelope, NodeInputPayload, NodeOutputEnvelope, PendingPredPlaceholder,
+    PredecessorOutput,
+};
+pub use templates::{
+    allocate_ids, build_topology, BuildTopology, TemplateApprovalSpec, TemplateCatalog,
+    TemplateEdgeSpec, TemplateId, TemplateIdMap, TemplateManifest, TemplateNodeSpec,
+};
 pub use types::*;
 pub use validate::{DagValidationError, DagValidator, RetryIncoherence, ValidateOpts};
+
+/// Optional re-export of the storage trait for convenience (concrete type stays in storage).
+pub mod store {
+    pub use crate::storage::{DagStore, ReplanReplaceError, SqliteDagStore};
+}
