@@ -70,7 +70,7 @@ Nine RFCs and ~40k lines of source exist on `main`, and **nothing yet writes to 
 2. `EditEngine::apply(EditRequest::TextPatch { .. }, ctx)` MUST: validate → verify repo/jail invariants → compute `pre_digest` → create git checkpoint → apply patch under PathPolicy → compute `post_digest` → CAS put → sync-commit (`TxRecord=Committed`, `abandoned=None`) → **attempt** `EditApplied` when `session_id` is `Some` → return `EditTransaction` with `checkpoint_id = Some(...)`, `post_digest = Some(...)`, `state = Committed`. After the commit point, EditApplied failure MUST NOT roll back and MUST still return `Ok(EditTransaction)` (§5.1).
 3. `EditEngine::apply(EditRequest::SemanticOps { .. }, ctx)` MUST return `Err(EditError::UnsupportedOp { op })` for **every** variant and every non-empty ops list, with `op` equal to the serde tag string (§5.10). Empty ops list MUST return `Err(EditError::InvalidRequest("semantic_ops empty"))`.
 4. `ApplyPatchArgs.dry_run == true` MUST call `EditEngine::validate` only: it MUST NOT mutate the workspace, MUST NOT create a checkpoint, MUST NOT write CAS patch bytes as a committed edit, MUST NOT emit `EditApplied`, and MUST return `transaction_id: None`.
-5. A partially-applied patch MUST NOT be observable as a committed edit. On apply failure after checkpoint, the engine MUST restore the checkpoint before returning `Err`. If restore fails, return `Err(EditError::RollbackFailed { .. })` and leave the checkpoint ref intact for operator recovery.
+5. A partially-applied patch MUST NOT be observable as a committed edit. On apply failure after checkpoint, the engine MUST restore the checkpoint before returning `Err`. If restore fails for a **non-expiry** reason, return `Err(EditError::RollbackFailed { tx, checkpoint_id, detail })` and leave the checkpoint ref intact. If restore fails because the token expired (broker or pre-restore expiry check), return `Err(EditError::TokenExpired)` **after** recording FailedDirty state (`TxRecord` remains `Open`, `abandoned` set, ref retained). `TokenExpired` is the public signal; recovery is reconcile under a fresh token (§5.2 / AC 39). Callers MUST NOT need private `TxRecord` fields to know recovery is required — a mid-apply `TokenExpired` after mutation always implies FailedDirty.
 6. `rollback(tx, ctx)` MUST restore eligible transactions only (§5.11). It MUST be idempotent for `state == RolledBack` when the workspace digest still equals `pre_digest`.
 7. Every validation rejection in §5.4 MUST map to exactly one `EditError` variant. At the MCP boundary, §8.3 MAY collapse several `EditError` variants onto one `PatchApplyError` variant; that collapse is explicit and total.
 8. `ApplyPatchOutcome.message` MUST NEVER contain raw patch bodies or absolute paths (honour RFC-0006 §5.9; engine produces jail-relative, length-capped summaries). Engine messages MUST NEVER equal `EDIT_ENGINE_UNWIRED_MESSAGE`.
@@ -577,14 +577,23 @@ pub enum EditError {
     #[error("checkpoint failed: {0}")]
     CheckpointFailed(String),
 
-    #[error("rollback failed: tx={tx}: {detail}")]
-    RollbackFailed { tx: TransactionId, detail: String },
+    #[error("rollback failed: tx={tx} checkpoint={checkpoint_id}: {detail}")]
+    RollbackFailed {
+        tx: TransactionId,
+        checkpoint_id: CheckpointId,
+        detail: String,
+    },
 
     #[error("unknown transaction: {0}")]
     UnknownTransaction(TransactionId),
 
-    #[error("transaction not eligible for rollback: {tx}: state={state:?}")]
-    RollbackNotEligible { tx: TransactionId, state: TxState },
+    #[error("transaction not eligible for rollback: {tx}: state={state:?}: {reason}")]
+    RollbackNotEligible {
+        tx: TransactionId,
+        state: TxState,
+        /// Static reason: `"not newest"` | `"not abandon target"` | `"wrong state"`.
+        reason: &'static str,
+    },
 
     #[error("workspace drifted since transaction: {0}")]
     WorkspaceDrifted(TransactionId),
@@ -844,7 +853,7 @@ Touch points: `mcp/patch.rs`, `mcp/builtins/apply_patch.rs`, `mcp/builtins/mod.r
 
 **Run attribution:** `PermissionToken.run_id` is always present. If `run == Some(r)` and `r != perms.run_id`, return `EditError::InvalidRequest("run_id mismatch")` → `PatchApplyError::InvalidPatch("run_id mismatch")` (envelope validation, not a patch-body defect). Else `EditContext.run_id = Some(run.unwrap_or(perms.run_id))`.
 
-**Engine-side run check (direct callers):** `validate` / `apply` / `rollback` / `recover_checkpoint` MUST, after expiry check, enforce: if `ctx.run_id` is `Some(r)` and `r != ctx.perms.run_id`, return `InvalidRequest("run_id mismatch")`. When `ctx.run_id` is `None`, treat effective run as `ctx.perms.run_id` for attribution only.
+**Engine-side run check (direct callers):** `apply` / `rollback` / `recover_checkpoint` MUST, after expiry check and before reconcile, enforce: if `ctx.run_id` is `Some(r)` and `r != ctx.perms.run_id`, return `InvalidRequest("run_id mismatch")`. When `ctx.run_id` is `None`, treat effective run as `ctx.perms.run_id` for attribution only. `validate` does **not** perform this check (§5.5.1).
 
 #### 3.8.6 Effective patch size ceiling
 
@@ -1048,7 +1057,7 @@ stateDiagram-v2
   DigestPost --> Persisting: post_digest ok
   DigestPost --> RollingBack: digest failed
   Persisting --> Committed: CAS sync-commit (EditApplied best-effort)
-  Persisting --> RollingBack: CAS or event failed after mutate
+  Persisting --> RollingBack: CAS failed after mutate
   RollingBack --> Failed: restore ok
   RollingBack --> FailedDirty: restore failed
   DryRunComplete --> [*]
@@ -1074,11 +1083,12 @@ Ordering inside Persisting:
 
 ### 5.2 Apply pipeline (mutating, normative order)
 
-1. Acquire write lock and run abandon reconcile (§6.4) using `ctx.perms` (**apply/rollback only** — not validate).
+0. **Common locked preamble (apply / rollback / recover_checkpoint):** acquire `write_lock` → check token expiry (V21) → enforce run attribution (§3.8.5) → **then** abandon reconcile (§6.4). Expiry / run mismatch MUST NOT run reconcile (no restore side effects on a rejected call). `validate` acquires the lock but **MUST NOT** check V21 / run attribution / reconcile (matrix §5.5.1); host `run_call` already expired-checks on the MCP path. Direct `validate` callers may see an expired token succeed dry-run — documented MVP limitation.
+1. After preamble: abandon reconcile using `ctx.perms` (**apply/rollback only** — not validate).
 2. Reject `SemanticOps` → `UnsupportedOp` (§5.10 / V15).
-3. Normalize/validate local `PatchSet` rules (V1–V11, V18–V19, V22). No git yet.
-4. Check token expiry → `TokenExpired` (V21). Enforce run attribution (§3.8.5). Clone `ctx.perms` into a local `perms` used for all subsequent grant checks and `SandboxExecRequest`s. Re-check expiry immediately before checkpoint create. **If the broker returns `TokenExpired` during a post-mutation restore**, leave `abandoned = Some`, leave `TxRecord` `Open`, return `EditError::TokenExpired` (→ `PatchApplyError::TokenExpired` → `McpError::TokenExpired` per §8.3). The error surface is expiry, not a silent FailedDirty collapse: callers MUST also observe that `abandoned` remains set / tx remains `Open` (AC 39). Recovery is the next `apply`/`rollback` reconcile under a **fresh** non-expired token (§6.4). Do not claim restore can succeed with an expired token — the broker will deny it.
-5. Authorize `GitWrite` (V12) and preflight **all** git argv shapes (§5.6.2) via `match_exec_grant(&perms, &argv, broker.profile().backend_for(ExecClass::Check), jail_cwd, &trusted_path)` → V13 `MissingGrant("exec:git")` on any failure (no fork).
+3. Normalize/validate local `PatchSet` rules (V1–V11, V18–V19, V22, V26–V28). No git yet.
+4. Clone `ctx.perms` into a local `perms` used for all subsequent grant checks and `SandboxExecRequest`s. Re-check expiry immediately before checkpoint create. **If the broker returns `TokenExpired` during a post-mutation restore**, leave `abandoned = Some`, leave `TxRecord` `Open`, return `EditError::TokenExpired` (→ `PatchApplyError::TokenExpired` → `McpError::TokenExpired` per §8.3) — FailedDirty by Day-1 item 5. Recovery is the next `apply`/`rollback` reconcile under a **fresh** non-expired token (§6.4).
+5. Authorize `GitWrite` (V12) and preflight **all** git argv shapes (§5.6.2) via `match_exec_grant(...)` → V13 on any failure (no fork). **MVP ExecAllow for git MUST use `args_glob: None`** (preflight placeholders cannot authorize later concrete SHA/UUID args if a narrow glob is used). Profiles with a non-`None` `args_glob` for `git` are unsupported in MVP → treat match failure as V13.
 6. Run repo/jail + tracked-deny + untracked-in-patch git probes (§5.6.1) — V14, V16, V17.
 7. Compute `pre_digest` (§5.8). On limit → `DigestLimitExceeded` (V20; no mutate).
 8. Allocate `TransactionId::new()`, `CheckpointId::new()`.
@@ -1151,8 +1161,10 @@ CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention a
 | V4b | ≥1 `FsWrite` grant but no glob matches path | `PathNotCovered` |
 | V5 | `FilePatch::Delete` used with non-empty hunks at struct build | `InvalidPatch` (parser prevents) |
 | V6 | Duplicate paths in one PatchSet (byte-exact **and** case-fold on case-insensitive FS) | `InvalidPatch("duplicate path")` |
-| V7 | Overlapping old-line ranges | `OverlappingHunks` |
+| V7 | Overlapping old-line ranges (two hunks whose old-side consumed ranges intersect; zero-length insertions at the same `old_start` also overlap) | `OverlappingHunks` |
 | V8 | Hunk header counts ≠ line kinds; or any `Hunk.lines` entry contains NUL or raw `\n` | `InvalidPatch("hunk line count")` / `InvalidPatch("hunk line content")` |
+| V8b | `Modify` hunk with `old_start == 0` (reserved for Create) | `InvalidPatch("modify old_start")` |
+| V8c | After applying all hunks in order, reconstructed new-side line positions disagree with each hunk’s `new_start`/`new_lines` (treat `new_*` as assertions) | `InvalidPatch("hunk new_start")` |
 | V9 | Context/delete lines mismatch file (incl. old-side no-newline assertion) | `ContextMismatch` |
 | V10 | Delete target missing | `Conflict("delete missing file")` |
 | V11 | Create target already exists | `Conflict("create exists")` |
@@ -1179,7 +1191,7 @@ CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention a
 
 | Action | dry_run=true (`validate`) | dry_run=false (`apply`) |
 | --- | --- | --- |
-| V1–V11, V15, V18–V19, V22–V23, V26–V28 | Yes | Yes |
+| V1–V11, V8b–V8c, V15, V18–V19, V22–V23, V26–V28 | Yes | Yes |
 | V16 tracked-set (needs `git ls-files`) | **Skip** (no git exec) | Yes |
 | V12–V14, V17, V20, V21, V24–V25, V29 | **Skip** | Yes |
 | Digest / checkpoint / mutate / CAS / EditApplied | **MUST NOT** | Yes |
@@ -1191,11 +1203,13 @@ CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention a
 
 The adapter MUST invoke `EditEngine::validate`, never `apply`, when `dry_run` is true. Dry-run context matching reads the current workspace for V9/V10/V11/V18/V19/V22 **without** git exec.
 
+**Nested Create authorization on `validate` (no mkdir):** For each missing path segment of a `Create` target, authorize Write on the prospective jail-relative directory/file path using PathPolicy’s missing-final-component canonicalize against the **deepest existing ancestor** (recompute ancestor per segment without creating it). Symlink on any existing prefix → V18-style `PathDenied`. This mirrors §5.9.1 step 3 without calling `create_dir`. If PathPolicy cannot express a multi-segment missing path in one call, the engine MUST loop segment-by-segment as specified — do not invent a new PathPolicy API in MVP.
+
 #### 5.5.1 Validation matrix (normative)
 
 | Rule | `validate` | `apply` |
 | --- | --- | --- |
-| V1–V11, V15, V18–V19, V22–V23, V26–V28 | yes | yes |
+| V1–V11, V8b–V8c, V15, V18–V19, V22–V23, V26–V28 | yes | yes |
 | V12–V14, V16–V17, V20–V21, V24–V25, V29 | no | yes |
 
 ### 5.6 Git checkpoint backend
@@ -1224,7 +1238,7 @@ Without identity, `stash create` fails in the broker’s ephemeral HOME. Filtere
 2. Prefixed `rev-parse --is-inside-work-tree` — else `Environment("not a git repository")`.
 3. Prefixed `rev-parse -q --verify HEAD` — else `Environment("empty repository: make initial commit")`.
 4. Prefixed object-format check → V29.
-5. Prefixed `diff --name-only --diff-filter=U` non-empty → V24. Also reject when `.git/MERGE_HEAD`, `.git/rebase-merge`, `.git/rebase-apply`, or `.git/BISECT_LOG` exists (host `symlink_metadata` under jail — same mechanism as V25).
+5. Prefixed `diff --name-only --diff-filter=U` non-empty → V24. Also reject when `.git/MERGE_HEAD`, `.git/CHERRY_PICK_HEAD`, `.git/REVERT_HEAD`, `.git/rebase-merge`, `.git/rebase-apply`, or `.git/BISECT_LOG` exists (host `symlink_metadata` under jail — same mechanism as V25).
 6. **V25 `index.lock`:** host-side `std::fs::symlink_metadata(jail.join(".git/index.lock"))` existence check (**not** a SandboxBroker exec; explicitly exempt from §10.3’s `Command::new` ban as a metadata probe, same class as PathPolicy reads). Present → `Git("index.lock present")`.
 7. Prefixed `stash create` — stdout trimmed; must be 40 lowercase hex → `checkpoint_sha`; empty stdout → use `HEAD` SHA from prefixed `rev-parse HEAD` (also 40 hex). Non-hex / wrong length → `CheckpointFailed`.
 8. Prefixed argv-only create-only update-ref (**MUST NOT** use `--stdin` — `SandboxExecRequest` has no stdin channel and process spawns with `Stdio::null()`):
@@ -1257,18 +1271,22 @@ All shapes include the `-c` identity/EOL prefix above as leading argv elements a
 
 ### 5.6.1 Untracked / deny-glob / repo-root policy
 
+**Stdout truncation (normative, all output-bearing git execs):** After every broker exec whose stdout is parsed (`ls-files`, `diff --name-only`, `stash create`, `rev-parse`, `--version`, `show-object-format`, restore is exit-only), if `SandboxExecResult.stdout_truncated` is true → `Environment("git stdout truncated; raise sandbox stdout_cap")` (permanent, fail closed). Same rationale as RFC-0005 deny-path budget exhaustion. Applies especially to `ls-files -z` (V16/V17/§5.8) and `diff --name-only --diff-filter=U` (V24).
+
 Before checkpoint on the mutating path:
 
 1. `git rev-parse --show-toplevel` canonicalize → MUST equal `path_policy.jail()`; else `Environment("repo toplevel != jail")`.
-2. `git ls-files -z` → build the **tracked-path set** (NUL-delimited). Any tracked path with `path_policy.deny_matches_rel` → `TrackedDeniedPath` (V17).
-3. **Tracked-set invariant (V16):** every `Modify` and `Delete` path MUST be in the tracked-path set; every `Create` path MUST NOT be. Violation → `UntrackedPath` (covers untracked **and** git-ignored paths that `status` would miss without `--ignored`). Paths outside the patch are left untouched.
-4. Nested `.git` directories below jail (submodules) are not walked by digest; patch paths inside submodules → `Environment("submodule path not supported")`.
+2. Confirm `.git` is a **directory** (not a gitfile). Host `symlink_metadata(jail.join(".git"))` — if not a directory → `Environment("linked worktree not supported")` (covers linked worktrees where toplevel can still equal jail).
+3. `git ls-files -z` → build the **tracked-path set** (NUL-delimited). **Non-UTF-8 tracked paths:** if any NUL-separated entry is not valid UTF-8 → `Environment("non-utf8 tracked path")` (fail closed; `deny_matches_rel` is `&str`). Otherwise any tracked path with `path_policy.deny_matches_rel` → `TrackedDeniedPath` (V17).
+4. **Tracked-set invariant (V16):** every `Modify` and `Delete` path MUST be in the tracked-path set; every `Create` path MUST NOT be. Violation → `UntrackedPath` (covers untracked **and** git-ignored paths). Paths outside the patch are left untouched.
+5. Nested `.git` directories below jail (submodules) are not walked by digest; patch paths inside submodules → `Environment("submodule path not supported")`.
+6. Patch paths under excluded digest prefixes `target/**` or matching `.**.alloy-tmp-**` → `InvalidPatch("path excluded from digest")` (edits there would be invisible to drift checks).
 
 **Restore MUST NOT** run broad `git clean -fd` over the jail (would delete untracked `.env` and user files). Restore uses:
 
 * Prefixed `["git", "restore", "--source=<checkpoint_sha>", "--staged", "--worktree", "--", ":/"]` so **HEAD / current branch tip do not move**.
-* Explicit `remove_file` for each `created_paths` and `temp_paths` entry (engine-owned cleanup; **MUST NOT** re-require `FsWrite` — Appendix A; still MUST refuse unlink when `deny_matches_rel` is true).
-* Explicit `remove_dir` for each `created_dirs` entry (deepest first), ignoring `NotFound` **and** `ENOTEMPTY` (a user file dropped into a created dir MUST NOT turn restore into `RollbackFailed`; leave the non-empty dir).
+* Explicit `remove_file` for each `created_paths` and `temp_paths` entry (engine-owned cleanup; **MUST NOT** re-require `FsWrite` — Appendix A). If `deny_matches_rel` is true for a path, **skip** that unlink (do not error immediately); continue. Final digest check then yields `RollbackFailed` or `WorkspaceDrifted` as appropriate — secrets stay on disk.
+* Explicit `remove_dir` for each `created_dirs` entry (deepest first), ignoring `NotFound` **and** `ENOTEMPTY` (a user file dropped into a created dir MUST NOT turn restore into `RollbackFailed`; leave the non-empty dir). Deny-glob dirs: same skip-then-digest rule.
 
 Record `head_sha_at_checkpoint` on the in-process `TxRecord` only (lost on restart; not required for restore).
 
@@ -1281,7 +1299,7 @@ MVP: in-process `TxRecord` map only (§4.4). Durable audit = checkpoint refs + `
 | Rule | Value |
 | --- | --- |
 | Root | `path_policy.jail()` |
-| Include | Regular files in the **tracked set** (`git ls-files -z`), minus excludes below, **plus** (for `post_digest` only) still-existing `created_paths` from the open/committed tx. Untracked and git-ignored files are never hashed. |
+| Include | Regular files in the **tracked set** (`git ls-files -z`), minus excludes below, **plus** (for `post_digest` only) still-existing `created_paths` from the open/committed tx. Untracked and git-ignored files are never hashed. Tracked paths that are missing on disk, non-regular, or become non-regular mid-tx are **omitted** from the encoding (e.g. after `Delete` while still listed by `ls-files` until the next index refresh — MVP hashes worktree bytes only). |
 | Exclude | `.git/**`, `.alloy-sbx/**`, `target/**`, paths matching deny-globs, temp files matching `.**.alloy-tmp-**`, symlinks (do not follow). Skip non-UTF-8 path names without hashing them. Rationale: `target/` and ignore rules routinely exceed digest caps and would make post-verify rollback impossible after `cargo check` (RFC-0010). |
 | Encoding | Sorted jail-relative paths; for each: `path\0` + `Digest::sha256(contents).as_hex()` + `\n`; `tree = Digest::sha256(concat)` |
 | Caps | Exceed → `DigestLimitExceeded` **before** mutate (pre) or trigger rollback (post) |
@@ -1329,7 +1347,7 @@ Partial apply is never a committed transaction.
 | --- | --- |
 | Parent dirs | Authorize-before-mkdir per §5.9.1 step 3. Record `created_dirs` for rollback unlink (deepest first). |
 | Symlink target / parents | Symlink at target or any parent segment → `PathDenied` (do not write through). |
-| File mode | For `Modify`, copy mode from the original file onto the temp before rename (`std::fs::set_permissions`). Creates use default mode `0o644` (platform-default via `OpenOptions`). |
+| File mode | For `Modify`, copy mode from the original file onto the temp before rename (`std::fs::set_permissions`). Creates: after exclusive create, `set_permissions` to exactly `0o644` on Unix (ignore umask for the recorded mode); Windows: leave platform default. |
 | fsync | MVP does **not** require `fsync` before rename. “Atomic replace” means same-directory `rename` only. |
 | Line endings / EOF | Split on `\n`; keep `\r` in content; final file newline follows last hunk’s new-side `eof_newline` (Appendix D). |
 | Empty dirs after delete | MVP does **not** prune empty parents after `Delete`. Empty dirs in `created_dirs` ARE removed on rollback (deepest first). |
@@ -1360,7 +1378,7 @@ Every variant in §3.2 MUST have a unit test asserting `UnsupportedOp { op }` eq
 | `Open` (and is the current `abandoned.transaction_id`, or no abandon is set and it is the newest Open by `created_at`) | Restore; unlink `created_paths`/`temp_paths`/`created_dirs`; mark `RolledBack` |
 | `Committed` | Eligible **only if** it is the newest `Committed` by `created_at` **and** current digest equals `post_digest` (no drift). Then restore; unlink `created_paths` that still exist and `created_dirs` (deepest first); mark `RolledBack` |
 | `RolledBack` | If current digest == `pre_digest` → `Ok(())`. Else → `WorkspaceDrifted` |
-| Other `Open` / non-newest `Committed` | `RollbackNotEligible { tx, state }` — message MUST include reason text `"not newest"` or `"not abandon target"` as applicable |
+| Other `Open` / non-newest `Committed` | `RollbackNotEligible { tx, state, reason }` with `reason` exactly `"not newest"` or `"not abandon target"` |
 
 **Ordering source:** `(created_at.0 /* OffsetDateTime */, id.as_uuid())` ascending. Newest = max pair. `Timestamp` compares via inner `OffsetDateTime`; UUID breaks ties.
 
@@ -1980,4 +1998,18 @@ sequenceDiagram
 | Dry-run message | `dry_run ok: {N} file(s)` |
 | Apply message | `applied {N} file(s)` |
 | Empty repo | `empty repository: make initial commit` |
-| Jail mismatch | `repository root is not the workspace jail` |
+| Jail mismatch | `repo toplevel != jail` |
+| Git too old | `git version < 2.23` |
+| Object format | `unsupported object format` |
+| Index lock | `index.lock present` |
+| Linked worktree | `linked worktree not supported` |
+| Stdout truncated | `git stdout truncated; raise sandbox stdout_cap` |
+| Non-UTF-8 tracked | `non-utf8 tracked path` |
+| Create hunk shape | `create hunk shape` |
+| Hunk order | `hunk order` |
+| Run mismatch | `run_id mismatch` |
+| Ambiguous JSON | `ambiguous patch json` |
+| Unrecognized JSON | `unrecognized patch json` |
+| Ref exists | `checkpoint ref exists` |
+| Ref missing | `checkpoint ref not found` |
+| Digest-excluded path | `path excluded from digest` |
