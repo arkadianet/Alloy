@@ -5,7 +5,7 @@
 | **Status** | Draft |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
-| **Depends on** | [RFC-0003](./RFC-0003-session-manager-run-controller.md) (merged), [RFC-0004](./RFC-0004-observability-cost-metering.md) (merged), [RFC-0006](./RFC-0006-mcp-host-builtins.md) (merged), [RFC-0009](./RFC-0009-task-dag-templates-planner.md) (merged) |
+| **Depends on** | [RFC-0003](./RFC-0003-session-manager-run-controller.md) (merged), [RFC-0004](./RFC-0004-observability-cost-metering.md) (merged), [RFC-0006](./RFC-0006-mcp-host-builtins.md) (merged), [RFC-0008](./RFC-0008-edit-engine.md) (merged), [RFC-0009](./RFC-0009-task-dag-templates-planner.md) (merged) |
 | **Effort** | 5–8 person-days |
 | **Related RFCs** | [0001](./RFC-0001-alloy-runtime.md) host / `SchedError` / drain · [0002](./RFC-0002-storage-artifacts-session-events.md) artifacts / events · [0005](./RFC-0005-sandbox-broker.md) sandbox via MCP · [0007](./RFC-0007-model-router-provider.md) `RetryDisposition` / `FailureIr.retry` (consumed, not a hard dep) · [0013](./RFC-0013-capability-registry-workers.md) capability workers · [0015](./RFC-0015-cli-profiles-config.md) `alloy run` |
 | **Product** | Alloy — AI Engineering Runtime |
@@ -13,7 +13,7 @@
 
 **Mental model (V2 §6.3 / §10.4 / ADR F-10 / F-16):** the Scheduler is the **first Alloy component that executes a plan**. It walks a validated `TaskDag` **serially** (`max_parallel_* = 1`), dispatches capability nodes versus runtime adapters, checkpoints same-generation state through `put_if_generation`, and returns a `DagOutcome` that RFC-0003 / RFC-0015 surface. `VerifyCompile` / `VerifyTest` / `GateHuman` are **runtime adapters**, not LLM capabilities. Capability workers land in RFC-0013; until then the scheduler MUST inject an explicit stub executor rather than fail opaquely.
 
-**Authority order (highest → lowest):** current `main` source → merged RFCs 0001–0007, 0009, 0016 → Architecture V2 → this document → roadmaps. Never reshape a merged public API solely to match an older V2 sketch or this document's prior outline. RFC-0009 §6.5 / §6.6 and Appendix C are **binding** here.
+**Authority order (highest → lowest):** current `main` source → merged RFCs 0001–0009, 0016 → Architecture V2 → this document → roadmaps. Never reshape a merged public API solely to match an older V2 sketch or this document's prior outline. RFC-0009 §6.5 / §6.6 and Appendix C are **binding** here. RFC-0008's single-write-stack and in-process edit-tx rules are **binding** for §6.5 / §8.5.
 
 **Reading rules.** MUST / MUST NOT / SHOULD / MAY are normative. Tables are normative unless labelled *informative*. This RFC contains no product code: every Rust block is a signature or a shape, and every algorithm is expressed as an ordered rule table.
 
@@ -101,6 +101,8 @@ Seven RFCs have built substrate — storage, sessions, observability, sandbox, t
 | Attempt context | Additive `NodeExecRef.attempt` for call_id / envelopes | §3.1.1 |
 | Artifacts | `Blob` + `application/json` (not `ArtifactKind::Json`); `verify_raw` = `Log` | Appendix G |
 | OS lock | `std::fs::File::try_lock` + `TryLockError` on pinned 1.97.1 | §4.5 |
+| Forward-only repair | Scheduler MUST NOT roll back an applied edit (RFC-0008 single write stack) | §8.5 / §5.11 |
+| Edit-tx vs DAG resume | DAG durable; edit txs in-process only — resume re-verifies | §6.5 |
 
 ---
 
@@ -131,6 +133,7 @@ Seven RFCs have built substrate — storage, sessions, observability, sandbox, t
 | **0005** | Sandbox enforcement **through** MCP builtins — adapters never call the broker |
 | **0006** | `ToolCall` / `ToolResult` / `ToolError` / `McpError` / `ToolHandle` / `cargo_check` / `cargo_test` / disclosure tags |
 | **0007** | `RetryDisposition` / `FailureIr.retry` admission rule (consumed; not a Cargo dependency of the hard path) |
+| **0008** | Single write stack (`EditWorker → apply_patch → EditEngine`); in-process-only edit txs; no MCP rollback; `recover_checkpoint` is operator/engine — **not** scheduler (§6.5 / §8.5) |
 | **0009** | Validated DAG shapes, readiness rules, `put_if_generation`, §6.5 / §6.6, envelopes, retry field ownership, Appendix C obligations |
 
 ### 2.3 Already implemented | Added by RFC-0010 | Deferred
@@ -145,8 +148,8 @@ Seven RFCs have built substrate — storage, sessions, observability, sandbox, t
 
 | Consumer | May rely on |
 | --- | --- |
-| **RFC-0013** | `CapabilityExecutor` injection point; `CapabilityExecContext` fields (`effective_tier`, `budget`, `input`, `attempt`, `cost_meter`, `cancellation`); serial dispatch; retry admission owned by the scheduler (workers return one-shot `CapabilityOutcome::Failed`, never self-retry); verify diagnostics reaching repair nodes through predecessor envelopes |
-| **RFC-0015** | `DagOutcome` field semantics (§5.18); `Scheduler::run` / `cancel` reached only through `RunController::start` / `cancel`; gate UX over existing `approve`; terminal mapping already implemented in RFC-0003; `failure.error_class` vocabulary for exit codes |
+| **RFC-0013** | `CapabilityExecutor` injection point; `CapabilityExecContext` fields (`effective_tier`, `budget`, `input`, `attempt`, `cost_meter`, `cancellation`); serial dispatch; retry admission owned by the scheduler (workers return one-shot `CapabilityOutcome::Failed`, never self-retry); verify diagnostics reaching repair nodes through predecessor envelopes; EditWorker calls `apply_patch` only (never `EditEngine` / never rollback); patch chunking under `MAX_ARGUMENT_BYTES` |
+| **RFC-0015** | `DagOutcome` field semantics (§5.18) including **workspace-modified** inference (§8.5); `Scheduler::run` / `cancel` reached only through `RunController::start` / `cancel`; gate UX over existing `approve`; terminal mapping already implemented in RFC-0003; `failure.error_class` vocabulary for exit codes; operator `recover_checkpoint` / create-cleanup after crash |
 
 ### 2.5 Inherited RFC-0009 constraints (normative — restated)
 
@@ -615,7 +618,7 @@ pub struct CapabilityExecContext {
     pub timeout: Duration,
     /// Decoded input envelope (`schema_version == 1`).
     pub input: NodeInputEnvelope,
-    /// Attempt index starting at 1.
+    /// Attempt index starting at 1. MUST equal `meta.attempt` (CE3).
     pub attempt: u32,
     /// Run-scoped meter. Workers MUST record model usage here (RFC-0004),
     /// and MUST NOT construct their own meter.
@@ -652,6 +655,7 @@ pub struct UnavailableCapabilityExecutor;
 | --- | --- |
 | CE1 | `CapabilityOutcome` MUST be the enum above. The previous struct-with-`Option<FailureIr>` shape made "succeeded and failed" representable. |
 | CE2 | The scheduler MUST overwrite `failure.node` with the dispatched `NodeId` before persisting, whatever the worker set. |
+| CE3 | `CapabilityExecContext.attempt` MUST equal `meta.attempt`; the scheduler sets both from the same counter and MUST NOT diverge. |
 | CE3 | Workers MUST NOT retry, sleep for backoff, escalate tiers, write `TaskNode` fields, or write `NodeState` events. |
 | CE4 | `UnavailableCapabilityExecutor::execute` MUST return `Err(CapabilityExecError::Unavailable)`. |
 | CE5 | `CapabilityExecContext.timeout` is advisory to the worker; the scheduler enforces it independently (§5.19). |
@@ -756,6 +760,8 @@ impl Scheduler for LinearScheduler {
 | D3 | `LinearScheduler` MUST be `Send + Sync` and is stored as `Arc<dyn Scheduler>` through `RuntimeHandle::set_scheduler`. |
 | D4 | One `LinearScheduler` per process. Constructing a second one against the same `data_dir` MUST fail with `SchedError::Ownership` (§4.5). |
 | D5 | `run_timeout` SHOULD come from `RuntimeConfig.run_timeout`; `budget_policy` SHOULD come from `RuntimeConfig.budget_policy`. The scheduler does not read config files. |
+| D6 | Production wiring MUST set `deps.runs = deps.session_plane.runs()` (same control plane the gate adapter registers waiters on). A mismatched pair is `Config("runs must be session_plane.runs()")` at `new`. |
+| D7 | `deps.events` MUST be the same store installed as the runtime event sink (sequence numbers must not fork). |
 
 ### 3.11 `SchedConfig` (new)
 
@@ -976,7 +982,7 @@ struct LinearScheduler {
     pending_cancels: Mutex<HashSet<DagId>>,
     /// Held for the process lifetime; released on Drop.
     _lock: OwnershipLock,
-    metrics: Arc<SchedulerMetrics>,
+    metrics: Arc<SchedulerCounters>,
 }
 ```
 
@@ -1134,7 +1140,7 @@ struct OwnershipLock {
 | R12 | Start the run clock; `gate_wait_total = 0` (§5.19) — **before** adoption so A6/backoff remaining-budget checks have a defined clock | — |
 | R13 | Adopt any node durably `Running` (§5.3.2) | — |
 | R14 | Gate resume decision (§5.7.2 / §5.7.3) when `dag.state == WaitingApproval` | — |
-| R15 | C1: if `dag.state == Pending` (or a gate resolution advanced the DAG per §5.7.6) CAS `DagState::Running` | `Conflict` ⇒ §5.8.4 |
+| R15 | C1: if `dag.state == Pending` CAS `DagState::Running`. Gate allow MUST NOT use C1 — it uses C9b (GA3). | `Conflict` ⇒ §5.8.4 |
 | R16 | Enter the loop (§5.2) | — |
 | R17 | On loop exit: derive the terminal `DagState` (§5.17), commit C7, assemble `DagOutcome` (§5.18), drop `OwnedGuard` | — |
 
@@ -1166,6 +1172,8 @@ struct OwnershipLock {
 #### 5.3.1 Attempt counters
 
 `TaskNode` has no attempt field (RFC-0009 §6.4), so counters are process-local and rebuilt from events on resume.
+
+**Event scans (normative).** Attempt rebuild (§5.3.1), `ApprovalResolved` scans (§5.7.2), and GR3/GR4 existence/timestamp probes MUST page `EventStore::list_session_events` and filter in memory (same pattern as `reaccumulate_cost_from_events`). `has_session_event_for_run` is a bool probe only and MUST NOT be treated as payload-capable. `replay_session` is `where Self: Sized` and unreachable through `Arc<dyn EventStore>`. GateId uniqueness within a DAG is validator V16; the scan key is `(run_id, gate_id, generation)`.
 
 | Source | Rule |
 | --- | --- |
@@ -1507,6 +1515,7 @@ Both events MUST be appended **after** the CAS, in order (c) then (d).
 | RT3 | The backoff sleep MUST happen **after** the CAS and after the events, so a crash during backoff resumes from a coherent blob. |
 | RT4 | On restart with the node `Ready` and `attempts_started = k` (a failed attempt recorded), the scheduler MUST continue the remaining backoff (§5.11.3 rule B4) and then perform C3 for attempt `k + 1`. |
 | RT5 | The `Failed → Ready` transition MUST NOT be used for non-admitted failures. Non-admitted failures go straight to durable `Failed` via C7. |
+| RT6 | Retry of an `Edit` node (when admitted) MUST produce a **new forward** patch via a fresh worker/`apply_patch` call. The scheduler MUST NOT reapply, replay, or revert the previous transaction (§8.5). |
 
 #### 5.8.4 Conflict handling
 
@@ -1582,7 +1591,9 @@ A retry for attempt `k + 1` is admitted iff **all** hold:
 | A3 | `attempts_started < node.retry.max_attempts` |
 | A4 | Neither `run_cancel` nor `runtime_cancel` is cancelled |
 | A5 | The run budget is not exhausted (§5.16.3) |
-| A6 | The remaining run budget exceeds the backoff delay plus a non-zero slice (otherwise the retry would immediately time out) |
+| A6 | The remaining run budget exceeds the backoff delay plus `RETRY_BUDGET_SLICE` (otherwise the retry would immediately time out) |
+
+`RETRY_BUDGET_SLICE = Duration::from_millis(250)` (named constant in `scheduler::retry`).
 
 Failing any condition ⇒ durable `Failed` via C7 with the same `FailureIr`.
 
@@ -1676,7 +1687,7 @@ delay = min(max(raw, 0), max_backoff)
 | 4 | Resolve the run binding for event attribution; missing ⇒ still write C6, log at `warn`, skip events |
 | 5 | C6 markings + `DagState::Cancelled` |
 | 6 | Append `NodeState` events |
-| 7 | Drop the guard (releases ownership, notifies) |
+| 7 | Write `cancel_result = Some(Ok(Cancelled))` (or `Some(Err(..))` on CAS failure), then drop the guard (releases ownership, notifies) |
 | 8 | Remove `dag_id` from `pending_cancels` |
 
 This is the path that makes `AlloyRuntime::drain` able to terminalize DAGs whose `run` future already returned (or never started).
@@ -1865,7 +1876,7 @@ meter.with_mut(|m| *m = rebuilt);
 
 | Rule | Statement |
 | --- | --- |
-| BE1 | On exhaustion the scheduler MUST append one `DecisionKind::Budget` record and a `BudgetWarning` session event, then terminalize with `DagState::Failed`. When `usd_spent` is still `None` (BG3 pre-dispatch), `maybe_signal_budget_warning` alone is insufficient — the scheduler MUST append `BudgetWarning` directly with `{ "reason": "effective_usd_exhausted", "effective_usd": … }`. |
+| BE1 | On exhaustion the scheduler MUST append one `DecisionKind::Budget` record and a `BudgetWarning` via `SessionPlane::signal_budget_warning(session, Some(run), snapshot, message)` (RFC-0004 `{ snapshot, message }` shape), then terminalize with `DagState::Failed`. When `usd_spent` is still `None` (BG3 pre-dispatch), `maybe_signal_budget_warning` will not fire — call `signal_budget_warning` directly with the current meter snapshot and `message = "budget exhausted: effective_usd <= 0 (pre-dispatch)"`. Extra keys MAY be added beside `snapshot`/`message` but MUST NOT replace them. |
 | BE2 | The scheduler MUST NOT itself add model usage to the meter. Workers (RFC-0013) and the router (RFC-0007) own `add_model_usage`; tool calls are metered by RFC-0006's `ToolCall` records. Double counting is an AC (§13 AC 38). |
 | BE3 | Budget exhaustion is a **planned** failure: `Ok(DagOutcome { state: Failed, .. })`, never `Err`. |
 | BE4 | `ObsError` / `DecisionLog` failure after a committed budget/retry/gate CAS MUST be logged at `warn` and MUST NOT rewrite or abort the durable outcome (same posture as W4 for events). `ObsError` **before** the corresponding CAS MUST map to `Err(Store(..))` and MUST NOT proceed with that CAS. |
@@ -2009,7 +2020,7 @@ drop(LinearScheduler) ──► lock file handle drops ──► advisory lock r
 | `Running` | one `Ready`, `attempts ≥ 1` | `running` | Resume backoff (B4) then C3 |
 | `Running` | all terminal | `running` | Derive terminal state, C7 |
 | `WaitingApproval` | gate `WaitingApproval` | `waiting_approval` | Re-register only (§5.7.3) |
-| `WaitingApproval` | gate `WaitingApproval` | `failed` | `resume` → `reconcile_terminal_run` (§5.7.11) |
+| `WaitingApproval` | gate `WaitingApproval` | `failed` | `resume` → `reconcile_terminal_run` (§5.7.12) |
 | `WaitingApproval` | gate `WaitingApproval` | `running` + `ApprovalResolved(allow)` | Allow path (§5.7.6) |
 | `Failed` / `Succeeded` / `Cancelled` | — | any | R9 short-circuit, no CAS |
 | `ReplanRequired` | — | `replan_requested` | R10 short-circuit |
@@ -2025,6 +2036,29 @@ drop(LinearScheduler) ──► lock file handle drops ──► advisory lock r
 | CI4 | One writer per DAG blob at any instant (CI2 + CAS). |
 | CI5 | Cargo invocations are serialized by `max_parallel_cargo = 1` plus MCP host admission (`host_parallel_honesty`). |
 | CI6 | No `.await` while holding an internal `Mutex`. |
+| CI7 | The scheduler's OS lock (`scheduler.lock`) is **process exclusivity for the scheduler**, not workspace exclusivity. RFC-0008 deferred workspace `flock`; nothing prevents an editor, stray `cargo`, or second Alloy process from mutating the tree between apply and verify (§6.5 AS1). |
+
+### 6.5 Edit transactions vs DAG resume (RFC-0008, normative)
+
+RFC-0008 MVP durability: **in-process edit-transaction map only** + durable checkpoint refs + `EditApplied` events. After process restart, in-memory txs are gone (`UnknownTransaction`); orphan checkpoint refs are **not** auto-restored. `recover_checkpoint` restores the tracked tree only and cannot unlink creates recorded only in lost memory.
+
+| # | Rule |
+| --- | --- |
+| ER1 | DAG node state is durable (`put_if_generation`). Edit transaction state is **not**. After restart the two MAY disagree: an `Edit` node can be durably `Succeeded` while no in-memory tx exists and workspace creates may be untracked leftovers. |
+| ER2 | The scheduler MUST NOT assume a `Succeeded` `Edit` node implies a clean, known, or exclusive workspace. |
+| ER3 | The scheduler MUST NOT call `EditEngine::rollback`, `EditEngine::apply`, or `GitEditEngine::recover_checkpoint`. Those belong to the write stack / operator (RFC-0008 §2.5 / §6.5; RFC-0015). |
+| ER4 | **Resume rule (re-verify).** After restart, before dispatching any further `Edit` / capability node that consumes the edited tree, if any `Edit` node in this generation is durably `Succeeded` and a Data or Sequence successor `VerifyCompile` or `VerifyTest` exists that is not yet `Succeeded`/`CachedHit`, the scheduler MUST run that verify path next (promote + dispatch under normal L-steps). Forward-only (§8.5): verification failure drives another patch later, never an undo. |
+| ER5 | If a `Succeeded` `Edit` has **no** verify successor in the DAG, the scheduler MUST stop: durable `Failed` with `FailureIr { error_class: Internal, retry: NonRetryable, notes: "edit succeeded without verify successor; workspace unverified after restart" }` and `Ok(DagOutcome { state: Failed, .. })`. |
+| ER6 | A crash with an `Edit` node durably `Running` follows §5.3.2 adoption (lost attempt). Re-dispatch produces a **new** forward `apply_patch`, not a replay of the lost tx (§8.5 RT6). |
+| ER7 | Operator cleanup of untracked creates after crash is out of band (RFC-0008 / RFC-0015). The scheduler MUST NOT invent cleanup. |
+
+**Assumptions (stated, not silent):**
+
+| # | Assumption |
+| --- | --- |
+| AS1 | **No external workspace exclusivity.** Between apply and verify the tree MAY change underfoot. Verify observes whatever is on disk at call time. |
+| AS2 | **Patch size.** One `Edit` node's `apply_patch` payload is bounded by RFC-0006 `MAX_ARGUMENT_BYTES` / `MAX_ARG_STRING_BYTES`. Raising them needs an RFC-0006 amendment; RFC-0013 workers MUST chunk larger repairs across nodes. |
+| AS3 | **Workspace digests are full-recompute** in RFC-0008. If a later algorithm digests per node, cost is O(tree); incremental digests are deferred — this RFC MUST NOT assume digests are cheap. |
 
 ---
 
@@ -2112,6 +2146,7 @@ The mapping is **total** over the exhaustive `StoreError` enum on `main` (not `#
 | Load-time validation failure | `Err(Invariant)` |
 | Stalled DAG after skip propagation | `Err(Invariant)` |
 | `run` about to return `Running` / `WaitingApproval` / `Pending` | `Err(Invariant)` |
+| Node `WaitingApproval` while `dag.state != WaitingApproval` | `Err(Invariant)` |
 
 ### 8.4 What MUST NOT be an error
 
@@ -2123,6 +2158,18 @@ The mapping is **total** over the exhaustive `StoreError` enum on `main` (not `#
 | Run timeout | `Ok(DagOutcome { state: Failed, .. })` |
 | Cancellation with a durable C6 | `Ok(DagOutcome { state: Cancelled, .. })` |
 | Replan observed | `Ok(DagOutcome { state: ReplanRequired, .. })` |
+
+### 8.5 Forward-only repair (RFC-0008, normative)
+
+The MCP bus exposes `ApplyPatch | CargoCheck | CargoTest | FsRead` — **no rollback tool**. RFC-0008 puts MCP rollback out of MVP and states that **RFC-0010's scheduler does not call EditEngine**. The write path is `EditWorker → apply_patch → EditEnginePatchBackend` (RFC-0008 §2.5).
+
+| # | Rule |
+| --- | --- |
+| FOW1 | The scheduler MUST NOT attempt to revert an applied edit — not via the tool bus, not via `EditEngine::rollback`, not via `recover_checkpoint`. Cite: RFC-0008 single-write-stack rule. |
+| FOW2 | Recovery is **forward-only**. A failed `VerifyCompile` / `VerifyTest` after a successful `Edit` drives another patch (replan or a later Edit attempt), never an undo. |
+| FOW3 | A `Failed` node after a successful earlier `Edit` leaves an **applied, unverified patch** on disk. That is a **normal terminal workspace state**, not store corruption and not an `Invariant`. |
+| FOW4 | Retry of an `Edit` node (when §5.11 admits it) MUST issue a **new** forward `apply_patch` (RT6). Reapplying or reverting the previous transaction is forbidden. |
+| FOW5 | **`DagOutcome` / workspace signal (no new fields).** `DagOutcome` stays as on `main`. RFC-0015 MUST treat the workspace as modified for a run iff any `Edit` node in that generation reached `Succeeded` **or** any `EditApplied` session event exists for the run. On `Failed` / `Cancelled` / `ReplanRequired`, that inference is how the CLI tells an operator the tree was touched. |
 
 ---
 
@@ -2160,6 +2207,8 @@ The mapping is **total** over the exhaustive `StoreError` enum on `main` (not `#
 | OB5 | Every `NodeState` event MUST carry `generation` so RF2 filtering works across replans. |
 
 ### 9.3 `SchedulerMetrics`
+
+Internal counters live in a private `SchedulerCounters` (`AtomicU64` fields, `Arc`-shared). `LinearScheduler::metrics()` snapshots them into the public `Copy` struct below (same pattern as `AtomicMetrics` → `RuntimeMetrics` on `main`).
 
 ```rust
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2379,6 +2428,11 @@ Each AC is a test name or a CI check.
 | 80 | `expire_gate` `Err(other)` retries up to `EXPIRE_RETRY_MAX`; on exhaustion the DAG terminalizes as expiry and `run` returns `Ok(Failed)` (A5 merges control). GT3 never terminalizes without a durable expired resolution or a successful/exhausted expiry path. |
 | 81 | Negative finite `MaxUsd` clamps to `0.0` and trips BG3 with a direct `BudgetWarning`. |
 | 82 | DecisionLog/`ObsError` after a committed CAS does not abort the durable outcome (BE4); before the CAS it maps to `Store`. |
+| 83 | Scheduler code paths never call `EditEngine::{apply,rollback}` or `recover_checkpoint` (CI grep / unit). |
+| 84 | After a simulated restart with `Edit=Succeeded` and `VerifyCompile=Pending`, resume dispatches verify next (ER4); with no verify successor, returns `Ok(Failed)` per ER5. |
+| 85 | Admitted Edit retry issues a distinct new `apply_patch` call_id / attempt (RT6 / FOW4), not a replay of the prior tx. |
+| 86 | BG3 exhaustion calls `SessionPlane::signal_budget_warning` with RFC-0004 `{snapshot, message}` shape. |
+| 87 | `new` rejects `deps.runs` that is not `session_plane.runs()` (D6). |
 
 ---
 
@@ -2439,7 +2493,7 @@ Every row is a single `put_if_generation(&dag, Some(dag.generation))`. `dag.gene
 
 | Id | Trigger | Node transitions | `DagState` after | Events appended after the CAS |
 | --- | --- | --- | --- | --- |
-| **C1** | `run` start / adopt | none | `Pending → Running` (or `WaitingApproval → Running` on the allow path) | none |
+| **C1** | `run` start / adopt | none | `Pending → Running` only (gate allow leaves `WaitingApproval` via C9b in the same CAS as node→`Ready` — GA3) | none |
 | **C2** | frontier promotion | `Pending → Ready` for every promotable node | `Running` | one `NodeState` per node |
 | **C3** | dispatch attempt `k` | `Ready → Running` | `Running` | `NodeState { to: running, attempt: k }` |
 | **C4** | node success | `Running → Succeeded`, `output_ref = Some(id)` | `Running` | `NodeState { to: succeeded, attempt: k }` |
@@ -2576,7 +2630,7 @@ Non-admission examples:
 | `Approval` | A1 (always `NonRetryable`) |
 | `Timeout` (run-level) | T5 |
 | any, with the budget exhausted | A5 |
-| any, with `remaining_run < backoff + slice` | A6 |
+| any, with `remaining_run < backoff + RETRY_BUDGET_SLICE` | A6 |
 
 ## Appendix F — Run binding resolution
 
@@ -2771,8 +2825,8 @@ Nodes `analyze → edit → verify → gate` with both Data and Sequence edges o
 | 1 | `RunController::start` → `RuntimeHandle::run_dag` → `LinearScheduler::run` |
 | 2 | R1 load, R2 validate, R3 bind run, R4 own, R6 session, R7 ceilings, R8 meter rebuild (no events yet) |
 | 3 | **C1** `DagState::Pending → Running` |
-| 4 | L6 **C2** `analyze: Pending → Ready` (`edit` still has an unsatisfied Data predecessor) |
-| 5 | L10 root node — no C5 (Goal payload retained) |
+| 4 | L7 **C2** `analyze: Pending → Ready` (`edit` still has an unsatisfied Data predecessor) |
+| 5 | L11 root node — no C5 (Goal payload retained) |
 | 6 | L14 **C3** `analyze: Ready → Running` (attempt 1); dispatch to the capability executor |
 | 7 | Worker returns `Succeeded { payload }`; put `node_output`; **C4** `Succeeded` + `output_ref` |
 | 8 | **C2** `edit: Pending → Ready` (Data + Sequence satisfied) |
@@ -2788,7 +2842,7 @@ Nodes `analyze → edit → verify → gate` with both Data and Sequence edges o
 | 18 | `gate_wait_total` accrues while the human deliberates; the run budget is not charged (T1) |
 | 19 | `RunController::approve(Allow)` → `ApprovalResolved` → waiter fires |
 | 20 | **C9b** `gate: WaitingApproval → Ready`, `DagState::Running`; **C3** `Running`; gate fold; **C4** `Succeeded` + `output_ref` |
-| 21 | L8 no `Ready` nodes; D7 ⇒ `Succeeded`; **C7** `DagState::Succeeded` |
+| 21 | L9 no `Ready` nodes; D7 ⇒ `Succeeded`; **C7** `DagState::Succeeded` |
 | 22 | `run` returns `Ok(DagOutcome { state: Succeeded, failed_node: None, failure: None })`; `OwnedGuard` drops, ownership released, `completed` notified |
 
 Crash injection points and their recoveries are the §6.3 matrix; every step above is idempotent under RF1–RF5.
