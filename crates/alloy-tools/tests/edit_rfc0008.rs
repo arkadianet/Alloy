@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use alloy_runtime::storage::{EventStore, StorageOpenOptions};
 use alloy_runtime::{
-    AlloyStorage, ArtifactKind, ArtifactStore, EditContext, EditEngine, EditError, EditRequest,
-    EventSeq, EventSink, EventSinkError, ExecAllow, FilePatch, Glob, Grant, Hunk, NewSessionEvent,
-    PatchSet, PermissionToken, ProfileId, RunId, RuntimeEvent, SessionEventType, SessionId,
-    TxState,
+    AlloyStorage, ArtifactKind, ArtifactStore, Digest, EditAppliedPayload, EditContext, EditEngine,
+    EditError, EditRequest, EditRequestKind, EventSeq, EventSink, EventSinkError, ExecAllow,
+    FilePatch, Glob, Grant, Hunk, NewSessionEvent, PatchSet, PermissionToken, ProfileId, RunId,
+    RuntimeEvent, SessionEventType, SessionId, TxState, EDIT_APPLIED_SCHEMA,
 };
 use alloy_tools::mcp::{ApplyPatchArgs, PatchApplyBackend, PatchApplyError, PermissionDenial};
 use alloy_tools::{
@@ -237,9 +237,14 @@ async fn textpatch_apply_checkpoint_event_and_rollback() {
         return;
     };
     let head_before = run_git(&fx.broker, &fx.jail, &["rev-parse", "HEAD"]).await;
+    let request = modify_patch();
+    let EditRequest::TextPatch { patch } = &request else {
+        unreachable!()
+    };
+    let expected_patch_hash = Digest::sha256(&serde_json::to_vec(patch).unwrap());
     let tx = fx
         .engine
-        .apply(modify_patch(), &fx.ctx(edit_token()))
+        .apply(request, &fx.ctx(edit_token()))
         .await
         .unwrap();
     assert_eq!(tx.state, TxState::Committed);
@@ -264,10 +269,28 @@ async fn textpatch_apply_checkpoint_event_and_rollback() {
         .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].type_, SessionEventType::EditApplied);
-    assert!(events[0].payload.get("patch_artifact_id").is_some());
+    let payload: EditAppliedPayload = serde_json::from_value(events[0].payload.clone()).unwrap();
     let artifact_id = tx.patch_artifact_id.unwrap();
-    let meta = fx.storage.artifacts().meta(artifact_id).await.unwrap();
-    assert_eq!(meta.kind, ArtifactKind::Patch);
+    assert_eq!(payload.schema, EDIT_APPLIED_SCHEMA);
+    assert_eq!(payload.transaction_id, tx.id);
+    assert_eq!(payload.checkpoint_id, checkpoint);
+    assert_eq!(payload.checkpoint_sha, checkpoint_sha.trim());
+    assert_eq!(payload.pre_digest, tx.pre_digest);
+    assert_eq!(payload.post_digest, tx.post_digest.clone().unwrap());
+    assert_eq!(payload.files_touched, tx.files_touched);
+    assert_eq!(payload.patch_artifact_id, artifact_id);
+    assert_eq!(payload.patch_content_hash, expected_patch_hash);
+    assert_eq!(payload.patch_content_hash, tx.patch_content_hash.unwrap());
+    assert_eq!(payload.request_kind, EditRequestKind::TextPatch);
+
+    let artifact = fx.storage.artifacts().get(artifact_id).await.unwrap();
+    assert_eq!(artifact.meta.kind, ArtifactKind::Patch);
+    assert_eq!(artifact.meta.digest, payload.patch_content_hash);
+    assert_eq!(
+        Digest::sha256(&artifact.bytes),
+        payload.patch_content_hash,
+        "CAS bytes, artifact metadata, transaction, and event must agree"
+    );
 
     fx.engine
         .rollback(tx.id, &fx.ctx(edit_token()))
