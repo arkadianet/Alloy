@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Draft |
+| **Status** | Implemented |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0002](./RFC-0002-storage-artifacts-session-events.md) (merged) |
@@ -107,7 +107,7 @@ Authoritative for: `TaskDag`, `TaskNode`, `NodeKind`, `NodeState`, `EdgeKind`, `
 
 **This RFC does not amend field shapes.** Behaviour and ownership around them are specified here.
 
-**Additive derive authorization (normative):** Implementation MAY add `PartialEq` (and `Eq` where sound) to `TaskDag`, `TaskNode`, `DependencyEdge`, `RetryPolicy`, `Backoff`, `ApprovalSpec`, and `CacheKey` for tests. This is not a field reshape.
+**Additive derive authorization (normative):** Implementation MAY add `PartialEq` (and `Eq` where sound) to `TaskDag`, `TaskNode`, `DependencyEdge`, `RetryPolicy`, `Backoff`, `ApprovalSpec`, and `CacheKey` for tests. Implementation MAY add `Hash` to `EdgeKind` (fieldless `Copy` enum; required for V8 `HashSet<(NodeId, NodeId, EdgeKind)>` keys). This is not a field reshape.
 
 **RFC-0003 additive derive (normative):** Implementation MUST add `PartialEq` to `ReplanReason` (sound: `FailureIr` already derives `PartialEq`) so `PlanProducedPayload` can derive `PartialEq`.
 
@@ -446,7 +446,7 @@ impl SqliteDagStore {
 | Gate | Every method MUST `StorageGate::enter()` for the operation; after `AlloyStorage::close()` → `StoreError::Closed` |
 | Busy | Map SQLite busy identically to other stores; increment `busy_errors` |
 | Construction | Built **once** inside `AlloyStorage::open` (same pattern as `events` / `artifacts`); `dags()` clones the `Arc` |
-| Module location | **MUST** live in `storage/dags.rs` (trait + `SqliteDagStore` + `ReplanReplaceError`) using `pub(crate)` `DbHandle` / `StorageGate` / `StorageMetrics`. `dag/store.rs` MAY only `pub use` re-exports. No alternate home. |
+| Module location | **MUST** live in `storage/dags.rs` (trait + `SqliteDagStore` + `ReplanReplaceError`) using `pub(crate)` `DbHandle` / `StorageGate` / `StorageMetrics`. The `dag::store` module MAY only `pub use` re-exports (inline or file). No alternate home. |
 
 ### 3.8 `AlloyStorage` additive API
 
@@ -538,14 +538,31 @@ impl TemplateCatalog {
 ### 3.11 Node I/O artifact envelopes
 
 ```rust
+/// Wire schema version for node I/O envelopes (MUST be 1).
+pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeInputEnvelope {
-    pub schema_version: u32, // MUST be 1
+    pub schema_version: u32, // MUST be ENVELOPE_SCHEMA_VERSION
     pub dag_id: DagId,
     pub node_id: NodeId,
     pub kind: NodeKind,
     pub generation: u64,
     pub payload: NodeInputPayload,
+}
+
+impl NodeInputEnvelope {
+    /// Construct with `ENVELOPE_SCHEMA_VERSION`.
+    pub fn new(
+        dag_id: DagId,
+        node_id: NodeId,
+        kind: NodeKind,
+        generation: u64,
+        payload: NodeInputPayload,
+    ) -> Self;
+
+    /// True when `schema_version == ENVELOPE_SCHEMA_VERSION`.
+    pub fn is_supported_schema(&self) -> bool;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -567,7 +584,7 @@ pub struct PredecessorOutput {
 /// concern and MUST NOT be written into `TaskNode.output_ref` on failure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeOutputEnvelope {
-    pub schema_version: u32, // MUST be 1
+    pub schema_version: u32, // MUST be ENVELOPE_SCHEMA_VERSION
     pub dag_id: DagId,
     pub node_id: NodeId,
     pub kind: NodeKind,
@@ -575,6 +592,21 @@ pub struct NodeOutputEnvelope {
     /// Attempt index starting at 1 for the producing attempt (writer: 0010).
     pub attempt: u32,
     pub payload: serde_json::Value,
+}
+
+impl NodeOutputEnvelope {
+    /// Construct with `ENVELOPE_SCHEMA_VERSION`.
+    pub fn new(
+        dag_id: DagId,
+        node_id: NodeId,
+        kind: NodeKind,
+        generation: u64,
+        attempt: u32,
+        payload: serde_json::Value,
+    ) -> Self;
+
+    /// True when `schema_version == ENVELOPE_SCHEMA_VERSION`.
+    pub fn is_supported_schema(&self) -> bool;
 }
 ```
 
@@ -613,6 +645,11 @@ pub fn compute_cache_key(m: CacheKeyMaterials<'_>) -> CacheKey;
 pub fn mvp_tool_versions_digest() -> Digest;      // sha256(b"alloy.mvp.tool_versions.v0")
 pub fn mvp_compiler_fingerprint_digest() -> Digest; // sha256(b"alloy.mvp.compiler_fingerprint.v0")
 pub fn mvp_policy_hash_digest() -> Digest;        // sha256(b"alloy.mvp.policy_hash.v0")
+
+/// Content-only digest for a `Goal` (§5.8 `Goal` row). MUST NOT include
+/// dag_id / node_id / generation. `Goal` is plain serde data — returns `Digest`
+/// directly (serialization cannot fail for valid values).
+pub fn goal_content_digest(goal: &Goal) -> Digest;
 ```
 
 ### 3.13 `PlanContext` / `PlanResult` / `PlanProducedPayload`
@@ -751,6 +788,10 @@ impl TemplatePlanService {
         artifacts: Arc<dyn ArtifactStore>,
         events: Arc<dyn EventSink>,
     ) -> Self;
+
+    /// Day-1 production wiring (§1.5 item 7): inject dags + artifacts + the
+    /// durable SQLite `EventSink` from an open `AlloyStorage`.
+    pub fn from_storage(storage: &AlloyStorage) -> Self;
 }
 ```
 
@@ -784,9 +825,7 @@ impl PlanService for DisabledLlmPlanService {
 
 ### 3.18 Crate-root re-exports
 
-MUST re-export: `DagStore`, `SqliteDagStore`, `ReplanReplaceError`, `DagValidator`, `ValidateOpts`, `DagValidationError`, `RetryIncoherence`, `TemplateId`, `TemplateManifest`, `TemplateCatalog`, `TemplateIdMap`, `BuildTopology`, `allocate_ids`, `build_topology`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput`, `CacheKeyMaterials`, `compute_cache_key`, `mvp_*_digest`, `PlanService`, `PlanContext`, `PlanResult`, `PlanProducedPayload`, `PlanError`, `TemplatePlanService`, `DisabledLlmPlanService`.
-
-Template DTO specs (`TemplateNodeSpec`, …) MAY stay module-public without crate-root re-export.
+MUST re-export: `DagStore`, `SqliteDagStore`, `ReplanReplaceError`, `DagValidator`, `ValidateOpts`, `DagValidationError`, `RetryIncoherence`, `TemplateId`, `TemplateManifest`, `TemplateNodeSpec`, `TemplateEdgeSpec`, `TemplateApprovalSpec`, `TemplateCatalog`, `TemplateIdMap`, `BuildTopology`, `allocate_ids`, `build_topology`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput`, `ENVELOPE_SCHEMA_VERSION`, `CacheKeyMaterials`, `compute_cache_key`, `goal_content_digest`, `mvp_*_digest`, `PlanService`, `PlanContext`, `PlanResult`, `PlanProducedPayload`, `PlanError`, `TemplatePlanService`, `DisabledLlmPlanService`.
 
 ### 3.19 Visibility & construction summary
 
@@ -795,7 +834,7 @@ Template DTO specs (`TemplateNodeSpec`, …) MAY stay module-public without crat
 | `DagValidator` | pub | unit / associated fn |
 | `SqliteDagStore` | pub type; fields private | `AlloyStorage::dags()` only |
 | `TemplateCatalog` | pub | static / OnceLock |
-| `TemplatePlanService` | pub | `new(dags, artifacts, events)` — events required |
+| `TemplatePlanService` | pub | `from_storage(&AlloyStorage)` (production) or `new(dags, artifacts, events)` — events required |
 | `DisabledLlmPlanService` | pub | unit; tests / future flag only |
 
 ---
@@ -810,7 +849,7 @@ crates/alloy-runtime/src/
     mod.rs
     types.rs            # EXISTING — field shapes unchanged
     validate.rs
-    store.rs            # optional re-export of storage::DagStore only
+    mod.rs → store { }  # inline re-export of storage::{DagStore, …} only (no store.rs file)
     templates.rs        # sync topology build (generation param; no I/O)
     cache.rs
     io.rs               # envelopes + encode helpers
@@ -873,7 +912,7 @@ select(ctx) -> TemplateId:
 3. **Phase A (sync):** `ids ← templates::allocate_ids(manifest)` → `TemplateIdMap` (local name → `NodeId`, plus `GateId` per approval node).
 4. **Validate before any CAS writes (§8.5):** build a validation-only `input_refs` map with ephemeral `ArtifactId::new()` placeholders (**not** written to the artifact store); `candidate ← build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs: &placeholders })`; `DagValidator::validate(&candidate, ValidateOpts::default())?`. On failure, return `Validation` with **zero** plan artifacts written.
 5. **Phase B (async, planner):** using `ids`, `put` every input / `pending_pred` artifact per §5.3.0 with `NodeInputEnvelope.generation = 1`; build `input_refs: BTreeMap<NodeId, ArtifactId>` covering **every** node. Missing coverage is a crate bug → `Internal`.
-6. **Phase C (sync):** `dag ← templates::build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs })` — every node `Pending`, `TaskDag.state = Pending`, `output_ref = None`, `cache_key = None` when `!enable_cache` (day-1: all false). Every `input_ref` MUST equal the Phase B map entry. Ephemeral ids from step 4 MUST NOT appear in the persisted DAG.
+6. **Phase C (sync):** `dag ← templates::build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs })` — every node `Pending`, `TaskDag.state = Pending`, `output_ref = None`, `cache_key = None` when `!enable_cache` (day-1: all false). If a manifest ever sets `enable_cache = true` before RFC-0010 supplies cache materials, `build_topology` MUST leave `cache_key = None` and emit an error-level log (must not invent keys). Every `input_ref` MUST equal the Phase B map entry. Ephemeral ids from step 4 MUST NOT appear in the persisted DAG.
 7. `snapshot ← artifacts.put(TaskDag JSON)` with snapshot labels. Serde failure → `PlanError::Internal`.
 8. `dags.put_if_generation(&dag, None)`:
    - `Ok` → continue
@@ -1051,14 +1090,15 @@ Evaluate **in order V1…V17**. Return the **first** violation.
 | `session_id` | `TaskDag.session_id` |
 | `generation` | `TaskDag.generation` as SQLite `INTEGER` (i64) |
 | `blob_json` | `serde_json::to_string(TaskDag)` |
-| `updated_at` | RFC3339 UTC |
+| `updated_at` | Fixed-width RFC3339 UTC with **9-digit** fractional seconds (`YYYY-MM-DDTHH:MM:SS.fffffffffZ`) so `ORDER BY updated_at ASC` is lexicographically chronological |
 
 #### 5.6.2 Replan algorithm
 
 Uses `ctx.dag_id` only (no separate `dag_id` argument).
 
-1. `probe ← dags.get(ctx.dag_id)?.ok_or(DagNotFound)?` (non-atomic preflight for session mismatch / overflow messaging).
-2. If `probe.session_id != ctx.session_id` → `SessionMismatch`.
+1. `probe ← dags.get(ctx.dag_id)?.ok_or(DagNotFound)?` (non-atomic preflight for session mismatch / overflow / Running messaging).
+2. If `probe.session_id != ctx.session_id` → `SessionMismatch`.  
+   If `probe.state == Running` → `PlanError::DagBusy { state: Running }` **before** any Phase A–C artifact writes (cheap preflight; `replace_for_replan` remains the atomic race guard).
 3. Prefer routing replan through `RunController::request_replan` first so gate waiters are cleared (0003). Production callers MUST do so; direct `PlanService::replan` is test/advanced-only (no public waiter-clear API outside the control plane).
 4. `template_id ← ctx.template_override.unwrap_or_else(|| select(ctx))`.  
    **No EventStore scan.** Callers SHOULD pass the prior `PlanResult.template_id` as override.
@@ -1075,7 +1115,7 @@ Uses `ctx.dag_id` only (no separate `dag_id` argument).
 9. Append `PlanProduced` (`replan: true`, `reason: Some(reason)`, `run_id: Some(ctx.run_id)`). Same event-failure semantics as §5.2 step 9.
 10. Return `PlanResult`.
 
-**Permitted preflight states:** any except that `replace_for_replan` **atomically** rejects `Running`. Terminal DAG states (`Succeeded`/`Cancelled`/`Failed`) are allowed at the store layer; RFC-0003 may still refuse replan on terminal *run* rows — that is a control-plane concern.
+**Permitted preflight states:** any non-`Running` state at the cheap preflight; `replace_for_replan` **also atomically** rejects `Running` under the race. Terminal DAG states (`Succeeded`/`Cancelled`/`Failed`) are allowed at the store layer; RFC-0003 may still refuse replan on terminal *run* rows — that is a control-plane concern.
 
 #### 5.6.3 Prior-generation recoverability (binding)
 
@@ -1143,7 +1183,7 @@ compiler_fingerprint.as_hex()
 
 | Payload | Bytes hashed |
 | --- | --- |
-| `Goal` | `serde_json::to_vec` of the `Goal` value only |
+| `Goal` | `serde_json::to_vec` of the `Goal` value only. **Note for RFC-0010:** reject non-finite `Goal` constraint values before enabling cache hits |
 | `FromPredecessors` | **Deferred to RFC-0010** — day-1 templates never enable cache on non-roots. Framing (NodeId encoding, separators, edge order) MUST be specified in 0010 before any non-root `enable_cache = true` ships |
 
 Day-1 templates never set `cache_key`. Pin a golden expected digest in `cache_key_stable` for a fixed `Goal` fixture (root/content path only).
@@ -1448,15 +1488,15 @@ Every criterion is independently testable by a named test or mechanical check.
 
 Merge only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
 
-- [ ] Architecture compliance: **PASS**
-- [ ] RFC acceptance criteria: **100% satisfied**
-- [ ] Unit tests: **passing**
-- [ ] Integration tests: **passing** (if applicable)
-- [ ] Documentation: **complete**
-- [ ] Public APIs: **reviewed and stable**
-- [ ] Clippy: **clean**
-- [ ] Formatting: **clean**
-- [ ] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
+- [x] Architecture compliance: **PASS**
+- [x] RFC acceptance criteria: **100% satisfied**
+- [x] Unit tests: **passing**
+- [x] Integration tests: **passing** (if applicable)
+- [x] Documentation: **complete**
+- [x] Public APIs: **reviewed and stable**
+- [x] Clippy: **clean**
+- [x] Formatting: **clean**
+- [x] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
 - [ ] Code review: **approved**
 
 ---
@@ -1539,11 +1579,14 @@ Replan: `"replan": true`, `"reason": "user_requested"` for unit variants, or `{"
 - On scheduler start / reclaim: if a DAG is `Running` and this process does not own it, transition it via same-generation `put_if_generation` to `Failed` or `ReplanRequired` (crash recovery) before accepting new work
 - On observing `RunControlState::ReplanRequested` for a live run this process owns: stop dispatch and write a non-`Running` `DagState` (`ReplanRequired`) via same-generation `put_if_generation` **before** `PlanService::replan` can succeed (otherwise `DagBusy` is permanent)
 - Rewrite final `input_ref` per §5.3.0
-- Enforce output_ref invariants on Succeeded/CachedHit
+- Enforce output_ref invariants on Succeeded/CachedHit (including: `CachedHit` MUST carry `output_ref`; `Succeeded` without `output_ref` MUST fail closed on Data edges)
 - Enforce GateHuman timeout using `timeout_ms`
 - Apply Data vs Sequence satisfaction per §5.3.1
 - Ignore `model_tier` / budgets on adapter nodes for routing
 - Specify `FromPredecessors` cache content-digest framing before enabling non-root cache
+- Reject non-finite `Goal` constraint values before enabling cache hits
+
+**Concurrency note (normative for 0010):** Same-generation checkpoint CAS (`put_if_generation(..., Some(generation))` where the blob’s generation equals the expected generation) assumes a **single scheduler writer** per DAG. Generation alone does not serialize two concurrent same-generation updates that both pass the compare; ownership / leasing is RFC-0010’s responsibility.
 
 ## Appendix D — What RFC-0013 may assume
 
