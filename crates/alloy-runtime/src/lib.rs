@@ -3,8 +3,9 @@
 //! This crate is the foundation defined by **RFC-0001**, extended by **RFC-0002**
 //! (durable storage, artifacts, session event log), **RFC-0003** (session manager
 //! and run controller), **RFC-0004** (observability & cost metering), tool IR
-//! from **RFC-0006**, model routing/provider support from **RFC-0007**, and
-//! Task DAG store/templates/planner from **RFC-0009**.
+//! from **RFC-0006**, model routing/provider support from **RFC-0007**, Task DAG
+//! store/templates/planner from **RFC-0009**, and EditEngine IR/trait from
+//! **RFC-0008**.
 //!
 //! # Crate map
 //!
@@ -19,6 +20,7 @@
 //! - [`router`] — sealed model routing, provider traits, and HTTP provider (RFC-0007)
 //! - [`dag`] — TaskDag types, validation, templates, cache, I/O envelopes (RFC-0009)
 //! - [`planner`] — [`PlanService`] / [`TemplatePlanService`] (RFC-0009)
+//! - [`edit`] — EditEngine trait + TextPatch / SemanticOps IR (RFC-0008)
 //! - [`config`] — TOML + env load (never writes `.env`)
 //!
 //! Author: arkadianet
@@ -29,6 +31,7 @@
 pub mod adapters;
 pub mod config;
 pub mod dag;
+pub mod edit;
 pub mod error;
 pub mod events;
 pub mod logging;
@@ -55,6 +58,11 @@ pub use dag::{
     NodeOutputEnvelope, NodeState, PredecessorOutput, RetryIncoherence, RetryPolicy, TaskDag,
     TaskNode, TemplateApprovalSpec, TemplateCatalog, TemplateEdgeSpec, TemplateId, TemplateIdMap,
     TemplateManifest, TemplateNodeSpec, ValidateOpts, ENVELOPE_SCHEMA_VERSION,
+};
+pub use edit::{
+    EditAppliedPayload, EditContext, EditEngine, EditError, EditRequest, EditRequestKind,
+    EditTransaction, EditValidation, FilePatch, Hunk, PatchSet, SemanticEditOp, TxState,
+    WorkspaceDigest, EDIT_APPLIED_SCHEMA,
 };
 pub use error::{AdapterError, RunError, RuntimeError, SchedError, SessionError};
 pub use events::{
