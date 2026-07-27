@@ -1220,13 +1220,13 @@ Because the write order is artifacts → CAS → events (§5.8.1), a crash can l
 | Rule | Statement |
 | --- | --- |
 | RF1 | The authoritative node state is `dag.nodes[id].state` from the blob. |
-| RF2 | Event-derived state MUST be filtered to the **newest** `NodeState` event for the node whose `payload.to` equals the persisted node state and whose `payload.generation` equals `dag.generation`. Newer events with a different `to` MUST be ignored (they belong to a transition that never committed). |
+| RF2 | Event-derived state MUST be filtered to the **newest** `NodeState` event for the node whose `payload.to` equals the persisted node state and whose `payload.generation` equals `dag.generation`. When multiple events share that `to` (retry cycles), prefer the newest whose `payload.attempt` / `next_attempt` matches the §5.3.1-derived counter when available. Newer events with a different `to` MUST be ignored (they belong to a transition that never committed). |
 | RF3 | If no such event exists, the transition's event is missing. The scheduler MUST append a repair `NodeState` event with `payload.repaired = true` before continuing, so the log matches the blob. |
 | RF4 | The scheduler MUST NOT roll a blob backwards to match an event. |
-| RF5 | Repair appends MUST be idempotent: at most one repair event per `(node, generation, to)`; existence is probed with the RF2 filter. |
+| RF5 | Repair appends MUST be idempotent. Dedup key: `(node, generation, to, attempt)` when the event carries `attempt` (C3 `to:running`); `(node, generation, to, next_attempt)` when it carries `next_attempt` (C8 `to:ready`); otherwise `(node, generation, to)`. A later retry cycle's lost `to:running` for attempt `k+1` MUST still be repairable after attempt `k`'s repair exists. Existence probes MUST use this key (not `to` alone). Logical C8(c) `to:failed` events are **not** RF3-repairable while the blob is `Ready` (RF2 has no durable `Failed` to anchor on) and MUST NOT consume a repair slot. |
 | RF6 | C9 committed with a missing `ApprovalRequested`: the scheduler MUST append a repair `ApprovalRequested` with `repaired: true`, `gate_id`, `node_id`, `generation: dag.generation`, and `ts = now` before GR4 deadline math. GR3's "MUST NOT re-emit" applies only to non-repair duplicates. |
 | RF7 | Gate deny/expiry CAS committed with a missing `NodeState`/`failure_ref` event: RF3 repairs the `NodeState`; if the `failure_ir` artifact is also missing, put a synthetic `Approval` `failure_ir` (`notes: "repaired after crash"`) **before** FN2 selection so FO2/FO6 hold. R9 MUST run RF7 before FO assembly on a durable `Failed` blob (not only mid-loop recovery). |
-| RF8 | Repair/`NodeState` events MUST carry the `attempt` (and `next_attempt` when applicable) derived by §5.3.1 **before** adoption continues. A lost C3 or C8 event pair MUST NOT reset `attempts_started` below the durable counter; AC 24 / AC 78 remain binding. **C8 crash pin:** W4a makes the C3 `NodeState{to:running, attempt:k}` event durable before dispatch, so it is the attempt anchor even when C8's (c)/(d) events are later lost: §5.3.1 yields `attempts_started = k` and the next C3 is `k+1` (RT4). A process MUST NOT reach C8 for attempt `k` unless that C3 event (or its RF3 repair) already exists. |
+| RF8 | Repair/`NodeState` events MUST carry the `attempt` (and `next_attempt` when applicable) derived by §5.3.1 **before** adoption continues. A lost C3 or C8 event pair MUST NOT reset `attempts_started` below the durable counter; AC 24 / AC 78 remain binding. **C8 crash pin:** W4a makes the C3 `to:running, attempt:k` event durable before dispatch. After a C8 CAS, (d) (`to:ready, next_attempt:k+1`) is the RF3-repairable anchor while the blob is `Ready`; (c) is logical-only and may stay missing. A process MUST NOT reach C8 for attempt `k` unless that C3 running event (or its RF3 repair) already exists. |
 
 ### 5.4 Ready-set derivation and selection
 
@@ -1280,7 +1280,7 @@ Because the write order is artifacts → CAS → events (§5.8.1), a crash can l
 
 | Rule | Statement |
 | --- | --- |
-| DP1 | Dispatch MUST happen after C3 commits, so a crash mid-node is recoverable as §5.3.2. |
+| DP1 | Dispatch MUST happen after C3 commits **and** after the `to:running` event is durable (W4a), so a crash mid-node is recoverable as §5.3.2 and attempt `k` cannot be orphaned. |
 | DP2 | Every dispatch MUST be wrapped in `tokio::time::timeout(node_deadline, fut)` except the gate wait, which uses its own deadline (§5.19). |
 | DP3 | `CapabilityExecContext.cost_meter` MUST be the run meter from `deps.cost_meters.meter_for(run_id)` (fix 9). Workers MUST NOT create their own. |
 | DP4 | The scheduler MUST overwrite `failure.node` with the dispatched `NodeId` on every returned `FailureIr` (CE2). |
