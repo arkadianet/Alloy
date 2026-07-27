@@ -1473,8 +1473,8 @@ impl GitEditEngine {
 
 `recover_checkpoint` normative contract:
 
-1. Acquire `write_lock` (same as apply/rollback).
-2. Check expiry; require `GitWrite` + Exec(git) preflight (§5.6.2 restore shapes).
+1. Locked preamble for `recover_checkpoint` (§5.2 step 0): lock → expiry → run attribution; **MUST NOT** run §6.4 reconcile.
+2. Require `GitWrite` + Exec(git) preflight (§5.6.2 restore shapes).
 3. V17 tracked-deny scan — fail closed with `TrackedDeniedPath` before restore.
 4. Resolve `refs/alloy/checkpoints/<id>`; missing → `Git("checkpoint ref not found")` (not `UnknownTransaction`).
 5. Run §5.6.1 restore (tracked tree only; no `created_paths`/`created_dirs` unlink — those lists are gone after restart).
@@ -1625,7 +1625,7 @@ Permission-class errors MUST become `PatchApplyError::PermissionDenied` so execu
 | `Busy` | `Conflict("edit busy")` | yes, but unused on production MCP path (§6.3) |
 | `Internal` | `Internal(msg)` | no |
 
-**Explicit collapse:** Several distinct `EditError` variants collapse onto fewer `PatchApplyError` variants because the merged host taxonomy is closed except for the additive `PermissionDenied`. That collapse is intentional and total.
+**Explicit collapse:** Several distinct `EditError` variants collapse onto fewer `PatchApplyError` variants because the merged host taxonomy is closed except for the additive `PermissionDenied` and `TokenExpired`. That collapse is intentional and total.
 
 Engine messages MUST NEVER equal `EDIT_ENGINE_UNWIRED_MESSAGE`.
 
