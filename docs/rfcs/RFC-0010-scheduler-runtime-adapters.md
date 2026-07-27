@@ -206,7 +206,7 @@ Each amendment is additive and MUST land with this RFC.
 | --- | --- | --- | --- |
 | A1 | 0001 | `AlloyRuntime::drain` MUST compute `deadline = Instant::now() + grace` **before** awaiting `Scheduler::cancel`, and MUST bound that await by the remaining budget (`tokio::time::timeout`). Today the deadline is taken after the cancel await, so a slow cancel consumes the whole grace and the in-flight wait degenerates. | §5.12 makes `cancel` blocking (it awaits drain completion), so the pre-cancel deadline is required for `drain(grace)` to mean anything. |
 | A2 | 0001 | Additive `RuntimeHandle::reconcile_terminal_run(dag_id, terminal) -> Result<(), RuntimeError>` forwarder to `Scheduler::reconcile_terminal_run`, allowed in phase `Running` \| `Draining`, **not** admitted through the single-flight run gate. | Lets RFC-0003 resume reconcile a DAG without becoming scheduler-aware. |
-| A3 | 0001 | `SchedError` becomes `#[non_exhaustive]` and gains the §3.2 variants; `runtime_to_run` MUST map every known §3.2 variant and end with a `_` arm (`RunError::Internal`). Do not keep a fully exhaustive pre-`non_exhaustive` match alongside `_` (unreachable under `-D warnings`). | Additive variants otherwise break the existing exhaustive match in `session::map_err`. |
+| A3 | 0001 | `SchedError` becomes `#[non_exhaustive]` and gains the §3.2 variants. `runtime_to_run` MUST map every **named** §3.2 variant explicitly. Because `SchedError` and `runtime_to_run` live in the **same crate**, a trailing `_` arm is unreachable under `-D warnings` once all variants are listed — omit `_` in-crate; the `#[non_exhaustive]` attribute still forces downstream crates to use `_`. | Additive variants otherwise break the existing exhaustive match in `session::map_err`. |
 | A4 | 0003 | Additive `RunController::expire_gate(run, gate) -> Result<(), RunError>` (§3.15). | The gate timeout is scheduler-observed but control-plane-durable; `approve` cannot express "expired" and requires a live waiter. |
 | A5 | 0003 | `apply_start_outcome` MUST NOT suppress a terminal scheduler outcome when durable state is `waiting_approval`: for `Ok(DagOutcome { state: Failed \| Cancelled, .. })` it MUST apply the terminal transition (events before row) instead of merging. `Running` / `WaitingApproval` / `ReplanRequired` outcomes keep merging. `replan_requested` / `cancelling` / `cancelled` keep winning. | Gate deny/expiry can terminalize the DAG while the row still says `waiting_approval` (expiry write failed, or the scheduler observed the resolution first); merging would strand the run non-terminal forever. |
 | A6 | 0003 | `SessionService::resume` MUST call `RuntimeHandle::reconcile_terminal_run(dag_id, terminal)` (best effort, warn on error, never abort resume) for every run row whose durable state is terminal (`failed` / `cancelled` / `succeeded`) and whose `goal_json` yields a `dag_id`. | Closes the crash window where the control row is `failed` (Deny/expiry) but the DAG blob is still `WaitingApproval` — no `start` will ever be dispatched for a terminal row, so nothing else would terminalize the DAG. |
@@ -325,7 +325,7 @@ pub enum SchedError {
 }
 ```
 
-**Complete boundary table (normative).** `run_dag` wraps every non-`Unavailable` variant in `RuntimeError::Scheduler`; `runtime_to_run` (RFC-0003 `session::map_err`) MUST map every arm below and MUST end with `RuntimeError::Scheduler(other) => RunError::Internal(other.to_string())`.
+**Complete boundary table (normative).** `run_dag` wraps every non-`Unavailable` variant in `RuntimeError::Scheduler`; `runtime_to_run` (RFC-0003 `session::map_err`) MUST map every arm below explicitly (A3: no same-crate `_` arm).
 
 | `SchedError` | `RuntimeHandle::run_dag` | `runtime_to_run` → `RunError` | Durable run row after `start` |
 | --- | --- | --- | --- |
@@ -584,7 +584,7 @@ pub struct SessionVerifyPermissions {
 }
 ```
 
-`token_for` loads the session row, sets `PermissionToken.profile` from `Session.profile`, and mints `Grant::Exec(ExecAllow { binary: "cargo", args_glob })` from the class glob. Missing session or missing glob for the class ⇒ `PermissionDenied`. A glob-only struct without session access is **not** sufficient. Adapters still MUST NOT invent grants.
+`token_for` (`await`) loads the session row, sets `PermissionToken.profile` from `Session.profile`, and mints `Grant::Exec(ExecAllow { binary: "cargo", args_glob })` from the class glob. Missing session or missing glob for the class ⇒ `PermissionDenied`. A glob-only struct without session access is **not** sufficient. `SessionVerifyPermissions` MUST live in `alloy-runtime::adapters::perms` and be re-exported from the crate root alongside `VerifyPermissions`. Adapters still MUST NOT invent grants.
 
 ### 3.8 `CapabilityExecutor` (new)
 
@@ -1086,17 +1086,17 @@ struct OwnershipLock {
 | Step | Action | Phase required |
 | --- | --- | --- |
 | 1 | Stop accepting new `start` calls at the caller (CLI/server closes its intake) | `Running` |
-| 2 | Wait for in-flight runs to finish, or accept that step 4 cancels them | `Running` |
-| 3 | `handle.set_scheduler(Arc::new(NullScheduler))` — new `run_dag` calls now fail fast with `SchedulerUnavailable` | `Running`, scheduler idle |
-| 4 | `runtime.drain(grace)` — computes the deadline **first** (amendment A1), cancels the at-most-one `active_dag`, then waits for the remaining budget | `Running → Draining` |
+| 2 | If a run is in flight: `handle.cancel_dag(active)` (or wait for natural completion) until `!run_in_flight` | `Running` |
+| 3 | `handle.set_scheduler(Arc::new(NullScheduler))` — requires `Running` **and** `!in_flight` on `main` (`SchedulerBusy` otherwise) | `Running`, idle |
+| 4 | `runtime.drain(grace)` — computes the deadline **first** (A1); with no in-flight run this is a no-op cancel + wait | `Running → Draining` |
 | 5 | `runtime.shutdown()` | `Draining → Stopped` |
 | 6 | Drop the `LinearScheduler`; `scheduler.lock` is released | — |
 
 | Rule | Statement |
 | --- | --- |
-| SD1 | Hosts MUST perform step 3 while the phase is still `Running`. Calling `set_scheduler` during drain MUST fail and MUST NOT be retried in a loop. |
-| SD2 | Step 3 MUST NOT be used as a cancellation mechanism: swapping the scheduler does not cancel an in-flight `run` future, because `run_dag` already holds an `Arc<dyn Scheduler>` clone. |
-| SD3 | `LinearScheduler::run` MUST tolerate being called after step 3 (a `run_dag` that captured the old `Arc`) and MUST honour `runtime_cancel` in that window. |
+| SD1 | Hosts MUST reach `!run_in_flight` **before** step 3. `set_scheduler` during an in-flight run returns `SchedulerBusy`; during drain it is rejected. Do not retry `set_scheduler` in a spin loop. |
+| SD2 | Step 3 MUST NOT be used as a cancellation mechanism: call `cancel_dag` (step 2) first. Swapping does not cancel an already-admitted `run` future (`run_dag` holds an `Arc<dyn Scheduler>` clone). |
+| SD3 | `LinearScheduler::run` MUST tolerate being called after step 3 only for futures that already held the old `Arc`, and MUST honour `runtime_cancel` in that window. Production hosts MUST NOT start new runs after step 1. |
 
 ### 4.7 Concurrency rules
 
@@ -1128,11 +1128,11 @@ struct OwnershipLock {
 | R9 | If `dag.state ∈ {Succeeded, Failed, Cancelled}` ⇒ return `Ok` outcome derived from the durable blob (§5.18) with **no** CAS | — |
 | R10 | If `dag.state == ReplanRequired` ⇒ return `Ok(DagOutcome { state: ReplanRequired, .. })` with no CAS | — |
 | R11 | Reconstruct per-node attempt counters (§5.3.1) | `Err(Store(..))` on event read failure |
-| R12 | Adopt any node durably `Running` (§5.3.2) | — |
-| R13 | Gate resume decision (§5.7.2 / §5.7.3) when `dag.state == WaitingApproval` | — |
-| R14 | C1: if `dag.state == Pending` (or a gate resolution advanced the DAG per §5.7.6) CAS `DagState::Running` | `Conflict` ⇒ §5.8.4 |
-| R15 | Start the run clock; `gate_wait_total = 0` (§5.19) | — |
-| R16 | Enter the loop (§5.4) | — |
+| R12 | Start the run clock; `gate_wait_total = 0` (§5.19) — **before** adoption so A6/backoff remaining-budget checks have a defined clock | — |
+| R13 | Adopt any node durably `Running` (§5.3.2) | — |
+| R14 | Gate resume decision (§5.7.2 / §5.7.3) when `dag.state == WaitingApproval` | — |
+| R15 | C1: if `dag.state == Pending` (or a gate resolution advanced the DAG per §5.7.6) CAS `DagState::Running` | `Conflict` ⇒ §5.8.4 |
+| R16 | Enter the loop (§5.2) | — |
 | R17 | On loop exit: derive the terminal `DagState` (§5.17), commit C7, assemble `DagOutcome` (§5.18), drop `OwnedGuard` | — |
 
 `run` MUST NOT return `Ok` with `state ∈ {Pending, Running, WaitingApproval}` (fix 24). Producing one is an `Invariant` bug and MUST be caught by AC 43.
@@ -1336,7 +1336,7 @@ Target sequence `WaitingApproval → Ready → Running → Succeeded`. Every ste
 | GA1 | The gate "execution" is a deterministic fold: it MUST put a `node_output` envelope whose payload records `{ "approved": true, "decision": …, "gate_id": … }` and MUST set `output_ref` on success (§5.9). The envelope `attempt` MUST be `>= 1` (the C3 attempt). |
 | GA2 | `allow` and `allow_once` are treated identically by the scheduler. Scope semantics (remembering `allow` for later gates) belong to the control plane / RFC-0015. |
 | GA3 | The DAG MUST leave `WaitingApproval` in the **same** CAS that moves the node to `Ready`. |
-| GA4 | The post-allow `Ready → Running` step **is** checkpoint C3 (`attempt++`, normally to `1`). L12 only forbids C3 while the gate is still unresolved. |
+| GA4 | The post-allow `Ready → Running` step **is** checkpoint C3 (`attempt++`, normally to `1`). L13 only forbids C3 while the gate is still unresolved. |
 
 #### 5.7.7 First schedule (fix 15)
 
@@ -1360,13 +1360,23 @@ On deadline expiry the scheduler MUST call `deps.runs.expire_gate(run_id, gate_i
 | `Err(RunError::InvalidPhase(_))` | Re-scan (§5.7.2). A resolution now present ⇒ follow that path. Still absent ⇒ classify via durable `RunControlState` exactly as §5.7.9 (cancel / Failed / replan / re-register), **not** as an automatic gate expiry | `Ok` / `Err` per that classification |
 | `Err(RunError::NotFound(_))` | No run row for a DAG we are executing — contract break | `Err(Internal("run row vanished during gate expiry: {run}"))` |
 | `Err(RunError::UnknownGate(_))` | MUST NOT happen (A7). Treat as `InvalidPhase` | as `InvalidPhase` row |
-| `Err(other)` | Retry `expire_gate` up to `EXPIRE_RETRY_MAX = 3` with interruptible short backoff. If still failing: terminalize the DAG per §5.7.5 (`notes` include the last error), record GT3, and return **`Ok(Failed)`**. Do **not** return `Err` while leaving `WaitingApproval` — on `main`, `apply_start_outcome` would swallow that `Err` under control-protected `WaitingApproval`, and `start` would refuse re-entry (`AlreadyStarted`). A5 then merges the control row to `failed`. | `Ok(Failed)` after exhausted retries |
+| `Err(other)` | Call count: up to `EXPIRE_RETRY_MAX = 3` total attempts (including the first) with interruptible short backoff (`EXPIRE_RETRY_BACKOFF = 50ms`). If still failing: terminalize the DAG per §5.7.5 (`notes` include the last error), apply GT3 case (iii), return **`Ok(Failed)`**. Do **not** return `Err` while leaving `WaitingApproval` — on `main`, `apply_start_outcome` would swallow that `Err` under control-protected `WaitingApproval`, and `start` would refuse re-entry (`AlreadyStarted`). A5 then merges the control row to `failed`. | `Ok(Failed)` after exhausted retries |
+
+**`expire_gate` call-count pin (AC 37 / AC 80):**
+
+| Path | Calls |
+| --- | --- |
+| `Ok(())` on first try | exactly 1 |
+| `InvalidPhase` → durable resolution found | exactly 1 |
+| `InvalidPhase` → still absent → §5.7.9 | exactly 1 |
+| `Err(other)` then success on retry `k` | exactly `k` (`1 ≤ k ≤ EXPIRE_RETRY_MAX`) |
+| `Err(other)` exhausted | exactly `EXPIRE_RETRY_MAX`, then local §5.7.5 terminalization |
 
 | Rule | Statement |
 | --- | --- |
 | GT1 | The gate deadline MUST come from `node.timeout_ms` (RFC-0009 obligation), not from `run_timeout`. |
 | GT2 | Gate wait time MUST NOT consume the run budget (§5.19, fix 44). |
-| GT3 | The expiry attempt MUST be recorded in an in-run `HashSet<(RunId, GateId)>` only after `expire_gate` returns `Ok(())` **or** a generation-matched durable `ApprovalResolved` with `decision == "expired"` is observed. A second pass for the same key MAY skip the call **only** when that durable expired resolution already exists (then terminalize per §5.7.5). If the prior call returned `Err` and no expired resolution exists, the scheduler MUST call `expire_gate` again (or follow the retry pin in §5.7.8) — it MUST NOT invent DAG `Failed` without a durable expiry. |
+| GT3 | Record `(run_id, gate_id)` in the in-run set when any of: (i) `expire_gate` returned `Ok(())`; (ii) a generation-matched durable `ApprovalResolved(expired)` exists; (iii) the §5.7.8 `Err(other)` path exhausted `EXPIRE_RETRY_MAX` and the scheduler itself terminalized per §5.7.5 (A5 merges control — no control-plane `ApprovalResolved` may exist). A later loop iteration for the same key MUST skip further `expire_gate` calls and, if the DAG is still non-terminal only under (ii), terminalize per §5.7.5; under (iii) the DAG is already terminal. |
 | GT4 | Expiry MUST produce `ErrorClass::Approval` with `retry: NonRetryable`, never `ErrorClass::Timeout`. Node-level `Timeout` is for execution deadlines. |
 
 #### 5.7.9 Closed receiver classification (fix 22)
@@ -1931,7 +1941,7 @@ node_deadline   = min(node.timeout_ms, remaining_run)
 | T5 | Run timeout MUST NOT admit a retry, even if `Timeout ∈ retry_on`. |
 | T6 | `gate_wait_total` is process-local; a resumed run starts a fresh run budget. That is intentional and documented (§15 Q3). |
 | T7 | **Deadline attribution when `node_deadline = min(...)` fires.** If `remaining_run < node.timeout_ms`, classify as **run timeout** (`NonRetryable`, notes `"run timeout after {ms}ms"`). If `node.timeout_ms < remaining_run`, classify as **node timeout** (`Retryable`, notes `"node timeout after {ms}ms"`). If equal, classify as **run timeout** (tie → run). |
-| T8 | **Run-timeout with no `Running` node** (L4 fires between promotions / before select, or T3 short-circuit): attribute the `Timeout` `FailureIr` to the selected Ready node if L9 already chose one; otherwise the lowest `NodeId` among `Ready`; otherwise the lowest among `Pending`. Mirror budget exhaustion §5.16.3. Then C7 terminalize `Failed`. Never leave the DAG without a `failed_node` on run timeout. |
+| T8 | **Run-timeout with no `Running` node** (L4 fires between promotions / before select, or T3 short-circuit): attribute the `Timeout` `FailureIr` to the selected Ready node if L10 already chose one; otherwise the lowest `NodeId` among `Ready`; otherwise the lowest among `Pending`. Mirror budget exhaustion §5.16.3. Then C7 terminalize `Failed`. Never leave the DAG without a `failed_node` on run timeout. |
 
 ### 5.20 `reconcile_terminal_run` (fix 12)
 
@@ -2136,7 +2146,7 @@ The mapping is **total** over the exhaustive `StoreError` enum on `main` (not `#
 | Event | When | Payload keys |
 | --- | --- | --- |
 | `NodeState` | every committed node transition (after the CAS) | `node_id`, `from`, `to`, `generation`, `attempt`, optional `failure_ref`, `error_class`, `retry`, `decision`, `repaired` |
-| `ApprovalRequested` | gate first schedule only | `gate_id`, `node_id`, `reason`, `timeout_ms` |
+| `ApprovalRequested` | gate first schedule only | `gate_id`, `node_id`, `reason`, `timeout_ms`, `generation`, optional `repaired` |
 | `Decision` | retry / budget / gate decisions | via `DecisionLog::record` |
 | `BudgetWarning` | exhaustion, via `maybe_signal_budget_warning` | RFC-0004 shape |
 
@@ -2320,7 +2330,7 @@ Each AC is a test name or a CI check.
 | 34 | Gate deny: gate node `Cancelled`, every other non-terminal node `Skipped`, `DagState::Failed`, `failed_node` = the gate, failure `ErrorClass::Approval`. |
 | 35 | Resume with `WaitingApproval` and no `ApprovalResolved`: the waiter is re-registered, no second `ApprovalRequested` is appended, and no `WaitingApproval` CAS is re-issued. |
 | 36 | Resume with a durable `ApprovalResolved(expired)`: the DAG terminalizes and `expire_gate` is **not** called again. |
-| 37 | Gate timeout calls `expire_gate` exactly once per `(run_id, gate_id)`; the §5.7.8 result table is covered for `Ok`, `InvalidPhase` (resolution present **and** still-absent → §5.7.9 classification, not automatic expiry), `NotFound`, and other errors. |
+| 37 | Gate timeout follows the §5.7.8 call-count pin (`Ok`/`InvalidPhase` ⇒ 1 call; `Err(other)` ⇒ up to `EXPIRE_RETRY_MAX`); InvalidPhase still-absent → §5.7.9, not automatic expiry. |
 | 38 | The scheduler appends no `ModelCall` / `ToolCall` events, and a run's cost meter total equals the sum of worker/router-recorded usage (no double counting). |
 | 39 | A closed gate receiver is classified by `RunControlState` per §5.7.9 (`Cancelling`, `Failed`, `WaitingApproval` cases all covered). |
 | 40 | Control row terminal (`failed`) with a `WaitingApproval` DAG: `SessionService::resume` calls `reconcile_terminal_run` and the DAG becomes `Failed`; a second call is a no-op. |
@@ -2334,7 +2344,7 @@ Each AC is a test name or a CI check.
 | 48 | A cancel arriving before `run` starts is captured in `pending_cancels` and cancels the run at R5. |
 | 49 | `OwnedGuard::drop` releases ownership and notifies waiters even when the run body panics. |
 | 50 | `AlloyRuntime::drain` computes its deadline before awaiting `Scheduler::cancel` (amendment A1), verified by a slow-cancel double that must not consume the whole grace. |
-| 51 | Host shutdown order test: `set_scheduler(NullScheduler)` succeeds in `Running`, fails in `Draining`, and drain still terminalizes live DAGs. |
+| 51 | Host shutdown order: with an in-flight run, `set_scheduler` returns `SchedulerBusy`; after `cancel_dag` reaches idle, `set_scheduler(NullScheduler)` succeeds in `Running`; it fails in `Draining`; drain after idle is a no-op cancel. |
 | 52 | Exit `101` with no signal on `cargo_check` yields `VerifyOutcome { ok: false }` with parsed diagnostics — not an `AdapterError`. |
 | 53 | A signal-killed cargo yields `ToolFailure(Transient { code: "cargo_signal", .. })` and `ErrorClass::Tool`, never `Compile`. |
 | 54 | A non-`101` non-zero exit yields `ToolFailure(Permanent { code: "cargo_exit_{n}", .. })`; `is_error == false` with a missing or non-zero `exit_code` yields `Internal`. |
@@ -2353,13 +2363,13 @@ Each AC is a test name or a CI check.
 | 67 | Observing `RunControlState::ReplanRequested` writes C10 `ReplanRequired` and returns `Ok(ReplanRequired)` so a subsequent `PlanService::replan` is not `DagBusy`. |
 | 68 | A generation bump mid-run yields `Conflict`, and no further CAS or event append is issued for that DAG. |
 | 69 | Cross-subsystem e2e (§11.3) passes against real SQLite and a real sandboxed `cargo_check` (lives in `alloy-tools` integration tests, not `alloy-runtime`). |
-| 70 | `runtime_to_run` compiles with `SchedError` `#[non_exhaustive]`: known §3.2 variants are mapped explicitly, and a final `_` arm maps unknown variants to `RunError::Internal` (required by `non_exhaustive`; do **not** also exhaustively match every variant in a way that makes `_` unreachable under `-D warnings`). |
+| 70 | `runtime_to_run` compiles with `SchedError` `#[non_exhaustive]` and maps every named §3.2 variant explicitly; no same-crate `_` arm (unreachable under `-D warnings`). |
 | 71 | `GateHuman` while unresolved (L13) never receives C3; after allow, §5.7.6 performs C3 (`Ready → Running`, `attempt >= 1`) then fold then `Succeeded`. |
 | 72 | `StoreError::{Migration, DigestMismatch, Closed}` map per §8.2; the match is exhaustive (no `_` arm). |
 | 73 | Structured artifacts use `ArtifactKind::Blob` + `content_type: application/json`; `verify_raw` uses `Log`; no `ArtifactKind::Json` appears in scheduler/adapter code. |
 | 74 | `NodeExecRef.attempt` is set on dispatch and appears in `call_id` as `{node_id}:{attempt}`; gate contexts may use `0`. |
 | 75 | `cancel` wait uses the O4 race-free `Notify` pattern (lost-wakeup test: terminal written before waiter subscribed still returns `Ok`). |
-| 76 | Multiple run rows for one `dag_id` resolve per Appendix F RB5 (`created_at`, then `run_id`). |
+| 76 | Multiple run rows for one `dag_id` resolve per Appendix F: RB6 (`Running` preferred) then RB5 (`created_at`, then `run_id`). |
 | 77 | Input envelope decode / schema / identity failures return `Invariant` (E8–E10) and issue no C3. |
 | 78 | Attempt rebuild after C8 (`next_attempt=k`) + C3 CAS-before-event yields `attempts_started = k` via `max(base, max_next, 1)`, and adoption does not redispatch `k`. |
 | 79 | `ApprovalResolved` without matching `generation` is ignored; A8 payloads include `generation`. |
@@ -2579,7 +2589,8 @@ resolve_run(dag_id):
   match matches:
     []                      -> Err(RunBindingMissing(dag_id))
     [one]                   -> Ok(one)
-    many                    -> Ok(last non-terminal by (created_at, run_id),
+    many                    -> Ok(prefer state==Running among non-terminal (RB6);
+                                   else last non-terminal by (created_at, run_id);
                                    else last by (created_at, run_id))
 ```
 
