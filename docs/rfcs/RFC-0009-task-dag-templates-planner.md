@@ -446,7 +446,7 @@ impl SqliteDagStore {
 | Gate | Every method MUST `StorageGate::enter()` for the operation; after `AlloyStorage::close()` → `StoreError::Closed` |
 | Busy | Map SQLite busy identically to other stores; increment `busy_errors` |
 | Construction | Built **once** inside `AlloyStorage::open` (same pattern as `events` / `artifacts`); `dags()` clones the `Arc` |
-| Module location | **MUST** live in `storage/dags.rs` (trait + `SqliteDagStore` + `ReplanReplaceError`) using `pub(crate)` `DbHandle` / `StorageGate` / `StorageMetrics`. `dag/store.rs` MAY only `pub use` re-exports. No alternate home. |
+| Module location | **MUST** live in `storage/dags.rs` (trait + `SqliteDagStore` + `ReplanReplaceError`) using `pub(crate)` `DbHandle` / `StorageGate` / `StorageMetrics`. The `dag::store` module MAY only `pub use` re-exports (inline or file). No alternate home. |
 
 ### 3.8 `AlloyStorage` additive API
 
