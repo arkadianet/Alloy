@@ -10,11 +10,11 @@
 | **Related RFCs** | [0002](./RFC-0002-storage-artifacts-session-events.md) CAS + session events · [0003](./RFC-0003-session-manager-run-controller.md) session/run ids · [0004](./RFC-0004-observability-cost-metering.md) retention defaults · [0009](./RFC-0009-task-dag-templates-planner.md) Edit node contract · [0010](./RFC-0010-scheduler-runtime-adapters.md) scheduler does **not** call EditEngine · [0013](./RFC-0013-capability-registry-workers.md) EditWorker → `apply_patch` · [0015](./RFC-0015-cli-profiles-config.md) freeform FS policy |
 | **Product** | Alloy — AI Engineering Runtime |
 | **Supersedes** | Draft outline of this filename (expanded to implementation grade) |
-| **Revision** | Implementation-grade draft for Phase B architecture review |
+| **Revision** | Implementation-grade draft addressing principal review (permissions, checkpoint correctness, recovery, error mapping) |
 
 **Mental model (V2 §13 / §3.5 / ADR F-01 / F-14 / F-24):** Alloy has **one write stack**. `EditEngine` is the only component that mutates a workspace under product policy. Agents reach it exclusively through the merged MCP seam `apply_patch` → `PatchApplyBackend`. MVP implements `EditRequest::TextPatch` (unified diff / `PatchSet`) plus **git-only** checkpoints. `SemanticEditOp` variants exist for serde stability and **fail closed**. No OverlayFS. No freeform filesystem writes in this RFC.
 
-**Authority order (highest → lowest):** current `main` source → merged RFCs 0001–0007, 0009, 0016 → Architecture V2 → this draft → roadmaps. Never reshape a merged public API solely to match an older V2 sketch. `PatchApplyBackend`, `ApplyPatchArgs`, `ApplyPatchOutcome`, `PatchApplyError`, `TransactionId`, and `CheckpointId` are **normative and present on `main`**. Extensions in this RFC are **additive** except where §3.8 explicitly amends RFC-0006 to pass `PermissionToken` into the backend (required for fine-grained `FsWrite` promised by RFC-0006 §5.5 and for `GitWrite` gating).
+**Authority order (highest → lowest):** current `main` source → merged RFCs 0001–0007, 0009, 0016 → Architecture V2 → this draft → roadmaps. Never reshape a merged public API solely to match an older V2 sketch. `ApplyPatchArgs`, `ApplyPatchOutcome`, `PatchApplyError` base variants, `TransactionId`, and `CheckpointId` are **normative and present on `main`**. This RFC defines new `EditEngine` APIs and makes **explicit additive amendments** to RFC-0006 only where §3.8 requires them.
 
 ---
 
@@ -24,13 +24,13 @@
 
 Ship the MVP **EditEngine** that closes Alloy’s first workspace write path:
 
-1. **`EditEngine` trait** — `apply` / `rollback` with transactional semantics.
+1. **`EditEngine` trait** — `validate` / `apply` / `rollback` with transactional semantics and explicit `EditContext` (permissions + attribution).
 2. **`EditRequest::TextPatch`** — accept unified diff string or structured `PatchSet`; validate; apply atomically relative to a git checkpoint.
 3. **Git checkpoint backend** — `CheckpointId` (UUID, already on `main`) names a git ref under `refs/alloy/checkpoints/<uuid>`; sole MVP checkpoint backend (ADR F-24).
-4. **Wire `apply_patch`** — replace `StubPatchApplyBackend` behaviour by injecting `EditEnginePatchBackend` implementing the merged `PatchApplyBackend` seam (RFC-0006 §3.7).
+4. **Wire `apply_patch`** — replace `StubPatchApplyBackend` behaviour by injecting `EditEnginePatchBackend` implementing the merged `PatchApplyBackend` seam (RFC-0006 §3.7), with the additive amendments in §3.8.
 5. **`SemanticEditOp` envelope** — present; every variant returns `EditError::UnsupportedOp` in MVP.
 6. **Workspace digests** — `pre` / `post` digests on every mutating apply; recorded on the transaction and in `SessionEventType::EditApplied`.
-7. **Auditability** — session events + CAS artifact metadata/hashes (RFC-0004 default retention: no patch bodies by default).
+7. **Auditability** — session events + CAS patch artifacts (event payload keeps metadata + hashes per RFC-0004; CAS stores the patch body for reconstruction).
 
 ### 1.2 Problem Statement
 
@@ -40,14 +40,14 @@ Nine RFCs and ~40k lines of source exist on `main`, and **nothing yet writes to 
 
 | In scope | Detail |
 | --- | --- |
-| `EditEngine` trait | `apply` / `rollback`; `Send + Sync`; async |
+| `EditEngine` trait | `validate` / `apply` / `rollback`; `Send + Sync`; async; `EditContext` |
 | TextPatch path | Unified diff parse + `PatchSet`; validation; apply; digests |
-| Git checkpoint | Ref backend; create before mutate; restore on rollback |
+| Git checkpoint | Ref backend; create before mutate; restore on rollback / abandon |
 | MCP wiring | `EditEnginePatchBackend: PatchApplyBackend`; default injection replaces stub |
 | Fine-grained `FsWrite` | Per-path glob match against extracted patch paths (RFC-0006 §5.5 forward pointer) |
-| `GitWrite` gate | Required for non-`dry_run` applies (additive RFC-0006 amendment, §3.8 / §8) |
+| `GitWrite` gate | Required for non-`dry_run` applies and rollback |
 | `SemanticEditOp` | Enum present; all variants → `UnsupportedOp` |
-| Observability | `EditApplied` payload; tracing spans; CAS patch artifact (hash retained) |
+| Observability | Typed `EditAppliedPayload`; tracing spans; CAS patch artifact |
 | Tests | Unit + cross-subsystem MCP→EditEngine→SQLite (§11) |
 
 ### 1.4 Non-goals
@@ -66,15 +66,15 @@ Nine RFCs and ~40k lines of source exist on `main`, and **nothing yet writes to 
 
 ### 1.5 Day-1 MVP (normative)
 
-1. Production wiring MUST inject `Arc<EditEnginePatchBackend>` (wrapping a live `GitEditEngine`) into `InProcessMcpHost::new` — **not** `StubPatchApplyBackend`. Tests MAY still construct the stub explicitly.
-2. `EditEngine::apply(EditRequest::TextPatch { .. })` MUST: validate → compute `pre_digest` → create git checkpoint → apply patch under PathPolicy → compute `post_digest` → persist transaction metadata → emit `EditApplied` → return `EditTransaction` with `checkpoint_id = Some(...)`.
-3. `EditEngine::apply(EditRequest::SemanticOps { .. })` MUST return `Err(EditError::UnsupportedOp { .. })` for **every** variant and every non-empty ops list. Empty ops list MUST return `Err(EditError::InvalidRequest("semantic_ops empty"))`.
+1. The cross-subsystem integration suite (§11.3) MUST construct `InProcessMcpHost` with `EditEnginePatchBackend` (not stub) and prove file mutation + checkpoint + `EditApplied` in SQLite. Production composition roots land with RFC-0015 / host wiring; until then the integration test is the normative reference constructor (§3.10).
+2. `EditEngine::apply(EditRequest::TextPatch { .. }, ctx)` MUST: validate → verify repo/jail invariants → compute `pre_digest` → create git checkpoint → apply patch under PathPolicy → compute `post_digest` → CAS put → emit `EditApplied` → return `EditTransaction` with `checkpoint_id = Some(...)`, `post_digest = Some(...)`, `state = Committed`.
+3. `EditEngine::apply(EditRequest::SemanticOps { .. }, ctx)` MUST return `Err(EditError::UnsupportedOp { op })` for **every** variant and every non-empty ops list, with `op` equal to the serde tag string (§5.10). Empty ops list MUST return `Err(EditError::InvalidRequest("semantic_ops empty"))`.
 4. `ApplyPatchArgs.dry_run == true` MUST call `EditEngine::validate` only: it MUST NOT mutate the workspace, MUST NOT create a checkpoint, MUST NOT write CAS patch bytes as a committed edit, MUST NOT emit `EditApplied`, and MUST return `transaction_id: None`.
 5. A partially-applied patch MUST NOT be observable as a committed edit. On apply failure after checkpoint, the engine MUST restore the checkpoint before returning `Err`. If restore fails, return `Err(EditError::RollbackFailed { .. })` and leave the checkpoint ref intact for operator recovery.
-6. `rollback(tx)` MUST restore the checkpoint for a known committed or open transaction and MUST be idempotent (second call succeeds with no further tree change).
-7. Every rejection path in §5.4 MUST map to a distinct `EditError` variant; the MCP adapter MUST apply the total mapping in §8.3 to `PatchApplyError`.
-8. `ApplyPatchOutcome.message` MUST NEVER contain raw patch bodies or absolute paths (honour RFC-0006 §5.9; engine produces jail-relative, length-capped summaries).
-9. Alloy MUST NEVER write `.env` (PathPolicy deny-glob + explicit engine deny before write).
+6. `rollback(tx, ctx)` MUST restore eligible transactions only (§5.11). It MUST be idempotent for `state == RolledBack` when the workspace digest still equals `pre_digest`.
+7. Every validation rejection in §5.4 MUST map to exactly one `EditError` variant. At the MCP boundary, §8.3 MAY collapse several `EditError` variants onto one `PatchApplyError` variant; that collapse is explicit and total.
+8. `ApplyPatchOutcome.message` MUST NEVER contain raw patch bodies or absolute paths (honour RFC-0006 §5.9; engine produces jail-relative, length-capped summaries). Engine messages MUST NEVER equal `EDIT_ENGINE_UNWIRED_MESSAGE`.
+9. Alloy MUST NEVER write `.env`. PathPolicy deny-globs apply to every write target. Rollback MUST NOT delete or overwrite deny-glob paths (including untracked `.env`) — see §5.6 / §5.11.
 10. No OverlayFS. No new crate. `alloy-runtime` and `alloy-tools` remain `#![forbid(unsafe_code)]`.
 
 ---
@@ -109,18 +109,22 @@ Authoritative for: `SandboxBroker`, `SandboxExecRequest`, `ExecClass::{Check,Tes
 * Uses `PathPolicy` with `PathAccess::Write` for every file mutation and path authorization (host-side, same pattern as `fs_read` reads).
 * Runs **git checkpoint / restore** via `SandboxBroker::exec` under **`ExecClass::Check`** (no new `ExecClass` variant — see §2.8).
 * Does **not** route file content writes through a sandboxed child; Alloy writes bytes itself after PathPolicy authorization (see §2.8 rationale).
+* Requires `PathPolicy` to expose deny-glob checking to the edit module via an additive `pub(crate)` accessor (§4.5).
 
 ### 2.4 Relationship to RFC-0006
 
-Authoritative for: `InProcessMcpHost`, `PatchApplyBackend`, `ApplyPatchArgs`, `ApplyPatchOutcome`, `PatchApplyError`, `StubPatchApplyBackend`, host output boundary (§5.9), `authorize_fs_write` stub behaviour.
+Authoritative for: `InProcessMcpHost`, `PatchApplyBackend`, `ApplyPatchArgs`, `ApplyPatchOutcome`, `PatchApplyError`, `StubPatchApplyBackend`, host output boundary (§5.9), `authorize_fs_write` stub behaviour, `PermissionDenial`, `McpError`.
 
-**This RFC completes the stub contract** (RFC-0006 §3.7.2): implement `PatchApplyBackend` as an adapter over `EditEngine`; host injection swaps the `Arc`.
+**This RFC completes the stub contract** (RFC-0006 §3.7.2): implement `PatchApplyBackend` as an adapter over `EditEngine`.
 
-**Additive amendments to RFC-0006** (normative here; see §3.8):
+**Additive amendments to RFC-0006** (normative here; full text in §3.8):
 
-1. `PatchApplyBackend::apply` gains `perms: &PermissionToken` so the backend can enforce fine-grained `FsWrite` globs and construct `SandboxExecRequest` for git.
-2. `apply_patch` prepare requires `Grant::GitWrite` when `dry_run == false`.
-3. Fine-grained `FsWrite(Glob)` matching against extracted patch paths (promised by 0006 §5.5).
+1. `PatchApplyBackend::apply` gains `perms: &PermissionToken` and attribution (`session`, `run`).
+2. Additive `PatchApplyError::PermissionDenied(PermissionDenial)`.
+3. `apply_patch` prepare requires `Grant::GitWrite` when `dry_run == false`.
+4. Fine-grained `FsWrite(Glob)` matching via shared `authz` helpers.
+5. Backend permission denials elevate to `Err(McpError::PermissionDenied)` (so DecisionLog `denied=true`).
+6. Effective patch size ceiling is the existing `MAX_ARGUMENT_BYTES` (64 KiB) for the whole arguments object — this RFC does **not** raise it.
 
 ### 2.5 Relationship to RFC-0010 and RFC-0013 (single write stack)
 
@@ -131,13 +135,14 @@ Authoritative for: `InProcessMcpHost`, `PatchApplyBackend`, `ApplyPatchArgs`, `A
 | **RFC-0010 LinearScheduler** | `CapabilityExecutor::execute` for `NodeKind::Edit` | `EditEngine`, `PatchApplyBackend`, `apply_patch` |
 | **RFC-0013 EditWorker** | `ToolHandle::call("apply_patch", …)` under run grants | `EditEngine` directly; raw `std::fs::write`; any second write API |
 | **MCP host `apply_patch`** | Injected `PatchApplyBackend` (= EditEngine adapter) | Bypass EditEngine |
-| **Tests / operator recovery / CLI** | `EditEngine::apply` / `rollback` on the **same** injected engine instance | A parallel mutate path |
+| **Tests / operator recovery / CLI** | `EditEngine::{validate,apply,rollback}` on the **same** engine instance | A parallel mutate path |
 
 **Why this is one write stack, not two:**
 
-* The **only** component that mutates workspace files under Alloy policy is `EditEngine` (and its git checkpoint helper).
+* The **only** component that mutates workspace files under Alloy policy is `GitEditEngine` (via `EditEngine`).
 * The **only** agent-facing entry is MCP `apply_patch` → `EditEnginePatchBackend` → `EditEngine`.
 * Direct `EditEngine::{apply,rollback}` from tests/CLI is the **same** stack without MCP mediation — not a second product write path.
+* Rollback is **not** an MCP tool in MVP; only `apply_patch` is exposed on the bus. Operator rollback uses the engine API (CLI/tests).
 * RFC-0010’s scheduler never touches the filesystem for Edit nodes; RFC-0013 workers produce patches and call the tool.
 
 Merged code supporting this:
@@ -152,15 +157,15 @@ Merged code supporting this:
 | Category | Contents |
 | --- | --- |
 | **Already implemented** | `TransactionId`, `CheckpointId`, `Digest`, `Grant::{FsWrite,GitWrite,Exec}`, `SessionEventType::EditApplied`, `ArtifactStore` / `ArtifactKind::Patch`, `PathPolicy`, `SandboxBroker`, `ExecClass::{Check,Test}`, `PatchApplyBackend` + stub + host sanitize, `authorize_fs_write` (≥1 FsWrite), DecisionLog / ToolCall recording for MCP calls |
-| **Added by RFC-0008** | `EditEngine` trait; `EditRequest`; `PatchSet` / hunk types; `SemanticEditOp`; `EditTransaction`; `WorkspaceDigest`; `EditError`; `GitEditEngine`; `EditEnginePatchBackend`; git checkpoint/restore; fine-grained FsWrite; GitWrite gate; `EditApplied` payload schema; digest computation; transaction registry; tests |
+| **Added by RFC-0008** | `EditEngine` trait + `EditContext` + `EditValidation`; `EditRequest`; `PatchSet` / `FilePatch` / `Hunk`; `SemanticEditOp`; `EditTransaction` + `TxState`; `WorkspaceDigest`; `EditError`; `EditAppliedPayload`; `GitEditEngine`; `EditEnginePatchBackend`; git checkpoint/restore; fine-grained FsWrite helpers; GitWrite prepare gate; `PatchApplyError::PermissionDenied`; digest computation; abandon reconcile; tests |
 | **Deferred** | SemanticOps lowering (future); OverlayFS (forbidden); compile gate (0010); workers producing patches (0013); freeform FS (0015); new `ExecClass` (not required — §2.8) |
 
 ### 2.7 What RFC-0010 and RFC-0013 MAY rely on
 
 | Consumer | MAY rely on | MUST NOT invent |
 | --- | --- | --- |
-| **RFC-0010** | That Edit nodes do not need EditEngine in the scheduler; verify adapters remain MCP `cargo_*` only; retryability of `PatchApplyError`/`ToolError` mappings in §8.4 | Scheduler→EditEngine call; second write API; OverlayFS rollback |
-| **RFC-0013** | `apply_patch` works end-to-end; `EditRequest::TextPatch` JSON shape for artifacts; `UnsupportedOp` for SemanticOps; `files_touched` / `transaction_id` in tool result | Direct EditEngine handle on `CapabilityContext`; raw FS writes |
+| **RFC-0010** | Edit nodes do not need EditEngine in the scheduler; verify adapters remain MCP `cargo_*` only; §8.3 retryability column | Scheduler→EditEngine call; second write API; OverlayFS rollback |
+| **RFC-0013** | `apply_patch` works end-to-end; TextPatch JSON shapes; `UnsupportedOp` for SemanticOps; `files_touched` / `transaction_id` in tool result | Direct EditEngine on `CapabilityContext`; raw FS writes; an MCP rollback tool |
 
 ### 2.8 Mandatory decision: git, sandbox, and `ExecClass`
 
@@ -168,12 +173,13 @@ Merged code supporting this:
 | --- | --- |
 | Does file mutation go through `SandboxBroker`? | **No.** Alloy writes file bytes on the host after `PathPolicy::authorize(..., PathAccess::Write)`. Same host-side pattern as `fs_read` (RFC-0006 §5.8). |
 | Does git checkpoint run inside the sandbox? | **Yes.** `git` argv runs via `SandboxBroker::exec` with `class: ExecClass::Check`. |
-| New `ExecClass` variant? | **No.** Reuse `Check`. Adding `ExecClass::Git` would be an additive change to a merged RFC-0005 type; it is **not** required because Check already selects the light Landlock/Seatbelt backend appropriate for trusted git in-jail. |
-| What does `Grant::GitWrite` gate? | Creating or restoring a git checkpoint (non-`dry_run` apply, and any `rollback`). Checked in `apply_patch` prepare (§5.5 amendment) **and** again inside `GitEditEngine` before checkpoint/restore. |
-| What does `Grant::Exec` gate for git? | The `git` binary argv must match an `ExecAllow` on the caller token (same `match_exec_grant` path as cargo). Profiles that grant `GitWrite` MUST also grant `Exec` for `git` (RFC-0015; tests mint both). |
-| What are “sandbox constraints” for M5? | (1) PathPolicy jail + deny-globs on every touched path; (2) FsWrite glob coverage; (3) GitWrite present for mutating ops; (4) git child isolated under Check backend with scrubbed env / jail cwd. |
-
-**Amendment path note:** If Phase B review rejects host-side file writes, the alternative is still **not** a new `ExecClass`; it would be a follow-up RFC routing writes through a helper child. This RFC freezes host-side writes + sandboxed git as above.
+| New `ExecClass` variant? | **No.** Reuse `Check`. Adding `ExecClass::Git` would amend a merged RFC-0005 type and is not required: Check already selects the light Landlock/Seatbelt backend. |
+| What does `Grant::GitWrite` gate? | Creating or restoring a git checkpoint (non-`dry_run` apply, abandon reconcile, and any `rollback`). Checked in `apply_patch` prepare (§3.8) **and** inside `GitEditEngine` before every git exec. |
+| What does `Grant::Exec` gate for git? | Every git argv must match an `ExecAllow` on the **same** caller token used for the apply/rollback. Profiles that grant `GitWrite` MUST also grant `Exec` for `git` (RFC-0015; tests mint both). Preflight (§5.4.4) verifies **all** argv shapes used by create and restore before the first mutation. |
+| Repo root vs jail | `git rev-parse --show-toplevel` (canonicalized) MUST equal `path_policy.jail()`. Nested repos, linked worktrees, or inherited `GIT_DIR`/`GIT_WORK_TREE` that violate this → `EditError::Git("repository root is not the workspace jail")`. Broker env scrubbing MUST leave git without attacker-controlled `GIT_DIR`/`GIT_WORK_TREE` (rely on RFC-0005 scrub; EditEngine MUST NOT set them). |
+| Tracked deny-glob paths | Before any git exec: if `git ls-files` lists a path matching deny-globs → `EditError::TrackedDeniedPath` (fail closed). Prevents Landlock `/dev/null` binds from capturing empty secret files into checkpoints. |
+| Untracked files | See §5.6.1 — modifying untracked paths is rejected; restore never broad-cleans. |
+| What are “sandbox constraints” for M5? | (1) PathPolicy jail + deny-globs on every touched path; (2) FsWrite glob coverage; (3) GitWrite present for mutating ops; (4) git child isolated under Check backend with scrubbed env / jail cwd; (5) repo toplevel == jail. |
 
 ### 2.9 Dependency boundaries
 
@@ -182,17 +188,17 @@ RFC-0013 EditWorker
         │  ToolHandle::call("apply_patch")
         ▼
 alloy-tools::mcp::InProcessMcpHost
-        │  PatchApplyBackend::apply(args, perms)
+        │  PatchApplyBackend::apply(args, perms, session, run)
         ▼
 alloy-tools::edit::EditEnginePatchBackend
         │
         ▼
 alloy-tools::edit::GitEditEngine  ──implements──►  alloy_runtime::edit::EditEngine
         │                           uses
-        ├─ PathPolicy (Write)
+        ├─ PathPolicy (Write + deny accessor)
         ├─ SandboxBroker (git, ExecClass::Check)
         ├─ ArtifactStore (patch bytes, ArtifactKind::Patch)
-        └─ EventSink (EditApplied)
+        └─ EventSink (EditApplied; append-only)
 ```
 
 * `alloy-runtime` defines the trait + IR types (`edit` module). **No** dependency on `alloy-tools`.
@@ -209,28 +215,29 @@ This RFC closes the *Patch+checkpoint* third of M5 when §13 acceptance criteria
 
 New items live under `alloy_runtime::edit` (types + trait) and `alloy_tools::edit` (implementation + MCP adapter). Merged MCP patch types remain in `alloy_tools::mcp::patch`. `alloy-runtime` is `#![deny(missing_docs)]`.
 
-### 3.1 Reused types (normative — unchanged)
+### 3.1 Reused types (normative — unchanged fields)
 
 | Type | Source | Notes |
 | --- | --- | --- |
 | `TransactionId`, `CheckpointId` | `types::ids` | UUID newtypes; **do not redefine** |
 | `Digest` | `types::ids` | SHA-256 hex via `Digest::sha256` |
-| `Grant`, `Glob`, `ExecAllow`, `PermissionToken` | `types::permission` | FsWrite / GitWrite / Exec |
+| `ArtifactId` | `types::ids` | CAS handle on transactions / events |
+| `Grant`, `Glob`, `ExecAllow`, `PermissionToken` | `types::permission` | FsWrite / GitWrite / Exec; `PermissionToken.run_id` is authoritative for run attribution when `EditContext.run_id` is `None` |
 | `SessionId`, `RunId` | `types::ids` | Attribution on events / artifacts |
 | `SessionEventType::EditApplied` | `events` | Already present |
-| `EventSink`, `NewSessionEvent` | `events` | Append path |
-| `ArtifactStore`, `ArtifactPut`, `ArtifactKind::Patch` | `storage` | CAS |
-| `PatchApplyBackend`, `ApplyPatchArgs`, `ApplyPatchOutcome`, `PatchApplyError` | `alloy-tools::mcp::patch` | Seam; signature amendment in §3.8 |
+| `EventSink`, `NewSessionEvent` | `events` | Append-only |
+| `ArtifactStore`, `ArtifactPut`, `ArtifactKind::Patch` | `storage` | CAS retains bytes; event payloads do not embed bodies |
+| `ApplyPatchArgs`, `ApplyPatchOutcome` | `alloy-tools::mcp::patch` | Field shapes unchanged |
+| `PatchApplyError` base variants | same | `Unsupported`, `InvalidPatch`, `Conflict`, `Io`, `Internal` unchanged; additive variant in §3.8 |
 | `StubPatchApplyBackend` | same | Remains for explicit test injection |
-| `PathPolicy`, `PathAccess`, `SandboxBroker`, `SandboxExecRequest`, `ExecClass` | `alloy-tools::sandbox` | Constraints |
+| `PermissionDenial`, `McpError` | `alloy-tools::mcp::error` | Permission elevation path |
+| `PathPolicy`, `PathAccess`, `SandboxBroker`, `SandboxExecRequest`, `ExecClass`, `SandboxError`, `DenialReason` | `alloy-tools::sandbox` | Constraints |
 | `InProcessMcpHost::new(..., patch_backend, ...)` | `alloy-tools::mcp::host` | Injection point unchanged |
 
 ### 3.2 `EditRequest` / `SemanticEditOp` / `PatchSet`
 
 ```rust
 // crates/alloy-runtime/src/edit/types.rs
-// Visibility: pub; re-exported from alloy_runtime::edit and crate root.
-
 use serde::{Deserialize, Serialize};
 
 /// Workspace edit envelope (Architecture V2 §13.2).
@@ -250,16 +257,33 @@ pub struct PatchSet {
     pub files: Vec<FilePatch>,
 }
 
-/// One file’s worth of hunks.
+/// One file operation inside a [`PatchSet`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FilePatch {
-    /// Jail-relative path to modify, create, or delete.
-    pub path: String,
-    /// `None` = modify/create from hunks; `Some(true)` = delete file (hunks MUST be empty).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delete: Option<bool>,
-    /// Hunks in file order. MUST be non-overlapping and ascending by old_start.
-    pub hunks: Vec<Hunk>,
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum FilePatch {
+    /// Modify an existing tracked file.
+    Modify {
+        path: String,
+        hunks: Vec<Hunk>,
+    },
+    /// Create a new file. Parent directories are created as needed (§5.9.3).
+    Create {
+        path: String,
+        hunks: Vec<Hunk>,
+    },
+    /// Delete an existing file. No hunks.
+    Delete {
+        path: String,
+    },
+}
+
+impl FilePatch {
+    /// Jail-relative path for this operation.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Modify { path, .. } | Self::Create { path, .. } | Self::Delete { path } => path,
+        }
+    }
 }
 
 /// One unified-diff hunk.
@@ -273,8 +297,7 @@ pub struct Hunk {
     pub new_start: u32,
     /// Line count on the new side (context + insertions).
     pub new_lines: u32,
-    /// Unified diff lines including leading ' ', '-', '+' (no '\\ No newline' markers as separate
-    /// semantics beyond preserving final-newline via content).
+    /// Unified diff lines including leading ' ', '-', '+' only.
     pub lines: Vec<String>,
 }
 
@@ -324,9 +347,40 @@ pub enum SemanticEditOp {
         field_source: String,
     },
 }
+
+impl SemanticEditOp {
+    /// Stable serde tag string for this variant (also used in `UnsupportedOp.op`).
+    pub fn op_tag(&self) -> &'static str {
+        match self {
+            Self::RenameType { .. } => "rename_type",
+            Self::UpdateImports { .. } => "update_imports",
+            Self::ReplaceBody { .. } => "replace_body",
+            Self::InsertImpl { .. } => "insert_impl",
+            Self::AddMethod { .. } => "add_method",
+            Self::MoveModule { .. } => "move_module",
+            Self::ExtractTrait { .. } => "extract_trait",
+            Self::SplitCrate { .. } => "split_crate",
+            Self::AddField { .. } => "add_field",
+        }
+    }
+}
 ```
 
-**Serde stability (normative):** `SemanticEditOp` uses `#[serde(tag = "op", rename_all = "snake_case")]`. Future RFCs implementing a variant MUST NOT rename existing tags or fields. Unknown tags at deserialize time MUST fail deserialize (deny unknown variants via closed enum — no `#[serde(other)]` in MVP).
+**Serde stability (normative):**
+
+* `SemanticEditOp` / `FilePatch` / `EditRequest` use closed tagged enums. Unknown tags fail deserialize. No `#[serde(other)]`.
+* Future RFCs implementing a SemanticEditOp variant MUST NOT rename existing tags or fields.
+* Unknown fields on structs (`Hunk`, `PatchSet`, `WorkspaceDigest`, payloads): `deny_unknown_fields` is **not** required in MVP; unknown fields are ignored by serde default. Callers MUST NOT rely on unknown fields.
+
+**Caps (normative):**
+
+| Cap | Limit | Error |
+| --- | --- | --- |
+| Files in one PatchSet | 256 | `InvalidPatch("too many files")` |
+| Hunks per file | 1024 | `InvalidPatch("too many hunks")` |
+| Lines per hunk | 10_000 | `InvalidPatch("hunk too large")` |
+| Path length | `MAX_ARG_STRING_BYTES` (4096) | `PathDenied` |
+| Whole MCP arguments object | `MAX_ARGUMENT_BYTES` (64 KiB) | Host `InvalidArguments` **before** backend (effective ceiling) |
 
 ### 3.3 `WorkspaceDigest`
 
@@ -343,74 +397,126 @@ pub struct WorkspaceDigest {
 }
 ```
 
-### 3.4 `EditTransaction`
+### 3.4 `EditTransaction` and `TxState`
 
 ```rust
+/// Lifecycle of a recorded edit transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxState {
+    /// Checkpoint created; mutate not yet committed.
+    Open,
+    /// Mutate + EditApplied succeeded.
+    Committed,
+    /// Rollback restored pre-image.
+    RolledBack,
+}
+
+/// Committed or open edit transaction returned by [`EditEngine::apply`].
+///
+/// This type is the in-memory / API return value. It MAY contain the full
+/// `request` for the caller. Persistence and session events MUST NOT store raw
+/// patch bodies — only ids, digests, and hashes (§5.7 / §9.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditTransaction {
     pub id: TransactionId,
-    pub request: EditRequest,
+    pub state: TxState,
+    pub request_kind: EditRequestKind,
     pub pre_digest: WorkspaceDigest,
+    /// Always `Some` when `state == Committed`. `None` while `Open` (should not
+    /// normally be returned to callers — `apply` returns only after Commit or Err).
     pub post_digest: Option<WorkspaceDigest>,
-    pub patch_set: Option<PatchSet>,
-    /// Set after successful checkpoint creation; `None` only for dry-run (dry-run never
-    /// returns EditTransaction through MCP — see adapter). On successful mutating apply: Some.
+    /// Always `Some` after checkpoint creation on the mutating path.
     pub checkpoint_id: Option<CheckpointId>,
+    /// Git commit SHA recorded at checkpoint (40 lowercase hex).
+    pub checkpoint_sha: Option<String>,
     /// Jail-relative paths touched (sorted, deduped).
     pub files_touched: Vec<String>,
-    /// CAS artifact id for the canonical PatchSet JSON, when stored.
+    /// Subset of `files_touched` that were created by this tx (for rollback unlink).
+    pub created_paths: Vec<String>,
+    /// CAS artifact id for the canonical PatchSet JSON, when stored (Committed).
     pub patch_artifact_id: Option<ArtifactId>,
+    /// `Digest::sha256` of the canonical PatchSet JSON bytes.
+    pub patch_content_hash: Option<Digest>,
+    pub created_at: Timestamp,
+}
+
+/// Wire/request kind without embedding bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditRequestKind {
+    TextPatch,
+    SemanticOps,
 }
 ```
 
-### 3.5 `EditEngine` trait
+**Normative invariants on successful `apply` return:** `state == Committed`, `post_digest.is_some()`, `checkpoint_id.is_some()`, `checkpoint_sha.is_some()`, `patch_artifact_id.is_some()`, `patch_content_hash.is_some()`, `request_kind == TextPatch`.
+
+### 3.5 `EditContext` / `EditEngine` trait
 
 ```rust
 use async_trait::async_trait;
+
+/// Per-call attribution and authorization for EditEngine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditContext {
+    /// Session for EditApplied; if `None`, mutating apply still proceeds but
+    /// skips EditApplied emission (mirrors DecisionLog skip-when-no-session).
+    pub session_id: Option<SessionId>,
+    /// Run attribution. If `None`, use `perms.run_id` when emitting events.
+    pub run_id: Option<RunId>,
+    /// Caller grants for this invocation.
+    pub perms: PermissionToken,
+}
 
 /// Result of a validation-only (dry-run) pass — never allocated a TransactionId.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditValidation {
     /// Jail-relative paths that would be touched (sorted, deduped).
     pub files_touched: Vec<String>,
-    /// Optional pre-digest when computed; MVP dry-run leaves this `None` (§5.5 / §5.8).
-    pub pre_digest: Option<WorkspaceDigest>,
 }
 
 /// Transactional workspace edit apply + rollback.
 ///
 /// Implementors MUST be `Send + Sync`. Methods are async and MAY perform filesystem
 /// and sandboxed git I/O. The trait object is shared as `Arc<dyn EditEngine>`.
+///
+/// **Permissions are explicit arguments** via `EditContext`. There is no ambient
+/// token slot, no `task_local!`, and no `apply_with_perms` twin API.
 #[async_trait]
 pub trait EditEngine: Send + Sync {
     /// Validate `req` without mutating the workspace or creating a checkpoint.
     ///
-    /// MUST enforce V1–V11 (§5.4). MUST NOT enforce V12–V14 (git grants/repo).
+    /// MUST enforce V1–V11 (§5.4). MUST NOT enforce V12–V14.
     /// MUST NOT write files, refs, CAS edit artifacts, or session events.
-    async fn validate(&self, req: EditRequest) -> Result<EditValidation, EditError>;
+    /// MAY run concurrently with other `validate` calls; MUST take the write lock
+    /// only if needed to observe a consistent abandoned-tx reconcile (§6.4) — MVP
+    /// MUST take the same write lock as `apply`/`rollback` for simplicity.
+    async fn validate(
+        &self,
+        req: EditRequest,
+        ctx: &EditContext,
+    ) -> Result<EditValidation, EditError>;
 
     /// Validate and apply `req`. On success returns a committed transaction.
-    ///
-    /// Lifecycle: see §5 state machine. Cancellation: if the future is dropped mid-apply
-    /// after a checkpoint was created, the implementation MUST attempt rollback in a
-    /// Drop/cancel path (§6.4) or leave an Open transaction recoverable via §6.5.
-    ///
-    /// MUST NOT be used for MCP `dry_run` — callers MUST use [`EditEngine::validate`].
-    async fn apply(&self, req: EditRequest) -> Result<EditTransaction, EditError>;
+    async fn apply(
+        &self,
+        req: EditRequest,
+        ctx: &EditContext,
+    ) -> Result<EditTransaction, EditError>;
 
-    /// Restore the checkpoint associated with `tx`.
-    ///
-    /// Idempotent: if the workspace already matches the pre-digest (or the checkpoint
-    /// ref is already the restored tip marker), return `Ok(())`.
-    async fn rollback(&self, tx: TransactionId) -> Result<(), EditError>;
+    /// Restore the checkpoint associated with `tx` when eligible (§5.11).
+    async fn rollback(
+        &self,
+        tx: TransactionId,
+        ctx: &EditContext,
+    ) -> Result<(), EditError>;
 }
 ```
 
-**Visibility:** `pub trait` in `alloy_runtime::edit`.  
-**Ownership:** callers hold `Arc<dyn EditEngine>`.  
-**Persistence:** transaction records — §5.7.  
-**Permissions:** checked by concrete impl using injected policy + per-call token context (§4.3).  
-**Export:** `EditValidation` is `pub` and crate-root re-exported with the other edit types (§3.11).
+**Visibility:** `pub` in `alloy_runtime::edit`.  
+**Lifecycle:** Engine is process-lifetime and **session-agnostic**; attribution comes from `EditContext` per call. One engine serves many sessions through one host.
+
 ### 3.6 `EditError`
 
 ```rust
@@ -450,6 +556,12 @@ pub enum EditError {
     #[error("overlapping hunks: {path}")]
     OverlappingHunks { path: String },
 
+    #[error("untracked path in patch: {path}")]
+    UntrackedPath { path: String },
+
+    #[error("tracked deny-glob path present: {path}")]
+    TrackedDeniedPath { path: String },
+
     #[error("checkpoint failed: {0}")]
     CheckpointFailed(String),
 
@@ -459,17 +571,35 @@ pub enum EditError {
     #[error("unknown transaction: {0}")]
     UnknownTransaction(TransactionId),
 
+    #[error("transaction not eligible for rollback: {tx}: state={state:?}")]
+    RollbackNotEligible { tx: TransactionId, state: TxState },
+
+    #[error("workspace drifted since transaction: {0}")]
+    WorkspaceDrifted(TransactionId),
+
+    #[error("digest limit exceeded: {0}")]
+    DigestLimitExceeded(String),
+
     #[error("io: {0}")]
     Io(String),
 
     #[error("git: {0}")]
     Git(String),
 
+    #[error("storage: {0}")]
+    Storage(String),
+
+    #[error("event sink: {0}")]
+    Event(String),
+
     #[error("busy: edit already in progress")]
     Busy,
 
     #[error("cancelled")]
     Cancelled,
+
+    #[error("token expired")]
+    TokenExpired,
 
     #[error("internal: {0}")]
     Internal(String),
@@ -485,11 +615,8 @@ pub enum EditError {
 pub struct GitEditEngine { /* private fields — §4.3 */ }
 
 impl GitEditEngine {
-    /// Construct the engine.
-    ///
-    /// `broker` and `path_policy` MUST refer to the same canonical jail as the MCP host.
-    /// `events` is required (not Option) — every committed apply emits EditApplied.
-    /// `artifacts` stores canonical PatchSet JSON (`ArtifactKind::Patch`).
+    /// Construct the engine. Synchronous. Performs **no** git I/O and **no**
+    /// restart recovery (recovery is §6.4 abandon reconcile on next locked op).
     pub fn new(config: GitEditEngineConfig) -> Result<Self, EditError>;
 }
 
@@ -498,12 +625,20 @@ pub struct GitEditEngineConfig {
     pub path_policy: PathPolicy,
     pub artifacts: Arc<dyn ArtifactStore>,
     pub events: Arc<dyn EventSink>,
-    pub session_id: SessionId,
-    pub run_id: Option<RunId>,
-    /// Soft cap on files walked for WorkspaceDigest (default 50_000).
+    /// Soft cap on files walked for WorkspaceDigest.
     pub max_digest_files: u64,
-    /// Soft cap on total bytes hashed for WorkspaceDigest (default 512 MiB).
+    /// Soft cap on total bytes hashed for WorkspaceDigest.
     pub max_digest_bytes: u64,
+}
+
+impl GitEditEngineConfig {
+    /// Defaults: `max_digest_files = 50_000`, `max_digest_bytes = 512 MiB`.
+    pub fn new(
+        broker: Arc<dyn SandboxBroker>,
+        path_policy: PathPolicy,
+        artifacts: Arc<dyn ArtifactStore>,
+        events: Arc<dyn EventSink>,
+    ) -> Self;
 }
 
 #[async_trait]
@@ -512,8 +647,6 @@ impl EditEngine for GitEditEngine { /* §5 */ }
 /// MCP adapter: PatchApplyBackend → EditEngine.
 pub struct EditEnginePatchBackend {
     engine: Arc<dyn EditEngine>,
-    /// Interior token slot set by the host for the duration of one apply (§3.8).
-    /// Alternative permitted shape: pass perms only via amended apply signature below.
 }
 
 impl EditEnginePatchBackend {
@@ -521,11 +654,27 @@ impl EditEnginePatchBackend {
 }
 ```
 
-### 3.8 RFC-0006 additive amendment — `PatchApplyBackend` signature
+**Jail alignment (normative):** Callers constructing both the host and the engine MUST build `PathPolicy` from the **same** `broker.profile()` and the **same** `read_only_roots` clone:
 
-**Problem:** Merged `PatchApplyBackend::apply(&self, args: ApplyPatchArgs)` cannot carry `PermissionToken`. RFC-0006 §5.5 explicitly deferred fine-grained `FsWrite` path matching to RFC-0008. Git via `SandboxBroker` also requires the caller token.
+```rust
+let roots_for_engine = read_only_roots.clone();
+let roots_for_host = read_only_roots;
+let path_policy = PathPolicy::from_profile(broker.profile(), roots_for_engine)
+    .map_err(...)?;
+let engine = GitEditEngine::new(GitEditEngineConfig::new(
+    Arc::clone(&broker),
+    path_policy,
+    artifacts,
+    events,
+))?;
+let host = InProcessMcpHost::new(broker, homes, roots_for_host, Arc::new(EditEnginePatchBackend::new(engine)), cfg)?;
+```
 
-**Amendment (normative):**
+`InProcessMcpHost` continues to build its own internal `PathPolicy` (unchanged). If the engine jail and host jail ever disagree, behaviour is undefined — composition roots MUST use the clone pattern above. No host accessor is added in MVP.
+
+### 3.8 RFC-0006 additive amendments (normative)
+
+#### 3.8.1 `PatchApplyBackend` signature
 
 ```rust
 // BEFORE (merged RFC-0006 / main):
@@ -536,72 +685,138 @@ async fn apply(
     &self,
     args: ApplyPatchArgs,
     perms: &PermissionToken,
+    session: Option<SessionId>,
+    run: Option<RunId>,
 ) -> Result<ApplyPatchOutcome, PatchApplyError>;
 ```
 
-| Call site | Change |
-| --- | --- |
-| `StubPatchApplyBackend` | Ignore `perms`; still return `Unsupported(EDIT_ENGINE_UNWIRED_MESSAGE)` |
-| `apply_patch::execute` | Pass the caller `PermissionToken` already available in `builtins::execute` |
-| `EditEnginePatchBackend` | Use `perms` for FsWrite globs, GitWrite, and git `SandboxExecRequest` |
-| Host constructor | Unchanged (`Arc<dyn PatchApplyBackend>`) |
+`ApplyPatchArgs` and `ApplyPatchOutcome` field shapes are **unchanged**.
 
-`ApplyPatchArgs`, `ApplyPatchOutcome`, and `PatchApplyError` variants are **unchanged**.
+#### 3.8.2 Additive `PatchApplyError` variant
 
-**Host prepare amendment (normative):**
+```rust
+pub enum PatchApplyError {
+    Unsupported(String),
+    InvalidPatch(String),
+    Conflict(String),
+    Io(String),
+    Internal(String),
+    /// Authorization failure discovered after patch decode (fine-grained path / git).
+    #[error("permission denied: {0}")]
+    PermissionDenied(PermissionDenial),
+}
+```
+
+#### 3.8.3 Authz helpers (exact)
+
+Add to `crates/alloy-tools/src/mcp/authz.rs`:
+
+```rust
+/// Require `Grant::GitWrite`.
+pub(crate) fn authorize_git_write(perms: &PermissionToken) -> Result<(), McpError> {
+    if perms.grants.iter().any(|g| matches!(g, Grant::GitWrite)) {
+        return Ok(());
+    }
+    Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(
+        "git_write".into(),
+    )))
+}
+
+/// Require some `Grant::FsWrite(Glob)` matches `rel` (jail-relative).
+/// Uses the same glob expansion as FsRead (§5.5 dialect).
+pub(crate) fn authorize_fs_write_path(
+    perms: &PermissionToken,
+    rel: &str,
+) -> Result<(), McpError>;
+```
+
+Share one private expansion helper for FsRead and FsWrite. `alloy-tools` MUST keep exactly one glob-expansion implementation.
+
+Keep existing `authorize_fs_write` (presence check) for prepare step 2.
+
+#### 3.8.4 `apply_patch` prepare amendment
 
 ```text
 apply_patch prepare:
   1. parse args
-  2. require ≥1 Grant::FsWrite(_)           // existing
-  3. if !dry_run: require Grant::GitWrite   // NEW
-  4. return args
+  2. authorize_fs_write(perms)?                         // existing ≥1 FsWrite
+  3. if !args.dry_run { authorize_git_write(perms)? }    // NEW
+  4. Ok(args)
 ```
 
-Supersedes RFC-0006’s line “`Grant::GitWrite`: ignored by all four MVP builtins” **for `apply_patch` only**. `cargo_*` / `fs_read` still ignore `GitWrite`.
+Supersedes RFC-0006’s “`Grant::GitWrite`: ignored by all four MVP builtins” **for `apply_patch` only**.
+
+#### 3.8.5 `apply_patch` execute amendment
+
+```rust
+pub(crate) async fn execute(
+    ctx: &BuiltinCtx<'_>,
+    args: ApplyPatchArgs,
+    perms: PermissionToken,
+    session: Option<SessionId>,
+    run: Option<RunId>,
+) -> Result<ToolResult, McpError> {
+    let dry_run = args.dry_run;
+    let outcome = ctx.patch_backend.apply(args, &perms, session, run).await;
+    match outcome {
+        Err(PatchApplyError::PermissionDenied(d)) => {
+            Err(McpError::PermissionDenied(d))
+        }
+        other => Ok(map_outcome(other, dry_run, elapsed)),
+    }
+}
+```
+
+`builtins::execute` MUST pass `call.session` / `call.run` from the `ToolCall` into `apply_patch::execute`. Touch points: `mcp/patch.rs`, `mcp/builtins/apply_patch.rs`, `mcp/builtins/mod.rs`, stub unit tests, any out-of-tree `PatchApplyBackend` implementors.
+
+#### 3.8.6 Effective patch size ceiling
+
+RFC-0006 `MAX_ARGUMENT_BYTES = 64 KiB` caps the entire serialized arguments object before the backend runs. This RFC’s logical 1 MiB patch cap is therefore **unreachable via `apply_patch`**. Normative effective ceiling: **patch payloads must fit in the 64 KiB arguments object**. No RFC-0006 amendment raises that cap in MVP.
 
 ### 3.9 Adapter behaviour — `EditEnginePatchBackend::apply`
 
 | Step | Behaviour |
 | --- | --- |
 | 1 | Decode `args.patch` → `EditRequest` per §5.3; on failure → `PatchApplyError::InvalidPatch` |
-| 2 | If `EditRequest::SemanticOps` → map `UnsupportedOp` via §8.3 (`Unsupported`) |
-| 3 | Install caller `perms` into the engine slot (§4.3) |
-| 4 | If `dry_run`: `engine.validate(req).await`; build `ApplyPatchOutcome { dry_run: true, files_touched, transaction_id: None, message }` |
-| 5 | Else: `engine.apply(req).await`; map errors via §8.3 |
-| 6 | On success: `ApplyPatchOutcome { dry_run: false, files_touched: tx.files_touched, transaction_id: Some(tx.id), message }` |
-| 7 | Clear perms slot (also on error paths — `scopeguard` or equivalent) |
+| 2 | If `EditRequest::SemanticOps` → map `UnsupportedOp` via §8.3 |
+| 3 | Build `EditContext { session_id: session, run_id: run.or(Some(perms.run_id)), perms: perms.clone() }` |
+| 4 | If `dry_run`: `engine.validate(req, &ctx).await` → outcome with `transaction_id: None` |
+| 5 | Else: `engine.apply(req, &ctx).await` → map via §8.3 |
+| 6 | Success message: `"applied N file(s)"` or `"dry_run ok: N file(s)"` (N = files_touched.len()), ≤512 bytes, no absolute paths, never equal to `EDIT_ENGINE_UNWIRED_MESSAGE` |
 
-`message` MUST be one of:
+Host prepare already required `FsWrite` and (when `!dry_run`) `GitWrite`. Backend MUST still enforce fine-grained `FsWrite` globs and (when mutating) `GitWrite` + `Exec(git)`.
 
-* `"applied N file(s)"` (N = files_touched.len())
-* `"dry_run ok: N file(s)"`
-* or a short jail-relative conflict hint ≤512 bytes with no absolute paths
-
-**Ordering vs host prepare:** Host already required `FsWrite` and (when `!dry_run`) `GitWrite` before calling the backend. Backend MUST still re-check fine-grained `FsWrite` globs and (when mutating) `GitWrite` + `Exec(git)` — defense in depth; duplicate denials are identical errors.
-### 3.10 Wiring diff (injection)
+### 3.10 Wiring (injection)
 
 ```rust
-// Production / integration (normative shape):
-let engine = Arc::new(GitEditEngine::new(GitEditEngineConfig { /* … */ })?);
+// Normative reference constructor (cross-subsystem / future CLI host):
+let read_only_roots_engine = read_only_roots.clone();
+let path_policy = PathPolicy::from_profile(broker.profile(), read_only_roots_engine)?;
+let engine = Arc::new(GitEditEngine::new(GitEditEngineConfig::new(
+    Arc::clone(&broker),
+    path_policy,
+    artifacts,
+    events,
+))?);
 let patch_backend: Arc<dyn PatchApplyBackend> =
     Arc::new(EditEnginePatchBackend::new(engine));
 let host = InProcessMcpHost::new(
     broker,
     homes,
     read_only_roots,
-    patch_backend,           // was Arc::new(StubPatchApplyBackend)
+    patch_backend,
     McpHostConfig::new(),
 )?;
 ```
 
-`StubPatchApplyBackend` remains `pub` for unit tests that assert unwired behaviour.
+`StubPatchApplyBackend` remains `pub` for unit tests that assert unwired behaviour. No production binary on `main` currently constructs the host; AC 1 is satisfied by the cross-subsystem reference constructor (§11.3 / §13).
 
 ### 3.11 Crate-root exports
 
 **`alloy-runtime` MUST `pub use`:**
 
-`EditEngine`, `EditValidation`, `EditRequest`, `EditTransaction`, `EditError`, `PatchSet`, `FilePatch`, `Hunk`, `SemanticEditOp`, `WorkspaceDigest`.
+`EditEngine`, `EditContext`, `EditValidation`, `EditRequest`, `EditRequestKind`, `EditTransaction`, `TxState`, `EditError`, `EditAppliedPayload`, `PatchSet`, `FilePatch`, `Hunk`, `SemanticEditOp`, `WorkspaceDigest`.
+
 **`alloy-tools` MUST `pub use` from `edit`:**
 
 `GitEditEngine`, `GitEditEngineConfig`, `EditEnginePatchBackend`.
@@ -616,7 +831,9 @@ let host = InProcessMcpHost::new(
 crates/alloy-runtime/src/
   edit/
     mod.rs          # re-exports
-    types.rs        # EditRequest, PatchSet, Hunk, SemanticEditOp, WorkspaceDigest, EditTransaction
+    types.rs        # EditRequest, PatchSet, FilePatch, Hunk, SemanticEditOp,
+                    # WorkspaceDigest, EditTransaction, TxState, EditRequestKind,
+                    # EditContext, EditValidation, EditAppliedPayload
     engine.rs       # EditEngine trait
     error.rs        # EditError
   lib.rs            # pub mod edit; pub use …
@@ -626,13 +843,17 @@ crates/alloy-tools/src/
     mod.rs
     engine.rs       # GitEditEngine
     checkpoint.rs   # git ref create/restore via SandboxBroker
-    patch_parse.rs  # unified diff → PatchSet; validation
+    patch_parse.rs  # decode_patch_value, parse_unified_diff, validation
     apply.rs        # hunk application
     digest.rs       # WorkspaceDigest computation
-    tx_store.rs     # transaction registry (SQLite sidecar or in-memory+CAS — §5.7)
+    tx.rs           # TxRecord + in-process registry
     backend.rs      # EditEnginePatchBackend
-  mcp/patch.rs      # amended PatchApplyBackend signature (§3.8)
-  mcp/builtins/apply_patch.rs  # pass perms; GitWrite prepare check
+    map_error.rs    # SandboxError/StoreError/EventSinkError → EditError
+  mcp/patch.rs      # amended PatchApplyBackend + PermissionDenied
+  mcp/authz.rs      # authorize_git_write, authorize_fs_write_path
+  mcp/builtins/apply_patch.rs
+  mcp/builtins/mod.rs
+  sandbox/path.rs   # additive pub(crate) deny accessor (§4.5)
   lib.rs            # pub mod edit;
 ```
 
@@ -642,8 +863,8 @@ crates/alloy-tools/src/
 | --- | --- |
 | Traits/types in §3 | `pub` |
 | `GitEditEngine` fields | private |
-| parse/apply helpers | `pub(crate)` |
-| checkpoint argv builders | `pub(crate)` |
+| parse/apply/checkpoint helpers | `pub(crate)` |
+| `TxRecord` | `pub(crate)` in `alloy-tools::edit::tx` |
 
 ### 4.3 `GitEditEngine` injected state
 
@@ -652,21 +873,67 @@ crates/alloy-tools/src/
 | `broker` | `Arc<dyn SandboxBroker>` | git exec |
 | `path_policy` | `PathPolicy` | jail / deny / write auth |
 | `artifacts` | `Arc<dyn ArtifactStore>` | patch CAS |
-| `events` | `Arc<dyn EventSink>` | EditApplied |
-| `session_id` / `run_id` | ids | attribution |
-| `tx_store` | internal | transaction records |
-| `write_lock` | `tokio::sync::Mutex<()>` | single-writer (§6) |
+| `events` | `Arc<dyn EventSink>` | EditApplied (append-only) |
+| `tx_store` | `Mutex<HashMap<TransactionId, TxRecord>>` | in-process registry |
+| `abandoned` | `Mutex<Option<AbandonedCheckpoint>>` | cancel/drop reconcile (§6.4) |
+| `write_lock` | `tokio::sync::Mutex<()>` | single-writer for validate/apply/rollback |
 | `max_digest_*` | u64 | digest caps |
-| `caller_perms` | see below | per-call grants |
 
-**Per-call permissions:** Because `EditEngine::apply` does not take `PermissionToken` (V2 sketch), `EditEnginePatchBackend` MUST set an `tokio::sync::Mutex<Option<PermissionToken>>` (or `task_local!`) on the engine **before** calling `apply`/`rollback`, and clear it after. Direct test callers of `GitEditEngine` MUST use `GitEditEngine::apply_with_perms(req, perms)` / `rollback_with_perms(tx, perms)` convenience methods that perform the same slot dance. The `EditEngine` trait methods require the slot to be populated; if missing → `EditError::Internal("missing caller perms")`.
+No session/run fields on the engine. No ambient `PermissionToken` slot.
 
-### 4.4 Who constructs what
+### 4.4 `TxRecord` (normative)
+
+```rust
+// alloy-tools::edit::tx — pub(crate)
+pub(crate) struct TxRecord {
+    pub id: TransactionId,
+    pub state: TxState,
+    pub checkpoint_id: CheckpointId,
+    pub checkpoint_sha: String,
+    pub head_sha_at_checkpoint: String,
+    pub pre_digest: WorkspaceDigest,
+    pub post_digest: Option<WorkspaceDigest>,
+    pub files_touched: Vec<String>,
+    pub created_paths: Vec<String>,
+    pub temp_paths: Vec<String>,
+    pub patch_artifact_id: Option<ArtifactId>,
+    pub patch_content_hash: Option<Digest>,
+    pub session_id: Option<SessionId>,
+    pub run_id: Option<RunId>,
+    pub created_at: Timestamp,
+}
+
+pub(crate) struct AbandonedCheckpoint {
+    pub checkpoint_id: CheckpointId,
+    pub checkpoint_sha: String,
+    pub created_paths: Vec<String>,
+    pub temp_paths: Vec<String>,
+    pub pre_digest: WorkspaceDigest,
+}
+```
+
+**MVP durability:** in-process map only + durable checkpoint refs + `EditApplied` events. No SQLite `edit_transactions` table in this RFC. After process restart, in-memory records are gone; orphan refs are **not** auto-restored (§6.5).
+
+### 4.5 PathPolicy deny accessor (additive)
+
+```rust
+// sandbox/path.rs
+impl PathPolicy {
+    /// True when `jail_relative` matches the profile deny-glob set.
+    pub(crate) fn deny_matches_rel(&self, jail_relative: &str) -> bool;
+    /// Borrow the canonical jail root (already exists as pub(crate) `jail()`).
+    pub(crate) fn jail(&self) -> &Path;
+}
+```
+
+Edit digest + tracked-deny checks MUST use this accessor — do not compile a second `GlobSet` in `edit/`.
+
+### 4.6 Who constructs what
 
 | Environment | Constructor |
 | --- | --- |
-| `alloy-cli` / future runtime host (RFC-0015) | Builds broker + PathPolicy + storage; constructs `GitEditEngine`; wraps `EditEnginePatchBackend`; passes into `InProcessMcpHost::new` |
-| `cross_subsystem` test | Same pattern over tempdir git repo + `AlloyStorage` |
+| Cross-subsystem test (§11.3) | Reference constructor in §3.10 |
+| Future `alloy-cli` / RFC-0015 | Same pattern |
 | Pure MCP unit tests | MAY keep `StubPatchApplyBackend` |
 
 ---
@@ -678,19 +945,19 @@ crates/alloy-tools/src/
 ```mermaid
 stateDiagram-v2
   [*] --> Validating
-  Validating --> DryRunComplete: dry_run && valid
+  Validating --> DryRunComplete: validate-only ok
   Validating --> Rejected: invalid / SemanticOps / grants / paths
-  Validating --> DigestPre: TextPatch ok && !dry_run
+  Validating --> DigestPre: TextPatch ok && mutating
   DigestPre --> Checkpointing: pre_digest ok
-  DigestPre --> Rejected: digest limit exceeded
+  DigestPre --> Rejected: DigestLimitExceeded
   Checkpointing --> Applying: checkpoint ref created
   Checkpointing --> Rejected: git checkpoint failed
   Applying --> DigestPost: all files written
   Applying --> RollingBack: apply failed
-  DigestPost --> Committing: post_digest ok
+  DigestPost --> Persisting: post_digest ok
   DigestPost --> RollingBack: digest failed
-  Committing --> Committed: event+CAS+tx store ok
-  Committing --> RollingBack: persist failed after mutate
+  Persisting --> Committed: CAS + EditApplied ok
+  Persisting --> RollingBack: CAS or event failed after mutate
   RollingBack --> Failed: restore ok
   RollingBack --> FailedDirty: restore failed
   DryRunComplete --> [*]
@@ -700,116 +967,120 @@ stateDiagram-v2
   FailedDirty --> [*]
 ```
 
-Reconciles the placeholder: Validating → Checkpointing → Applying → Committed, with explicit dry-run, digest, and FailedDirty.
+**Linearization point for success:** `EditApplied` append succeeding is the commit point. Ordering inside Persisting:
+
+1. CAS `ArtifactPut` for PatchSet JSON. On failure → RollingBack → return `EditError::Storage` (mapped `Io`).
+2. Append `EditApplied` with `patch_artifact_id` + `patch_content_hash`. On failure → RollingBack → return `EditError::Event` (mapped `Internal`).
+3. Update in-memory `TxRecord` to `Committed`. On failure after EditApplied: leave event as source of truth; retry in-memory update; if impossible, process restart treats event as committed (§6.5). **MUST NOT** roll back the workspace after a successful `EditApplied` append.
 
 ### 5.2 Apply pipeline (mutating, normative order)
 
-1. **Acquire** single-writer lock (fail `Busy` if not available within 0 ms try_lock for MVP — no queue).
-2. **Reject** `SemanticOps` → `UnsupportedOp`.
-3. **Normalize** `PatchSet` (§5.3–5.4).
-4. **Authorize paths** (§5.4.3): PathPolicy Write + FsWrite globs + deny `.env`.
-5. **Require** `GitWrite` + `Exec(git)` (§5.4.4).
-6. **Compute** `pre_digest` (§5.8).
-7. **Allocate** `TransactionId::new()`, `CheckpointId::new()`.
-8. **Create checkpoint** (§5.6) *before any file mutation*. On failure → `CheckpointFailed` (no mutate).
-9. **Record** Open transaction in tx store (checkpoint_id, pre_digest, patch hash).
-10. **Apply** each `FilePatch` in order (§5.4.5). On failure → restore checkpoint → `Conflict` / `Io` / etc.
-11. **Compute** `post_digest`.
-12. **CAS put** canonical PatchSet JSON (`ArtifactKind::Patch`, labels include tx id, checkpoint id, pre/post digests). Body retention follows store defaults; event keeps hash.
-13. **Append** `EditApplied` session event (§9.3).
-14. **Mark** transaction Committed in tx store.
-15. **Release** lock; return `EditTransaction`.
+1. Acquire write lock and run abandon reconcile (§6.4) using `ctx.perms`.
+2. Reject `SemanticOps` → `UnsupportedOp` (§5.10).
+3. Normalize/validate `PatchSet` (V1–V11, V16–V19).
+4. Repo/jail invariants + tracked deny-glob + untracked-in-patch checks (§5.6.1).
+5. Authorize git grants (V12–V14) and preflight **all** git argv shapes used by create **and** restore via `match_exec_grant`, so later rollback cannot fail auth after mutate.
+6. Check token expiry → `TokenExpired`.
+7. Compute `pre_digest` (§5.8). On limit → `DigestLimitExceeded` (no mutate).
+8. Allocate `TransactionId::new()`, `CheckpointId::new()`.
+9. Create checkpoint (§5.6). On failure → `CheckpointFailed` (no mutate).
+10. Record Open `TxRecord`; set `abandoned = Some(...)` before first mutation.
+11. Apply each `FilePatch` (§5.9). On failure → restore checkpoint → clear abandoned → return error.
+12. Compute `post_digest`. On failure → restore → return error.
+13. Persist CAS + EditApplied per §5.1 linearization. On failure before EditApplied → restore → return error.
+14. Mark Committed; clear abandoned; release lock; return `EditTransaction`.
 
+Production `validate` / `apply` / `rollback` all use `write_lock.lock().await` (fair queue). `EditError::Busy` is reserved for a `#[cfg(test)]` try-lock helper only and is not on the MCP path.
 ### 5.3 Patch wire format (`ApplyPatchArgs.patch`)
 
 The MCP host leaves `patch` as `serde_json::Value`. **This RFC owns decoding.**
 
-Decoder entrypoint (normative signature in `alloy-tools::edit::patch_parse`):
-
 ```rust
-/// Decode MCP `ApplyPatchArgs.patch` into an [`EditRequest`].
 pub fn decode_patch_value(value: &serde_json::Value) -> Result<EditRequest, EditError>;
-
-/// Parse unified diff text into a [`PatchSet`].
 pub fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError>;
 ```
 
 | JSON shape | Interpretation |
 | --- | --- |
-| `String` | Unified diff text (UTF-8). `parse_unified_diff` → `EditRequest::TextPatch`. |
-| `Object` with `"files"` array | Direct `PatchSet` deserialize → `TextPatch`. |
-| `Object` with `"kind": "text_patch"` and `"patch"` | Full `EditRequest::TextPatch` envelope (serde). |
-| `Object` with `"kind": "semantic_ops"` and `"ops"` | `EditRequest::SemanticOps` (later fail closed). |
-| `Null` / array / bool / number | `InvalidPatch("unrecognized patch json")` |
-| Other object | `InvalidPatch("unrecognized patch json")` |
+| `String` | Unified diff text (UTF-8) → `TextPatch` |
+| `Object` with `"files"` array and **without** `"kind"` | Direct `PatchSet` → `TextPatch` |
+| `Object` with `"kind": "text_patch"` | Serde `EditRequest::TextPatch` |
+| `Object` with `"kind": "semantic_ops"` | Serde `EditRequest::SemanticOps` |
+| Object with both `"files"` and `"kind"` | `InvalidPatch("ambiguous patch json")` |
+| Other | `InvalidPatch("unrecognized patch json")` |
 
-Maximum unified diff / PatchSet JSON size: **1 MiB** as UTF-8 bytes of the `Value` serialized in compact form **or** of the string contents (whichever applies). Larger → `InvalidPatch("patch too large")`.
+Effective size ceiling via MCP: **64 KiB arguments object** (RFC-0006). Backend additionally rejects decoded string/PatchSet payloads over 64 KiB as `InvalidPatch("patch too large")` for non-MCP callers.
 
 #### 5.3.1 Unified diff parse rules
 
-| Rule | Normative behaviour |
+| Rule | Behaviour |
 | --- | --- |
-| File headers | Accept `--- <old>` then `+++ <new>` (git `a/`/`b/` prefixes optional). |
-| Path normalize | Strip leading `a/` or `b/` once; reject if result absolute, empty, contains `\\`, NUL, or any `.`/`..` segment → `PathDenied`. |
-| Create | Old path is `/dev/null` (after strip) → `FilePatch` with empty old side; file MUST NOT already exist at apply (V11). |
-| Delete | New path is `/dev/null` → `delete: Some(true)`, `hunks: []` after parse of delete hunks into emptiness check; prefer encoding delete as `delete: Some(true)` and ignoring body hunks only when they are a full-file deletion. Full-file deletion hunks MAY be present in the diff text; parser MUST set `delete: Some(true)` and `hunks: []`. |
-| Rename/copy headers | `rename from` / `copy from` **unsupported** → `InvalidPatch("rename/copy unsupported")`. |
-| Binary marks | `Binary files differ` / `GIT binary patch` → `InvalidPatch("binary patch unsupported")`. |
-| Hunk header | `@@ -old_start,old_lines +new_start,new_lines @@` (comma counts optional when 1). |
-| Hunk lines | Each line MUST begin with ` `, `-`, or `+`, else `InvalidPatch`. |
-| No-newline marker | Line equal to `\ No newline at end of file` adjusts EOF newline flags; MUST NOT appear in `Hunk.lines`. |
-| Multi-file | Preserve file order from the diff. |
-| Text encoding | Input MUST be valid UTF-8; invalid → `InvalidPatch("patch not utf-8")`. |
+| File headers | `--- <old>` then `+++ <new>` (`a/`/`b/` optional) |
+| Path normalize | Strip one `a/` or `b/` prefix; reject absolute, empty, `\\`, NUL, `.`/`..` segments → `PathDenied` |
+| Create | Old `/dev/null` → `FilePatch::Create` |
+| Delete | New `/dev/null` → `FilePatch::Delete` (hunks discarded after confirming full-file deletion shape) |
+| Rename/copy | Unsupported → `InvalidPatch("rename/copy unsupported")` |
+| Binary | Unsupported → `InvalidPatch("binary patch unsupported")` |
+| Hunk header | `@@ -old_start,old_lines +new_start,new_lines @@` |
+| Hunk lines | Must start with ` `, `-`, or `+` |
+| No-newline marker | `\ No newline at end of file` adjusts EOF; not stored in `Hunk.lines` |
+| UTF-8 | Invalid → `InvalidPatch("patch not utf-8")` |
 
-#### 5.3.2 Canonical `PatchSet` JSON (CAS)
+#### 5.3.2 Canonical PatchSet JSON (CAS)
 
-When storing to CAS, serialize `PatchSet` with `serde_json::to_vec` using **sorted object keys disabled** (serde default field order as declared in §3.2). Labels on `ArtifactPut`:
+Serialize with serde field order as declared. `patch_content_hash = Digest::sha256(canonical_json_bytes)`. `ArtifactPut.kind = Patch`. Labels:
 
-| Label key | Value |
+| Key | Value |
 | --- | --- |
-| `transaction_id` | tx UUID string |
-| `checkpoint_id` | checkpoint UUID string |
-| `pre_digest` | `pre_digest.tree` hex |
-| `post_digest` | `post_digest.tree` hex |
-| `schema` | `"alloy.patch_set.v1"` |
-### 5.4 Validation (every rejection → distinct error)
+| `transaction_id` | UUID string |
+| `checkpoint_id` | UUID string |
+| `pre_digest` | tree hex |
+| `post_digest` | tree hex |
+| `schema` | `alloy.patch_set.v1` |
+
+CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention applies to **event payloads**, which MUST NOT embed the body. This matches PlanProduced’s CAS+hash pattern (RFC-0009).
+
+### 5.4 Validation (every rejection → distinct `EditError`)
 
 | # | Condition | Error |
 | --- | --- | --- |
-| V1 | PatchSet.files empty | `EmptyPatch` |
-| V2 | FilePatch.path empty / absolute / `\` / `.` / `..` segment / NUL | `PathDenied` |
-| V3 | Path fails `PathPolicy::authorize(Write)` (outside jail, deny-glob, RO root) | `PathDenied` |
-| V4 | Path not matched by any `Grant::FsWrite(Glob)` (FsRead dialect expansion, RFC-0006 §5.5) | `PathNotCovered` |
-| V5 | `delete == Some(true)` but hunks non-empty | `InvalidPatch` |
-| V6 | Two FilePatches with same path | `InvalidPatch("duplicate path")` |
-| V7 | Hunks overlap on old-line ranges within a file | `OverlappingHunks` |
-| V8 | Hunk line counts disagree with `lines` contents | `InvalidPatch` |
-| V9 | Context/delete lines do not match file at old_start | `ContextMismatch` |
+| V1 | `PatchSet.files` empty | `EmptyPatch` |
+| V2 | Path empty / absolute / `\\` / `.` / `..` / NUL / overlong | `PathDenied` |
+| V3 | `PathPolicy::authorize(Write)` fails | `PathDenied` (from SandboxError map) |
+| V4 | No `FsWrite` glob matches path (`authorize_fs_write_path` dialect) | `PathNotCovered` |
+| V5 | `FilePatch::Delete` used with non-empty hunks at struct build | `InvalidPatch` (parser prevents) |
+| V6 | Duplicate paths in one PatchSet (byte-exact **and** case-fold on case-insensitive FS) | `InvalidPatch("duplicate path")` |
+| V7 | Overlapping old-line ranges | `OverlappingHunks` |
+| V8 | Hunk header counts ≠ line kinds | `InvalidPatch("hunk line count")` |
+| V9 | Context/delete lines mismatch file | `ContextMismatch` |
 | V10 | Delete target missing | `Conflict("delete missing file")` |
 | V11 | Create target already exists | `Conflict("create exists")` |
-| V12 | Missing `GitWrite` on mutating path | `MissingGrant("git_write")` |
-| V13 | Missing `Exec` match for git argv | `MissingGrant("exec:git")` (or map from sandbox denial) |
-| V14 | Workspace is not a git repo (`rev-parse --is-inside-work-tree`) | `Git("not a git repository")` |
+| V12 | Missing `GitWrite` (mutating) | `MissingGrant("git_write")` |
+| V13 | Any preflighted git argv fails `match_exec_grant` | `MissingGrant("exec:git")` or mapped exec denial |
+| V14 | Not a git repo / toplevel ≠ jail | `Git(...)` |
 | V15 | SemanticOps | `UnsupportedOp` |
-
-**FsWrite glob dialect:** identical to RFC-0006 `FsRead` expansion (literal_separator, macOS case-insensitivity, `**/` expansion). Normative examples MUST be unit-tested (`fs_write_grant_examples_table`).
+| V16 | Patch path exists as untracked (`??`) | `UntrackedPath` |
+| V17 | Tracked path matches deny-glob | `TrackedDeniedPath` |
+| V18 | Symlink at target path | `PathDenied { reason: "symlink" }` |
+| V19 | Non-regular file (dir/fifo/socket) at modify/delete target | `PathDenied { reason: "not a regular file" }` |
+| V20 | Digest caps exceeded | `DigestLimitExceeded` |
+| V21 | Token expired mid-op | `TokenExpired` |
 
 ### 5.5 `dry_run` semantics
 
-| Action | dry_run=true | dry_run=false |
+| Action | dry_run=true (`validate`) | dry_run=false (`apply`) |
 | --- | --- | --- |
-| Parse + V1–V11 | Yes | Yes |
-| V12–V14 GitWrite/git repo | **Skip** GitWrite/Exec/git repo checks | Yes |
-| PathPolicy write *authorize* (no write) | Yes | Yes |
-| Create checkpoint | **MUST NOT** | Yes |
-| Mutate files | **MUST NOT** | Yes |
-| CAS patch put as edit | **MUST NOT** | Yes |
-| Emit `EditApplied` | **MUST NOT** | Yes |
-| `ApplyPatchOutcome.transaction_id` | `None` | `Some(tx)` |
-| `files_touched` | Paths that **would** change (sorted) | Paths changed |
-| `message` | `"dry_run ok: N file(s)"` | `"applied N file(s)"` |
+| Parse + V1–V11, V16–V19 | Yes | Yes |
+| V12–V14, V17 git preflight | **Skip** | Yes |
+| Digest | **Skip** | pre + post |
+| Checkpoint | **MUST NOT** | Yes |
+| Mutate | **MUST NOT** | Yes |
+| CAS / EditApplied | **MUST NOT** | Yes |
+| `transaction_id` | `None` | `Some` |
+| `files_touched` | would-touch | touched |
+| `message` | `dry_run ok: N file(s)` | `applied N file(s)` |
 
-Dry-run context matching MUST read the current workspace (no writes). The adapter MUST invoke `EditEngine::validate`, never `apply`, when `dry_run` is true.
+The adapter MUST invoke `EditEngine::validate`, never `apply`, when `dry_run` is true. Dry-run context matching MUST read the current workspace without writes.
 
 ### 5.6 Git checkpoint backend
 
@@ -817,52 +1088,56 @@ Dry-run context matching MUST read the current workspace (no writes). The adapte
 | --- | --- |
 | Checkpoint id | `CheckpointId::new()` (UUID) |
 | Git ref | `refs/alloy/checkpoints/<uuid>` (lowercase UUID hyphenated) |
-| Create algorithm | See steps below |
-| Dirty tree | MVP MUST capture HEAD **and** working tree / index via `git stash create` |
-| Restore | `git reset --hard <sha>` then `git clean -fd -e .alloy-sbx` |
-| Sandbox | `SandboxExecRequest { argv, cwd: jail, perms: caller_token, class: ExecClass::Check }` |
-| Failure | Non-zero exit or empty unexpected stdout → `CheckpointFailed` / `Git` / `RollbackFailed` |
+| Dirty tree capture | `git stash create` (non-mutating). Empty stdout (clean tree) → use `HEAD` SHA. |
+| Restore | `git restore --source=<sha> --staged --worktree -- :/` plus unlink `created_paths`/`temp_paths` (§5.6.1) |
+| Sandbox | `SandboxExecRequest { argv, cwd: jail, perms: ctx.perms, class: ExecClass::Check }` |
+| Failure | Non-zero exit → `CheckpointFailed` / `Git` / `RollbackFailed` |
 
 **Create steps (normative):**
 
 1. `["git", "rev-parse", "--is-inside-work-tree"]` — stdout must contain `true`; else `Git("not a git repository")`.
 2. `["git", "rev-parse", "-q", "--verify", "HEAD"]` — if fails, `Git("empty repository: make initial commit")` (§15.5).
-3. `["git", "stash", "create"]` — if stdout is a 40-hex SHA, use it as `checkpoint_sha`. If stdout empty (clean tree), run `["git", "rev-parse", "HEAD"]` and use that SHA.
-4. `["git", "update-ref", "refs/alloy/checkpoints/<uuid>", "<checkpoint_sha>"]`.
-5. Persist `checkpoint_sha` on the Open tx record.
+3. Record `head_sha_at_checkpoint` from step 2 (audit only; never used to move the branch tip).
+4. `["git", "stash", "create"]` — 40-hex SHA → `checkpoint_sha`; empty stdout → `checkpoint_sha = HEAD`.
+5. `["git", "update-ref", "refs/alloy/checkpoints/<uuid>", "<checkpoint_sha>"]`.
+6. Persist `checkpoint_sha` on the Open `TxRecord`.
 
-**Restore steps (normative):**
+**ExecAllow:** resolve argv[0] like cargo via `match_exec_grant`. Tests grant `ExecAllow { binary: "git", args_glob: None }` (or a glob covering `stash`, `update-ref`, `rev-parse`, `restore`, `ls-files`, `status`).
 
-1. Read `checkpoint_sha` from tx record, or `["git", "rev-parse", "refs/alloy/checkpoints/<uuid>"]`.
-2. `["git", "reset", "--hard", "<checkpoint_sha>"]`.
-3. `["git", "clean", "-fd", "-e", ".alloy-sbx"]`.
-4. Recompute digest; compare to `pre_digest`.
+**Forbidden for checkpoints:** `git add`, `git commit`, mutating `git stash push`, `git checkout`, `git reset --hard` on the branch tip.
 
-**ExecAllow subject:** argv[0] is the path or basename resolved the same way as cargo (`match_exec_grant` / trusted PATH). Tests SHOULD grant `ExecAllow { binary: "git", args_glob: None }` or a glob that permits `stash`, `update-ref`, `rev-parse`, `reset`, `clean`.
+### 5.6.1 Untracked / deny-glob / repo-root policy
 
-**Safety:** Checkpoint create MUST NOT mutate the working tree (`stash create` is non-mutating). `git add`, `git commit`, `git stash push` (mutating), and `git checkout` MUST NOT be used for MVP checkpoints.
+Before checkpoint on the mutating path:
+
+1. `git rev-parse --show-toplevel` canonicalize → MUST equal `path_policy.jail()`.
+2. `git ls-files -z` → any path with `path_policy.deny_matches_rel` → `TrackedDeniedPath`.
+3. `git status --porcelain=v1 -uall` → for each `??` path that appears in the patch’s paths → `UntrackedPath`. Untracked paths **not** in the patch are left untouched for the whole apply/rollback.
+4. Nested `.git` directories below jail (submodules) are not walked by digest; patch paths inside submodules → `Git("submodule path not supported")`.
+
+**Restore MUST NOT** run broad `git clean -fd` over the jail (would delete untracked `.env` and user files). Restore uses:
+
+* `["git", "restore", "--source=<checkpoint_sha>", "--staged", "--worktree", "--", ":/"]` so **HEAD / current branch tip do not move**.
+* Explicit `remove_file` for each `created_paths` entry.
+* Explicit `remove_file` for each `temp_paths` entry.
+
+Record `head_sha_at_checkpoint` for audit only; never `reset --hard` to the stash commit on the branch tip.
 
 ### 5.7 Transaction registry
 
-| Field | Persistence |
-| --- | --- |
-| `id`, `checkpoint_id`, `pre_digest`, `post_digest`, `state`, `files_touched`, `patch_artifact_id`, `created_at` | Durable under `AlloyStorage` data dir: SQLite table `edit_transactions` (new) **or** a CAS JSON blob indexed by label — implementation MUST pick SQLite table in `alloy-tools` via `rusqlite` **only if** that does not require `alloy-runtime` schema migration in this RFC. Preferred: store JSON records as `ArtifactKind::Other("edit_transaction")` plus in-process map, and rely on `EditApplied` + checkpoint ref for restart recovery (§6.5). |
-
-**Normative minimum for MVP:** In-process `Mutex<HashMap<TransactionId, TxRecord>>` plus durable `EditApplied` event + checkpoint ref is sufficient if §6.5 restart recovery is implemented from events. If the process restarts mid-Open, recovery scans `refs/alloy/checkpoints/*` and session events (§6.5).
+MVP: in-process `TxRecord` map only (§4.4). Durable audit = checkpoint refs + `EditApplied`. No `edit_transactions` SQLite table in this RFC (§15.2 closed).
 
 ### 5.8 `WorkspaceDigest` computation
 
 | Rule | Value |
 | --- | --- |
-| Roots | Canonical jail from `PathPolicy` |
+| Root | `path_policy.jail()` |
 | Include | Regular files only |
-| Exclude | `.git/**`, `.alloy-sbx/**`, paths matching deny-globs, symlinks (do not follow) |
-| Encoding | For each file in ascending jail-relative path order (UTF-8, `/` sep): `path\0` + `Digest::sha256(contents).as_hex()` + `\n`; then `tree = Digest::sha256(concat)` |
-| Caps | If file_count > `max_digest_files` OR total_bytes > `max_digest_bytes` → `Io("workspace digest limit exceeded")` before mutate (or after, trigger rollback) |
-| When | Every mutating apply: pre and post. Dry-run: optional pre only; MUST NOT fail the dry-run solely because digest caps trip if validation otherwise passes — dry-run MAY skip digest (normative: **skip digest on dry_run**). |
-| Consumers | `EditTransaction`, `EditApplied` payload, rollback idempotence check (compare current tree to `pre_digest`) |
-
-A digest nothing consumed would be dead weight; these three consumers are required.
+| Exclude | `.git/**`, `.alloy-sbx/**`, deny-glob matches, temp files matching `.**.alloy-tmp-**`, symlinks (do not follow). Skip non-UTF-8 path names without hashing them. |
+| Encoding | Sorted jail-relative paths; for each: `path\0` + `Digest::sha256(contents).as_hex()` + `\n`; `tree = Digest::sha256(concat)` |
+| Caps | Exceed → `DigestLimitExceeded` **before** mutate (pre) or trigger rollback (post) |
+| When | Mutating apply: pre and post. `validate`/dry_run: **skip**. |
+| Consumers | `EditTransaction`, `EditAppliedPayload`, rollback eligibility digest check |
 
 ### 5.9 Apply mechanics (no partial commit)
 
@@ -871,51 +1146,82 @@ A digest nothing consumed would be dead weight; these three consumers are requir
 For each `FilePatch` in vector order:
 
 1. Authorize path (defensive repeat of V2–V4).
-2. If `delete == Some(true)`: require file exists (else V10); `std::fs::remove_file` on the canonical path returned by PathPolicy; continue.
-3. Load current file as UTF-8 text. Invalid UTF-8 → `Io("file not utf-8")` (MVP text-only). Missing file allowed only when the patch is a create (old side empty / no prior content expected).
-4. Split into lines **preserving** whether the file ended with `\n` (retain an explicit `trailing_newline: bool`).
-5. Apply hunks in ascending `old_start` order against the **original** line array (do not compose offsets from prior hunks’ new sides — each hunk’s `old_start` refers to the pre-patch file). Implementation MUST either (a) apply from last hunk to first, or (b) build a new buffer by streaming through old lines once — both are permitted; tests MUST cover multi-hunk files.
-6. On context/delete mismatch → `ContextMismatch` (trigger full rollback if any prior file already written).
-7. Write new bytes to ` <parent>/.<file_name>.alloy-tmp-<tx_uuid> ` (temp name MUST be deny-glob safe and inside jail).
-8. `std::fs::rename(temp, final)` atomic replace.
-9. Temp files left after failure MUST be removed during rollback restore (`git clean`) or explicit unlink in the failure path.
+2. If `FilePatch::Delete`: require file exists (else V10); `remove_file` on the PathPolicy-canonical path; record path in `files_touched`; continue.
+3. If `FilePatch::Create` / `Modify`: load current file as UTF-8 when present. Invalid UTF-8 → `Io("file not utf-8")`. Missing file allowed only for `Create`.
+4. Split into lines on `\n`, preserving `\r` in line content and `trailing_newline: bool`.
+5. Apply hunks against the **original** line array (each `old_start` is pre-patch). Implementation MUST apply last-to-first **or** stream once into a new buffer. Tests MUST cover multi-hunk files.
+6. On context/delete mismatch → `ContextMismatch` (trigger full restore if any prior file already written).
+7. Write bytes to temp `<parent>/.<file_name>.alloy-tmp-<tx_uuid>` inside the jail; record in `temp_paths`.
+8. For `Modify`, copy original permissions onto the temp before rename.
+9. `rename(temp, final)`. For `Create`, also record path in `created_paths`.
+10. Unlink temps on success; on failure, restore path handles cleanup (§5.6.1).
 
 #### 5.9.2 Atomicity guarantee
 
 | Stage | Observable workspace |
 | --- | --- |
 | Before checkpoint | Unchanged |
-| After checkpoint, before any rename | Unchanged (temp files ignored by digest excludes? **Normative:** temp files matching `.*.alloy-tmp-*` MUST be excluded from `WorkspaceDigest` and removed on success and on rollback) |
-| Mid-rename sequence failure | May contain a mix of new and old files **until** checkpoint restore completes |
-| After successful apply | All files new; temps removed |
-| After failed apply + successful restore | Bit-identical to pre-image (digest match) |
-| After failed apply + failed restore | `FailedDirty` / `RollbackFailed` — operator uses checkpoint ref |
+| After checkpoint, before renames | Unchanged aside from excluded temps |
+| Mid-rename failure | Mix of new/old until restore completes |
+| Successful apply | All target files new; temps removed |
+| Failed apply + successful restore | Digest equals `pre_digest` |
+| Failed apply + failed restore | `RollbackFailed`; checkpoint ref retained |
 
-**Partial apply is not a committed transaction.** Callers receive `Err` unless the pipeline reaches `Committed`.
+Partial apply is never a committed transaction.
+
+#### 5.9.3 Creates, parents, modes, line endings
+
+| Topic | Normative rule |
+| --- | --- |
+| Parent dirs | For `FilePatch::Create`, if parents missing: verify each relative segment is a single safe component; `create_dir_all(parent)` inside jail; then `PathPolicy::authorize(Write)` on final path. On failure → `Io` / `PathDenied`. |
+| Symlink target | If final path is a symlink → `PathDenied { reason: "symlink" }` (do not write through). |
+| File mode | For `Modify`, copy mode from the original file onto the temp before rename (`std::fs::set_permissions`). Creates use default mode `0o644` (platform-default via `OpenOptions`). |
+| fsync | MVP does **not** require `fsync` before rename. “Atomic replace” means same-directory `rename` only. |
+| Line endings | Split on `\n`; keep any `\r` in line content. Preserve original `trailing_newline`. |
+| Empty dirs after delete | MVP does **not** prune empty parent directories. |
+| Case-insensitive FS | Duplicate-path check MUST case-fold paths on macOS (same as glob case-insensitivity). |
+
 ### 5.10 SemanticOps fail closed
 
-```text
-match req {
-  EditRequest::SemanticOps { ops } if ops.is_empty() =>
-      Err(InvalidRequest("semantic_ops empty")),
-  EditRequest::SemanticOps { ops } =>
-      Err(UnsupportedOp { op: format!("{:?}", ops[0].tag()) }),
-  EditRequest::TextPatch { .. } => /* pipeline */
+```rust
+match &req {
+    EditRequest::SemanticOps { ops } if ops.is_empty() => {
+        Err(EditError::InvalidRequest("semantic_ops empty".into()))
+    }
+    EditRequest::SemanticOps { ops } => Err(EditError::UnsupportedOp {
+        op: ops[0].op_tag().to_string(), // exact serde tag, e.g. "rename_type"
+    }),
+    EditRequest::TextPatch { .. } => { /* pipeline */ }
 }
 ```
 
-Every variant listed in §3.2 MUST have a unit test asserting `UnsupportedOp`.
+Every variant in §3.2 MUST have a unit test asserting `UnsupportedOp { op }` equals that variant’s `op_tag()`.
 
-### 5.11 Rollback algorithm
+### 5.11 Rollback eligibility and algorithm
 
-1. Acquire write lock.
-2. Load `TxRecord` by `TransactionId` (memory and/or event+CAS lookup). Missing → `UnknownTransaction`.
-3. Require `GitWrite` + Exec(git).
-4. Resolve checkpoint SHA from `refs/alloy/checkpoints/<id>` (or stored sha).
-5. Sandboxed `git reset --hard` + `git clean` per §5.6.
-6. Verify current digest == `pre_digest` (warn + `RollbackFailed` if mismatch after reset).
-7. Mark tx RolledBack; emit optional decision/log span.
-8. Second rollback: if state already RolledBack and digest matches → `Ok(())`.
+**Eligible states:**
+
+| State | `rollback` behaviour |
+| --- | --- |
+| `Open` | Restore checkpoint; unlink created/temp paths; mark `RolledBack` |
+| `Committed` | Restore checkpoint; unlink created paths that still exist as the post-image creates; mark `RolledBack` |
+| `RolledBack` | If current digest == `pre_digest` → `Ok(())` (idempotent). Else → `WorkspaceDrifted` |
+
+**Drift / ordering:**
+
+* If the workspace digest differs from both `pre_digest` and `post_digest` before rollback of a `Committed` tx (user or later edit changed files) → `WorkspaceDrifted` (MUST NOT restore).
+* Rolling back an older transaction after a newer Committed transaction exists in-memory → `RollbackNotEligible` (MVP: only the latest Committed/Open tx for this engine instance is eligible unless digests still match pre and no newer tx exists).
+* After process restart, in-memory txs are gone → `UnknownTransaction` for UUID-only rollback. Operator recovery uses explicit `recover_checkpoint` test/CLI helper (§6.5) — not automatic.
+
+**Algorithm:**
+
+1. `write_lock.lock().await`; reconcile abandoned (§6.4).
+2. Load `TxRecord` by id. Missing → `UnknownTransaction`.
+3. Enforce eligibility table above.
+4. Require `GitWrite` + preflighted Exec(git) on `ctx.perms`; check expiry.
+5. Restore per §5.6.1 (`git restore --source=...`, unlink created/temps).
+6. Verify digest == `pre_digest` else `RollbackFailed`.
+7. Mark `RolledBack`; return Ok.
 
 ---
 
@@ -923,41 +1229,62 @@ Every variant listed in §3.2 MUST have a unit test asserting `UnsupportedOp`.
 
 ### 6.1 Single-writer
 
-`GitEditEngine` MUST serialize mutating `apply` / `rollback` with a `tokio::sync::Mutex`. Concurrent `apply` → `EditError::Busy` (mapped to `PatchApplyError::Internal` or `Conflict`? → **`Conflict("edit busy")`** for retryability honesty — see §8: Busy is retryable → map to `Io`? Normative: map `Busy` → `PatchApplyError::Conflict("edit busy")` so callers can back off; RFC-0010 treats Conflict as Permanent today — see §8.3 retry table).
+All of `validate` / `apply` / `rollback` MUST acquire the same `tokio::sync::Mutex<()>` (`write_lock`) with `lock().await` (fair queue). This also serializes permission use and abandon reconcile.
 
-**MVP honesty:** With `max_parallel_edits = 1` (V2 / RFC-0009), the linear scheduler will not overlap Edit nodes. The mutex is still REQUIRED as a defense in depth.
+**MVP honesty:** `max_parallel_edits = 1` (V2 / RFC-0009). The mutex is defense in depth against concurrent MCP calls.
 
 ### 6.2 Interaction with linear scheduler
 
-RFC-0010 MUST treat `max_parallel_edits = 1`. EditEngine locking does not replace that budget; it guards the write stack against tests and mistaken concurrent tool calls.
+RFC-0010 MUST treat `max_parallel_edits = 1`. EditEngine locking does not replace that budget.
 
 ### 6.3 Concurrent MCP `apply_patch` calls
 
-Host `max_in_flight` may be >1. Two concurrent `apply_patch` calls: first holds engine lock; second returns mapped `Conflict("edit busy")` quickly without mutating.
+Host `max_in_flight` may be >1. Concurrent `apply_patch` calls queue on `write_lock`. No `Busy` on the production path.
 
-### 6.4 Cancellation mid-apply
+### 6.4 Cancellation / abandon (single normative path)
 
-If the `apply` future is dropped after checkpoint creation and before commit:
+**MUST NOT** restore from `Drop` via async, `block_in_place`, or sync `Command`.
 
-* Prefer: `Drop` guard on an RAII `CheckpointGuard` that calls restore synchronously via `block_in_place` / dedicated sync git helper in `checkpoint.rs` (sandbox process module).
-* If restore cannot run on drop: tx remains Open; §6.5 recovery applies.
+Normative mechanism:
 
-Host `call_timeout` / cancel (RFC-0006 §5.11–5.12) drops the backend future; the guard MUST still run.
+1. After a successful checkpoint and **before** the first file mutation, set `abandoned = Some(AbandonedCheckpoint { ... })` on the engine.
+2. On successful commit, or on a fully-handled failure path that already restored, set `abandoned = None`.
+3. If the `apply` future is dropped mid-mutate, `abandoned` remains `Some`.
+4. At the start of the next `validate` / `apply` / `rollback` (while holding `write_lock`), call `reconcile_abandoned(&ctx.perms)`:
+   * If `abandoned` is `Some`, restore per §5.6.1 using those perms (MUST include `GitWrite` + Exec git); on success clear it; on failure return `RollbackFailed` and keep the abandon record.
+5. Dropped callers receive no return value (RFC-0006 cancel-on-drop). `EditError::Cancelled` is reserved and unused on the MVP host path.
 
-### 6.5 Restart with an open transaction
+Observable state after mid-apply timeout: workspace may be partially mutated until the next EditEngine call restores the checkpoint.
 
-On engine construction:
+### 6.5 Restart behaviour
 
-1. List `refs/alloy/checkpoints/*`.
-2. Load recent `EditApplied` events for the session (if session known).
-3. For checkpoint refs **without** a matching Committed `EditApplied` whose `checkpoint_id` matches: treat as Open → restore that checkpoint → delete or keep ref (MUST restore; MAY leave ref for audit).
-4. Committed transactions need no action (workspace already post-image).
+`GitEditEngine::new` is synchronous and performs **no** recovery.
 
-Idempotent across restarts.
+After process restart:
+
+* In-memory `TxRecord`s and `abandoned` are lost.
+* Checkpoint refs remain (audit).
+* **MUST NOT** automatically `git restore` orphan refs (would destroy later user work).
+* Explicit operator/test helper:
+
+```rust
+impl GitEditEngine {
+    /// Operator recovery: restore a checkpoint ref without a TxRecord.
+    pub async fn recover_checkpoint(
+        &self,
+        checkpoint_id: CheckpointId,
+        ctx: &EditContext,
+    ) -> Result<(), EditError>;
+}
+```
+
+`recover_checkpoint` requires GitWrite+Exec(git), verifies ref exists, runs §5.6.1 restore, does not invent a TransactionId.
+
+Committed edits after restart are evidenced by `EditApplied` in the session log + CAS artifact; no engine action required.
 
 ### 6.6 Process lifetime
 
-`GitEditEngine` lives as long as the host that holds the `Arc`. Dropping the engine MUST NOT delete checkpoint refs (audit trail).
+Engine is process-lifetime, session-agnostic (§3.5). Dropping the engine MUST NOT delete checkpoint refs.
 
 ---
 
@@ -965,14 +1292,12 @@ Idempotent across restarts.
 
 | Knob | Location | Default | Notes |
 | --- | --- | --- | --- |
-| `max_digest_files` | `GitEditEngineConfig` | `50_000` | Not `.env` |
-| `max_digest_bytes` | `GitEditEngineConfig` | `512 * 1024 * 1024` | Not `.env` |
+| `max_digest_files` | `GitEditEngineConfig::new` | `50_000` | Not `.env` |
+| `max_digest_bytes` | `GitEditEngineConfig::new` | `512 * 1024 * 1024` | Not `.env` |
 | Checkpoint ref namespace | constant | `refs/alloy/checkpoints/` | code constant |
-| Patch size cap | constant | 1 MiB | code constant |
+| Patch size cap | constant | 64 KiB (aligned to MCP args) | code constant |
 
-**MUST NOT** create or modify `.env`. If documentation needs an example variable for a future CLI knob, update `example.env` only (none required for MVP).
-
-Profile grants (`FsWrite`, `GitWrite`, `Exec` for git) are owned by RFC-0015; tests mint tokens explicitly.
+**MUST NOT** create or modify `.env`. No new `example.env` keys are required for MVP.
 
 ---
 
@@ -980,59 +1305,115 @@ Profile grants (`FsWrite`, `GitWrite`, `Exec` for git) are owned by RFC-0015; te
 
 ### 8.1 `EditError` catalog
 
-| Variant | Producer | Meaning | Retryable? | Caller visibility |
-| --- | --- | --- | --- | --- |
-| `UnsupportedOp` | apply SemanticOps | Not implemented | no | yes (sanitized) |
-| `InvalidRequest` | empty SemanticOps / bad envelope | Bad request | no | yes |
-| `InvalidPatch` | parse / structure | Malformed patch | no | yes |
-| `EmptyPatch` | V1 | No files | no | yes |
-| `PathDenied` | PathPolicy / path shape | Jail/deny/escape | no | yes (jail-relative path only) |
-| `PathNotCovered` | FsWrite glob miss | Grant gap | no | yes |
-| `MissingGrant` | GitWrite / Exec | Permission | no | yes |
-| `Conflict` | create exists / delete missing / busy | Cannot apply cleanly | **busy: yes**; others: no | yes |
-| `ContextMismatch` | hunk context | Drift | no | yes |
-| `OverlappingHunks` | validation | Bad patch | no | yes |
-| `CheckpointFailed` | git create | Fail closed pre-mutate | yes (transient git) | fixed message at MCP |
-| `RollbackFailed` | restore | Dirty failure | no | fixed / limited |
-| `UnknownTransaction` | rollback | Bad id | no | yes |
-| `Io` | filesystem | IO errors | yes | fixed at MCP |
-| `Git` | git child | Git failures | yes | fixed at MCP |
-| `Busy` | lock | Concurrent edit | yes | yes |
-| `Cancelled` | drop/timeout | Cancelled | yes | yes |
-| `Internal` | invariant | Bug | no | fixed at MCP |
+| Variant | Producer | Meaning | Retryable? |
+| --- | --- | --- | --- |
+| `UnsupportedOp` | SemanticOps | Not implemented | no |
+| `InvalidRequest` | empty SemanticOps / bad envelope | Bad request | no |
+| `InvalidPatch` | parse / structure | Malformed patch | no |
+| `EmptyPatch` | V1 | No files | no |
+| `PathDenied` | PathPolicy / symlink / path shape | Jail/deny/escape | no |
+| `PathNotCovered` | FsWrite glob miss | Grant gap | no |
+| `MissingGrant` | GitWrite / Exec | Permission | no |
+| `Conflict` | create exists / delete missing | Cannot apply cleanly | no |
+| `ContextMismatch` | hunk context | Drift | no |
+| `OverlappingHunks` | validation | Bad patch | no |
+| `UntrackedPath` | status porcelain | Untracked modify | no |
+| `TrackedDeniedPath` | ls-files ∩ deny | Secrets tracked | no |
+| `CheckpointFailed` | git create | Fail closed pre-mutate | yes |
+| `RollbackFailed` | restore | Dirty failure | no |
+| `UnknownTransaction` | rollback | Bad id | no |
+| `RollbackNotEligible` | state machine | Wrong state | no |
+| `WorkspaceDrifted` | digest check | Later edits | no |
+| `DigestLimitExceeded` | digest caps | Config/workspace too large | no |
+| `Io` | filesystem | IO errors | yes |
+| `Git` | git child | Git failures | yes |
+| `Storage` | ArtifactStore | CAS failure | yes |
+| `Event` | EventSink | Audit append failure | no |
+| `Busy` | test helper only | Concurrent try_lock | yes |
+| `Cancelled` | reserved | Cooperative cancel | yes |
+| `TokenExpired` | expiry check | Expired token | no |
+| `Internal` | invariant | Bug | no |
 
-### 8.2 Absolute path / body rule
+### 8.2 Conversions into `EditError`
 
-Engine-produced strings that reach `PatchApplyError::*` string fields MUST already be jail-relative and free of patch bodies. Host sanitize (RFC-0006 §5.9) remains the final boundary.
+```rust
+// alloy-tools::edit::map_error — normative mapping tables
+
+fn map_sandbox(err: SandboxError) -> EditError {
+    match err {
+        SandboxError::Denied(DenialReason::PathDenied(m)) =>
+            EditError::PathDenied { path: "<redacted>".into(), reason: "path denied".into() },
+        SandboxError::Denied(DenialReason::CwdOutsideJail) =>
+            EditError::Git("cwd outside jail".into()),
+        SandboxError::Denied(DenialReason::MissingExecGrant) =>
+            EditError::MissingGrant("exec".into()),
+        SandboxError::Denied(DenialReason::ExecNotAllowlisted) =>
+            EditError::MissingGrant("exec:git".into()),
+        SandboxError::Denied(DenialReason::ArgsNotAllowlisted) =>
+            EditError::MissingGrant("exec:git args".into()),
+        SandboxError::Denied(DenialReason::EnvDenied(_)) =>
+            EditError::MissingGrant("env".into()),
+        SandboxError::TokenExpired => EditError::TokenExpired,
+        SandboxError::Timeout(_) => EditError::Git("sandbox timeout".into()),
+        SandboxError::Cancelled => EditError::Cancelled,
+        SandboxError::BackendUnavailable { .. } |
+        SandboxError::BackendCannotEnforce(_) =>
+            EditError::Git("sandbox backend unavailable".into()),
+        other => EditError::Git(format!("sandbox: {other}")), // MUST redact abs paths
+    }
+}
+
+fn map_store(err: StoreError) -> EditError {
+    EditError::Storage(format!("{err}")) // redact paths
+}
+
+fn map_event(err: EventSinkError) -> EditError {
+    EditError::Event(format!("{err}"))
+}
+```
+
+Uncompilable `FsWrite` grant glob is detected in `authorize_fs_write_path` → `McpError::InvalidToken` at the host authz helper when the adapter elevates, or `EditError::InvalidRequest` if encountered inside the engine; prefer compiling globs in authz and returning `PermissionDenial` / `InvalidToken` before mutate.
 
 ### 8.3 Total mapping `EditError` → `PatchApplyError`
 
-| EditError | PatchApplyError | Retryable for RFC-0010 |
+Permission-class errors MUST become `PatchApplyError::PermissionDenied` so execute elevates to `McpError::PermissionDenied` (DecisionLog `denied=true`).
+
+| EditError | PatchApplyError | Retryable (RFC-0010) |
 | --- | --- | --- |
-| `UnsupportedOp` | `Unsupported(msg)` | no → ToolError::Permanent |
+| `UnsupportedOp` | `Unsupported(op)` | no |
 | `InvalidRequest` | `InvalidPatch(msg)` | no |
 | `InvalidPatch` | `InvalidPatch(msg)` | no |
 | `EmptyPatch` | `InvalidPatch("empty patch")` | no |
-| `PathDenied` | `InvalidPatch(msg)` | no |
-| `PathNotCovered` | `InvalidPatch(msg)` | no |
-| `MissingGrant` | `Unsupported(msg)` **or** host would have denied earlier — defensive `Unsupported` | no |
-| `Conflict` | `Conflict(msg)` | no (Permanent) |
+| `PathDenied` | `PermissionDenied(PathNotCovered("path denied"))` | no |
+| `PathNotCovered` | `PermissionDenied(PathNotCovered(path))` | no |
+| `MissingGrant(g)` | `PermissionDenied(MissingGrant(g))` | no |
+| `Conflict` | `Conflict(msg)` | no |
 | `ContextMismatch` | `Conflict(msg)` | no |
 | `OverlappingHunks` | `InvalidPatch(msg)` | no |
-| `Busy` | `Conflict("edit busy")` | **yes** — see amendment below |
-| `CheckpointFailed` | `Io(msg)` | yes (Transient io) |
+| `UntrackedPath` | `Conflict(msg)` | no |
+| `TrackedDeniedPath` | `PermissionDenied(PathNotCovered(path))` | no |
+| `CheckpointFailed` | `Io(msg)` | yes |
 | `Git` | `Io(msg)` | yes |
 | `Io` | `Io(msg)` | yes |
+| `Storage` | `Io(msg)` | yes |
 | `Cancelled` | `Io("cancelled")` | yes |
+| `DigestLimitExceeded` | `InvalidPatch(msg)` | no |
 | `RollbackFailed` | `Internal(msg)` | no |
 | `UnknownTransaction` | `InvalidPatch(msg)` | no |
+| `RollbackNotEligible` | `InvalidPatch(msg)` | no |
+| `WorkspaceDrifted` | `Conflict(msg)` | no |
+| `Event` | `Internal(msg)` | no |
+| `TokenExpired` | *(execute should not see — host checks expiry first; defensive)* `Unsupported("token expired")` | no |
+| `Busy` | `Conflict("edit busy")` | yes, but unused on production MCP path (§6.3) |
 | `Internal` | `Internal(msg)` | no |
 
-**RFC-0006 mapping note:** `Conflict` → `ToolError::Permanent` today. `Busy` is retryable in substance but maps through `Conflict`. **Open Question §15.1** records whether RFC-0010 should treat `code: "conflict"` + message `"edit busy"` as retryable, or whether a future additive `PatchApplyError` variant is needed. Until then, workers MUST NOT overlap edits (`max_parallel_edits=1`).
+**Explicit collapse:** Several distinct `EditError` variants collapse onto fewer `PatchApplyError` variants because the merged host taxonomy is closed except for the additive `PermissionDenied`. That collapse is intentional and total.
 
-### 8.4 Host boundary (unchanged behaviour)
+Engine messages MUST NEVER equal `EDIT_ENGINE_UNWIRED_MESSAGE`.
 
-Success / error sanitization per RFC-0006 §5.9 and §8.4 remains authoritative after this RFC’s adapter returns.
+### 8.4 Host boundary
+
+Success / error sanitization per RFC-0006 §5.9 and §8.4 remains authoritative after this RFC’s adapter returns, with §3.8.5 elevation for `PermissionDenied`.
 
 ---
 
@@ -1042,42 +1423,46 @@ Success / error sanitization per RFC-0006 §5.9 and §8.4 remains authoritative 
 
 | Span | Fields |
 | --- | --- |
-| `edit.apply` | `tx.id`, `dry_run`, `file_count`, `error` |
-| `edit.checkpoint` | `checkpoint_id`, `ref`, `git.exit` |
-| `edit.rollback` | `tx.id`, `checkpoint_id` |
+| `edit.validate` | `file_count`, `error` |
+| `edit.apply` | `tx.id`, `file_count`, `checkpoint_id`, `error` |
+| `edit.checkpoint` | `checkpoint_id`, `sha`, `git.exit` |
+| `edit.rollback` | `tx.id`, `checkpoint_id`, `sha`, `files_touched` |
 | `edit.digest` | `phase=pre\|post`, `file_count`, `total_bytes` |
+| `edit.reconcile_abandoned` | `checkpoint_id`, `result` |
 
 ### 9.2 Log points
 
 * info: apply committed (tx, N files, checkpoint)
-* warn: rollback invoked; digest mismatch after restore
+* warn: abandon reconcile invoked; tracked deny-glob refusal
 * error: RollbackFailed / FailedDirty
 
-MUST NOT log patch bodies or absolute paths at info. Debug MAY log jail-relative paths.
+MUST NOT log patch bodies or absolute paths at info.
 
-### 9.3 `EditApplied` session event
+### 9.3 Typed `EditApplied` payload
 
-```json
-{
-  "transaction_id": "<uuid>",
-  "checkpoint_id": "<uuid>",
-  "pre_digest": { "tree": "<hex>", "file_count": 0, "total_bytes": 0 },
-  "post_digest": { "tree": "<hex>", "file_count": 0, "total_bytes": 0 },
-  "files_touched": ["src/lib.rs"],
-  "patch_artifact_id": "<uuid>",
-  "patch_content_hash": "<sha256 hex>",
-  "request_kind": "text_patch"
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditAppliedPayload {
+    pub schema: String, // must be "alloy.edit_applied.v1"
+    pub transaction_id: TransactionId,
+    pub checkpoint_id: CheckpointId,
+    pub checkpoint_sha: String,
+    pub pre_digest: WorkspaceDigest,
+    pub post_digest: WorkspaceDigest,
+    pub files_touched: Vec<String>,
+    pub patch_artifact_id: ArtifactId,
+    /// Digest::sha256 of canonical PatchSet JSON (same as artifact meta.digest).
+    pub patch_content_hash: Digest,
+    pub request_kind: EditRequestKind,
 }
 ```
 
 | Rule | Value |
 | --- | --- |
-| `type` | `SessionEventType::EditApplied` |
-| `session_id` / `run_id` | from engine config |
-| Patch body in payload | **MUST NOT** include (RFC-0004 default) |
-| Reconstruct “what changed” | Load CAS artifact by `patch_artifact_id` when operators opt into retention; otherwise hash + files_touched + digests suffice to detect drift |
-
-MCP `ToolCall` decision log entries continue to be written by the host (RFC-0006); EditApplied is **additional** and owned by EditEngine.
+| Event type | `SessionEventType::EditApplied` |
+| Body in payload | **MUST NOT** include patch bytes |
+| When `session_id` is `None` | Skip event; still CAS-put; still return success |
+| Reconstruct changes | Event metadata + CAS get(`patch_artifact_id`) |
 
 ---
 
@@ -1085,22 +1470,20 @@ MCP `ToolCall` decision log entries continue to be written by the host (RFC-0006
 
 ### 10.1 New dependencies
 
-| Crate | Where | Licence | Justification |
-| --- | --- | --- | --- |
-| *(none required for MVP parse)* | — | — | Implement unified-diff parse in `patch_parse.rs` (~few hundred LOC) to avoid dialect surprises and keep fail-closed validation with distinct errors. |
-| Optional: `diffy` | `alloy-tools` | MIT/Apache-2.0 | **Only if** Phase B prefers a crate; MUST still wrap with §5.4 validation. Default decision: **in-tree parser** — no new dep. |
+| Crate | Decision |
+| --- | --- |
+| Diff/patch crates (`diffy`, `patch`, …) | **Do not add.** In-tree unified-diff parser in `patch_parse.rs`. |
+| `git2` / `libgit2` / `gix` | **Do not add.** Invoke `git` binary via SandboxBroker. |
 
-**No `git2` / `libgit2`.** Git is invoked as the `git` binary under `SandboxBroker` (ADR F-24 operational simplicity; matches cargo path).
-
-Existing deps reused: `async-trait`, `serde`, `serde_json`, `thiserror`, `tokio`, `tracing`, `uuid`, `sha2`/`Digest` via alloy-runtime, `globset` (FsWrite matching).
+Reuse: `async-trait`, `serde`, `serde_json`, `thiserror`, `tokio`, `tracing`, `uuid`, runtime `Digest`, `globset`.
 
 ### 10.2 `unsafe`
 
-`alloy-runtime` and `alloy-tools` remain `#![forbid(unsafe_code)]`. Git/process isolation stays inside existing sandbox backends.
+`alloy-runtime` and `alloy-tools` remain `#![forbid(unsafe_code)]`.
 
 ### 10.3 Clippy `Command` ban
 
-Git argv MUST be spawned only through `SandboxBroker` → `sandbox::process` (the allowed seam). Edit modules MUST NOT call `Command::new` directly.
+Git argv MUST be spawned only through `SandboxBroker` → `sandbox::process`. Edit modules MUST NOT call `Command::new` directly.
 
 ---
 
@@ -1110,48 +1493,61 @@ Git argv MUST be spawned only through `SandboxBroker` → `sandbox::process` (th
 
 | Test | Asserts |
 | --- | --- |
-| `textpatch_apply_modifies_file` | File content changes; checkpoint ref exists |
-| `rollback_restores_preimage` | Content + digest match pre |
-| `rollback_idempotent` | Second rollback Ok |
+| `textpatch_apply_modifies_file` | File bytes change; checkpoint ref exists; HEAD/branch tip unchanged |
+| `textpatch_multi_hunk_file` | Multi-hunk apply correct |
+| `textpatch_create_and_delete` | Create parents; delete removes file |
+| `rollback_restores_preimage` | Content + digest match pre; HEAD unchanged |
+| `rollback_idempotent` | Second rollback Ok when digest matches |
+| `rollback_rejects_drift` | `WorkspaceDrifted` after unrelated edit |
 | `overlapping_hunks_rejected` | `OverlappingHunks` |
 | `context_mismatch_rejected` | `ContextMismatch` |
-| `path_escape_rejected` | `..`, absolute, `.env` → `PathDenied` |
-| `fs_write_grant_examples_table` | Glob table like fs_read |
+| `path_escape_rejected` | `..`, absolute → `PathDenied` |
+| `dotenv_denied` | `.env` → PathDenied; rollback does not delete untracked `.env` |
+| `fs_write_grant_examples_table` | Glob table |
+| `missing_git_write_denied` | PermissionDenied elevation |
+| `missing_exec_git_denied` | MissingGrant exec:git |
+| `untracked_modify_rejected` | `UntrackedPath` |
+| `tracked_denied_path_rejected` | `TrackedDeniedPath` |
+| `repo_not_jail_rejected` | nested git root ≠ jail |
 | `dry_run_no_mutate_no_checkpoint` | Tree unchanged; no new refs; `transaction_id=None` |
 | `empty_patch_rejected` | `EmptyPatch` |
-| `semantic_ops_all_variants_unsupported` | each variant |
-| `checkpoint_before_mutate` | On apply failure after forced IO error, tree restored |
-| `busy_second_writer` | Concurrent apply → Busy/Conflict |
+| `patch_too_large_rejected` | size cap |
+| `binary_and_rename_rejected` | InvalidPatch |
+| `semantic_ops_all_variants_unsupported` | each `op_tag()` |
+| `checkpoint_before_mutate` | failure restores |
+| `preserve_mode_and_trailing_newline` | mode + EOF newline |
+| `abandon_reconcile_on_next_call` | drop mid-apply → next validate/apply restores |
+| `digest_limit_exceeded` | `DigestLimitExceeded` |
 
 ### 11.2 Adapter / MCP mapping
 
 | Test | Asserts |
 | --- | --- |
-| `backend_maps_edit_errors` | §8.3 table |
-| `message_never_has_abs_path` | sanitize invariants |
-| `stub_still_unwired` | Stub behaviour unchanged |
+| `backend_maps_edit_errors` | §8.3 table including PermissionDenied elevation |
+| `message_never_has_abs_path` | sanitize |
+| `message_never_equals_unwired_stub` | inequality |
+| `stub_still_unwired` | stub + new signature |
+| `wire_shapes_string_and_files_object` | both decode paths |
 
-### 11.3 Cross-subsystem (`crates/alloy-tools/tests/cross_subsystem.rs`)
+### 11.3 Cross-subsystem
 
-**Precedent:** existing suite wires real runtime + SQLite + sandbox + MCP host with `StubPatchApplyBackend`.
+Update `crates/alloy-tools/tests/cross_subsystem.rs` (or add `cross_subsystem_edit.rs`):
 
-**Normative update:** add a test (new function in the same file or `cross_subsystem_edit.rs`) that:
+1. Temp **git** workspace inside jail (`git init` + initial commit) — hermetic.
+2. Inject `EditEnginePatchBackend` / `GitEditEngine` (not stub) using §3.10 constructor.
+3. `apply_patch` via host with FsWrite+GitWrite+Exec(git).
+4. Assert file changed; checkpoint ref exists; **HEAD and branch tip unchanged**; `EditApplied` in SQLite; CAS meta present.
+5. `rollback` restores file; digest matches pre.
+6. Negative: concurrent second apply queues then succeeds or runs serially (no Busy required).
 
-1. Builds a temp **git** workspace inside the jail (`git init` + initial commit) — hermetic.
-2. Injects `EditEnginePatchBackend` wrapping `GitEditEngine` (not stub).
-3. Calls `apply_patch` through `InProcessMcpHost` / `ToolHandle` with FsWrite+GitWrite+Exec(git) grants.
-4. Asserts: target file bytes changed; `refs/alloy/checkpoints/<id>` exists; `SessionEventType::EditApplied` readable from SQLite; CAS artifact meta present.
-5. Calls `EditEngine::rollback` and asserts file restored.
+Stub-based durability tests remain valid.
 
-**Hermetic rules:** no network; use `NativeSandboxBroker` with skip-if-unavailable pattern already in the suite; git binary from PATH via ExecAllow; fake cargo still fine for unrelated tests.
-
-Stub-based tests in the same file **remain** valid for ToolCall durability without edits.
-
-### 11.4 Restart recovery
+### 11.4 Restart / recovery
 
 | Test | Asserts |
 | --- | --- |
-| `open_tx_recover_on_new_engine` | Create checkpoint, kill mid-apply (simulated), new engine restores |
+| `recover_checkpoint_explicit` | After simulated restart (new engine), `recover_checkpoint` restores; no auto-restore on `new` |
+| `orphan_ref_not_auto_restored` | New engine leaves orphan ref untouched |
 
 ---
 
@@ -1159,53 +1555,63 @@ Stub-based tests in the same file **remain** valid for ToolCall durability witho
 
 ### 12.1 MVP
 
-TextPatch apply + git checkpoint + rollback; MCP wiring; digests; EditApplied; SemanticOps fail closed; fine-grained FsWrite; GitWrite gate; single-writer; dry_run; cross-subsystem test.
+TextPatch apply + git checkpoint + rollback; `validate` dry-run; MCP wiring + §3.8 amendments; digests; typed EditApplied; SemanticOps fail closed; fine-grained FsWrite; GitWrite gate; single-writer lock; abandon reconcile; cross-subsystem test.
 
 ### 12.2 Deferred
 
 | Item | Owner |
 | --- | --- |
 | SemanticEditOp lowering / RenameType via RA | Future / M3 |
-| OverlayFS / snapshot bundles | Forbidden (V2 kill list) |
+| OverlayFS / snapshot bundles | Forbidden |
 | Compile verification | **RFC-0010** |
 | EditWorker patch production | **RFC-0013** |
 | Freeform FS writes | **RFC-0015** |
-| `ExecClass::Git` | Not required; revisit only via amendment |
-| `PatchApplyError::Busy` variant | §15.1 |
-| Patch body retention defaults change | RFC-0004 flags only |
+| `ExecClass::Git` | Not required |
+| Dedicated `edit_transactions` SQL table | Future amendment if needed |
+| Raising MCP 64 KiB args cap | RFC-0006 amendment if ever required |
+| MCP rollback tool | Not in MVP |
 
 ---
 
 ## 13. Acceptance Criteria
 
-Every criterion is independently testable.
+Every criterion is independently testable by a named test or mechanical check.
 
 | # | Criterion | Proof |
 | --- | --- | --- |
-| 1 | `StubPatchApplyBackend` is **not** the wired default in production/integration constructors documented in §3.10; cross-subsystem edit test injects `EditEnginePatchBackend` | code + test |
-| 2 | TextPatch apply changes file bytes on a temp git repo | unit |
-| 3 | Checkpoint ref `refs/alloy/checkpoints/<uuid>` exists after mutating apply | unit |
-| 4 | `rollback` restores pre-image; second rollback Ok | unit |
-| 5 | dry_run mutates nothing and creates no checkpoint; `transaction_id=None` | unit |
-| 6 | Overlapping hunks → `OverlappingHunks` / mapped InvalidPatch | unit |
-| 7 | Context mismatch → `ContextMismatch` / Conflict | unit |
-| 8 | Path with `..` or absolute → PathDenied; never escapes jail | unit |
-| 9 | `.env` path denied | unit |
-| 10 | Empty patch → EmptyPatch | unit |
-| 11 | Every `SemanticEditOp` variant → UnsupportedOp | unit |
-| 12 | Missing GitWrite on mutating apply → denied | unit |
-| 13 | Fine-grained FsWrite miss → PathNotCovered | unit |
-| 14 | `EditApplied` event in SQLite with digests + checkpoint_id + hash (no body) | cross-subsystem |
-| 15 | CAS `ArtifactKind::Patch` meta exists for committed apply | cross-subsystem |
-| 16 | Partial apply failure restores checkpoint | unit |
-| 17 | No OverlayFS types/modules introduced | `rg` |
-| 18 | No sixth crate; forbid(unsafe_code) retained | Cargo.toml / attrs |
-| 19 | Never writes `.env` | unit + `rg` |
-| 20 | `PatchApplyBackend::apply` takes `perms` per §3.8; stub updated | compile |
-| 21 | Scheduler-facing docs in §2.5 state EditEngine is not called by RFC-0010 | review |
-| 22 | `ApplyPatchOutcome.message` has no abs paths / patch bodies | unit |
-| 23 | WorkspaceDigest pre/post present on committed `EditTransaction` | unit |
-| 24 | Concurrent apply → Busy mapped per §8.3 | unit |
+| 1 | Cross-subsystem edit test injects `EditEnginePatchBackend`, not stub (§3.10 / §11.3) | test |
+| 2 | TextPatch apply changes file bytes | unit |
+| 3 | Checkpoint ref exists after mutating apply; HEAD/branch tip unchanged | unit |
+| 4 | `rollback` restores pre-image; idempotent when digest matches; rejects drift | unit |
+| 5 | dry_run → `validate` only; no mutate/checkpoint; `transaction_id=None` | unit |
+| 6 | Overlapping hunks rejected | unit |
+| 7 | Context mismatch rejected | unit |
+| 8 | Path escape rejected | unit |
+| 9 | `.env` write denied; rollback does not delete untracked `.env` | unit |
+| 10 | Empty patch rejected | unit |
+| 11 | Every SemanticEditOp → UnsupportedOp with exact `op_tag` | unit |
+| 12 | Missing GitWrite on mutating prepare → `PermissionDenied(MissingGrant("git_write"))` | unit |
+| 13 | Fine-grained FsWrite miss → PermissionDenied elevation | unit |
+| 14 | Missing Exec(git) preflight → denied before mutate | unit |
+| 15 | `EditApplied` in SQLite with typed payload fields; no body | cross-subsystem |
+| 16 | CAS Patch artifact exists; hash matches payload | cross-subsystem |
+| 17 | Partial apply failure restores checkpoint | unit |
+| 18 | Abandon-on-drop reconciled on next call | unit |
+| 19 | `new` does not auto-restore orphan refs; `recover_checkpoint` works | unit |
+| 20 | Untracked modify rejected; create+rollback unlinks created paths | unit |
+| 21 | Repo toplevel ≠ jail rejected | unit |
+| 22 | Empty/unborn HEAD rejected with exact message | unit |
+| 23 | Binary/rename-copy rejected | unit |
+| 24 | Digest limit exceeded → DigestLimitExceeded before mutate | unit |
+| 25 | Mode + trailing newline preserved on modify | unit |
+| 26 | String and `{files:[...]}` wire shapes both work | unit |
+| 27 | No OverlayFS; no sixth crate; forbid(unsafe_code) | `rg` / attrs |
+| 28 | Never writes `.env` | unit + `rg` |
+| 29 | `PatchApplyBackend::apply` has perms+session+run; stub updated | compile |
+| 30 | Engine messages ≠ unwired stub string | unit |
+| 31 | WorkspaceDigest pre/post on committed transaction | unit |
+| 32 | CAS/event failure after mutate triggers rollback (before EditApplied) | unit |
+| 33 | Single glob-expansion implementation shared by FsRead/FsWrite | `rg` / unit |
 
 ---
 
@@ -1228,54 +1634,48 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 
 ## 15. Open Questions
 
-Genuine unresolved implementation questions only.
-
 ### 15.1 Retryability of `edit busy`
 
-RFC-0006 maps all `PatchApplyError::Conflict` to `ToolError::Permanent`. Engine `Busy` maps to `Conflict("edit busy")` but is operationally retryable. Options: (a) accept Permanent under `max_parallel_edits=1`; (b) additive `PatchApplyError::Busy` + host map to Transient. **Recommendation for batched cleanup:** (a) for MVP; revisit if concurrent tools appear.
+Production path queues on `write_lock` (§6.3); `Busy` is test-helper-only. **Closed for MVP:** no host Transient mapping required. Revisit only if a non-blocking MCP admission policy is introduced.
 
 ### 15.2 Transaction durability store
 
-§5.7 permits in-process map + events/CAS versus a dedicated SQLite table. Prefer events/CAS to avoid `alloy-runtime` schema migration in this RFC. Confirm at implementation if `AlloyStorage` should grow an `edit_transactions` table via additive RFC-0002 amendment.
+**Closed for MVP:** in-process `TxRecord` map + checkpoint refs + `EditApplied` (§4.4 / §5.7). No SQL table in this RFC.
 
 ### 15.3 Proposed index metadata (do not edit README in this PR)
-
-Recorded for batched cleanup (RFC-0010 authored in parallel):
 
 | Field | Current README | Proposed |
 | --- | --- | --- |
 | Status | Draft | Draft (unchanged until Phase B) |
-| Depends on | 0001, 0005, 0006 | 0001, 0005, 0006 (+ soft: 0002 events/CAS, 0004 retention) |
-| Effort | 4–6 pd | 4–6 pd (unchanged) |
+| Depends on | 0001, 0005, 0006 | 0001, 0005, 0006 (soft: 0002 CAS/events, 0004 retention) |
+| Effort | 4–6 pd | 4–6 pd (unchanged); risk concentrated in git checkpoint slice |
 
-### 15.4 `git stash create` availability
+### 15.4 Git version
 
-Requires a git version supporting `stash create`. Minimum git version to document in implementation notes: **2.20+**. If missing → `CheckpointFailed` with clear message.
+Require `git stash create` (git ≥ 2.13 sufficient; document **≥ 2.20** for CI images). Probe failure → `CheckpointFailed` with stderr summary (redacted).
 
-### 15.5 Unborn HEAD / empty repo
+### 15.5 Empty / unborn HEAD
 
-Empty repo with no commits: checkpoint MUST create an empty-tree commit via sandboxed git (`git hash-object` / `git mktree` / `git commit-tree`) **or** refuse with `Git("empty repository: make initial commit")`. **Recommendation:** refuse with explicit error for MVP simplicity (tests always create an initial commit).
+**Closed for MVP:** refuse with `Git("empty repository: make initial commit")`. Tests always create an initial commit.
 
 ---
 
 ## 16. Estimated Implementation Effort
 
-**Total: 4–6 person-days.**
+**Total: 4–6 person-days** (stretch to 6 if sandbox+git edge cases dominate).
 
 | Slice | Work | Effort | Depends on |
 | --- | --- | --- | --- |
-| A | `alloy-runtime::edit` types + trait + error + exports | 0.5–1 pd | — |
+| A | `alloy-runtime::edit` types/trait/error/exports | 0.5–1 pd | — |
 | B | Unified diff parse + PatchSet validation | 1 pd | A |
-| C | PathPolicy apply + atomic writes + digest | 1 pd | A, B |
-| D | Git checkpoint/restore via SandboxBroker Check | 1 pd | A |
-| E | `GitEditEngine` state machine + tx/rollback | 1 pd | B–D |
-| F | `EditEnginePatchBackend` + RFC-0006 signature/prepare amendments | 0.5 pd | E |
-| G | Observability EditApplied + CAS | 0.5 pd | E |
+| C | PathPolicy apply + atomic writes + digest + deny accessor | 1 pd | A, B |
+| D | Git checkpoint/restore via SandboxBroker Check + repo/deny/untracked guards | 1–1.5 pd | A, C |
+| E | `GitEditEngine` state machine + abandon reconcile + rollback eligibility | 1 pd | B–D |
+| F | `EditEnginePatchBackend` + RFC-0006 amendments (signature, authz, prepare, execute) | 0.5–1 pd | E |
+| G | EditApplied payload + CAS labels | 0.5 pd | E |
 | H | Unit tests + cross-subsystem edit test | 1 pd | F, G |
 
-**Sequencing:** A → B ∥ D → C → E → F → G → H.
-
-**Risks:** git dirty-tree capture edge cases; Landlock + git on CI; digest cost on huge trees (caps mitigate).
+**Sequencing:** A → B → C → D → E → F → G → H. Slice D is highest risk and is **not** parallel with C after path/deny accessors land.
 
 ---
 
@@ -1283,9 +1683,9 @@ Empty repo with no commits: checkpoint MUST create an empty-tree commit via sand
 
 | Mode | FsWrite | GitWrite | Exec(git) |
 | --- | --- | --- | --- |
-| dry_run | required (≥1) | not required | not required |
-| mutating apply | required + path match | required | required |
-| rollback | not via MCP | required | required |
+| dry_run / validate | required (≥1) + path match | not required | not required |
+| mutating apply | required + path match | required | required (all argv shapes preflighted) |
+| rollback / recover_checkpoint / reconcile | path N/A | required | required |
 
 ## Appendix B — Single write stack diagram
 
@@ -1300,8 +1700,8 @@ sequenceDiagram
 
   W->>H: call(apply_patch, perms)
   H->>H: FsWrite + GitWrite gate
-  H->>B: apply(args, perms)
-  B->>E: apply(TextPatch)
+  H->>B: apply(args, perms, session, run)
+  B->>E: apply(TextPatch, EditContext)
   E->>E: validate + pre_digest
   E->>S: exec(git stash create / update-ref) Check
   S-->>E: checkpoint sha
@@ -1324,7 +1724,7 @@ This document **replaces** the prior outline in full. The placeholder state mach
 | `-` | consumed / must match | omitted |
 | `+` | omitted | inserted |
 
-Counts in the hunk header MUST equal the number of old-side lines (` ` + `-`) and new-side lines (` ` + `+`). Mismatch → `InvalidPatch("hunk line count")` at validation, before any write.
+Header counts MUST equal old-side (` ` + `-`) and new-side (` ` + `+`) line tallies.
 
 ## Appendix E — Rollback sequence
 
@@ -1333,30 +1733,23 @@ sequenceDiagram
   participant C as Caller
   participant E as GitEditEngine
   participant S as SandboxBroker
-  participant FS as Workspace
 
-  C->>E: rollback(tx)
-  E->>E: load TxRecord / resolve ref
-  E->>S: git reset --hard <sha> (Check)
-  S-->>E: exit 0
-  E->>S: git clean -fd -e .alloy-sbx (Check)
-  S-->>E: exit 0
-  E->>FS: recompute digest
-  alt digest == pre_digest
-    E-->>C: Ok(())
-  else mismatch
-    E-->>C: Err(RollbackFailed)
-  end
+  C->>E: rollback(tx, ctx)
+  E->>E: eligibility + drift checks
+  E->>S: git restore --source=sha --staged --worktree -- :/
+  E->>E: unlink created_paths + temp_paths
+  E->>E: digest == pre_digest?
+  E-->>C: Ok or RollbackFailed / WorkspaceDrifted
 ```
 
-## Appendix F — Error string constants (stable where required)
+## Appendix F — Error string constants
 
-| Situation | Exact / prefix |
+| Situation | Exact string |
 | --- | --- |
-| Stub unwired (unchanged) | `edit_engine_unwired: apply_patch requires RFC-0008 EditEngine` |
+| Stub unwired | `edit_engine_unwired: apply_patch requires RFC-0008 EditEngine` |
 | Empty patch | `empty patch` |
 | Edit busy | `edit busy` |
 | Dry-run message | `dry_run ok: {N} file(s)` |
 | Apply message | `applied {N} file(s)` |
-
-Stub message and code remain byte-identical to RFC-0006 / `EDIT_ENGINE_UNWIRED_*` on `main`.
+| Empty repo | `empty repository: make initial commit` |
+| Jail mismatch | `repository root is not the workspace jail` |
