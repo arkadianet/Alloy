@@ -69,7 +69,7 @@ Nine RFCs and ~40k lines of source exist on `main`, and **nothing yet writes to 
 1. Production wiring MUST inject `Arc<EditEnginePatchBackend>` (wrapping a live `GitEditEngine`) into `InProcessMcpHost::new` — **not** `StubPatchApplyBackend`. Tests MAY still construct the stub explicitly.
 2. `EditEngine::apply(EditRequest::TextPatch { .. })` MUST: validate → compute `pre_digest` → create git checkpoint → apply patch under PathPolicy → compute `post_digest` → persist transaction metadata → emit `EditApplied` → return `EditTransaction` with `checkpoint_id = Some(...)`.
 3. `EditEngine::apply(EditRequest::SemanticOps { .. })` MUST return `Err(EditError::UnsupportedOp { .. })` for **every** variant and every non-empty ops list. Empty ops list MUST return `Err(EditError::InvalidRequest("semantic_ops empty"))`.
-4. `ApplyPatchArgs.dry_run == true` MUST validate the patch (parse, paths, grants, context match) and MUST NOT mutate the workspace, MUST NOT create a checkpoint, MUST NOT write CAS patch bytes as a committed edit, MUST NOT emit `EditApplied`, and MUST return `transaction_id: None`.
+4. `ApplyPatchArgs.dry_run == true` MUST call `EditEngine::validate` only: it MUST NOT mutate the workspace, MUST NOT create a checkpoint, MUST NOT write CAS patch bytes as a committed edit, MUST NOT emit `EditApplied`, and MUST return `transaction_id: None`.
 5. A partially-applied patch MUST NOT be observable as a committed edit. On apply failure after checkpoint, the engine MUST restore the checkpoint before returning `Err`. If restore fails, return `Err(EditError::RollbackFailed { .. })` and leave the checkpoint ref intact for operator recovery.
 6. `rollback(tx)` MUST restore the checkpoint for a known committed or open transaction and MUST be idempotent (second call succeeds with no further tree change).
 7. Every rejection path in §5.4 MUST map to a distinct `EditError` variant; the MCP adapter MUST apply the total mapping in §8.3 to `PatchApplyError`.
@@ -809,7 +809,7 @@ When storing to CAS, serialize `PatchSet` with `serde_json::to_vec` using **sort
 | `files_touched` | Paths that **would** change (sorted) | Paths changed |
 | `message` | `"dry_run ok: N file(s)"` | `"applied N file(s)"` |
 
-Dry-run context matching MUST read the current workspace (no writes).
+Dry-run context matching MUST read the current workspace (no writes). The adapter MUST invoke `EditEngine::validate`, never `apply`, when `dry_run` is true.
 
 ### 5.6 Git checkpoint backend
 
