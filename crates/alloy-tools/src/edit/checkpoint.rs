@@ -9,12 +9,16 @@ use alloy_runtime::{CheckpointId, EditError, FilePatch, Grant, PatchSet, Permiss
 
 use crate::edit::map_error::map_sandbox;
 use crate::edit::patch_parse::is_digest_excluded_path;
+use crate::redact::redacted_snippet;
 use crate::sandbox::grant::match_exec_grant;
 use crate::sandbox::{ExecClass, PathPolicy, SandboxBroker, SandboxExecRequest, SandboxExecResult};
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 const PLACEHOLDER_UUID: &str = "00000000-0000-0000-0000-000000000000";
 const STDOUT_TRUNCATED: &str = "git stdout truncated; raise sandbox stdout_cap";
+
+/// Cap on the stderr text carried in an [`EditError`] detail.
+const MAX_STDERR_SNIPPET_BYTES: usize = 200;
 
 /// Created checkpoint metadata.
 #[derive(Debug, Clone)]
@@ -86,7 +90,12 @@ pub(crate) async fn create_checkpoint(
     head_sha: &str,
     tracked: BTreeSet<String>,
 ) -> Result<CreatedCheckpoint, EditError> {
-    let stash = git_stdout(broker, policy, perms, &["stash", "create"]).await?;
+    // Everything from here is checkpoint creation, not repo probing: a failing
+    // `stash create` is `CheckpointFailed`, never `Git`.
+    let stash = git_stdout_or(broker, policy, perms, &["stash", "create"], |result| {
+        EditError::CheckpointFailed(with_stderr("stash create failed", result))
+    })
+    .await?;
     let checkpoint_sha = if stash.trim().is_empty() {
         head_sha.to_string()
     } else {
@@ -104,7 +113,10 @@ pub(crate) async fn create_checkpoint(
     )
     .await?;
     if result.exit_code != Some(0) {
-        return Err(EditError::CheckpointFailed("checkpoint ref exists".into()));
+        return Err(EditError::CheckpointFailed(with_stderr(
+            "checkpoint ref exists",
+            &result,
+        )));
     }
     Ok(CreatedCheckpoint {
         checkpoint_sha,
@@ -123,7 +135,10 @@ pub(crate) async fn resolve_checkpoint(
     let reference = checkpoint_ref(id);
     let result = git_exec(broker, policy, perms, &["rev-parse", &reference]).await?;
     if result.exit_code != Some(0) {
-        return Err(EditError::Git("checkpoint ref not found".into()));
+        return Err(EditError::Git(with_stderr(
+            "checkpoint ref not found",
+            &result,
+        )));
     }
     stdout_string(&result).map(|s| s.trim().to_string())
 }
@@ -147,7 +162,9 @@ pub(crate) async fn restore_checkpoint(
     )
     .await?;
     if result.exit_code != Some(0) {
-        return Err(EditError::Git("restore failed".into()));
+        // The engine wraps this into `RollbackFailed`, so the snippet is what an
+        // operator sees when a restore leaves the tree dirty.
+        return Err(EditError::Git(with_stderr("restore failed", &result)));
     }
     for rel in created_paths.iter().chain(temp_paths.iter()) {
         if policy.deny_matches_rel(rel) {
@@ -184,7 +201,7 @@ pub(crate) async fn tracked_set(
 ) -> Result<BTreeSet<String>, EditError> {
     let result = git_exec(broker, policy, perms, &["ls-files", "-z"]).await?;
     if result.exit_code != Some(0) {
-        return Err(EditError::Git("ls-files failed".into()));
+        return Err(EditError::Git(with_stderr("ls-files failed", &result)));
     }
     if result.stdout_truncated {
         return Err(EditError::Environment(STDOUT_TRUNCATED.into()));
@@ -247,7 +264,12 @@ async fn ensure_git_version(
     policy: &PathPolicy,
     perms: &PermissionToken,
 ) -> Result<(), EditError> {
-    let out = git_stdout(broker, policy, perms, &["--version"]).await?;
+    // An unusable git is an environment problem, including when the probe itself
+    // fails: `Git` is reserved for a working git refusing an operation.
+    let out = git_stdout_or(broker, policy, perms, &["--version"], |result| {
+        EditError::Environment(with_stderr("git --version failed", result))
+    })
+    .await?;
     if parse_git_version(&out)
         .is_some_and(|(major, minor)| major > 2 || (major == 2 && minor >= 23))
     {
@@ -262,17 +284,30 @@ async fn ensure_inside_work_tree(
     policy: &PathPolicy,
     perms: &PermissionToken,
 ) -> Result<(), EditError> {
-    let inside = git_stdout(
+    let not_a_repo = |result: &SandboxExecResult| {
+        EditError::Environment(with_stderr("not a git repository", result))
+    };
+    let inside = git_stdout_or(
         broker,
         policy,
         perms,
         &["rev-parse", "--is-inside-work-tree"],
+        not_a_repo,
     )
     .await?;
     if inside.trim() != "true" {
         return Err(EditError::Environment("not a git repository".into()));
     }
-    let top = git_stdout(broker, policy, perms, &["rev-parse", "--show-toplevel"]).await?;
+    let top = git_stdout_or(
+        broker,
+        policy,
+        perms,
+        &["rev-parse", "--show-toplevel"],
+        not_a_repo,
+    )
+    .await?;
+    // `PathPolicy::from_profile` canonicalizes the jail (RFC-0005 §3.6), so only
+    // git's answer needs resolving before the two are compared.
     let top = PathBuf::from(top.trim())
         .canonicalize()
         .map_err(|_| EditError::Environment("repo toplevel != jail".into()))?;
@@ -382,11 +417,48 @@ async fn git_stdout(
     perms: &PermissionToken,
     tail: &[&str],
 ) -> Result<String, EditError> {
+    git_stdout_or(broker, policy, perms, tail, |result| {
+        EditError::Git(with_stderr("git command failed", result))
+    })
+    .await
+}
+
+/// Run git, require exit 0, and classify a non-zero exit through `on_failure`.
+///
+/// Callers pick the taxonomy: a probe that fails because the environment is
+/// unusable is `Environment`, a checkpoint step that fails is `CheckpointFailed`,
+/// and only a working git refusing an operation is `Git` (RFC-0008 §5.4).
+async fn git_stdout_or<F>(
+    broker: &dyn SandboxBroker,
+    policy: &PathPolicy,
+    perms: &PermissionToken,
+    tail: &[&str],
+    on_failure: F,
+) -> Result<String, EditError>
+where
+    F: FnOnce(&SandboxExecResult) -> EditError,
+{
     let result = git_exec(broker, policy, perms, tail).await?;
     if result.exit_code != Some(0) {
-        return Err(EditError::Git("git command failed".into()));
+        return Err(on_failure(&result));
     }
     stdout_string(&result)
+}
+
+/// `message`, plus git's stderr when it said anything useful.
+///
+/// Absolute paths are redacted and the text is capped, so the detail is safe to
+/// surface through `apply_patch` while still naming the actual git complaint.
+fn with_stderr(message: &str, result: &SandboxExecResult) -> String {
+    let snippet = redacted_snippet(
+        &String::from_utf8_lossy(&result.stderr),
+        MAX_STDERR_SNIPPET_BYTES,
+    );
+    if snippet.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}: {snippet}")
+    }
 }
 
 async fn git_exec(
@@ -524,6 +596,31 @@ mod tests {
             assert!(argv.windows(2).any(|w| w == ["-c", "filter.lfs.process="]));
             assert!(!argv.iter().any(|a| a == "--stdin"));
         }
+    }
+
+    #[test]
+    fn stderr_snippet_is_redacted_capped_and_optional() {
+        let result = SandboxExecResult::synthetic(
+            Some(128),
+            None,
+            SandboxBackend::Landlock,
+            alloy_runtime::Digest::sha256(b"policy"),
+        );
+        assert_eq!(with_stderr("restore failed", &result), "restore failed");
+
+        let with_paths = result.clone().with_stdio(
+            Vec::new(),
+            b"fatal: unable to write /home/op/repo/.git/index\n".to_vec(),
+        );
+        assert_eq!(
+            with_stderr("restore failed", &with_paths),
+            "restore failed: fatal: unable to write <path>"
+        );
+
+        let long = result.with_stdio(Vec::new(), vec![b'x'; MAX_STDERR_SNIPPET_BYTES * 2]);
+        let detail = with_stderr("restore failed", &long);
+        assert!(detail.len() <= "restore failed: ".len() + MAX_STDERR_SNIPPET_BYTES + 3);
+        assert!(detail.ends_with("..."));
     }
 
     #[test]
