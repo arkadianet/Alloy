@@ -758,7 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_plan_generation_mismatch() {
-        let (_dir, _storage, svc, _) = service().await;
+        let (_dir, storage, svc, _) = service().await;
         let ctx = plan_ctx(SessionId::new(), RunId::new(), DagId::new());
         svc.plan(ctx.clone()).await.unwrap();
         let err = svc.plan(ctx).await.unwrap_err();
@@ -769,6 +769,7 @@ mod tests {
                 actual: 1
             }
         ));
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -822,6 +823,7 @@ mod tests {
             .unwrap();
         let old_dag: TaskDag = serde_json::from_slice(&old_snap.bytes).unwrap();
         assert_eq!(old_dag.generation, 1);
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -842,6 +844,7 @@ mod tests {
                 state: DagState::Running
             }
         ));
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -878,6 +881,7 @@ mod tests {
             }
             _ => panic!("expected FromPredecessors"),
         }
+        storage.close().await.unwrap();
     }
 
     /// Event sink that fails append_session.
@@ -928,5 +932,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, PlanError::Event(_)));
         assert!(storage.dags().get(dag_id).await.unwrap().is_some());
+        storage.close().await.unwrap();
     }
 }

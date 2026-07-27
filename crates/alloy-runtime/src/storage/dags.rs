@@ -89,17 +89,18 @@ pub trait DagStore: Send + Sync {
     /// `SELECT` → checks → `UPDATE`.
     ///
     /// Check order (RFC-0009 §3.6):
-    /// 1. Generation bound overflow → [`ReplanReplaceError::Store`](`Internal`)
+    /// 1. Generation bound overflow → [`ReplanReplaceError::Store`] / [`StoreError::Internal`]
     /// 2. Missing row → [`ReplanReplaceError::NotFound`]
-    /// 3. Column/blob integrity → [`ReplanReplaceError::Store`](`Corrupt`|…)
-    /// 4. Stored generation ≠ `expected_generation` → [`GenerationMismatch`]
-    /// 5. Decoded `state == Running` → [`DagBusy`]
-    /// 6. `dag.generation != expected_generation + 1` → Store(`Internal`)
-    /// 7. `dag.session_id` differs from stored → Store(`Internal`)
+    /// 3. Column/blob integrity → [`ReplanReplaceError::Store`] / [`StoreError::Corrupt`]
+    /// 4. Stored generation ≠ `expected_generation` → [`ReplanReplaceError::GenerationMismatch`]
+    /// 5. Decoded `state == Running` → [`ReplanReplaceError::DagBusy`]
+    /// 6. `dag.generation != expected_generation + 1` → [`StoreError::Internal`]
+    /// 7. `dag.session_id` differs from stored → [`StoreError::Internal`]
     /// 8. Else write and `Ok(())`
     ///
     /// Callers: clear gate waiters via `RunController::request_replan` first;
-    /// scheduler must leave a non-`Running` checkpoint or [`DagBusy`] persists.
+    /// scheduler must leave a non-`Running` checkpoint or [`ReplanReplaceError::DagBusy`]
+    /// persists.
     async fn replace_for_replan(
         &self,
         dag: &TaskDag,
@@ -216,11 +217,7 @@ struct PreparedDagWrite {
     generation: u64,
     blob: String,
     updated_at: String,
-    /// Decoded state needed only by `replace_for_replan` Busy check path when
-    /// validating the *incoming* dag.generation / session invariants already
-    /// encoded above; retained for put overwrite identity checks.
     session_id_typed: SessionId,
-    generation_typed: u64,
 }
 
 fn prepare_write(dag: &TaskDag) -> Result<PreparedDagWrite, StoreError> {
@@ -232,7 +229,6 @@ fn prepare_write(dag: &TaskDag) -> Result<PreparedDagWrite, StoreError> {
         blob: encode_blob(dag)?,
         updated_at: updated_at_rfc3339(&Timestamp::now())?,
         session_id_typed: dag.session_id,
-        generation_typed: dag.generation,
     })
 }
 
@@ -432,9 +428,8 @@ impl DagStore for SqliteDagStore {
             )));
         }
         let prepared = prepare_write(dag).map_err(ReplanReplaceError::Store)?;
-        // Capture incoming invariants for checks that need typed values.
         let incoming_session = prepared.session_id_typed;
-        let incoming_generation = prepared.generation_typed;
+        let incoming_generation = prepared.generation;
         let db = Arc::clone(&self.db);
         let result = spawn_db(db, move |handle| {
             handle.with_mut(|conn| {
@@ -504,9 +499,9 @@ impl DagStore for SqliteDagStore {
                     }
                 };
                 if n != 1 {
-                    return Ok(Err(ReplanReplaceError::GenerationMismatch {
-                        actual: expected_generation, // best-effort; race lost
-                    }));
+                    return Ok(Err(ReplanReplaceError::Store(StoreError::Internal(
+                        "replan cas rowcount invariant violated".into(),
+                    ))));
                 }
                 if let Err(e) = tx.commit() {
                     return Ok(Err(ReplanReplaceError::Store(StoreError::from(e))));
@@ -845,6 +840,14 @@ mod tests {
         assert!(matches!(
             dags.replace_for_replan(&dag, 0).await.unwrap_err(),
             ReplanReplaceError::Store(StoreError::Closed)
+        ));
+        assert!(matches!(
+            dags.delete(dag.id).await.unwrap_err(),
+            StoreError::Closed
+        ));
+        assert!(matches!(
+            dags.list_by_session(SessionId::new()).await.unwrap_err(),
+            StoreError::Closed
         ));
     }
 
