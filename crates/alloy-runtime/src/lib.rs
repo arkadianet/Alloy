@@ -111,9 +111,9 @@ pub use types::diagnostic::{
     DiagnosticEvent, DiagnosticLevel, ErrorClass, FailureIr, RetryDisposition, SpanRef,
 };
 pub use types::ids::{
-    ArtifactId, CapabilityId, CheckpointId, DagId, DiagnosticId, Digest, DigestError, EndpointId,
-    EventSeq, GateId, GraphNodeId, GraphVersion, IdError, LanguageId, NodeId, ProfileId,
-    ProviderId, RunId, ServerId, SessionId, Timestamp, TransactionId,
+    ArtifactId, CapabilityId, CheckpointId, DagId, DiagnosticId, Digest, DigestError, DigestHasher,
+    EndpointId, EventSeq, GateId, GraphNodeId, GraphVersion, IdError, LanguageId, NodeId,
+    ProfileId, ProviderId, RunId, ServerId, SessionId, Timestamp, TransactionId,
 };
 pub use types::metrics::{RuntimeMetrics, WorkerMetrics};
 pub use types::permission::{ExecAllow, Glob, Grant, HostAllow, PermissionToken};

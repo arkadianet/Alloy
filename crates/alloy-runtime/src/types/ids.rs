@@ -206,6 +206,39 @@ impl<'de> Deserialize<'de> for Digest {
     }
 }
 
+/// Incremental SHA-256 hasher for inputs that should not be buffered whole.
+///
+/// [`DigestHasher::finish`] returns exactly what [`Digest::sha256`] would return
+/// for the concatenation of every [`DigestHasher::update`] chunk, so streamed
+/// and buffered producers of the same bytes stay interchangeable.
+#[derive(Clone, Default)]
+pub struct DigestHasher(Sha256);
+
+impl DigestHasher {
+    /// Start a hasher over the empty input.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    /// Append the next chunk of input.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// Consume the hasher and return the lowercase hex digest.
+    #[must_use]
+    pub fn finish(self) -> Digest {
+        Digest(hex::encode(self.0.finalize()))
+    }
+}
+
+impl std::fmt::Debug for DigestHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DigestHasher(sha256)")
+    }
+}
+
 /// Digest parse/validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DigestError {
@@ -261,6 +294,17 @@ mod tests {
         assert!(serde_json::from_str::<Digest>(&format!("\"{}\"", "A".repeat(64))).is_err());
         let ok: Digest = serde_json::from_str(&format!("\"{}\"", d.as_hex())).unwrap();
         assert_eq!(ok, d);
+    }
+
+    #[test]
+    fn chunked_hasher_matches_one_shot_digest() {
+        let payload: Vec<u8> = (0..4096_u32).map(|i| (i % 251) as u8).collect();
+        let mut hasher = DigestHasher::new();
+        for chunk in payload.chunks(97) {
+            hasher.update(chunk);
+        }
+        assert_eq!(hasher.finish(), Digest::sha256(&payload));
+        assert_eq!(DigestHasher::new().finish(), Digest::sha256(b""));
     }
 
     #[test]

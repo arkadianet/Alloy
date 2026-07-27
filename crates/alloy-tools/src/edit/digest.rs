@@ -4,13 +4,24 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
+use std::path::Path;
 
-use alloy_runtime::{Digest, EditError, WorkspaceDigest};
+use alloy_runtime::{Digest, DigestHasher, EditError, WorkspaceDigest};
 
 use crate::edit::patch_parse::is_digest_excluded_path;
 use crate::sandbox::PathPolicy;
 
+/// Chunk size for content hashing; large enough to keep syscall overhead low
+/// without scaling memory with file size.
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Compute a digest over tracked files plus transaction-created paths.
+///
+/// The tree encoding (`path\0<content-sha-hex>\n` per sorted path, hashed as one
+/// stream) and both counters are byte-identical to a buffered implementation;
+/// neither the per-file contents nor the encoding is ever held whole in memory,
+/// so a 50k-file workspace costs one chunk buffer rather than its own size.
 pub(crate) fn compute_workspace_digest(
     policy: &PathPolicy,
     tracked: &BTreeSet<String>,
@@ -30,7 +41,8 @@ pub(crate) fn compute_workspace_digest(
         }
     }
 
-    let mut encoding = String::new();
+    let mut tree = DigestHasher::new();
+    let mut buf = vec![0_u8; READ_CHUNK_BYTES];
     let mut file_count = 0_u64;
     let mut total_bytes = 0_u64;
     for rel in paths {
@@ -42,26 +54,54 @@ pub(crate) fn compute_workspace_digest(
         if meta.file_type().is_symlink() || !meta.is_file() {
             continue;
         }
-        let bytes = fs::read(&path).map_err(|e| EditError::Io(e.to_string()))?;
         file_count = file_count.saturating_add(1);
-        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
         if file_count > max_files {
             return Err(EditError::DigestLimitExceeded("file count".into()));
         }
-        if total_bytes > max_bytes {
+        // Refuse on the recorded length before opening the file: a single
+        // oversized blob must not be read at all, let alone buffered.
+        let remaining = max_bytes.saturating_sub(total_bytes);
+        if meta.len() > remaining {
             return Err(EditError::DigestLimitExceeded("byte count".into()));
         }
-        let digest = Digest::sha256(&bytes);
-        encoding.push_str(&rel);
-        encoding.push('\0');
-        encoding.push_str(digest.as_hex());
-        encoding.push('\n');
+        let (content, hashed) = hash_file_capped(&path, remaining, &mut buf)?;
+        total_bytes = total_bytes.saturating_add(hashed);
+        tree.update(rel.as_bytes());
+        tree.update(b"\0");
+        tree.update(content.as_hex().as_bytes());
+        tree.update(b"\n");
     }
     Ok(WorkspaceDigest {
-        tree: Digest::sha256(encoding.as_bytes()),
+        tree: tree.finish(),
         file_count,
         total_bytes,
     })
+}
+
+/// Hash `path` in chunks, returning its content digest and byte length.
+///
+/// `remaining` is re-checked while reading because the recorded metadata length
+/// is only a hint: a file can grow between `symlink_metadata` and the read.
+fn hash_file_capped(
+    path: &Path,
+    remaining: u64,
+    buf: &mut [u8],
+) -> Result<(Digest, u64), EditError> {
+    let mut file = fs::File::open(path).map_err(|e| EditError::Io(e.to_string()))?;
+    let mut content = DigestHasher::new();
+    let mut hashed = 0_u64;
+    loop {
+        let read = file.read(buf).map_err(|e| EditError::Io(e.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        hashed = hashed.saturating_add(read as u64);
+        if hashed > remaining {
+            return Err(EditError::DigestLimitExceeded("byte count".into()));
+        }
+        content.update(&buf[..read]);
+    }
+    Ok((content.finish(), hashed))
 }
 
 fn include_path(policy: &PathPolicy, rel: &str) -> bool {
@@ -97,6 +137,31 @@ mod tests {
         let digest = compute_workspace_digest(&policy(dir.path()), &tracked, &[], 10, 10).unwrap();
         assert_eq!(digest.file_count, 1);
         assert_eq!(digest.total_bytes, 1);
+    }
+
+    /// The streamed tree hash must equal the documented encoding byte for byte.
+    #[test]
+    fn digest_encoding_matches_rfc_shape_across_chunk_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = vec![b'z'; READ_CHUNK_BYTES * 2 + 7];
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("big.bin"), &big).unwrap();
+        let tracked = ["a.txt", "big.bin"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let digest =
+            compute_workspace_digest(&policy(dir.path()), &tracked, &[], 10, 1 << 30).unwrap();
+
+        let expected = format!(
+            "a.txt\0{}\nbig.bin\0{}\n",
+            Digest::sha256(b"a").as_hex(),
+            Digest::sha256(&big).as_hex()
+        );
+        assert_eq!(digest.tree, Digest::sha256(expected.as_bytes()));
+        assert_eq!(digest.file_count, 2);
+        assert_eq!(digest.total_bytes, 1 + big.len() as u64);
     }
 
     #[test]
