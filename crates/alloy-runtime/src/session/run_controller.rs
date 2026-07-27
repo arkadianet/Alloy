@@ -383,8 +383,34 @@ impl RunControllerView {
         let durable = parse_state(&row)?;
 
         if is_control_protected(durable) {
-            // A cancel, replan, or gate registration landed while we awaited. Preserving
-            // it is the contract, so this is an expected merge rather than a fault.
+            // A5: `waiting_approval` is the one control-protected state a
+            // *terminal* scheduler outcome overrides rather than merges
+            // under. A gate deny/expiry writes `RunControlState::Failed`
+            // directly (`approve`/`expire_gate`), independent of whether
+            // `run_dag` is even in flight for this DAG right now. If the
+            // scheduler *also* observed a terminal Failed/Cancelled outcome
+            // (it re-scanned the same resolution, or was cancelled) before
+            // `run_dag` returned, merging would silently drop that outcome
+            // and strand the DAG blob non-terminal forever — nothing else
+            // ever revisits a run row that's already terminal (RC2 treats
+            // it as a no-op), so no later call terminalizes the DAG either.
+            if durable == RunControlState::WaitingApproval {
+                if let Ok(outcome) = &result {
+                    if matches!(outcome.state, DagState::Failed | DagState::Cancelled) {
+                        info!(
+                            run_id = %run,
+                            state = durable.as_str(),
+                            dag_state = ?outcome.state,
+                            "start outcome applied: terminal outcome overrides waiting_approval (A5)"
+                        );
+                        let outcome = result.expect("matched Ok above");
+                        return self.apply_ok_outcome(&row, session, run, outcome).await;
+                    }
+                }
+            }
+            // `Running` / `WaitingApproval` (non-terminal) / `ReplanRequired` outcomes
+            // keep merging here, as do the other control-protected durable states
+            // (`replan_requested` / `cancelling` / `cancelled` keep winning outright).
             info!(
                 run_id = %run,
                 state = durable.as_str(),
