@@ -9,7 +9,10 @@ use std::path::Path;
 use alloy_runtime::{EditError, FilePatch, Hunk, PatchSet, PermissionToken, TransactionId};
 
 use crate::authz::{self, GrantGlobError};
-use crate::edit::patch_parse::{rel_from_abs, validate_rel_path};
+use crate::edit::patch_parse::{
+    authorize_create_path, read_utf8_file, reject_symlink_components, rel_from_abs,
+    validate_hunk_line_counts, validate_rel_path,
+};
 use crate::sandbox::{PathAccess, PathPolicy, SandboxError};
 
 /// Paths produced while applying a PatchSet.
@@ -83,17 +86,19 @@ pub(crate) fn apply_hunks_to_text(
     old_text: &str,
     hunks: &[Hunk],
 ) -> Result<Vec<u8>, EditError> {
+    for hunk in hunks {
+        validate_hunk_line_counts(hunk)?;
+    }
     let (old_lines, old_eof_newline) = split_lines(old_text);
     let mut new_lines = Vec::new();
     let mut old_idx = 0_usize;
-    let mut final_eof_newline = true;
-    let mut saw_old_no_newline_assert = false;
+    let mut final_eof_newline = old_eof_newline;
     for hunk in hunks {
-        if hunk.old_eof_no_newline {
-            saw_old_no_newline_assert = true;
-        }
-        let start = if hunk.old_start == 0 {
-            0
+        let start = if hunk.old_lines == 0 {
+            usize::try_from(hunk.old_start)
+                .map_err(|_| EditError::InvalidPatch("hunk header".into()))?
+        } else if hunk.old_start == 0 {
+            return Err(EditError::InvalidPatch("hunk header".into()));
         } else {
             usize::try_from(hunk.old_start - 1)
                 .map_err(|_| EditError::InvalidPatch("hunk header".into()))?
@@ -107,9 +112,13 @@ pub(crate) fn apply_hunks_to_text(
         new_lines.extend_from_slice(&old_lines[old_idx..start]);
         old_idx = start;
         for raw in &hunk.lines {
-            let (prefix, content) = raw.split_at(1);
+            let Some((&prefix, content)) = raw.as_bytes().split_first() else {
+                return Err(EditError::InvalidPatch("hunk line content".into()));
+            };
+            let content = std::str::from_utf8(content)
+                .map_err(|_| EditError::InvalidPatch("hunk line content".into()))?;
             match prefix {
-                " " => {
+                b' ' => {
                     let Some(actual) = old_lines.get(old_idx) else {
                         return Err(EditError::ContextMismatch {
                             path: rel.to_string(),
@@ -125,7 +134,7 @@ pub(crate) fn apply_hunks_to_text(
                     new_lines.push(content.to_string());
                     old_idx += 1;
                 }
-                "-" => {
+                b'-' => {
                     let Some(actual) = old_lines.get(old_idx) else {
                         return Err(EditError::ContextMismatch {
                             path: rel.to_string(),
@@ -140,19 +149,28 @@ pub(crate) fn apply_hunks_to_text(
                     }
                     old_idx += 1;
                 }
-                "+" => new_lines.push(content.to_string()),
+                b'+' => new_lines.push(content.to_string()),
                 _ => return Err(EditError::InvalidPatch("hunk line content".into())),
             }
         }
-        final_eof_newline = hunk.eof_newline;
+        if hunk.old_eof_no_newline {
+            if old_idx != old_lines.len() {
+                return Err(EditError::InvalidPatch(
+                    "old no-newline marker before eof".into(),
+                ));
+            }
+            if old_eof_newline {
+                return Err(EditError::ContextMismatch {
+                    path: rel.to_string(),
+                    detail: "old file has trailing newline".into(),
+                });
+            }
+        }
+        if old_idx == old_lines.len() {
+            final_eof_newline = hunk.eof_newline;
+        }
     }
     new_lines.extend_from_slice(&old_lines[old_idx..]);
-    if saw_old_no_newline_assert && old_eof_newline {
-        return Err(EditError::ContextMismatch {
-            path: rel.to_string(),
-            detail: "old file has trailing newline".into(),
-        });
-    }
     Ok(join_lines(&new_lines, final_eof_newline))
 }
 
@@ -162,7 +180,7 @@ fn apply_delete(
     perms: &PermissionToken,
     out: &mut FileApplyOutcome,
 ) -> Result<(), EditError> {
-    authorize_write(policy, perms, rel)?;
+    authorize_patch_path_write(policy, perms, rel)?;
     let path = policy.jail().join(rel);
     let meta = fs::symlink_metadata(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -172,6 +190,7 @@ fn apply_delete(
         }
     })?;
     ensure_regular(rel, &meta)?;
+    read_utf8_file(&path)?;
     fs::remove_file(&path).map_err(|e| EditError::Io(e.to_string()))?;
     out.files_touched.push(rel.to_string());
     Ok(())
@@ -189,7 +208,7 @@ fn apply_modify<F>(
 where
     F: FnMut(ApplyProgress),
 {
-    authorize_write(policy, perms, rel)?;
+    authorize_patch_path_write(policy, perms, rel)?;
     let path = policy.jail().join(rel);
     let meta = fs::symlink_metadata(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -199,12 +218,12 @@ where
         }
     })?;
     ensure_regular(rel, &meta)?;
-    let old = fs::read_to_string(&path).map_err(|e| EditError::Io(e.to_string()))?;
+    let old = read_utf8_file(&path)?;
     let new_bytes = apply_hunks_to_text(rel, &old, hunks)?;
     let temp = temp_path_for(&path, tx)?;
     let temp_rel = rel_from_abs(policy.jail(), &temp)
         .ok_or_else(|| EditError::Internal("temp path outside jail".into()))?;
-    authorize_write(policy, perms, &temp_rel)?;
+    authorize_policy_write(policy, &temp_rel)?;
     progress(ApplyProgress::TempPath(temp_rel.clone()));
     out.temp_paths.push(temp_rel);
     write_temp(&temp, &new_bytes)?;
@@ -226,11 +245,12 @@ fn apply_create<F>(
 where
     F: FnMut(ApplyProgress),
 {
+    authorize_patch_create(policy, perms, rel)?;
     if policy.jail().join(rel).exists() {
         return Err(EditError::Conflict("create exists".into()));
     }
-    create_parents(rel, policy, perms, out, progress)?;
-    authorize_write(policy, perms, rel)?;
+    create_parents(rel, policy, out, progress)?;
+    authorize_policy_write(policy, rel)?;
     let path = policy.jail().join(rel);
     if path.exists() {
         return Err(EditError::Conflict("create exists".into()));
@@ -239,7 +259,7 @@ where
     let temp = temp_path_for(&path, tx)?;
     let temp_rel = rel_from_abs(policy.jail(), &temp)
         .ok_or_else(|| EditError::Internal("temp path outside jail".into()))?;
-    authorize_write(policy, perms, &temp_rel)?;
+    authorize_policy_write(policy, &temp_rel)?;
     progress(ApplyProgress::TempPath(temp_rel.clone()));
     out.temp_paths.push(temp_rel);
     write_temp(&temp, &new_bytes)?;
@@ -262,7 +282,6 @@ where
 fn create_parents<F>(
     rel: &str,
     policy: &PathPolicy,
-    perms: &PermissionToken,
     out: &mut FileApplyOutcome,
     progress: &mut F,
 ) -> Result<(), EditError>
@@ -294,7 +313,7 @@ where
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                authorize_write(policy, perms, &cur_rel)?;
+                authorize_policy_write(policy, &cur_rel)?;
                 fs::create_dir(&cur_abs).map_err(|err| EditError::Io(err.to_string()))?;
                 progress(ApplyProgress::CreatedDir(cur_rel.clone()));
                 out.created_dirs.insert(0, cur_rel.clone());
@@ -305,12 +324,27 @@ where
     Ok(())
 }
 
-fn authorize_write(
+fn authorize_patch_path_write(
     policy: &PathPolicy,
     perms: &PermissionToken,
     rel: &str,
 ) -> Result<(), EditError> {
     validate_rel_path(rel)?;
+    authorize_patch_grant(perms, rel)?;
+    authorize_policy_write(policy, rel)
+}
+
+fn authorize_patch_create(
+    policy: &PathPolicy,
+    perms: &PermissionToken,
+    rel: &str,
+) -> Result<(), EditError> {
+    validate_rel_path(rel)?;
+    authorize_patch_grant(perms, rel)?;
+    authorize_create_path(policy, rel)
+}
+
+fn authorize_patch_grant(perms: &PermissionToken, rel: &str) -> Result<(), EditError> {
     if !authz::has_fs_write_grant(perms) {
         return Err(EditError::MissingGrant("fs_write".into()));
     }
@@ -325,6 +359,12 @@ fn authorize_write(
             return Err(EditError::InvalidRequest("grant glob".into()))
         }
     }
+    Ok(())
+}
+
+fn authorize_policy_write(policy: &PathPolicy, rel: &str) -> Result<(), EditError> {
+    validate_rel_path(rel)?;
+    reject_symlink_components(policy, rel)?;
     policy
         .authorize(&policy.jail().join(rel), PathAccess::Write)
         .map(|_| ())
@@ -382,17 +422,16 @@ fn split_lines(text: &str) -> (Vec<String>, bool) {
     } else {
         text
     };
-    if body.is_empty() {
-        (Vec::new(), eof_newline)
-    } else {
-        (
-            body.split('\n').map(ToOwned::to_owned).collect(),
-            eof_newline,
-        )
-    }
+    (
+        body.split('\n').map(ToOwned::to_owned).collect(),
+        eof_newline,
+    )
 }
 
 fn join_lines(lines: &[String], eof_newline: bool) -> Vec<u8> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
     let mut text = lines.join("\n");
     if eof_newline {
         text.push('\n');
@@ -418,9 +457,13 @@ mod tests {
     use alloy_runtime::{Glob, Grant, Hunk, ProfileId, RunId};
 
     fn token() -> PermissionToken {
+        token_with_glob("**")
+    }
+
+    fn token_with_glob(glob: &str) -> PermissionToken {
         PermissionToken {
             profile: ProfileId::new("default").unwrap(),
-            grants: vec![Grant::FsWrite(Glob("**".into()))],
+            grants: vec![Grant::FsWrite(Glob(glob.into()))],
             expires: None,
             run_id: RunId::new(),
         }
@@ -475,6 +518,55 @@ mod tests {
     }
 
     #[test]
+    fn invalid_hunk_prefixes_are_panic_free() {
+        for line in ["", "écontent"] {
+            let malformed = Hunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 0,
+                lines: vec![line.into()],
+                eof_newline: true,
+                old_eof_no_newline: false,
+            };
+            assert!(matches!(
+                apply_hunks_to_text("a.txt", "one\n", &[malformed]),
+                Err(EditError::InvalidPatch(ref message)) if message == "hunk line content"
+            ));
+        }
+    }
+
+    #[test]
+    fn mid_file_hunk_preserves_original_eof() {
+        let mut mid_file = hunk(vec!["-one", "+ONE"]);
+        mid_file.eof_newline = false;
+        let bytes = apply_hunks_to_text("a.txt", "one\ntwo\n", &[mid_file]).unwrap();
+        assert_eq!(bytes, b"ONE\ntwo\n");
+    }
+
+    #[test]
+    fn one_empty_line_is_not_an_empty_file() {
+        assert_eq!(split_lines("\n"), (vec![String::new()], true));
+        let bytes = apply_hunks_to_text("a.txt", "\n", &[hunk(vec![" ", "+after"])]).unwrap();
+        assert_eq!(bytes, b"\nafter\n");
+    }
+
+    #[test]
+    fn zero_length_range_inserts_after_old_start() {
+        let insertion = Hunk {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 2,
+            new_lines: 1,
+            lines: vec!["+two".into()],
+            eof_newline: true,
+            old_eof_no_newline: false,
+        };
+        let bytes = apply_hunks_to_text("a.txt", "one\n", &[insertion]).unwrap();
+        assert_eq!(bytes, b"one\ntwo\n");
+    }
+
+    #[test]
     fn create_records_parents_and_file() {
         let dir = tempfile::tempdir().unwrap();
         let patch = PatchSet {
@@ -507,5 +599,36 @@ mod tests {
         assert_eq!(out.created_paths, vec!["a/b.txt"]);
         assert_eq!(out.created_dirs, vec!["a"]);
         assert!(!progress.is_empty());
+    }
+
+    #[test]
+    fn create_only_requires_grant_for_final_patch_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = PatchSet {
+            files: vec![FilePatch::Create {
+                path: "a/b.txt".into(),
+                hunks: vec![Hunk {
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec!["+hi".into()],
+                    eof_newline: true,
+                    old_eof_no_newline: false,
+                }],
+            }],
+        };
+        apply_file_patches(
+            &patch,
+            &policy(dir.path()),
+            &token_with_glob("a/b.txt"),
+            TransactionId::new(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b.txt")).unwrap(),
+            "hi\n"
+        );
     }
 }

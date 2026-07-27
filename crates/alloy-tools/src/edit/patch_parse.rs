@@ -64,12 +64,12 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
     if text.contains('\0') {
         return Err(EditError::InvalidPatch("hunk line content".into()));
     }
-    let raw_lines: Vec<&str> = text.split('\n').collect();
+    let raw_lines = split_patch_lines(text);
     let mut files = Vec::new();
     let mut i = 0;
     while i < raw_lines.len() {
-        let line = strip_cr(raw_lines[i]);
-        if line.is_empty() || line.starts_with("index ") || line.starts_with("diff --git ") {
+        let line = raw_lines[i];
+        if line.is_empty() || is_git_extended_header(line) {
             i += 1;
             continue;
         }
@@ -87,7 +87,7 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
         if i >= raw_lines.len() {
             return Err(EditError::InvalidPatch("unified diff header".into()));
         }
-        let new_line = strip_cr(raw_lines[i]);
+        let new_line = raw_lines[i];
         if !new_line.starts_with("+++ ") {
             return Err(EditError::InvalidPatch("unified diff header".into()));
         }
@@ -113,7 +113,7 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
 
         let mut hunks = Vec::new();
         while i < raw_lines.len() {
-            let hline = strip_cr(raw_lines[i]);
+            let hline = raw_lines[i];
             if hline.starts_with("diff --git ") || hline.starts_with("--- ") {
                 break;
             }
@@ -127,6 +127,10 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
                 i += 1;
                 continue;
             }
+            if is_git_extended_header(hline) {
+                i += 1;
+                continue;
+            }
             if !hline.starts_with("@@ ") {
                 return Err(EditError::InvalidPatch("hunk header".into()));
             }
@@ -136,18 +140,28 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
             let mut eof_newline = true;
             let mut old_eof_no_newline = false;
             let mut last_side = None;
+            let mut old_marker_seen = false;
+            let mut new_marker_seen = false;
+            let mut old_count = 0_u32;
+            let mut new_count = 0_u32;
             while i < raw_lines.len() {
-                let l = strip_cr(raw_lines[i]);
-                if i + 1 == raw_lines.len() && l.is_empty() {
-                    break;
-                }
-                if l.starts_with("@@ ") || l.starts_with("diff --git ") || l.starts_with("--- ") {
-                    break;
-                }
+                let l = raw_lines[i];
                 if l == r"\ No newline at end of file" {
-                    match last_side {
-                        Some('+') => eof_newline = false,
-                        Some(' ' | '-') => old_eof_no_newline = true,
+                    match last_side.take() {
+                        Some('+') => {
+                            eof_newline = false;
+                            new_marker_seen = true;
+                        }
+                        Some(' ') => {
+                            old_eof_no_newline = true;
+                            old_marker_seen = true;
+                            eof_newline = false;
+                            new_marker_seen = true;
+                        }
+                        Some('-') => {
+                            old_eof_no_newline = true;
+                            old_marker_seen = true;
+                        }
                         _ => {
                             return Err(EditError::InvalidPatch(
                                 "no-newline marker without prior hunk line".into(),
@@ -157,13 +171,38 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
                     i += 1;
                     continue;
                 }
-                let Some(prefix) = l.chars().next() else {
+                if old_count == old_lines && new_count == new_lines {
+                    break;
+                }
+                if l.starts_with("@@ ") || l.starts_with("diff --git ") {
+                    break;
+                }
+                let Some(&prefix) = l.as_bytes().first() else {
                     return Err(EditError::InvalidPatch("hunk line content".into()));
                 };
-                if !matches!(prefix, ' ' | '-' | '+') {
+                if !matches!(prefix, b' ' | b'-' | b'+') {
                     return Err(EditError::InvalidPatch("hunk line content".into()));
                 }
-                last_side = Some(prefix);
+                if old_marker_seen && matches!(prefix, b' ' | b'-') {
+                    return Err(EditError::InvalidPatch(
+                        "old no-newline marker before final old line".into(),
+                    ));
+                }
+                if new_marker_seen && matches!(prefix, b' ' | b'+') {
+                    return Err(EditError::InvalidPatch(
+                        "new no-newline marker before final new line".into(),
+                    ));
+                }
+                match prefix {
+                    b' ' => {
+                        old_count = old_count.saturating_add(1);
+                        new_count = new_count.saturating_add(1);
+                    }
+                    b'-' => old_count = old_count.saturating_add(1),
+                    b'+' => new_count = new_count.saturating_add(1),
+                    _ => unreachable!("prefix validated"),
+                }
+                last_side = Some(char::from(prefix));
                 lines.push(l.to_string());
                 i += 1;
             }
@@ -181,7 +220,7 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
         if is_create {
             files.push(FilePatch::Create { path, hunks });
         } else if is_delete {
-            files.push(FilePatch::Delete { path, hunks });
+            files.push(FilePatch::Delete { path });
         } else {
             files.push(FilePatch::Modify { path, hunks });
         }
@@ -221,8 +260,7 @@ pub(crate) fn validate_patchset_local(
             FilePatch::Modify { path, hunks } => {
                 validate_modify_hunks(path, hunks)?;
                 validate_existing_file_shape(policy, path, true)?;
-                let old = std::fs::read_to_string(policy.jail().join(path))
-                    .map_err(|e| EditError::Io(e.to_string()))?;
+                let old = read_utf8_file(&policy.jail().join(path))?;
                 crate::edit::apply::apply_hunks_to_text(path, &old, hunks)?;
             }
             FilePatch::Create { path, hunks } => {
@@ -231,18 +269,9 @@ pub(crate) fn validate_patchset_local(
                     return Err(EditError::Conflict("create exists".into()));
                 }
             }
-            FilePatch::Delete { path, hunks } => {
+            FilePatch::Delete { path } => {
                 validate_existing_file_shape(policy, path, false)?;
-                if !hunks.is_empty() {
-                    let old = std::fs::read_to_string(policy.jail().join(path))
-                        .map_err(|e| EditError::Io(e.to_string()))?;
-                    let new_bytes = crate::edit::apply::apply_hunks_to_text(path, &old, hunks)?;
-                    if !new_bytes.is_empty() {
-                        return Err(EditError::InvalidPatch(
-                            "delete must remove entire file".into(),
-                        ));
-                    }
-                }
+                read_utf8_file(&policy.jail().join(path))?;
             }
         }
         paths.push(path.to_string());
@@ -356,14 +385,17 @@ fn authorize_patch_path(
     }
     match file {
         FilePatch::Create { path, .. } => authorize_create_path(policy, path),
-        _ => policy
-            .authorize(&policy.jail().join(rel), PathAccess::Write)
-            .map(|_| ())
-            .map_err(|e| path_policy_error(e, rel)),
+        _ => {
+            reject_symlink_components(policy, rel)?;
+            policy
+                .authorize(&policy.jail().join(rel), PathAccess::Write)
+                .map(|_| ())
+                .map_err(|e| path_policy_error(e, rel))
+        }
     }
 }
 
-fn authorize_create_path(policy: &PathPolicy, rel: &str) -> Result<(), EditError> {
+pub(crate) fn authorize_create_path(policy: &PathPolicy, rel: &str) -> Result<(), EditError> {
     if policy.deny_matches_rel(rel) {
         return Err(EditError::PathDenied {
             path: rel.to_string(),
@@ -389,6 +421,12 @@ fn authorize_create_path(policy: &PathPolicy, rel: &str) -> Result<(), EditError
                     cur = next;
                     continue;
                 }
+                Ok(_) if !is_final => {
+                    return Err(EditError::PathDenied {
+                        path: rel.to_string(),
+                        reason: "not a directory".into(),
+                    })
+                }
                 Ok(_) => {
                     policy
                         .authorize(&next, PathAccess::Write)
@@ -397,7 +435,7 @@ fn authorize_create_path(policy: &PathPolicy, rel: &str) -> Result<(), EditError
                     cur = next;
                     continue;
                 }
-                Err(_) => {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     policy
                         .authorize(&cur, PathAccess::Write)
                         .map(|_| ())
@@ -412,9 +450,37 @@ fn authorize_create_path(policy: &PathPolicy, rel: &str) -> Result<(), EditError
                             .map_err(|e| path_policy_error(e, rel))?;
                     }
                 }
+                Err(e) => return Err(EditError::Io(e.to_string())),
             }
         }
         cur = next;
+    }
+    Ok(())
+}
+
+pub(crate) fn reject_symlink_components(policy: &PathPolicy, rel: &str) -> Result<(), EditError> {
+    let mut current = policy.jail().to_path_buf();
+    let segments: Vec<&str> = rel.split('/').collect();
+    for (idx, segment) in segments.iter().enumerate() {
+        current.push(segment);
+        let is_final = idx + 1 == segments.len();
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(EditError::PathDenied {
+                    path: rel.to_string(),
+                    reason: "symlink component".into(),
+                })
+            }
+            Ok(meta) if !is_final && !meta.is_dir() => {
+                return Err(EditError::PathDenied {
+                    path: rel.to_string(),
+                    reason: "not a directory".into(),
+                })
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(EditError::Io(e.to_string())),
+        }
     }
     Ok(())
 }
@@ -424,6 +490,7 @@ fn validate_existing_file_shape(
     rel: &str,
     modify: bool,
 ) -> Result<(), EditError> {
+    reject_symlink_components(policy, rel)?;
     let path = policy.jail().join(rel);
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(meta) => meta,
@@ -457,7 +524,7 @@ fn validate_modify_hunks(path: &str, hunks: &[Hunk]) -> Result<(), EditError> {
     }
     validate_common_hunks(path, hunks)?;
     for hunk in hunks {
-        if hunk.old_start == 0 {
+        if hunk.old_start == 0 && hunk.old_lines != 0 {
             return Err(EditError::InvalidPatch("modify old_start".into()));
         }
     }
@@ -487,50 +554,52 @@ fn validate_common_hunks(path: &str, hunks: &[Hunk]) -> Result<(), EditError> {
     if hunks.len() > MAX_HUNKS_PER_FILE {
         return Err(EditError::InvalidPatch("too many hunks".into()));
     }
-    let mut prev_old_start: Option<u32> = None;
-    let mut prev_old_end: Option<u32> = None;
+    let mut prev_old_start: Option<u64> = None;
+    let mut prev_old_end: Option<u64> = None;
+    let mut prev_was_insertion = false;
     let mut delta: i64 = 0;
     for hunk in hunks {
         if hunk.lines.len() > MAX_LINES_PER_HUNK {
             return Err(EditError::InvalidPatch("hunk too large".into()));
         }
+        let old_start = if hunk.old_lines == 0 {
+            u64::from(hunk.old_start)
+        } else {
+            u64::from(hunk.old_start.saturating_sub(1))
+        };
         if let Some(prev) = prev_old_start {
-            if hunk.old_start < prev {
+            if old_start < prev {
                 return Err(EditError::InvalidPatch("hunk order".into()));
             }
-            if hunk.old_start == prev && hunk.old_lines == 0 {
+            if old_start == prev && hunk.old_lines == 0 && prev_was_insertion {
                 return Err(EditError::OverlappingHunks {
                     path: path.to_string(),
                 });
             }
         }
-        let old_end = hunk.old_start.saturating_add(hunk.old_lines);
+        let old_end = old_start.saturating_add(u64::from(hunk.old_lines));
         if let Some(prev_end) = prev_old_end {
-            if hunk.old_lines == 0 {
-                if hunk.old_start < prev_end {
-                    return Err(EditError::OverlappingHunks {
-                        path: path.to_string(),
-                    });
-                }
-            } else if hunk.old_start < prev_end {
+            if old_start < prev_end {
                 return Err(EditError::OverlappingHunks {
                     path: path.to_string(),
                 });
             }
         }
         validate_hunk_line_counts(hunk)?;
-        let expected_new = i64::from(hunk.old_start) + delta;
+        let insertion_offset = if hunk.old_lines == 0 { 1 } else { 0 };
+        let expected_new = i64::from(hunk.old_start) + delta + insertion_offset;
         if i64::from(hunk.new_start) != expected_new {
             return Err(EditError::InvalidPatch("hunk new_start".into()));
         }
         delta += i64::from(hunk.new_lines) - i64::from(hunk.old_lines);
-        prev_old_start = Some(hunk.old_start);
+        prev_old_start = Some(old_start);
         prev_old_end = Some(old_end);
+        prev_was_insertion = hunk.old_lines == 0;
     }
     Ok(())
 }
 
-fn validate_hunk_line_counts(hunk: &Hunk) -> Result<(), EditError> {
+pub(crate) fn validate_hunk_line_counts(hunk: &Hunk) -> Result<(), EditError> {
     let mut old_count = 0_u32;
     let mut new_count = 0_u32;
     for line in &hunk.lines {
@@ -565,13 +634,38 @@ fn validate_hunk_shapes_for_action(
     if is_create {
         validate_create_hunks(hunks)
     } else if is_delete {
-        for hunk in hunks {
-            validate_hunk_line_counts(hunk)?;
-        }
-        Ok(())
+        validate_delete_hunks(hunks)
     } else {
         validate_modify_hunks(path, hunks)
     }
+}
+
+fn validate_delete_hunks(hunks: &[Hunk]) -> Result<(), EditError> {
+    if hunks.len() > MAX_HUNKS_PER_FILE {
+        return Err(EditError::InvalidPatch("too many hunks".into()));
+    }
+    let mut next_old_start = 1_u64;
+    for hunk in hunks {
+        if hunk.lines.len() > MAX_LINES_PER_HUNK {
+            return Err(EditError::InvalidPatch("hunk too large".into()));
+        }
+        validate_hunk_line_counts(hunk)?;
+        if u64::from(hunk.old_start) != next_old_start
+            || hunk.old_lines == 0
+            || hunk.new_start != 0
+            || hunk.new_lines != 0
+            || hunk
+                .lines
+                .iter()
+                .any(|line| line.as_bytes().first() != Some(&b'-'))
+        {
+            return Err(EditError::InvalidPatch(
+                "delete must remove entire file".into(),
+            ));
+        }
+        next_old_start = next_old_start.saturating_add(u64::from(hunk.old_lines));
+    }
+    Ok(())
 }
 
 fn parse_hunk_header(line: &str) -> Result<(u32, u32, u32, u32), EditError> {
@@ -629,8 +723,31 @@ fn normalize_diff_path(raw: &str) -> Result<String, EditError> {
     Ok(stripped.to_string())
 }
 
-fn strip_cr(s: &str) -> &str {
-    s.strip_suffix('\r').unwrap_or(s)
+fn split_patch_lines(text: &str) -> Vec<&str> {
+    text.split_inclusive('\n')
+        .map(|line| {
+            let Some(without_lf) = line.strip_suffix('\n') else {
+                return line;
+            };
+            without_lf.strip_suffix('\r').unwrap_or(without_lf)
+        })
+        .collect()
+}
+
+fn is_git_extended_header(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("dissimilarity index ")
+}
+
+pub(crate) fn read_utf8_file(path: &Path) -> Result<String, EditError> {
+    let bytes = std::fs::read(path).map_err(|e| EditError::Io(e.to_string()))?;
+    String::from_utf8(bytes).map_err(|_| EditError::InvalidPatch("file not utf-8".into()))
 }
 
 fn path_policy_error(err: SandboxError, rel: &str) -> EditError {
@@ -776,11 +893,9 @@ mod tests {
             files: vec![
                 FilePatch::Delete {
                     path: "a.txt".into(),
-                    hunks: vec![],
                 },
                 FilePatch::Delete {
                     path: "a.txt".into(),
-                    hunks: vec![],
                 },
             ],
         };
@@ -791,7 +906,6 @@ mod tests {
         let patch = PatchSet {
             files: vec![FilePatch::Delete {
                 path: "a.txt".into(),
-                hunks: vec![],
             }],
         };
         assert!(matches!(
@@ -894,6 +1008,268 @@ mod tests {
                 &token(vec![Grant::FsWrite(Glob("**".into()))])
             ),
             Err(EditError::OverlappingHunks { .. })
+        ));
+    }
+
+    #[test]
+    fn git_style_create_and_delete_headers_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "old\n").unwrap();
+        let diff = "\
+diff --git a/new.txt b/new.txt
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1 @@
++new
+diff --git a/old.txt b/old.txt
+deleted file mode 100644
+index 2222222..0000000
+--- a/old.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-old
+";
+        let patch = parse_unified_diff(diff).unwrap();
+        assert!(matches!(
+            &patch.files[0],
+            FilePatch::Create { path, .. } if path == "new.txt"
+        ));
+        assert!(matches!(
+            &patch.files[1],
+            FilePatch::Delete { path } if path == "old.txt"
+        ));
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap()["files"][1],
+            serde_json::json!({"action": "delete", "path": "old.txt"})
+        );
+        assert_eq!(
+            validate_patchset_local(
+                &patch,
+                &policy(dir.path()),
+                &token(vec![Grant::FsWrite(Glob("**".into()))])
+            )
+            .unwrap(),
+            vec!["new.txt", "old.txt"]
+        );
+    }
+
+    #[test]
+    fn extended_headers_skip_but_rename_copy_and_binary_reject() {
+        let mode_change = "\
+diff --git a/a.txt b/a.txt
+old mode 100644
+new mode 100755
+dissimilarity index 100%
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-old
++new
+";
+        assert!(parse_unified_diff(mode_change).is_ok());
+
+        for (diff, message) in [
+            (
+                "diff --git a/a b/b\nsimilarity index 100%\nrename from a\nrename to b\n",
+                "rename/copy unsupported",
+            ),
+            (
+                "diff --git a/a b/b\ncopy from a\ncopy to b\n",
+                "rename/copy unsupported",
+            ),
+            (
+                "diff --git a/a b/a\nBinary files a/a and b/a differ\n",
+                "binary patch unsupported",
+            ),
+        ] {
+            assert!(matches!(
+                parse_unified_diff(diff),
+                Err(EditError::InvalidPatch(ref got)) if got == message
+            ));
+        }
+    }
+
+    #[test]
+    fn delete_hunks_enforce_shape_and_caps_before_discard() {
+        let context_delete = "\
+--- a/a.txt
++++ /dev/null
+@@ -1 +0,0 @@
+ line
+";
+        assert!(matches!(
+            parse_unified_diff(context_delete),
+            Err(EditError::InvalidPatch(_))
+        ));
+
+        let empty = Hunk {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 0,
+            new_lines: 0,
+            lines: vec![],
+            eof_newline: true,
+            old_eof_no_newline: false,
+        };
+        assert!(matches!(
+            validate_delete_hunks(&vec![empty.clone(); MAX_HUNKS_PER_FILE + 1]),
+            Err(EditError::InvalidPatch(ref message)) if message == "too many hunks"
+        ));
+        let mut too_large = empty;
+        too_large.lines = vec!["-x".into(); MAX_LINES_PER_HUNK + 1];
+        assert!(matches!(
+            validate_delete_hunks(&[too_large]),
+            Err(EditError::InvalidPatch(ref message)) if message == "hunk too large"
+        ));
+    }
+
+    #[test]
+    fn parser_preserves_content_carriage_returns() {
+        let final_content_cr = "--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+value\r";
+        let patch = parse_unified_diff(final_content_cr).unwrap();
+        let FilePatch::Create { hunks, .. } = &patch.files[0] else {
+            panic!("expected create");
+        };
+        assert_eq!(hunks[0].lines, vec!["+value\r"]);
+
+        let crlf = "--- /dev/null\r\n+++ b/b.txt\r\n@@ -0,0 +1 @@\r\n+value\r\n";
+        let patch = parse_unified_diff(crlf).unwrap();
+        let FilePatch::Create { hunks, .. } = &patch.files[0] else {
+            panic!("expected create");
+        };
+        assert_eq!(hunks[0].lines, vec!["+value"]);
+    }
+
+    #[test]
+    fn zero_length_insertion_range_is_valid() {
+        let diff = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1,0 +2 @@
++two
+";
+        let patch = parse_unified_diff(diff).unwrap();
+        let FilePatch::Modify { hunks, .. } = &patch.files[0] else {
+            panic!("expected modify");
+        };
+        assert_eq!(
+            crate::edit::apply::apply_hunks_to_text("a.txt", "one\n", hunks).unwrap(),
+            b"one\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn create_rejects_non_directory_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("parent"), "file").unwrap();
+        let patch = PatchSet {
+            files: vec![FilePatch::Create {
+                path: "parent/child.txt".into(),
+                hunks: vec![Hunk {
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec!["+child".into()],
+                    eof_newline: true,
+                    old_eof_no_newline: false,
+                }],
+            }],
+        };
+        assert!(matches!(
+            validate_patchset_local(
+                &patch,
+                &policy(dir.path()),
+                &token(vec![Grant::FsWrite(Glob("**".into()))])
+            ),
+            Err(EditError::PathDenied { ref reason, .. }) if reason == "not a directory"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_patch_path_rejects_symlink_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::fs::write(dir.path().join("real/file.txt"), "old\n").unwrap();
+        std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
+        let hunks = vec![Hunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 1,
+            new_lines: 1,
+            lines: vec!["-old".into(), "+new".into()],
+            eof_newline: true,
+            old_eof_no_newline: false,
+        }];
+        let patches = [
+            PatchSet {
+                files: vec![FilePatch::Modify {
+                    path: "link/file.txt".into(),
+                    hunks: hunks.clone(),
+                }],
+            },
+            PatchSet {
+                files: vec![FilePatch::Delete {
+                    path: "link/file.txt".into(),
+                }],
+            },
+            PatchSet {
+                files: vec![FilePatch::Create {
+                    path: "link/new.txt".into(),
+                    hunks,
+                }],
+            },
+        ];
+        for patch in patches {
+            assert!(matches!(
+                validate_patchset_local(
+                    &patch,
+                    &policy(dir.path()),
+                    &token(vec![Grant::FsWrite(Glob("**".into()))])
+                ),
+                Err(EditError::PathDenied { .. })
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_file_is_invalid_patch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bad.txt"), [0xff]).unwrap();
+        let patch = PatchSet {
+            files: vec![FilePatch::Delete {
+                path: "bad.txt".into(),
+            }],
+        };
+        assert!(matches!(
+            validate_patchset_local(
+                &patch,
+                &policy(dir.path()),
+                &token(vec![Grant::FsWrite(Glob("**".into()))])
+            ),
+            Err(EditError::InvalidPatch(ref message)) if message == "file not utf-8"
+        ));
+    }
+
+    #[test]
+    fn old_no_newline_marker_must_follow_final_old_line() {
+        let diff = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1 @@
+-one
+\\ No newline at end of file
+-two
++new
+";
+        assert!(matches!(
+            parse_unified_diff(diff),
+            Err(EditError::InvalidPatch(ref message))
+                if message == "old no-newline marker before final old line"
         ));
     }
 

@@ -13,6 +13,10 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Workspace edit envelope (Architecture V2 §13.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -58,11 +62,6 @@ pub enum FilePatch {
     Delete {
         /// Jail-relative path.
         path: String,
-        /// Optional hunks retained from unified-diff parse for context validation
-        /// (RFC-0008 V5/V9). Structured JSON omits this (default empty); apply
-        /// ignores hunks and unlinks the path.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        hunks: Vec<Hunk>,
     },
 }
 
@@ -71,9 +70,7 @@ impl FilePatch {
     #[must_use]
     pub fn path(&self) -> &str {
         match self {
-            Self::Modify { path, .. } | Self::Create { path, .. } | Self::Delete { path, .. } => {
-                path
-            }
+            Self::Modify { path, .. } | Self::Create { path, .. } | Self::Delete { path } => path,
         }
     }
 }
@@ -81,7 +78,8 @@ impl FilePatch {
 /// One unified-diff hunk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hunk {
-    /// 1-based start line in the current file (0 only for create-from-empty old side).
+    /// 1-based old line for nonempty ranges; for zero-length ranges, the
+    /// insertion boundary after this many old lines (0 means before line 1).
     pub old_start: u32,
     /// Line count on the old side (context + deletions).
     pub old_lines: u32,
@@ -97,8 +95,8 @@ pub struct Hunk {
     pub eof_newline: bool,
     /// When true, the current (old) file must lack a trailing newline at EOF
     /// (unified-diff `\ No newline at end of file` after a `-` or context line).
-    /// Structured JSON patches omit this (default `false`).
-    #[serde(default)]
+    /// Structured JSON and canonical CAS patches omit this when it is `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub old_eof_no_newline: bool,
 }
 
@@ -411,11 +409,41 @@ mod tests {
     fn file_patch_path_accessor() {
         assert_eq!(
             FilePatch::Delete {
-                path: "a.rs".into(),
-                hunks: vec![],
+                path: "a.rs".into()
             }
             .path(),
             "a.rs"
         );
+    }
+
+    #[test]
+    fn canonical_patch_omits_private_defaults_and_delete_hunks() {
+        let patch = PatchSet {
+            files: vec![
+                FilePatch::Delete {
+                    path: "old.rs".into(),
+                },
+                FilePatch::Modify {
+                    path: "a.rs".into(),
+                    hunks: vec![Hunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 1,
+                        lines: vec![" line".into()],
+                        eof_newline: true,
+                        old_eof_no_newline: false,
+                    }],
+                },
+            ],
+        };
+        let value = serde_json::to_value(patch).unwrap();
+        assert_eq!(
+            value["files"][0],
+            serde_json::json!({"action": "delete", "path": "old.rs"})
+        );
+        assert!(value["files"][1]["hunks"][0]
+            .get("old_eof_no_newline")
+            .is_none());
     }
 }
