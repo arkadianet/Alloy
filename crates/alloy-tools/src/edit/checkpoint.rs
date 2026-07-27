@@ -249,7 +249,7 @@ fn ensure_tracked_policy(
         let parts: Vec<&str> = rel.split('/').collect();
         for i in 1..parts.len() {
             let prefix = parts[..i].join("/");
-            if policy.jail().join(&prefix).join(".git").is_dir() {
+            if is_nested_git_dir(&policy.jail().join(&prefix).join(".git")) {
                 return Err(EditError::Environment(
                     "submodule path not supported".into(),
                 ));
@@ -257,6 +257,17 @@ fn ensure_tracked_policy(
         }
     }
     Ok(())
+}
+
+/// True when `path` is a nested repository marker.
+///
+/// Submodules and nested clones both count: git stores a submodule's real repo
+/// under the superproject and leaves a `.git` **gitfile** in the worktree, while
+/// a plain nested clone leaves a `.git` **directory**. Either way the path below
+/// it is not ours to checkpoint. `symlink_metadata` keeps a symlinked `.git`
+/// from being followed out of the jail.
+fn is_nested_git_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() || meta.is_dir())
 }
 
 async fn ensure_git_version(
@@ -569,8 +580,8 @@ fn is_sha1(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::SandboxBackend;
-    use alloy_runtime::{ExecAllow, Glob, Grant, ProfileId, RunId};
+    use crate::sandbox::{RecordingSandboxBroker, SandboxBackend, SandboxProfile};
+    use alloy_runtime::{ExecAllow, Glob, Grant, Hunk, ProfileId, RunId};
 
     fn token(grants: Vec<Grant>) -> PermissionToken {
         PermissionToken {
@@ -579,6 +590,228 @@ mod tests {
             expires: None,
             run_id: RunId::new(),
         }
+    }
+
+    /// A canonicalized jail plus a broker whose git output is fully scripted.
+    ///
+    /// The repo probes are pure argv + stdout, so scripting them exercises the
+    /// exact classification an unusable repository produces without needing a
+    /// real git of that shape on the host.
+    struct Probe {
+        _root: tempfile::TempDir,
+        jail: PathBuf,
+        policy: PathPolicy,
+        broker: RecordingSandboxBroker,
+    }
+
+    fn probe() -> Probe {
+        let root = tempfile::tempdir().unwrap();
+        let jail = root.path().join("repo");
+        std::fs::create_dir_all(&jail).unwrap();
+        let jail = jail.canonicalize().unwrap();
+        let profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
+        let policy = PathPolicy::from_profile(&profile, Vec::new()).unwrap();
+        Probe {
+            _root: root,
+            jail,
+            policy,
+            broker: RecordingSandboxBroker::new(profile),
+        }
+    }
+
+    impl Probe {
+        fn push_stdout(&self, stdout: &str) {
+            self.broker.push(Ok(SandboxExecResult::synthetic(
+                Some(0),
+                None,
+                SandboxBackend::Landlock,
+                alloy_runtime::Digest::sha256(b"policy"),
+            )
+            .with_stdio(stdout.as_bytes().to_vec(), Vec::new())));
+        }
+
+        fn push_exit(&self, code: i32) {
+            self.broker.push(Ok(SandboxExecResult::synthetic(
+                Some(code),
+                None,
+                SandboxBackend::Landlock,
+                alloy_runtime::Digest::sha256(b"policy"),
+            )));
+        }
+
+        fn push_truncated_stdout(&self, stdout: &str) {
+            let mut result = SandboxExecResult::synthetic(
+                Some(0),
+                None,
+                SandboxBackend::Landlock,
+                alloy_runtime::Digest::sha256(b"policy"),
+            )
+            .with_stdio(stdout.as_bytes().to_vec(), Vec::new());
+            result.stdout_truncated = true;
+            self.broker.push(Ok(result));
+        }
+    }
+
+    /// AC 21: a nested repo (or any repo whose toplevel is not the jail) is a
+    /// permanent environment problem, never a git or checkpoint failure.
+    #[tokio::test]
+    async fn nested_repo_toplevel_outside_jail_is_environment() {
+        let fx = probe();
+        std::fs::create_dir_all(fx.jail.join(".git")).unwrap();
+        let outer = fx.jail.parent().unwrap().to_path_buf();
+        fx.push_stdout("true\n");
+        fx.push_stdout(&format!("{}\n", outer.display()));
+
+        let err = ensure_inside_work_tree(&fx.broker, &fx.policy, &token(vec![]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EditError::Environment(ref message) if message == "repo toplevel != jail"
+        ));
+    }
+
+    /// AC 45: a `.git` gitfile means a linked worktree, whose checkpoint refs
+    /// would live in another repository.
+    #[tokio::test]
+    async fn gitfile_worktree_is_environment() {
+        let fx = probe();
+        std::fs::write(fx.jail.join(".git"), "gitdir: ../real.git\n").unwrap();
+        fx.push_stdout("true\n");
+        fx.push_stdout(&format!("{}\n", fx.jail.display()));
+
+        let err = ensure_inside_work_tree(&fx.broker, &fx.policy, &token(vec![]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EditError::Environment(ref message) if message == "linked worktree not supported"
+        ));
+    }
+
+    /// AC 22: an unborn HEAD has no tree to checkpoint against.
+    #[tokio::test]
+    async fn empty_repository_is_environment() {
+        let fx = probe();
+        fx.push_exit(1);
+
+        let err = rev_parse_head(&fx.broker, &fx.policy, &token(vec![]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EditError::Environment(ref message)
+                if message == "empty repository: make initial commit"
+        ));
+    }
+
+    /// AC 41 / V29: both the declared object format and the SHA length must say
+    /// SHA-1, since `update-ref`'s create-only zero old-oid is SHA-1 shaped.
+    #[tokio::test]
+    async fn non_sha1_object_format_and_sha_length_are_environment() {
+        let sha256 = "a".repeat(64);
+        let sha1 = "b".repeat(40);
+        assert!(is_sha1(&sha1));
+        assert!(!is_sha1(&sha256));
+        assert!(!is_sha1(&"c".repeat(39)));
+        assert!(!is_sha1(&"D".repeat(40)), "uppercase hex is not canonical");
+
+        // A SHA-256 repo answers `--show-object-format` honestly.
+        let fx = probe();
+        fx.push_stdout("sha256\n");
+        let err = ensure_object_format(&fx.broker, &fx.policy, &token(vec![]), &sha1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::Environment(ref message) if message == "unsupported object format"
+        ));
+
+        // Older git without `--show-object-format`: fall back to SHA length.
+        let fx = probe();
+        fx.push_exit(129);
+        let err = ensure_object_format(&fx.broker, &fx.policy, &token(vec![]), &sha256)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::Environment(ref message) if message == "unsupported object format"
+        ));
+
+        // And a SHA-256 HEAD is refused by `rev-parse -q --verify HEAD` itself.
+        let fx = probe();
+        fx.push_stdout(&format!("{sha256}\n"));
+        let err = rev_parse_head(&fx.broker, &fx.policy, &token(vec![]))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::Environment(ref message) if message == "unsupported object format"
+        ));
+    }
+
+    /// AC 44: a truncated `ls-files` would look like a smaller tracked set, so
+    /// it must fail closed rather than under-report tracked paths.
+    #[tokio::test]
+    async fn truncated_ls_files_stdout_fails_closed() {
+        let fx = probe();
+        fx.push_truncated_stdout("a.txt\0");
+
+        let err = tracked_set(&fx.broker, &fx.policy, &token(vec![]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EditError::Environment(ref message)
+                if message == "git stdout truncated; raise sandbox stdout_cap"
+        ));
+    }
+
+    /// A submodule keeps its real repo in the superproject and leaves a `.git`
+    /// gitfile in the worktree; a nested clone leaves a `.git` directory. Both
+    /// put the path outside this repository's checkpoint.
+    #[test]
+    fn nested_git_marker_detected_as_file_or_directory() {
+        let fx = probe();
+        let tracked = ["sub/file.txt"].into_iter().map(str::to_string).collect();
+        let patch = PatchSet {
+            files: vec![FilePatch::Modify {
+                path: "sub/file.txt".into(),
+                hunks: vec![Hunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec!["-old".into(), "+new".into()],
+                    eof_newline: true,
+                    old_eof_no_newline: false,
+                }],
+            }],
+        };
+        std::fs::create_dir_all(fx.jail.join("sub")).unwrap();
+        assert!(ensure_tracked_policy(&fx.policy, &tracked, &patch).is_ok());
+
+        let marker = fx.jail.join("sub/.git");
+        std::fs::write(&marker, "gitdir: ../.git/modules/sub\n").unwrap();
+        assert!(is_nested_git_dir(&marker), "gitfile marks a submodule");
+        assert!(matches!(
+            ensure_tracked_policy(&fx.policy, &tracked, &patch),
+            Err(EditError::Environment(ref message))
+                if message == "submodule path not supported"
+        ));
+
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert!(is_nested_git_dir(&marker), "a nested clone marks one too");
+        assert!(matches!(
+            ensure_tracked_policy(&fx.policy, &tracked, &patch),
+            Err(EditError::Environment(ref message))
+                if message == "submodule path not supported"
+        ));
     }
 
     #[test]
