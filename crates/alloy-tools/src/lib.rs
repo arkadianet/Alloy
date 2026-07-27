@@ -7,6 +7,7 @@
 //! - [`mcp`] — MCP host, in-process builtins, tool disclosure (RFC-0006)
 //! - [`edit`] — GitEditEngine + EditEnginePatchBackend (RFC-0008)
 //! - `authz` — transport-neutral FsRead/FsWrite grant-glob matching (crate-private)
+//! - `redact` — absolute-path redaction for operator/model-visible strings (crate-private)
 //!
 //! Public surface matches RFC-0005 §3.1, RFC-0006 §3.1, and RFC-0008 §3.
 //! Internal helpers stay crate-private: `sandbox::grant` / `sandbox::path` are
@@ -20,6 +21,7 @@
 pub(crate) mod authz;
 pub mod edit;
 pub mod mcp;
+pub(crate) mod redact;
 pub mod sandbox;
 
 pub use sandbox::{
