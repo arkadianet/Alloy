@@ -617,6 +617,12 @@ impl GitEditEngine {
                     // callbacks already recorded whatever it created, so restore
                     // against the abandon record rather than nothing.
                     let _guard = Arc::clone(&self.write_lock).lock_owned().await;
+                    // Whoever held the lock in between may already have
+                    // reconciled this transaction; restoring a second time would
+                    // undo work that is no longer ours.
+                    if self.tx_state(tx_id) != Some(TxState::Open) {
+                        return Err(err);
+                    }
                     let partial = self.partial_from_abandoned(tx_id);
                     return Err(self
                         .restore_after_failure(err, &state, &partial, &ctx.perms)
@@ -815,6 +821,14 @@ impl GitEditEngine {
         })
         .await
         .map_err(|err| EditError::Internal(format!("apply task: {err}")))
+    }
+
+    /// Current state of `tx`, or `None` when the record is gone or unreadable.
+    fn tx_state(&self, tx: TransactionId) -> Option<TxState> {
+        lock(&self.tx_store)
+            .ok()?
+            .get(&tx)
+            .map(|record| record.state)
     }
 
     /// Paths the armed abandon record says this transaction created.
