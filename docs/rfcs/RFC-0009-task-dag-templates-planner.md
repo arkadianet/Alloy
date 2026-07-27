@@ -871,9 +871,9 @@ select(ctx) -> TemplateId:
 1. `template_id ← select(ctx)`.
 2. `manifest ← TemplateCatalog::get(template_id)`.
 3. **Phase A (sync):** `ids ← templates::allocate_ids(manifest)` → `TemplateIdMap` (local name → `NodeId`, plus `GateId` per approval node).
-4. **Phase B (async, planner):** using `ids`, `put` every input / `pending_pred` artifact per §5.3.0 with `NodeInputEnvelope.generation` equal to the plan/replan generation; build `input_refs: BTreeMap<NodeId, ArtifactId>` covering **every** node. Missing coverage is a crate bug → `Internal`.
-5. **Phase C (sync):** `dag ← templates::build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs })` — every node `Pending`, `TaskDag.state = Pending`, `output_ref = None`, `cache_key = None` when `!enable_cache` (day-1: all false). Every `input_ref` MUST equal the Phase B map entry (no synthetic `ArtifactId::new()`).
-6. `DagValidator::validate(&dag, ValidateOpts::default())?`.
+4. **Validate before any CAS writes (§8.5):** build a validation-only `input_refs` map with ephemeral `ArtifactId::new()` placeholders (**not** written to the artifact store); `candidate ← build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs: &placeholders })`; `DagValidator::validate(&candidate, ValidateOpts::default())?`. On failure, return `Validation` with **zero** plan artifacts written.
+5. **Phase B (async, planner):** using `ids`, `put` every input / `pending_pred` artifact per §5.3.0 with `NodeInputEnvelope.generation = 1`; build `input_refs: BTreeMap<NodeId, ArtifactId>` covering **every** node. Missing coverage is a crate bug → `Internal`.
+6. **Phase C (sync):** `dag ← templates::build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs })` — every node `Pending`, `TaskDag.state = Pending`, `output_ref = None`, `cache_key = None` when `!enable_cache` (day-1: all false). Every `input_ref` MUST equal the Phase B map entry. Ephemeral ids from step 4 MUST NOT appear in the persisted DAG.
 7. `snapshot ← artifacts.put(TaskDag JSON)` with snapshot labels. Serde failure → `PlanError::Internal`.
 8. `dags.put_if_generation(&dag, None)`:
    - `Ok` → continue
@@ -883,7 +883,7 @@ select(ctx) -> TemplateId:
    **If append fails after successful CAS insert:** return `PlanError::Event(...)`. The DAG row and snapshot remain durable; there is no distributed rollback. Callers MAY `replan` (which emits a new PlanProduced) or repair by appending a PlanProduced out-of-band; MVP ships no separate repair API.
 10. Return `PlanResult`.
 
-**Invariant:** after a successful `plan`/`replan`, every `nodes[*].input_ref` MUST resolve via `ArtifactStore::get` (AC 31).
+**Invariant:** after a successful `plan`/`replan`, every `nodes[*].input_ref` MUST resolve via `ArtifactStore::get` (AC 31). Validation-only placeholders from step 4 are never persisted and MUST NOT appear in the returned `PlanResult.dag`.
 
 `load_template(id, ctx)` uses `id` directly (ignores override) and follows the same steps.
 
@@ -912,12 +912,15 @@ pub fn allocate_ids(manifest: &TemplateManifest) -> TemplateIdMap;
 
 /// Phase C — sync, pure. MUST look up every node’s `input_ref` in
 /// `input_refs`. Missing key is a programmer error → panic.
-/// MUST NOT call `ArtifactId::new()`. Signature is infallible; the planner
-/// maps missing Phase B coverage to `PlanError::Internal` **before** calling.
+/// Signature is infallible; the planner maps missing Phase B coverage to
+/// `PlanError::Internal` **before** the persisted Phase C call.
+/// Ephemeral `ArtifactId::new()` values are permitted **only** for the
+/// pre-CAS validation candidate in §5.2 step 4; the persisted DAG’s
+/// `input_ref`s MUST come from Phase B CAS puts.
 pub fn build_topology(args: BuildTopology<'_>) -> TaskDag;
 ```
 
-Phase B is owned by `TemplatePlanService` (§5.2 steps 4 / §5.3.0).
+Phase B is owned by `TemplatePlanService` (§5.2 step 5 / §5.3.0).
 
 ### 5.3.0 Plan-time `input_ref` wiring (binding)
 
@@ -1059,15 +1062,18 @@ Uses `ctx.dag_id` only (no separate `dag_id` argument).
 3. Prefer routing replan through `RunController::request_replan` first so gate waiters are cleared (0003). Production callers MUST do so; direct `PlanService::replan` is test/advanced-only (no public waiter-clear API outside the control plane).
 4. `template_id ← ctx.template_override.unwrap_or_else(|| select(ctx))`.  
    **No EventStore scan.** Callers SHOULD pass the prior `PlanResult.template_id` as override.
-5. Build fresh topology via Phases A→B→C (§5.3) reusing `ctx.dag_id`, `generation = next_gen`, **`TaskDag.state = Pending`**, all nodes `Pending`, new node/gate ids, new artifacts.
-6. Validate; snapshot (serde fail → `Internal`).
-7. `dags.replace_for_replan(&dag, probe.generation)` mapping:
+5. `next_gen ← probe.generation.checked_add(1).ok_or(GenerationOverflow)?`.  
+   If `next_gen > i64::MAX as u64` → `PlanError::GenerationOverflow` (SQLite `INTEGER` bound).  
+   Return **before** Phases A–C or any artifact writes.
+6. Build + validate via §5.2 steps 3–6 pattern (Phase A → pre-CAS validate → Phase B → Phase C) reusing `ctx.dag_id`, `generation = next_gen`, **`TaskDag.state = Pending`**, all nodes `Pending`, new node/gate ids, new artifacts. Envelope `generation` fields MUST equal `next_gen`. Validation failure returns without writing plan artifacts.
+7. Snapshot (serde fail → `Internal`).
+8. `dags.replace_for_replan(&dag, probe.generation)` mapping:
    - `NotFound` → `DagNotFound`
    - `GenerationMismatch { actual }` → `PlanError::GenerationMismatch { expected: probe.generation, actual }`
    - `DagBusy { state }` → `PlanError::DagBusy { state }`
    - `Store(e)` → `PlanError::Store(e)`
-8. Append `PlanProduced` (`replan: true`, `reason: Some(reason)`, `run_id: Some(ctx.run_id)`). Same event-failure semantics as §5.2 step 8.
-9. Return `PlanResult`.
+9. Append `PlanProduced` (`replan: true`, `reason: Some(reason)`, `run_id: Some(ctx.run_id)`). Same event-failure semantics as §5.2 step 9.
+10. Return `PlanResult`.
 
 **Permitted preflight states:** any except that `replace_for_replan` **atomically** rejects `Running`. Terminal DAG states (`Succeeded`/`Cancelled`/`Failed`) are allowed at the store layer; RFC-0003 may still refuse replan on terminal *run* rows — that is a control-plane concern.
 
@@ -1162,16 +1168,25 @@ Accepted in serde; endpoints validated; excluded from readiness, cycle/reachabil
 
 ### 6.1 DAG lifecycle
 
+Persisted `TaskDag.state` values are only the merged `DagState` variants (`Pending`, `Running`, `WaitingApproval`, `Succeeded`, `Failed`, `Cancelled`, `ReplanRequired`). `RunControlState::ReplanRequested` is a **control-plane** state owned by RFC-0003 — it is not a `DagState`.
+
 ```mermaid
 stateDiagram-v2
-  [*] --> Planned: PlanService::plan
-  Planned --> Stored: put_if_generation insert
-  Stored --> Running: Scheduler::run (0010)
-  Running --> ReplanRequested: request_replan (0003)
-  ReplanRequested --> Planned: PlanService::replan
-  Running --> Terminal: Succeeded/Failed/Cancelled
-  Terminal --> [*]
+  [*] --> Pending: PlanService::plan
+  Pending --> Running: Scheduler::run (0010)
+  Running --> WaitingApproval: GateHuman (0010)
+  WaitingApproval --> Running: approve (0003)
+  Running --> ReplanRequired: scheduler checkpoint after request_replan (0010)
+  ReplanRequired --> Pending: PlanService::replan
+  Running --> Succeeded: ok
+  Running --> Failed: error
+  Running --> Cancelled: cancel
+  Succeeded --> [*]
+  Failed --> [*]
+  Cancelled --> [*]
 ```
+
+**Control-plane (not a DAG edge):** `RunController::request_replan` sets `RunControlState::ReplanRequested` and clears gate waiters (RFC-0003). Appendix C obliges the owning scheduler to checkpoint `DagState::ReplanRequired` (same generation) before `PlanService::replan` can succeed; otherwise `replace_for_replan` rejects `Running` with `DagBusy`.
 
 ### 6.2 Creation
 
@@ -1257,7 +1272,7 @@ Prefer Rust builders inside `OnceLock` (fallible `CapabilityId::new` at init). J
 | `SessionMismatch` | replan | no | |
 | `GenerationMismatch` | CAS | yes — re-read | |
 | `DagBusy` | `replace_for_replan` | yes — wait | atomic with CAS |
-| `GenerationOverflow` | u64 overflow | no | |
+| `GenerationOverflow` | u64 overflow **or** `next_gen > i64::MAX as u64` | no | before any artifact writes |
 | `Internal` | invariant / serde | no | |
 
 ### 8.3 Store boundary mapping
@@ -1277,7 +1292,7 @@ No new `RunError` variants. Map at 0003/0015 boundary to `Internal` / `Invalid` 
 
 | Failure | Recovery |
 | --- | --- |
-| Validation | Do not write |
+| Validation | Do not write (pre-CAS validate in §5.2 step 4; no transactional artifact cleanup) |
 | CAS Conflict on insert | Do not invent new dag_id; use `replan` or fix caller |
 | Event append after CAS | Return `Event`; row+snapshot durable; retry append or inspect |
 | Artifact put before CAS | Orphan CAS blob OK (no GC); retry plan fails insert if row exists |
@@ -1392,7 +1407,7 @@ Every criterion is independently testable by a named test or mechanical check.
 | # | Criterion | Proof |
 | --- | --- | --- |
 | 1 | `dag::types` field shapes unchanged | diff |
-| 2 | Validator implements V1–V16 with distinct variants (V17 Hint exclusion); first error wins under §5.4 determinism rules; `Unreachable` may be defensive-only | unit suite |
+| 2 | Validator implements V1–V17 rules (V17 Hint exclusion has no variant); first error wins under §5.4 determinism; `Unreachable` may be defensive-only | unit suite |
 | 3 | Adapter rejects capability; LLM requires Appendix A ids | unit |
 | 4 | Non-gate approval forbidden; gates unique | unit |
 | 5 | `repair_local_diagnostic` golden + **validates with dual edges** | golden |
