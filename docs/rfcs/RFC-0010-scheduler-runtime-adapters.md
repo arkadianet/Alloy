@@ -100,6 +100,7 @@ Seven RFCs have built substrate — storage, sessions, observability, sandbox, t
 | Outcome | Total `DagState` table D1–D9 + stall; Failed dominates Cancelled; `Skipped` never succeeds alone; `derive_dag_state` → `Result` | §5.17 |
 | Attempt context | Additive `NodeExecRef.attempt` for call_id / envelopes | §3.1.1 |
 | Artifacts | `Blob` + `application/json` (not `ArtifactKind::Json`); `verify_raw` = `Log` | Appendix G |
+| OS lock | `std::fs::File::try_lock` + `TryLockError` on pinned 1.97.1 | §4.5 |
 
 ---
 
@@ -913,7 +914,7 @@ Resume repair: a `failed` row missing its terminal events is repaired by the exi
 
 ### 3.17 Crate-root re-exports
 
-`alloy-runtime` MUST re-export: `LinearScheduler`, `LinearSchedulerDeps`, `SchedConfig`, `SchedulerMetrics`, `ready_nodes`, `promotable_nodes`, `backoff_delay`, `derive_dag_state`, `DeriveFlags`, `ToolCaller`, `ToolCallerError`, `VerifyPermissions`, `VerifyClass`, `CapabilityExecutor`, `CapabilityExecContext`, `CapabilityOutcome`, `CapabilityExecError`, `UnavailableCapabilityExecutor`, `CostMeterFactory`, `ProcessCostMeterFactory`, `McpVerifyCompileAdapter`, `McpVerifyTestAdapter`, `SessionGateHumanAdapter`, `parse_rustc_diagnostics`, `diagnostic_fingerprint`.
+`alloy-runtime` MUST re-export: `LinearScheduler`, `LinearSchedulerDeps`, `SchedConfig`, `SchedulerMetrics`, `ready_nodes`, `promotable_nodes`, `backoff_delay`, `derive_dag_state`, `DeriveFlags`, `ToolCaller`, `ToolCallerError`, `VerifyPermissions`, `VerifyClass`, `SessionVerifyPermissions`, `CapabilityExecutor`, `CapabilityExecContext`, `CapabilityOutcome`, `CapabilityExecError`, `UnavailableCapabilityExecutor`, `CostMeterFactory`, `ProcessCostMeterFactory`, `McpVerifyCompileAdapter`, `McpVerifyTestAdapter`, `SessionGateHumanAdapter`, `parse_rustc_diagnostics`, `diagnostic_fingerprint`.
 
 `alloy-tools` MUST re-export `ToolHandleToolCaller` and `map_mcp_error` from `mcp`.
 
@@ -1074,8 +1075,8 @@ struct OwnershipLock {
 | # | Rule |
 | --- | --- |
 | L1 | `new` MUST `create_dir_all(data_dir)`, then `OpenOptions::new().read(true).write(true).create(true).open(data_dir.join("scheduler.lock"))`. |
-| L2 | `new` MUST call `std::fs::File::try_lock` (stable since Rust 1.89; the toolchain is pinned at 1.97.1). The `fs4` / `fs2` crates MUST NOT be added. |
-| L3 | `TryLockError::WouldBlock` MUST map to `Ownership("scheduler.lock held by another process: {path}")`. Any other error MUST map to `Ownership("scheduler.lock: {e}")`. |
+| L2 | `new` MUST call `std::fs::File::try_lock` → `Result<(), std::fs::TryLockError>` (stable since 1.89.0; present on the pinned 1.97.1 toolchain — verified). The `fs4` / `fs2` crates MUST NOT be added. |
+| L3 | `std::fs::TryLockError::WouldBlock` MUST map to `Ownership("scheduler.lock held by another process: {path}")`. `TryLockError::Error(e)` MUST map to `Ownership("scheduler.lock: {e}")`. |
 | L4 | The lock file MUST NOT be deleted on drop (deleting it races a second process that already opened the same inode). It MAY be truncated and MAY have the owning pid written for debugging; correctness MUST NOT depend on its contents. |
 | L5 | `run` MUST acquire DAG ownership **before** any CAS and MUST hold it until the terminal checkpoint is committed. |
 | L6 | A DAG whose durable `DagState::Running` is not owned by this process is a **crash residue**: `run` MUST adopt it (§5.3.2), and a `LinearScheduler` MUST NOT leave a foreign `Running` DAG untouched while accepting new work for it (RFC-0009 Appendix C). |
@@ -1127,7 +1128,7 @@ struct OwnershipLock {
 | R6 | `sessions.get_session(dag.session_id)` for `workspace_root`, `profile`, `budget` | `None` ⇒ `Err(Invariant("session row missing for dag {id}"))` |
 | R7 | Compute effective budget ceilings (§5.16.1) | non-fatal; degenerate ceilings recorded as a `Budget` decision |
 | R8 | Rebuild the run cost meter from events (§5.16.2) | `ObsError` ⇒ `Err(Store(..))` |
-| R9 | If `dag.state ∈ {Succeeded, Failed, Cancelled}` ⇒ return `Ok` outcome derived from the durable blob (§5.18) with **no** CAS | — |
+| R9 | If `dag.state ∈ {Succeeded, Failed, Cancelled}` ⇒ return `Ok` with `state = dag.state` verbatim (do **not** re-run §5.17 — DeriveFlags are unset on a fresh entry and would mis-classify a gate-denied `Failed` blob as `Cancelled`). Assemble `failed_node` / `failure` via §5.18 FO1–FO6 only. **No** CAS. | — |
 | R10 | If `dag.state == ReplanRequired` ⇒ return `Ok(DagOutcome { state: ReplanRequired, .. })` with no CAS | — |
 | R11 | Reconstruct per-node attempt counters (§5.3.1) | `Err(Store(..))` on event read failure |
 | R12 | Start the run clock; `gate_wait_total = 0` (§5.19) — **before** adoption so A6/backoff remaining-budget checks have a defined clock | — |
@@ -1438,7 +1439,7 @@ impl GateHumanAdapter for SessionGateHumanAdapter {
 | GC4 | The adapter MUST NOT append events, write the DAG, or call `approve` / `expire_gate`. |
 | GC5 | `register_gate_waiter` MUST be called by the adapter (it needs the receiver), and its `RunError` MUST map: `InvalidPhase(m) → AdapterError::Internal("gate registration: {m}")`, `NotFound → Internal`, everything else → `Internal`. The scheduler re-reads `RunControlState` for classification rather than trusting the string. |
 
-#### 5.7.11 Crash window: terminal control row, `WaitingApproval` DAG (fix 21)
+#### 5.7.12 Crash window: terminal control row, `WaitingApproval` DAG (fix 21)
 
 | Step | Actor |
 | --- | --- |
