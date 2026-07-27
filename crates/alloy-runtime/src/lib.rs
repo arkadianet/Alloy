@@ -95,8 +95,9 @@ pub use router::{
 pub use router::{OpenAiCompatibleProvider, OpenAiCompatibleSpec};
 pub use runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
 pub use scheduler::{
-    DagOutcome, DagState, LinearScheduler, LinearSchedulerDeps, NullScheduler, SchedConfig,
-    Scheduler, SchedulerMetrics,
+    backoff_delay, derive_dag_state, promotable_nodes, ready_nodes, DagOutcome, DagState,
+    DeriveFlags, LinearScheduler, LinearSchedulerDeps, NullScheduler, SchedConfig, Scheduler,
+    SchedulerMetrics,
 };
 pub use session::{
     clamp_events_page_limit, ReplanReason, RunControlState, RunController, RunGoalRecord, Session,

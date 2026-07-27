@@ -638,8 +638,10 @@ fn check_linear(
 ///
 /// Runtime Ready transitions remain RFC-0010; this helper ships for unit tests
 /// and for the scheduler to reuse without inventing a second rule set.
+///
+/// Used in production by `scheduler::linear::ready::promotable_nodes`
+/// (RFC-0010 §3.13 / §5.4), not only by tests.
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn preds_satisfied(dag: &TaskDag, node: NodeId) -> bool {
     for edge in &dag.edges {
         if edge.to != node {

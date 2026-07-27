@@ -22,6 +22,10 @@ pub use templates::{
     TemplateEdgeSpec, TemplateId, TemplateIdMap, TemplateManifest, TemplateNodeSpec,
 };
 pub use types::*;
+/// Shared predecessor-satisfaction rule (RFC-0009 §5.3.1), reused by
+/// `scheduler::linear::ready::promotable_nodes` (RFC-0010 §3.13) so the
+/// scheduler does not reimplement the readiness predicate.
+pub(crate) use validate::preds_satisfied;
 pub use validate::{DagValidationError, DagValidator, RetryIncoherence, ValidateOpts};
 
 /// Optional re-export of the storage trait for convenience (concrete type stays in storage).

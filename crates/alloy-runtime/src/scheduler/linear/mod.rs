@@ -5,8 +5,10 @@
 
 mod metrics;
 mod own;
+mod ready;
 
 pub use metrics::SchedulerMetrics;
+pub use ready::{backoff_delay, derive_dag_state, promotable_nodes, ready_nodes, DeriveFlags};
 
 use std::path::PathBuf;
 use std::sync::Arc;
