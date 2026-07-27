@@ -851,7 +851,7 @@ crates/alloy-runtime/src/
     mod.rs
     types.rs            # EXISTING — field shapes unchanged
     validate.rs
-    store.rs            # optional re-export of storage::DagStore only
+    mod.rs → store { }  # inline re-export of storage::{DagStore, …} only (no store.rs file)
     templates.rs        # sync topology build (generation param; no I/O)
     cache.rs
     io.rs               # envelopes + encode helpers
@@ -914,7 +914,7 @@ select(ctx) -> TemplateId:
 3. **Phase A (sync):** `ids ← templates::allocate_ids(manifest)` → `TemplateIdMap` (local name → `NodeId`, plus `GateId` per approval node).
 4. **Validate before any CAS writes (§8.5):** build a validation-only `input_refs` map with ephemeral `ArtifactId::new()` placeholders (**not** written to the artifact store); `candidate ← build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs: &placeholders })`; `DagValidator::validate(&candidate, ValidateOpts::default())?`. On failure, return `Validation` with **zero** plan artifacts written.
 5. **Phase B (async, planner):** using `ids`, `put` every input / `pending_pred` artifact per §5.3.0 with `NodeInputEnvelope.generation = 1`; build `input_refs: BTreeMap<NodeId, ArtifactId>` covering **every** node. Missing coverage is a crate bug → `Internal`.
-6. **Phase C (sync):** `dag ← templates::build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs })` — every node `Pending`, `TaskDag.state = Pending`, `output_ref = None`, `cache_key = None` when `!enable_cache` (day-1: all false). Every `input_ref` MUST equal the Phase B map entry. Ephemeral ids from step 4 MUST NOT appear in the persisted DAG.
+6. **Phase C (sync):** `dag ← templates::build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs })` — every node `Pending`, `TaskDag.state = Pending`, `output_ref = None`, `cache_key = None` when `!enable_cache` (day-1: all false). If a manifest ever sets `enable_cache = true` before RFC-0010 supplies cache materials, `build_topology` MUST leave `cache_key = None` and emit an error-level log (must not invent keys). Every `input_ref` MUST equal the Phase B map entry. Ephemeral ids from step 4 MUST NOT appear in the persisted DAG.
 7. `snapshot ← artifacts.put(TaskDag JSON)` with snapshot labels. Serde failure → `PlanError::Internal`.
 8. `dags.put_if_generation(&dag, None)`:
    - `Ok` → continue
@@ -1185,7 +1185,7 @@ compiler_fingerprint.as_hex()
 
 | Payload | Bytes hashed |
 | --- | --- |
-| `Goal` | `serde_json::to_vec` of the `Goal` value only |
+| `Goal` | `serde_json::to_vec` of the `Goal` value only. **Note for RFC-0010:** `serde_json` encodes non-finite `f64` constraint values as `null`, so `MaxUsd(NaN)` and `MaxUsd(+Inf)` collide; reject non-finite constraint values before enabling cache hits |
 | `FromPredecessors` | **Deferred to RFC-0010** — day-1 templates never enable cache on non-roots. Framing (NodeId encoding, separators, edge order) MUST be specified in 0010 before any non-root `enable_cache = true` ships |
 
 Day-1 templates never set `cache_key`. Pin a golden expected digest in `cache_key_stable` for a fixed `Goal` fixture (root/content path only).
@@ -1586,6 +1586,7 @@ Replan: `"replan": true`, `"reason": "user_requested"` for unit variants, or `{"
 - Apply Data vs Sequence satisfaction per §5.3.1
 - Ignore `model_tier` / budgets on adapter nodes for routing
 - Specify `FromPredecessors` cache content-digest framing before enabling non-root cache
+- Reject non-finite `f64` values in `Goal` constraints before enabling cache hits (serde_json maps them to `null`, colliding digests)
 
 **Concurrency note (normative for 0010):** Same-generation checkpoint CAS (`put_if_generation(..., Some(generation))` where the blob’s generation equals the expected generation) assumes a **single scheduler writer** per DAG. Generation alone does not serialize two concurrent same-generation updates that both pass the compare; ownership / leasing is RFC-0010’s responsibility.
 

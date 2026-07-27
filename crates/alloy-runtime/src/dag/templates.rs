@@ -542,6 +542,8 @@ mod tests {
         assert_eq!(gate.retry.max_attempts, 1);
         assert!(matches!(gate.retry.backoff, Backoff::Fixed { delay_ms: 0 }));
         assert!(gate.retry.retry_on.is_empty());
+        assert!(gate.retry.escalate_after.is_none());
+        assert!(gate.retry.escalate_to_tier.is_none());
         assert_eq!(
             gate.approval.as_ref().unwrap().reason,
             "Approve repair diff before completion"
