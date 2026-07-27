@@ -20,7 +20,8 @@ use crate::events::{EventSink, NewSessionEvent, RuntimeEvent, SessionEvent, Sess
 use crate::runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
 use crate::scheduler::{DagOutcome, DagState, Scheduler};
 use crate::storage::{
-    install_sqlite_event_sink, AlloyStorage, EventStore, RunRow, SessionRows, StorageOpenOptions,
+    install_sqlite_event_sink, AlloyStorage, DagStore, EventStore, RunRow, SessionRows,
+    StorageOpenOptions,
 };
 use crate::types::budget::{BudgetPolicy, BudgetSnapshot, CreateSession, Goal};
 use crate::types::ids::{DagId, EventSeq, GateId, LanguageId, ProfileId, RunId, SessionId};
@@ -201,6 +202,29 @@ impl Harness {
         serde_json::from_value::<RunGoalRecord>(self.run_row(run).await.goal_json)
             .unwrap()
             .dag_id
+    }
+
+    /// Seed the minimal `TaskDag` row `approve`/`expire_gate` need to resolve a
+    /// generation (amendment A8). Production always has this row by the time a
+    /// gate exists (the scheduler's C1 checkpoint writes it before first
+    /// dispatch); tests that jump a run straight to `waiting_approval` without
+    /// running a real scheduler must seed it explicitly.
+    async fn seed_dag(&self, run: RunId) -> DagId {
+        let session_id = self.run_row(run).await.session_id;
+        let dag_id = self.dag_id(run).await;
+        self.storage
+            .dags()
+            .put(&crate::dag::TaskDag {
+                id: dag_id,
+                session_id,
+                generation: 0,
+                nodes: Default::default(),
+                edges: Vec::new(),
+                state: DagState::WaitingApproval,
+            })
+            .await
+            .unwrap();
+        dag_id
     }
 
     async fn session_events(&self, session: SessionId) -> Vec<SessionEvent> {
@@ -857,6 +881,7 @@ async fn start_lock_not_held_across_run_dag() {
     )]));
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
 
     let runs = h.runs();
     let started = tokio::spawn(async move { runs.start(run).await });
@@ -1143,6 +1168,7 @@ async fn run_approve_with_waiter() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.set_run_state(run, RunControlState::Accepted).await;
     let gate = GateId::new();
     let rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
@@ -1183,6 +1209,7 @@ async fn run_approve_deny_during_run_dag_joins_cleanly() {
     let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(DagState::Failed)]));
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
 
     let runs = h.runs();
     let started = tokio::spawn(async move { runs.start(run).await });
@@ -1214,6 +1241,7 @@ async fn run_approve_deny_fails_run() {
     h.install_scheduler(MockScheduler::new([Plan::State(DagState::WaitingApproval)]));
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.runs().start(run).await.unwrap();
     assert_eq!(h.run_state(run).await, RunControlState::WaitingApproval);
 
@@ -1240,6 +1268,7 @@ async fn run_approve_persists_before_notify() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.set_run_state(run, RunControlState::Accepted).await;
     let gate = GateId::new();
     let mut rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
@@ -1293,6 +1322,7 @@ async fn run_approve_deny_drops_waiter_when_append_fails() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.set_run_state(run, RunControlState::Accepted).await;
     let gate = GateId::new();
     let mut rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
@@ -1429,6 +1459,7 @@ async fn run_approve_deny_emits_run_finished_after_redispatch() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
 
     // First dispatch announces acceptance, then fails to find a scheduler.
     assert!(matches!(
@@ -1452,6 +1483,7 @@ async fn run_approve_deny_emits_run_finished_after_redispatch() {
     // A run this process never dispatched still gets its terminal event: durable state
     // having left `created` is what proves acceptance was already announced.
     let restored = h.submit(session).await;
+    h.seed_dag(restored).await;
     h.set_run_state(restored, RunControlState::WaitingApproval)
         .await;
     let gate = GateId::new();
@@ -1691,6 +1723,7 @@ async fn register_gate_waiter_replaces_prior_waiter() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.set_run_state(run, RunControlState::Accepted).await;
     let gate = GateId::new();
 

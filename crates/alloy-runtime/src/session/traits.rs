@@ -53,6 +53,12 @@ pub trait RunController: Send + Sync {
     async fn approve(&self, run: RunId, gate: GateId, decision: Approval) -> Result<(), RunError>;
     /// Request a replan.
     async fn request_replan(&self, run: RunId, reason: ReplanReason) -> Result<(), RunError>;
+    /// Terminalize a gate whose `timeout_ms` elapsed (RFC-0010 §3.15 / §5.7.8,
+    /// amendment A4). Mirrors `approve(Deny)` with `decision: "expired"`.
+    ///
+    /// Idempotent with respect to a missing waiter (amendment A7): a
+    /// `(run, gate)` with no registered waiter is not an error.
+    async fn expire_gate(&self, run: RunId, gate: GateId) -> Result<(), RunError>;
 }
 
 /// Session record snapshot.

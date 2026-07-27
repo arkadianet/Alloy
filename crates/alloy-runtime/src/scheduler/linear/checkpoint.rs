@@ -966,9 +966,9 @@ impl Checkpoint {
     /// idempotence contract as [`Self::repair_node_state`], keyed on
     /// `(gate_id, generation)`.
     ///
-    /// Not yet wired into `loop_.rs` — see [`Self::repair_node_state`]'s doc.
+    /// Wired into `gate.rs`'s `gate_remaining_deadline` (§5.7.3 GR3 — the only
+    /// place the scheduler may re-emit it).
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
     pub(crate) async fn repair_approval_requested(
         &self,
         dag_id: DagId,

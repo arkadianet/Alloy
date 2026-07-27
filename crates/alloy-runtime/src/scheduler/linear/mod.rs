@@ -5,6 +5,7 @@
 
 mod checkpoint;
 mod envelopes;
+mod gate;
 mod loop_;
 mod metrics;
 mod own;

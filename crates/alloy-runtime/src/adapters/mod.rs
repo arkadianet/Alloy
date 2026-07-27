@@ -2,6 +2,7 @@
 
 mod capability;
 mod diagnostics;
+mod gate;
 mod perms;
 mod tool_caller;
 mod verify;
@@ -11,6 +12,7 @@ pub use capability::{
     UnavailableCapabilityExecutor,
 };
 pub use diagnostics::{diagnostic_fingerprint, parse_rustc_diagnostics};
+pub use gate::SessionGateHumanAdapter;
 pub use perms::{SessionVerifyPermissions, VerifyClass, VerifyPermissions};
 pub use tool_caller::{ToolCaller, ToolCallerError};
 pub use verify::{McpVerifyCompileAdapter, McpVerifyTestAdapter};

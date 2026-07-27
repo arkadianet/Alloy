@@ -40,16 +40,14 @@ use tokio::time::Instant;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use super::checkpoint::{
-    map_store_error, map_store_error_on_load, Checkpoint, CheckpointCtx, GateDecision,
-};
+use super::checkpoint::{map_store_error, map_store_error_on_load, Checkpoint, CheckpointCtx};
 use super::envelopes::{self, InputShape};
 use super::ready::{derive_dag_state, promotable_nodes, ready_nodes, DeriveFlags};
 use super::retry::{self, Admission, Escalation};
 use super::LinearScheduler;
 use crate::adapters::{
-    Approval, CapabilityExecContext, CapabilityExecError, CapabilityOutcome, NodeExecContext,
-    NodeExecRef, VerifyOutcome,
+    CapabilityExecContext, CapabilityExecError, CapabilityOutcome, NodeExecContext, NodeExecRef,
+    VerifyOutcome,
 };
 use crate::dag::{DagValidator, NodeKind, NodeOutputEnvelope, NodeState, TaskDag};
 use crate::error::{AdapterError, SchedError};
@@ -59,10 +57,13 @@ use crate::session::{RunControlState, RunGoalRecord, Session};
 use crate::storage::RunRow;
 use crate::types::budget::ModelTier;
 use crate::types::diagnostic::{ErrorClass, FailureIr, RetryDisposition};
-use crate::types::ids::{DagId, NodeId, RunId};
+use crate::types::ids::{DagId, GateId, NodeId, RunId};
 
 /// What a single loop iteration produced.
-enum StepOutcome {
+///
+/// `pub(super)`: shared with `gate.rs`, a sibling module under
+/// `scheduler::linear` that implements the §5.7 state machine.
+pub(super) enum StepOutcome {
     /// Keep looping.
     Continue,
     /// Leave the loop: derive the terminal state naturally (§5.17) and
@@ -74,19 +75,29 @@ enum StepOutcome {
 }
 
 /// Per-`run` state threaded through the loop.
-struct RunCtx<'a> {
-    checkpoint: &'a Checkpoint,
-    ctx: CheckpointCtx,
-    session: &'a Session,
-    run_cancel: &'a CancellationToken,
-    run_id: RunId,
-    run_started: Instant,
-    run_timeout: Duration,
+///
+/// `pub(super)`: shared with `gate.rs` (see [`StepOutcome`]).
+pub(super) struct RunCtx<'a> {
+    pub(super) checkpoint: &'a Checkpoint,
+    pub(super) ctx: CheckpointCtx,
+    pub(super) session: &'a Session,
+    pub(super) run_cancel: &'a CancellationToken,
+    pub(super) run_id: RunId,
+    pub(super) run_started: Instant,
+    pub(super) run_timeout: Duration,
     /// §5.19 T1: wall time spent inside gate waits, excluded from the
     /// charged run elapsed. `std::sync::Mutex` (not `Cell`) because `&RunCtx`
     /// crosses `.await` points and the held future must stay `Send`, which
     /// requires `RunCtx: Sync`; only the gate route mutates it.
     gate_wait_total: std::sync::Mutex<Duration>,
+    /// §5.7.8 GT3: `(run_id, gate_id)` keys this `run` invocation has already
+    /// called `expire_gate` for (successfully, or found durably expired, or
+    /// exhausted retries and self-terminalized). Process-local and scoped to
+    /// this one `run` call, not durable — matches GT3's "in-run set" wording.
+    pub(super) expired_gates: std::sync::Mutex<std::collections::HashSet<GateId>>,
+    /// §5.7.9 `GATE_REREGISTER_MAX`: per-gate re-registration attempts
+    /// consumed so far this `run` invocation.
+    gate_reregister_counts: std::sync::Mutex<std::collections::HashMap<GateId, u32>>,
 }
 
 impl RunCtx<'_> {
@@ -97,7 +108,7 @@ impl RunCtx<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn add_gate_wait(&self, delta: Duration) {
+    pub(super) fn add_gate_wait(&self, delta: Duration) {
         let mut g = self
             .gate_wait_total
             .lock()
@@ -106,12 +117,48 @@ impl RunCtx<'_> {
     }
 
     /// §5.19: `remaining_run = run_timeout - (elapsed - gate_wait_total)`.
-    fn remaining_run(&self) -> Duration {
+    pub(super) fn remaining_run(&self) -> Duration {
         let elapsed_charged = self
             .run_started
             .elapsed()
             .saturating_sub(self.gate_wait_total());
         self.run_timeout.saturating_sub(elapsed_charged)
+    }
+
+    /// GT3: has `(run_id, gate_id)` already had its expiry resolved (by
+    /// `expire_gate`, a durable scan, or local exhaustion) during this `run`?
+    pub(super) fn gate_already_expired(&self, gate: GateId) -> bool {
+        self.expired_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&gate)
+    }
+
+    /// GT3: record that `(run_id, gate_id)` has had its expiry resolved.
+    pub(super) fn mark_gate_expired(&self, gate: GateId) {
+        self.expired_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(gate);
+    }
+
+    /// §5.7.9 `GATE_REREGISTER_MAX`: consume one re-registration attempt for
+    /// `gate`, returning `true` if one was available (caller may
+    /// re-register) or `false` once the bound is exhausted (caller MUST
+    /// fall back to `Internal`).
+    pub(super) fn try_consume_gate_reregister(&self, gate: GateId) -> bool {
+        const GATE_REREGISTER_MAX: u32 = 3;
+        let mut counts = self
+            .gate_reregister_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = counts.entry(gate).or_insert(0);
+        if *count >= GATE_REREGISTER_MAX {
+            false
+        } else {
+            *count += 1;
+            true
+        }
     }
 }
 
@@ -274,6 +321,8 @@ impl LinearScheduler {
             run_started: Instant::now(), // R12
             run_timeout: self.deps.run_timeout,
             gate_wait_total: std::sync::Mutex::new(Duration::ZERO),
+            expired_gates: std::sync::Mutex::new(std::collections::HashSet::new()),
+            gate_reregister_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
 
         // R13: adopt any node durably Running (crash resume).
@@ -289,8 +338,7 @@ impl LinearScheduler {
         // R15: edit-tx resume is a no-op (see module docs — `needs_reverify`
         // does not exist on `TaskNode` yet).
 
-        // R16: minimal WaitingApproval resume (P7 owns the real durable
-        // resolution scan / re-register-only semantics, §5.7.2/§5.7.3).
+        // R16: resume with a durable WaitingApproval DAG (§5.7.2/§5.7.3).
         if dag.state == DagState::WaitingApproval {
             if let Some(gate_node) = dag
                 .nodes
@@ -298,7 +346,7 @@ impl LinearScheduler {
                 .find(|n| n.state == NodeState::WaitingApproval)
                 .map(|n| n.id)
             {
-                match self.dispatch_gate(&mut dag, &rc, gate_node, true).await? {
+                match self.gate_route(&mut dag, &rc, gate_node, true).await? {
                     StepOutcome::Terminal(outcome) => return Ok(outcome),
                     StepOutcome::Continue | StepOutcome::NaturalExit => {}
                 }
@@ -565,7 +613,7 @@ impl LinearScheduler {
 
         // L10 done (selected). L13: gate route before any C3.
         if dag.nodes[&selected].kind == NodeKind::GateHuman {
-            return self.dispatch_gate(dag, rc, selected, false).await;
+            return self.gate_route(dag, rc, selected, false).await;
         }
 
         self.dispatch_node(dag, rc, selected).await
@@ -769,7 +817,9 @@ impl LinearScheduler {
     // §5.9 success path / §5.14 Aggregate fold
     // -----------------------------------------------------------------
 
-    async fn apply_success(
+    /// `pub(super)`: called from `gate.rs`'s allow-fold (GA1) as well as the
+    /// ordinary dispatch path.
+    pub(super) async fn apply_success(
         &self,
         dag: &mut TaskDag,
         rc: &RunCtx<'_>,
@@ -1038,149 +1088,8 @@ impl LinearScheduler {
         })
     }
 
-    // -----------------------------------------------------------------
-    // §5.7 gate route (minimal placeholder — see module docs)
-    // -----------------------------------------------------------------
-
-    /// **P7 seam.** Mechanical `C9a -> wait_approval -> C9b/C9c` happy
-    /// path: no deadline wrapping (§5.7.8), no durable-resolution resume
-    /// scan (§5.7.2/§5.7.3), no closed-receiver reclassification (§5.7.9).
-    /// `resuming = true` skips C9a (the node is already `WaitingApproval`).
-    async fn dispatch_gate(
-        &self,
-        dag: &mut TaskDag,
-        rc: &RunCtx<'_>,
-        node_id: NodeId,
-        resuming: bool,
-    ) -> Result<StepOutcome, SchedError> {
-        let approval = dag.nodes[&node_id]
-            .approval
-            .clone()
-            .ok_or_else(|| SchedError::Invariant(format!("gate node {node_id} has no approval")))?;
-
-        if !resuming {
-            rc.checkpoint
-                .c9a_gate_schedule(
-                    dag,
-                    rc.ctx,
-                    node_id,
-                    approval.gate,
-                    &approval.reason,
-                    dag.nodes[&node_id].timeout_ms,
-                )
-                .await?;
-        }
-
-        let meta = NodeExecRef {
-            session_id: rc.session.id,
-            run_id: rc.run_id,
-            dag_id: dag.id,
-            node_id,
-            workspace_root: rc.session.workspace_root.clone(),
-            attempt: 0, // NX1: gate wait contexts use 0 (no C3 yet).
-        };
-        let wait_started = Instant::now();
-        let result = self
-            .deps
-            .gate_human
-            .wait_approval(
-                &NodeExecContext {
-                    meta,
-                    cancellation: rc.run_cancel.clone(),
-                },
-                approval.gate,
-            )
-            .await;
-        rc.add_gate_wait(wait_started.elapsed()); // T1
-
-        match result {
-            Ok(Approval::Allow) => self.gate_allow(dag, rc, node_id, GateDecision::Allow).await,
-            Ok(Approval::AllowOnce) => {
-                self.gate_allow(dag, rc, node_id, GateDecision::AllowOnce)
-                    .await
-            }
-            Ok(Approval::Deny) => self.gate_deny(dag, rc, node_id, GateDecision::Deny).await,
-            Err(e) => {
-                let failure = failure_from_adapter_error(node_id, e);
-                self.gate_deny_with_failure(dag, rc, node_id, GateDecision::Deny, failure)
-                    .await
-            }
-        }
-    }
-
-    /// GA1-GA4: `WaitingApproval -> Ready -> Running -> Succeeded`.
-    async fn gate_allow(
-        &self,
-        dag: &mut TaskDag,
-        rc: &RunCtx<'_>,
-        node_id: NodeId,
-        decision: GateDecision,
-    ) -> Result<StepOutcome, SchedError> {
-        rc.checkpoint
-            .c9b_gate_allow(dag, rc.ctx, node_id, decision)
-            .await?; // GA3
-
-        // GA4: the post-allow Ready -> Running step is C3.
-        let attempts_started = rc
-            .checkpoint
-            .rebuild_attempts_started(dag.id, rc.session.id, node_id, dag.generation, false)
-            .await?;
-        let attempt = (attempts_started + 1).max(1);
-        rc.checkpoint
-            .c3_dispatch(dag, rc.ctx, node_id, attempt)
-            .await?;
-
-        // GA1: deterministic fold, not a worker/adapter call.
-        let payload = serde_json::json!({
-            "approved": true,
-            "decision": gate_decision_str(decision),
-            "gate_id": dag.nodes[&node_id]
-                .approval
-                .as_ref()
-                .map(|a| a.gate.to_string()),
-        });
-        self.apply_success(dag, rc, node_id, attempt, payload).await
-    }
-
-    async fn gate_deny(
-        &self,
-        dag: &mut TaskDag,
-        rc: &RunCtx<'_>,
-        node_id: NodeId,
-        decision: GateDecision,
-    ) -> Result<StepOutcome, SchedError> {
-        let failure = FailureIr {
-            node: node_id,
-            error_class: ErrorClass::Approval,
-            retry: RetryDisposition::NonRetryable,
-            diagnostics: vec![],
-            notes: "approval denied".into(),
-        };
-        self.gate_deny_with_failure(dag, rc, node_id, decision, failure)
-            .await
-    }
-
-    async fn gate_deny_with_failure(
-        &self,
-        dag: &mut TaskDag,
-        rc: &RunCtx<'_>,
-        node_id: NodeId,
-        decision: GateDecision,
-        failure: FailureIr,
-    ) -> Result<StepOutcome, SchedError> {
-        let skipped = non_terminal_except(dag, node_id);
-        let _failure_ref = rc
-            .checkpoint
-            .c9c_gate_deny(dag, rc.ctx, node_id, decision, &failure, &skipped)
-            .await?;
-        Ok(StepOutcome::Terminal(DagOutcome {
-            dag_id: dag.id,
-            generation: dag.generation,
-            state: DagState::Failed,
-            failed_node: Some(node_id), // FN2
-            failure: Some(failure),
-        }))
-    }
+    // §5.7 gate orchestration lives in `gate.rs` (`LinearScheduler::gate_route`
+    // and friends) — a separate `impl LinearScheduler` block in that file.
 
     // -----------------------------------------------------------------
     // Cancel / replan / budget / run-timeout terminal paths
@@ -1189,7 +1098,10 @@ impl LinearScheduler {
     /// §5.12.2 owned cancel (run-side): in-flight node (`Running`/`Ready`/
     /// `WaitingApproval`) → `Cancelled`; every other non-terminal node →
     /// `Skipped`.
-    async fn cancel_path(
+    ///
+    /// `pub(super)`: also the §5.7.10/§5.7.9 cancel routing target from
+    /// `gate.rs`.
+    pub(super) async fn cancel_path(
         &self,
         dag: &mut TaskDag,
         rc: &RunCtx<'_>,
@@ -1207,7 +1119,9 @@ impl LinearScheduler {
         }))
     }
 
-    async fn replan_path(
+    /// `pub(super)`: also the §5.7.9 `ReplanRequested` classification target
+    /// from `gate.rs`.
+    pub(super) async fn replan_path(
         &self,
         dag: &mut TaskDag,
         rc: &RunCtx<'_>,
@@ -1448,8 +1362,9 @@ fn failure_from_capability_exec_error(node: NodeId, e: CapabilityExecError) -> F
     }
 }
 
-/// §5.10 `AdapterError` -> `FailureIr`.
-fn failure_from_adapter_error(node: NodeId, e: AdapterError) -> FailureIr {
+/// §5.10 `AdapterError` -> `FailureIr`. `pub(super)`: also used by `gate.rs`
+/// for the wait-result's non-gate-specific adapter failures.
+pub(super) fn failure_from_adapter_error(node: NodeId, e: AdapterError) -> FailureIr {
     let (error_class, retry, notes) = match &e {
         AdapterError::Unavailable => (
             ErrorClass::Internal,
@@ -1525,15 +1440,6 @@ fn failure_from_adapter_error(node: NodeId, e: AdapterError) -> FailureIr {
     }
 }
 
-fn gate_decision_str(d: GateDecision) -> &'static str {
-    match d {
-        GateDecision::Allow => "allow",
-        GateDecision::AllowOnce => "allow_once",
-        GateDecision::Deny => "deny",
-        GateDecision::Expired => "expired",
-    }
-}
-
 /// §5.11.4 ES5: escalation only applies to capability-worker node kinds.
 /// `VerifyCompile`/`VerifyTest`/`GateHuman`/`Aggregate` have no model call
 /// to escalate.
@@ -1545,8 +1451,9 @@ fn is_capability_kind(kind: NodeKind) -> bool {
 }
 
 /// Every node not `except` and not already terminal (SK3: reachability is
-/// not consulted in MVP).
-fn non_terminal_except(dag: &TaskDag, except: NodeId) -> Vec<NodeId> {
+/// not consulted in MVP). `pub(super)`: also used by `gate.rs`'s deny/expiry
+/// terminal writes.
+pub(super) fn non_terminal_except(dag: &TaskDag, except: NodeId) -> Vec<NodeId> {
     dag.nodes
         .values()
         .filter(|n| {
@@ -1625,12 +1532,13 @@ mod tests {
 
     use super::*;
     use crate::adapters::{
-        CapabilityExecutor, GateHumanAdapter, VerifyCompileAdapter, VerifyTestAdapter,
+        Approval, CapabilityExecutor, GateHumanAdapter, VerifyCompileAdapter, VerifyTestAdapter,
     };
     use crate::dag::{
         Backoff, DependencyEdge, EdgeKind, NodeInputEnvelope, NodeInputPayload, PredecessorOutput,
         RetryPolicy, TaskNode,
     };
+    use crate::events::EventSink;
     use crate::obs::{ProcessCostMeterFactory, RecordingDecisionLog, RetentionPolicy};
     use crate::runtime::AlloyRuntime;
     use crate::scheduler::linear::{LinearSchedulerDeps, SchedConfig};
@@ -1706,12 +1614,23 @@ mod tests {
         }
     }
 
+    /// `GateHumanAdapter` test double that also drives the real control plane
+    /// (`SessionPlane::register_gate_waiter` + `approve`) for `Ok` outcomes.
+    ///
+    /// §5.7.10 requires `gate_wait_and_dispatch` to re-scan for a durable
+    /// `ApprovalResolved` event after the wait returns, trusting that over the
+    /// in-memory decision (crash-tolerant by design). A canned in-memory
+    /// return with no matching event would make that scan correctly fail
+    /// closed, so this double performs the same two writes a real
+    /// `SessionGateHumanAdapter` + operator `approve()` call would.
     struct StaticGate {
+        plane: SessionPlane,
         outcomes: StdMutex<VecDeque<Result<Approval, AdapterError>>>,
     }
     impl StaticGate {
-        fn new(outcomes: Vec<Result<Approval, AdapterError>>) -> Arc<Self> {
+        fn new(plane: SessionPlane, outcomes: Vec<Result<Approval, AdapterError>>) -> Arc<Self> {
             Arc::new(Self {
+                plane,
                 outcomes: StdMutex::new(VecDeque::from(outcomes)),
             })
         }
@@ -1720,14 +1639,30 @@ mod tests {
     impl GateHumanAdapter for StaticGate {
         async fn wait_approval(
             &self,
-            _ctx: &NodeExecContext,
-            _gate: GateId,
+            ctx: &NodeExecContext,
+            gate: GateId,
         ) -> Result<Approval, AdapterError> {
-            self.outcomes
+            let outcome = self
+                .outcomes
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(Err(AdapterError::Internal("exhausted".into())))
+                .unwrap_or(Err(AdapterError::Internal("exhausted".into())));
+            if let Ok(approval) = outcome {
+                // Keep the receiver alive until `approve` fires the sender —
+                // dropping it immediately (e.g. via a bare `?` on the `Result`)
+                // makes `approve`'s `sender.send` fail closed.
+                let _rx = self
+                    .plane
+                    .register_gate_waiter(ctx.meta.run_id, gate)
+                    .await
+                    .map_err(|e| AdapterError::Internal(format!("static gate register: {e}")))?;
+                self.plane
+                    .approve(ctx.meta.run_id, gate, approval)
+                    .await
+                    .map_err(|e| AdapterError::Internal(format!("static gate approve: {e}")))?;
+            }
+            outcome
         }
     }
 
@@ -2148,7 +2083,7 @@ mod tests {
             }),
         ]);
         let verify_compile = StaticVerify::ok_once();
-        let gate_human = StaticGate::new(vec![Ok(Approval::Allow)]);
+        let gate_human = StaticGate::new(fx.plane.clone(), vec![Ok(Approval::Allow)]);
 
         let sched = fx.build_scheduler(
             fx._dir.path().join("s1"),
@@ -2346,7 +2281,7 @@ mod tests {
         fx.storage.dags().put(&dag).await.unwrap();
         fx.seed_run(session, dag_id, "running").await;
 
-        let gate_human = StaticGate::new(vec![Ok(Approval::Deny)]);
+        let gate_human = StaticGate::new(fx.plane.clone(), vec![Ok(Approval::Deny)]);
         let sched = fx.build_scheduler(
             fx._dir.path().join("s1"),
             Arc::new(crate::adapters::UnavailableCapabilityExecutor),
@@ -2362,6 +2297,175 @@ mod tests {
         let failure = outcome.failure.unwrap();
         assert_eq!(failure.error_class, ErrorClass::Approval);
         assert_eq!(failure.retry, RetryDisposition::NonRetryable);
+        fx.close().await;
+    }
+
+    /// `GateHumanAdapter` that registers a real waiter (so the control plane
+    /// durably reaches `waiting_approval`, matching what a real
+    /// `SessionGateHumanAdapter` does) but then never resolves it — the
+    /// scheduler's own `timeout_ms` deadline (GC1) must be what fires, not
+    /// the adapter.
+    struct NeverGate {
+        plane: SessionPlane,
+    }
+    #[async_trait]
+    impl GateHumanAdapter for NeverGate {
+        async fn wait_approval(
+            &self,
+            ctx: &NodeExecContext,
+            gate: GateId,
+        ) -> Result<Approval, AdapterError> {
+            let _rx = self
+                .plane
+                .register_gate_waiter(ctx.meta.run_id, gate)
+                .await
+                .map_err(|e| AdapterError::Internal(format!("never gate register: {e}")))?;
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_expiry_terminalizes_failed_with_approval_class() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let gate = NodeId::new();
+        let gate_id = GateId::new();
+        let gate_input = fx
+            .put_placeholder_input(dag_id, gate, NodeKind::GateHuman, vec![])
+            .await;
+        let mut gate_node_val = adapter_node(gate, NodeKind::GateHuman, gate_input);
+        gate_node_val.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "risky".into(),
+        });
+        gate_node_val.timeout_ms = 50; // GT: short deadline under the paused clock.
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(gate, gate_node_val)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let sched = Arc::new(fx.build_scheduler(
+            fx._dir.path().join("s1"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(NeverGate {
+                plane: fx.plane.clone(),
+            }),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        ));
+        let sched2 = Arc::clone(&sched);
+        let handle = tokio::spawn(async move { sched2.run(dag_id).await });
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let outcome = handle.await.unwrap().unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(gate));
+        let failure = outcome.failure.unwrap();
+        assert_eq!(failure.error_class, ErrorClass::Approval); // GT4
+        assert_eq!(failure.retry, RetryDisposition::NonRetryable);
+
+        // The control plane must have durably recorded the expiry (§5.7.8).
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 50)
+            .await
+            .unwrap();
+        let resolved = events
+            .iter()
+            .find(|e| e.type_ == crate::events::SessionEventType::ApprovalResolved)
+            .expect("expiry must write a durable ApprovalResolved");
+        assert_eq!(resolved.payload["decision"], serde_json::json!("expired"));
+        assert_eq!(
+            resolved.payload["gate_id"],
+            serde_json::json!(gate_id.to_string())
+        );
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn gate_resume_with_durable_resolution_never_calls_adapter() {
+        // §5.7.2/§5.7.3 crash recovery: a prior process's `approve()` already
+        // landed durably before this process ever starts. R16 must find and
+        // apply that resolution via the re-scan alone — the adapter must not
+        // be touched at all.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let gate = NodeId::new();
+        let gate_id = GateId::new();
+        let gate_input = fx
+            .put_placeholder_input(dag_id, gate, NodeKind::GateHuman, vec![])
+            .await;
+        let mut gate_node_val = adapter_node(gate, NodeKind::GateHuman, gate_input);
+        gate_node_val.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "risky".into(),
+        });
+        gate_node_val.state = NodeState::WaitingApproval; // durable pre-crash state
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(gate, gate_node_val)]),
+            edges: vec![],
+            state: DagState::WaitingApproval,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let run_id = fx
+            .seed_run(session, dag_id, RunControlState::WaitingApproval.as_str())
+            .await;
+
+        // Simulate the prior process's durable ApprovalResolved write (what
+        // `RunController::approve` would have appended) without ever
+        // registering a waiter in this process.
+        fx.storage
+            .events()
+            .append_session(crate::events::NewSessionEvent {
+                session_id: session,
+                run_id: Some(run_id),
+                type_: crate::events::SessionEventType::ApprovalResolved,
+                payload: serde_json::json!({
+                    "gate_id": gate_id.to_string(),
+                    "decision": "allow",
+                    "generation": 1u64,
+                }),
+            })
+            .await
+            .unwrap();
+
+        struct PanicGate;
+        #[async_trait]
+        impl GateHumanAdapter for PanicGate {
+            async fn wait_approval(
+                &self,
+                _ctx: &NodeExecContext,
+                _gate: GateId,
+            ) -> Result<Approval, AdapterError> {
+                panic!("adapter must not be called when a durable resolution already exists");
+            }
+        }
+
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s1"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(PanicGate),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+        assert_eq!(outcome.failed_node, None);
         fx.close().await;
     }
 
