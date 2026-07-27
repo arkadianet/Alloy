@@ -15,6 +15,7 @@
 mod artifacts;
 mod checkpoint;
 mod codec;
+mod dags;
 mod error;
 mod events;
 mod gate;
@@ -28,6 +29,7 @@ mod sessions;
 pub use artifacts::{
     ArtifactBlob, ArtifactKind, ArtifactMeta, ArtifactPut, ArtifactStore, FsArtifactStore,
 };
+pub use dags::{DagStore, ReplanReplaceError, SqliteDagStore};
 pub use error::{store_to_session, StoreError};
 pub use events::{EventStore, SqliteEventStore};
 pub use install::{install_sqlite_event_sink, store_to_runtime};
@@ -55,6 +57,7 @@ pub struct AlloyStorage {
     events: Arc<SqliteEventStoreImpl>,
     artifacts: Arc<FsArtifactStoreImpl>,
     sessions: Arc<SqliteSessionRowsImpl>,
+    dags: Arc<SqliteDagStore>,
     metrics: Arc<StorageMetrics>,
     gate: Arc<StorageGate>,
 }
@@ -84,6 +87,11 @@ impl AlloyStorage {
             Arc::clone(&metrics),
             Arc::clone(&gate),
         ));
+        let dags = Arc::new(SqliteDagStore::new(
+            Arc::clone(&db),
+            Arc::clone(&metrics),
+            Arc::clone(&gate),
+        ));
 
         Ok(Self {
             layout: opts.layout,
@@ -92,6 +100,7 @@ impl AlloyStorage {
             events,
             artifacts,
             sessions,
+            dags,
             metrics,
             gate,
         })
@@ -125,6 +134,12 @@ impl AlloyStorage {
     #[must_use]
     pub fn sessions(&self) -> Arc<SqliteSessionRows> {
         Arc::clone(&self.sessions)
+    }
+
+    /// Shared DAG store handle (Arc clone of the open-time instance).
+    #[must_use]
+    pub fn dags(&self) -> Arc<SqliteDagStore> {
+        Arc::clone(&self.dags)
     }
 
     /// Force WAL checkpoint (uses connection `synchronous` from open).
