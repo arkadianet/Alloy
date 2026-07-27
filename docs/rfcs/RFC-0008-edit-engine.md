@@ -306,6 +306,9 @@ pub struct Hunk {
     pub eof_newline: bool,
 }
 
+// In types.rs (private):
+fn default_true() -> bool { true }
+
 /// Semantic edit ops (V2 §13). Serde-stable; MVP returns UnsupportedOp for all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -491,8 +494,8 @@ pub struct EditValidation {
 pub trait EditEngine: Send + Sync {
     /// Validate `req` without mutating the workspace or creating a checkpoint.
     ///
-    /// MUST enforce the **validate** column of §5.5.1 (V1–V11, V15–V16, V18–V19).
-    /// MUST NOT enforce V12–V14, V17, V20, V21 and MUST NOT exec git.
+    /// MUST enforce the **validate** column of §5.5.1 (V1–V11, V15, V18–V19, V22–V23).
+    /// MUST NOT enforce V12–V14, V16–V17, V20–V21, V24–V25 and MUST NOT exec git.
     /// MUST NOT write files, refs, CAS edit artifacts, or session events.
     /// MUST NOT run abandon reconcile (that is `apply`/`rollback` only — §6.4).
     /// MUST take the same write lock as `apply`/`rollback` for single-writer honesty.
@@ -1198,11 +1201,11 @@ Before checkpoint on the mutating path:
 
 **Restore MUST NOT** run broad `git clean -fd` over the jail (would delete untracked `.env` and user files). Restore uses:
 
-* `["git", "restore", "--source=<checkpoint_sha>", "--staged", "--worktree", "--", ":/"]` so **HEAD / current branch tip do not move**.
-* Explicit `remove_file` for each `created_paths` entry.
-* Explicit `remove_file` for each `temp_paths` entry.
+* Prefixed `["git", "restore", "--source=<checkpoint_sha>", "--staged", "--worktree", "--", ":/"]` so **HEAD / current branch tip do not move**.
+* Explicit `remove_file` for each `created_paths` and `temp_paths` entry.
+* Explicit `remove_dir` for each `created_dirs` entry (deepest first), ignoring `NotFound`.
 
-Record `head_sha_at_checkpoint` for audit only; never `reset --hard` to the stash commit on the branch tip.
+Record `head_sha_at_checkpoint` on the in-process `TxRecord` only (lost on restart; not required for restore).
 
 ### 5.7 Transaction registry
 
