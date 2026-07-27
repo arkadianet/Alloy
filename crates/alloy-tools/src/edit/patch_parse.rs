@@ -360,20 +360,29 @@ pub(crate) fn validate_rel_path(path: &str) -> Result<(), EditError> {
                 reason: "invalid path".into(),
             });
         }
-        if segment == ".git" {
+        if let Some(reason) = protected_segment_reason(segment) {
             return Err(EditError::PathDenied {
                 path: path.to_string(),
-                reason: "git metadata path".into(),
-            });
-        }
-        if segment == ".alloy-sbx" {
-            return Err(EditError::PathDenied {
-                path: path.to_string(),
-                reason: "sandbox scratch path".into(),
+                reason: reason.into(),
             });
         }
     }
     Ok(())
+}
+
+/// Reason string when `segment` is a protected path component (ASCII case-folded).
+fn protected_segment_reason(segment: &str) -> Option<&'static str> {
+    match segment.to_ascii_lowercase().as_str() {
+        ".git" => Some("git metadata path"),
+        ".alloy-sbx" => Some("sandbox scratch path"),
+        _ => None,
+    }
+}
+
+/// True when any path segment is protected (`.git` / `.alloy-sbx`, any casing).
+#[must_use]
+pub(crate) fn has_protected_segment(path: &str) -> bool {
+    path.split('/').any(|segment| protected_segment_reason(segment).is_some())
 }
 
 /// True when a path is excluded from WorkspaceDigest.
@@ -381,6 +390,7 @@ pub(crate) fn validate_rel_path(path: &str) -> Result<(), EditError> {
 pub(crate) fn is_digest_excluded_path(path: &str) -> bool {
     path == "target"
         || path.starts_with("target/")
+        || has_protected_segment(path)
         || path
             .rsplit('/')
             .next()
@@ -886,7 +896,9 @@ mod tests {
             "a/../b",
             "a\\b",
             ".git/hooks/x",
+            ".GIT/hooks/x",
             ".alloy-sbx/x",
+            ".Alloy-Sbx/x",
         ] {
             assert!(matches!(
                 validate_rel_path(bad),
@@ -895,6 +907,8 @@ mod tests {
         }
         assert!(is_digest_excluded_path("target/debug/x"));
         assert!(is_digest_excluded_path("src/.lib.alloy-tmp-abc"));
+        assert!(is_digest_excluded_path(".GIT/config"));
+        assert!(is_digest_excluded_path("nested/.Alloy-Sbx/tmp"));
     }
 
     #[test]

@@ -1511,10 +1511,12 @@ impl GitEditEngine {
 2. Require `GitWrite` + Exec(git) preflight (§5.6.2 restore shapes).
 3. V17 tracked-deny scan — fail closed with `TrackedDeniedPath` before restore.
 4. Resolve `refs/alloy/checkpoints/<id>`; missing → `Git("checkpoint ref not found")` (not `UnknownTransaction`).
-5. Run §5.6.1 restore (tracked tree only; no `created_paths`/`created_dirs` unlink — those lists are gone after restart).
+5. Run §5.6.1 restore. When an in-memory `abandoned` record matches this `checkpoint_id`, pass its `created_paths` / `temp_paths` / `created_dirs` so engine-owned artifacts are unlinked after the tracked restore; clear that record only after restore succeeds. After restart those lists are gone — restore is tracked-tree only and leftover creates need operator cleanup.
 6. If an in-memory `TxRecord` or `abandoned` matches this `checkpoint_id` (FailedDirty / Open): on success mark `RolledBack` and clear `abandoned`.
 7. No digest equality check (pre_digest may be lost); success = restore exit 0.
 8. Does not allocate a new `TransactionId`.
+
+**Checkpoint ref GC:** MVP retains `refs/alloy/checkpoints/<uuid>` for FailedDirty / operator recovery (dropping the engine MUST NOT delete refs, §6.6). Removal of successfully committed or rolled-back refs is deferred to an explicit operator/admin expiry policy; it is not automatic on commit.
 
 **In-process FailedDirty path:** prefer next `apply`/`rollback` reconcile (§6.4) when `abandoned` is still set. `recover_checkpoint` is for post-restart / operator recovery when the in-memory abandon record is gone **or** as an explicit operator tool when reconcile is unavailable. §4.4’s “operator uses `recover_checkpoint`” refers to this helper.
 

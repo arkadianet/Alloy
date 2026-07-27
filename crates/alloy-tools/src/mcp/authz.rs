@@ -63,7 +63,7 @@ pub(crate) fn authorize_fs_read(perms: &PermissionToken, rel: &str) -> Result<()
 /// Require at least one `Grant::FsWrite`.
 ///
 /// Fine-grained per-path write grants are enforced via
-/// [`authorize_fs_write_path`] after patch path extraction (RFC-0008).
+/// [`authorize_fs_write_paths`] after patch path extraction (RFC-0008).
 pub(crate) fn authorize_fs_write(perms: &PermissionToken) -> Result<(), McpError> {
     if perms.grants.iter().any(|g| matches!(g, Grant::FsWrite(_))) {
         return Ok(());
@@ -83,25 +83,31 @@ pub(crate) fn authorize_git_write(perms: &PermissionToken) -> Result<(), McpErro
     )))
 }
 
-/// Require an `FsWrite` grant covering the jail-relative path `rel`.
+/// Require an `FsWrite` grant covering every jail-relative path in `paths`.
 ///
-/// Compiles the token's globs per call; authorization passes over many paths
-/// should hold a `crate::authz::GrantMatcher` instead.
-pub(crate) fn authorize_fs_write_path(perms: &PermissionToken, rel: &str) -> Result<(), McpError> {
-    if !authz::has_fs_write_grant(perms) {
+/// Compiles the token's globs once via [`authz::GrantMatcher`] and reuses the
+/// matcher for the whole list (RFC-0006 §5.9 re-check after apply).
+pub(crate) fn authorize_fs_write_paths(
+    perms: &PermissionToken,
+    paths: &[impl AsRef<str>],
+) -> Result<(), McpError> {
+    let matcher = authz::GrantMatcher::fs_write(perms).map_err(|e| match e {
+        GrantGlobError::Invalid(msg) => McpError::InvalidToken(format!("grant glob: {msg}")),
+    })?;
+    if !matcher.has_grant() {
         return Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(
             "fs_write".into(),
         )));
     }
-    match authz::fs_write_covers(perms, rel) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(McpError::PermissionDenied(
-            PermissionDenial::PathNotCovered(rel.to_string()),
-        )),
-        Err(GrantGlobError::Invalid(msg)) => {
-            Err(McpError::InvalidToken(format!("grant glob: {msg}")))
+    for rel in paths {
+        let rel = rel.as_ref();
+        if !matcher.covers(rel) {
+            return Err(McpError::PermissionDenied(
+                PermissionDenial::PathNotCovered(rel.to_string()),
+            ));
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -210,15 +216,15 @@ mod tests {
     #[test]
     fn fs_write_path_v4a_v4b() {
         assert!(matches!(
-            authorize_fs_write_path(&token(vec![]), "a.rs"),
+            authorize_fs_write_paths(&token(vec![]), &["a.rs"]),
             Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(
                 ref k
             ))) if k == "fs_write"
         ));
         let t = token(vec![Grant::FsWrite(Glob("src/**".into()))]);
-        assert!(authorize_fs_write_path(&t, "src/lib.rs").is_ok());
+        assert!(authorize_fs_write_paths(&t, &["src/lib.rs"]).is_ok());
         assert!(matches!(
-            authorize_fs_write_path(&t, "README.md"),
+            authorize_fs_write_paths(&t, &["README.md"]),
             Err(McpError::PermissionDenied(
                 PermissionDenial::PathNotCovered(ref p)
             )) if p == "README.md"

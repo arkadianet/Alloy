@@ -44,7 +44,7 @@ pub(crate) fn map_sandbox(err: SandboxError) -> EditError {
         }
         SandboxError::Invalid(_) => EditError::Git("sandbox: invalid request".into()),
         SandboxError::Io(_) => EditError::Io("sandbox io".into()),
-        SandboxError::Internal(_) => EditError::Git("sandbox: internal error".into()),
+        SandboxError::Internal(_) => EditError::Internal("sandbox: internal error".into()),
     }
 }
 
@@ -93,6 +93,10 @@ mod tests {
                 message: "/abs".into(),
             }),
             EditError::Environment(ref m) if m == "sandbox backend unavailable"
+        ));
+        assert!(matches!(
+            map_sandbox(SandboxError::Internal("boom".into())),
+            EditError::Internal(ref m) if m == "sandbox: internal error"
         ));
     }
 

@@ -445,6 +445,8 @@ fn write_temp(path: &Path, bytes: &[u8]) -> Result<(), EditError> {
         .map_err(|e| EditError::Io(e.to_string()))?;
     file.write_all(bytes)
         .map_err(|e| EditError::Io(e.to_string()))?;
+    file.sync_all()
+        .map_err(|e| EditError::Io(e.to_string()))?;
     Ok(())
 }
 

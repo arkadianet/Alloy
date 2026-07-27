@@ -84,6 +84,7 @@ impl GrantMatcher {
 /// `Ok(false)` when grants exist but none match; caller distinguishes zero-grant
 /// (`MissingGrant("fs_write")`) from a miss (`PathNotCovered`). Prefer
 /// [`GrantMatcher::fs_write`] when authorizing more than one path.
+#[cfg(test)]
 pub(crate) fn fs_write_covers(perms: &PermissionToken, rel: &str) -> Result<bool, GrantGlobError> {
     Ok(GrantMatcher::fs_write(perms)?.covers(rel))
 }
@@ -102,6 +103,7 @@ pub(crate) fn has_fs_read_grant(perms: &PermissionToken) -> bool {
 }
 
 /// Whether the token carries at least one `FsWrite` grant (regardless of match).
+#[cfg(test)]
 pub(crate) fn has_fs_write_grant(perms: &PermissionToken) -> bool {
     perms.grants.iter().any(|g| matches!(g, Grant::FsWrite(_)))
 }

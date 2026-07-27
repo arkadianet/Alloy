@@ -118,12 +118,8 @@ fn hash_file_capped(
 }
 
 fn include_path(policy: &PathPolicy, rel: &str) -> bool {
-    !(rel == ".git"
-        || rel.starts_with(".git/")
-        || rel == ".alloy-sbx"
-        || rel.starts_with(".alloy-sbx/")
-        || is_digest_excluded_path(rel)
-        || policy.deny_matches_rel(rel))
+    // `.git` / `.alloy-sbx` (any casing) are covered by `is_digest_excluded_path`.
+    !(is_digest_excluded_path(rel) || policy.deny_matches_rel(rel))
 }
 
 #[cfg(test)]

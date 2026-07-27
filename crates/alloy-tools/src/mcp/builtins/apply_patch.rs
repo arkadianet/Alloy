@@ -81,9 +81,7 @@ pub(crate) async fn execute(
             // unsafe backend output. Runs once per tool call, after the patch
             // already applied, so the per-path grant compile is not hot.
             if outcome.files_touched.iter().all(|p| is_jail_relative(p)) {
-                for rel in &outcome.files_touched {
-                    authz::authorize_fs_write_path(&perms, rel)?;
-                }
+                authz::authorize_fs_write_paths(&perms, &outcome.files_touched)?;
             }
             Ok(map_outcome(Ok(outcome), dry_run, elapsed))
         }

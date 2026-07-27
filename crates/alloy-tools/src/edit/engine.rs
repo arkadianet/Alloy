@@ -147,6 +147,11 @@ impl GitEditEngine {
     }
 
     /// Operator / post-restart recovery for a checkpoint ref.
+    ///
+    /// Checkpoint refs under `refs/alloy/checkpoints/<uuid>` are retained for
+    /// FailedDirty recovery (RFC §6.5 / §6.6). GC of successfully committed or
+    /// rolled-back refs is deferred to an explicit operator/admin policy and is
+    /// not performed automatically on drop or commit.
     pub async fn recover_checkpoint(
         &self,
         checkpoint_id: CheckpointId,
@@ -166,14 +171,28 @@ impl GitEditEngine {
         )
         .await?;
         check_expiry(&ctx.perms)?;
+        // When the in-memory abandon record still matches, unlink its creates
+        // after the tracked restore. After restart the lists are gone and these
+        // stay empty (operator cleans leftover untracked creates).
+        let (created_paths, temp_paths, created_dirs) = {
+            let abandoned = lock(&self.abandoned)?;
+            match abandoned.as_ref() {
+                Some(a) if a.checkpoint_id == checkpoint_id => (
+                    a.created_paths.clone(),
+                    a.temp_paths.clone(),
+                    a.created_dirs.clone(),
+                ),
+                _ => (Vec::new(), Vec::new(), Vec::new()),
+            }
+        };
         restore_checkpoint(
             self.broker.as_ref(),
             &self.path_policy,
             &ctx.perms,
             &sha,
-            &[],
-            &[],
-            &[],
+            &created_paths,
+            &temp_paths,
+            &created_dirs,
         )
         .await?;
         {
@@ -1286,9 +1305,9 @@ mod tests {
             transaction_id: record.id,
             checkpoint_id: record.checkpoint_id,
             checkpoint_sha: record.checkpoint_sha.clone(),
-            created_paths: Vec::new(),
-            temp_paths: Vec::new(),
-            created_dirs: Vec::new(),
+            created_paths: record.created_paths.clone(),
+            temp_paths: record.temp_paths.clone(),
+            created_dirs: record.created_dirs.clone(),
             pre_digest: record.pre_digest.clone(),
         }
     }
@@ -1505,6 +1524,74 @@ mod tests {
             "committed edits never restore"
         );
         assert_eq!(state_of(&fx, record.id), TxState::Committed);
+        assert!(fx.engine.abandoned.lock().unwrap().is_none());
+    }
+
+    fn recover_ctx(perms: PermissionToken) -> EditContext {
+        EditContext {
+            session_id: None,
+            run_id: None,
+            perms,
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_checkpoint_refuses_tracked_deny_and_keeps_abandon() {
+        let fx = fixture();
+        let record = tx_record(TxState::Open, jail_digest(&fx, &[]).await);
+        arm(&fx, &record);
+        fx.broker.push(ls_files(b".env\0a.txt\0"));
+
+        let err = fx
+            .engine
+            .recover_checkpoint(record.checkpoint_id, &recover_ctx(edit_token()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, EditError::TrackedDeniedPath { ref path } if path == ".env"));
+        assert_eq!(
+            fx.broker.recorded().len(),
+            1,
+            "only the tracked-set probe may run; restore must not"
+        );
+        assert_eq!(state_of(&fx, record.id), TxState::Open);
+        assert!(
+            fx.engine.abandoned.lock().unwrap().is_some(),
+            "the abandon record survives so recovery can retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_checkpoint_unlinks_abandoned_creates_and_rolls_back() {
+        let fx = fixture();
+        std::fs::write(fx.jail.join("a.txt"), b"tracked\n").unwrap();
+        std::fs::write(fx.jail.join("new.txt"), b"created\n").unwrap();
+        std::fs::write(fx.jail.join(".new.txt.alloy-tmp-1"), b"temp\n").unwrap();
+        std::fs::create_dir_all(fx.jail.join("sub")).unwrap();
+        let mut record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]).await);
+        record.created_paths = vec!["new.txt".into()];
+        record.temp_paths = vec![".new.txt.alloy-tmp-1".into()];
+        record.created_dirs = vec!["sub".into()];
+        arm(&fx, &record);
+        fx.broker.push(ls_files(b"a.txt\0"));
+        fx.broker.push(Ok(SandboxExecResult::synthetic(
+            Some(0),
+            None,
+            SandboxBackend::Landlock,
+            Digest::sha256(b"policy"),
+        )
+        .with_stdio(format!("{}\n", "0".repeat(40)).into_bytes(), Vec::new())));
+        fx.broker.push(exit(0)); // git restore
+
+        fx.engine
+            .recover_checkpoint(record.checkpoint_id, &recover_ctx(edit_token()))
+            .await
+            .unwrap();
+
+        assert!(!fx.jail.join("new.txt").exists());
+        assert!(!fx.jail.join(".new.txt.alloy-tmp-1").exists());
+        assert!(!fx.jail.join("sub").exists());
+        assert_eq!(state_of(&fx, record.id), TxState::RolledBack);
         assert!(fx.engine.abandoned.lock().unwrap().is_none());
     }
 
