@@ -5,7 +5,7 @@
 | **Status** | Draft |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
-| **Depends on** | [RFC-0003](./RFC-0003-session-manager-run-controller.md) (merged), [RFC-0004](./RFC-0004-observability-cost-metering.md) (merged), [RFC-0006](./RFC-0006-mcp-host-builtins.md) (merged), [RFC-0008](./RFC-0008-edit-engine.md) (merged), [RFC-0009](./RFC-0009-task-dag-templates-planner.md) (merged) |
+| **Depends on** | [RFC-0003](./RFC-0003-session-manager-run-controller.md) (merged), [RFC-0004](./RFC-0004-observability-cost-metering.md) (merged), [RFC-0006](./RFC-0006-mcp-host-builtins.md) (merged), [RFC-0008](./RFC-0008-edit-engine.md) (draft), [RFC-0009](./RFC-0009-task-dag-templates-planner.md) (merged) |
 | **Effort** | 5–8 person-days |
 | **Related RFCs** | [0001](./RFC-0001-alloy-runtime.md) host / `SchedError` / drain · [0002](./RFC-0002-storage-artifacts-session-events.md) artifacts / events · [0005](./RFC-0005-sandbox-broker.md) sandbox via MCP · [0007](./RFC-0007-model-router-provider.md) `RetryDisposition` / `FailureIr.retry` (consumed, not a hard dep) · [0013](./RFC-0013-capability-registry-workers.md) capability workers · [0015](./RFC-0015-cli-profiles-config.md) `alloy run` |
 | **Product** | Alloy — AI Engineering Runtime |
@@ -1207,7 +1207,7 @@ struct OwnershipLock {
 | --- | --- |
 | Node `Running`, `attempts_started < max_attempts`, failure would be admissible | Treat the lost attempt as a soft failure with `FailureIr { error_class: Internal, retry: Retryable, notes: "adopted after restart" }`, apply §5.11 from step (a) |
 | Node `Running`, retries exhausted | Terminalize: durable `Failed` (C7) with `notes: "adopted after restart; retries exhausted"` |
-| Node `Running` and `NodeKind::GateHuman` **without** a durable `ApprovalResolved(allow|allow_once)` for this gate | Illegal — unresolved gates never reach `Running`; `Err(Invariant("gate node running"))` |
+| Node `Running` and `NodeKind::GateHuman` **without** a durable `ApprovalResolved` whose `decision` is `allow` or `allow_once` for this gate | Illegal — unresolved gates never reach `Running`; `Err(Invariant("gate node running"))` |
 | Node `Running` and `NodeKind::GateHuman` **with** durable allow | Resume the allow path mid-fold (§5.7.6 `Running` row); `attempts_started` follows §5.3.1 |
 | More than one node `Running` | `Err(Invariant("multiple running nodes after restart"))` |
 
@@ -1318,11 +1318,11 @@ Scanning MUST match on `payload.gate_id == gate_id` **and** `payload.generation 
 
 | Rule | Statement |
 | --- | --- |
-| GR1 | The scheduler MUST re-register the waiter (`SessionPlane::register_gate_waiter`) and await it. |
+| GR1 | The scheduler MUST await the gate via `deps.gate_human.wait_approval` under the gate deadline (§5.7.10). **Registration is adapter-owned** (`SessionGateHumanAdapter` calls `SessionPlane::register_gate_waiter` inside `wait_approval` per GC5). The scheduler MUST NOT call `register_gate_waiter` itself. |
 | GR2 | The scheduler MUST NOT re-checkpoint `NodeState::WaitingApproval` / `DagState::WaitingApproval` — they are already durable. |
 | GR3 | The scheduler MUST NOT re-emit `ApprovalRequested` except RF6 repair. Existence / payload filters use paged `list_session_events` (§5.3.1); match `gate_id` **and** `generation == dag.generation`. |
 | GR4 | The remaining gate deadline MUST be recomputed as `timeout_ms - elapsed_since(first generation-matched ApprovalRequested.ts)`, clamped at `>= 0`. A non-positive remainder MUST go straight to §5.7.8 expiry. Events from other generations MUST be ignored. |
-| GR5 | `register_gate_waiter` returning `Err(RunError::InvalidPhase(..))` for a terminal row MUST be classified through §5.7.9 (crash window), not treated as an internal error. |
+| GR5 | When the adapter maps registration `InvalidPhase` (GC5) for a terminal control row, the scheduler MUST classify through §5.7.9 (crash window), not treat it as a hard internal error. |
 
 #### 5.7.4 Deny path (fix 17)
 
@@ -1372,8 +1372,7 @@ Target sequence `WaitingApproval → Ready → Running → Succeeded`. Every ste
 | 1 | Single CAS: gate node `Ready → WaitingApproval`, `DagState::Running → WaitingApproval` (C9) |
 | 2 | Append `NodeState` `ready → waiting_approval` |
 | 3 | Append `ApprovalRequested` `{ "gate_id": …, "node_id": …, "reason": approval.reason, "timeout_ms": node.timeout_ms, "generation": dag.generation }` |
-| 4 | `register_gate_waiter(run, gate)` |
-| 5 | Await under the gate deadline (§5.7.10) |
+| 4 | Await via `deps.gate_human.wait_approval` under the gate deadline (§5.7.10). The adapter registers the waiter once inside that call (GC5); the scheduler MUST NOT register separately. |
 
 The CAS MUST precede the events (§5.8.1), so a crash between them is repaired by RF3.
 
@@ -1676,7 +1675,7 @@ delay = min(max(raw, 0), max_backoff)
 | CN1 | On observing cancel (L1/L2 or in-flight `select!`), the run loop MUST **drop** the node future immediately. That is the cancellation mechanism for tools (RFC-0006 §3.8) and workers. The scheduler MUST NOT wait for a cooperative acknowledgement from the node. |
 | CN2 | `cancel` MUST await `OwnedDag::completed` for at most `cancel_drain_grace + cancel_write_grace`, using the race-free pattern in O4. |
 | CN3 | After dropping the node future, the run loop MUST complete C6 and write `cancel_result` promptly. `cancel_drain_grace` bounds how long **`cancel` waits** for that work — it is not a cooperative node-drain window. |
-| CN4 | After forcing C6 the run loop MUST write `cancel_result` (`Ok(Cancelled)` or `Err(Conflict|Store)`) and notify `completed` even if the CAS failed, so `cancel` never hangs (G2). |
+| CN4 | After forcing C6 the run loop MUST write `cancel_result` (`Ok(Cancelled)` or `Err(Conflict)` / `Err(Store)`) and notify `completed` even if the CAS failed, so `cancel` never hangs (G2). |
 | CN5 | A cancel arriving after the terminal checkpoint MUST NOT rewrite it. `cancel` returns `Ok(())` observing the terminal state. |
 
 #### 5.12.3 `cancel` return table (fix 30, normative)
@@ -2578,7 +2577,7 @@ Legal transitions (superset of RFC-0009 §5.3.2, with the RFC-0010 owner named):
 | Durable `ApprovalResolved` | Node state | Control row | Scheduler action | `run` result |
 | --- | --- | --- | --- | --- |
 | none | `Ready` | `running` | C9a, register, wait | depends |
-| none | `WaitingApproval` | `running` \| `waiting_approval` | re-register only (GR1–GR3) | depends |
+| none | `WaitingApproval` | `running` \| `waiting_approval` | await via adapter (GR1–GR3; adapter re-registers) | depends |
 | none | `WaitingApproval` | `failed` | terminalize as expiry | `Ok(Failed)` |
 | none | `WaitingApproval` | `cancelled` \| `cancelling` | cancel path | `Ok(Cancelled)` |
 | `allow` \| `allow_once` | `WaitingApproval` | any non-terminal | allow path from `WaitingApproval` | `Ok(Succeeded)` if the rest succeeds |

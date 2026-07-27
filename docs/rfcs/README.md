@@ -49,7 +49,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | [RFC-0007](./RFC-0007-model-router-provider.md) | Model Router & Provider | Implemented | 7–9 pd | 0001, 0004 | **Yes** |
 | [RFC-0008](./RFC-0008-edit-engine.md) | EditEngine (TextPatch + Git Checkpoint) | Draft | 4–6 pd | 0001, 0005, 0006 | **Yes** |
 | [RFC-0009](./RFC-0009-task-dag-templates-planner.md) | Task DAG, Templates & Planner | Implemented | 4–6 pd | 0001, 0002 | **Yes** |
-| [RFC-0010](./RFC-0010-scheduler-runtime-adapters.md) | Scheduler & Runtime Adapters | Draft | 5–8 pd | 0003, 0004, 0006, 0008, 0009 | **Yes** |
+| [RFC-0010](./RFC-0010-scheduler-runtime-adapters.md) | Scheduler & Runtime Adapters | Draft | 5–8 pd | 0003, 0004, 0006, 0008 (draft), 0009 | **Yes** |
 | [RFC-0011](./RFC-0011-project-graph.md) | ProjectGraph (`alloy-index`) | Draft | 6–10 pd | 0001, 0002 | M2 path |
 | [RFC-0012](./RFC-0012-context-engine.md) | Context Engine | Draft | 4–6 pd | 0001, 0011 | M1 thin / M2 deep |
 | [RFC-0013](./RFC-0013-capability-registry-workers.md) | Capability Registry & MVP Workers | Draft | 6–10 pd | 0006, 0007, 0008, 0011, 0012 | **Yes** |
