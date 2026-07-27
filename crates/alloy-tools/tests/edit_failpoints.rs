@@ -34,6 +34,11 @@ struct Fixture {
 
 impl Fixture {
     async fn build() -> Option<Self> {
+        Self::build_with_initial_commit(true).await
+    }
+
+    /// `initial_commit == false` leaves the repo with an unborn HEAD (AC 22).
+    async fn build_with_initial_commit(initial_commit: bool) -> Option<Self> {
         let root = tempfile::tempdir().unwrap();
         let jail = root.path().join("repo");
         std::fs::create_dir_all(&jail).unwrap();
@@ -60,21 +65,23 @@ impl Fixture {
         run_git(&native, &jail, &["init"]).await;
         std::fs::write(jail.join("a.txt"), "one\n").unwrap();
         std::fs::write(jail.join("delete.txt"), "bye\n").unwrap();
-        run_git(&native, &jail, &["add", "."]).await;
-        run_git(
-            &native,
-            &jail,
-            &[
-                "-c",
-                "user.name=alloy",
-                "-c",
-                "user.email=alloy@localhost",
-                "commit",
-                "-m",
-                "init",
-            ],
-        )
-        .await;
+        if initial_commit {
+            run_git(&native, &jail, &["add", "."]).await;
+            run_git(
+                &native,
+                &jail,
+                &[
+                    "-c",
+                    "user.name=alloy",
+                    "-c",
+                    "user.email=alloy@localhost",
+                    "commit",
+                    "-m",
+                    "init",
+                ],
+            )
+            .await;
+        }
 
         let storage =
             AlloyStorage::open(StorageOpenOptions::for_data_dir(root.path().join("data")))
@@ -223,6 +230,29 @@ async fn checkpoint_refs(fx: &Fixture) -> Vec<String> {
     .collect()
 }
 
+/// Add `rel` to the index the way a careless `git add .env` would.
+///
+/// The sandbox binds deny-glob paths away from the child, so a plain `git add`
+/// cannot see `.env` at all; `update-index --cacheinfo` records the same index
+/// entry without reading the worktree.
+async fn track_deny_path(fx: &Fixture, rel: &str) {
+    let blob = run_git(&fx.native, &fx.jail, &["hash-object", "-w", "a.txt"]).await;
+    let cacheinfo = format!("100644,{},{rel}", blob.trim());
+    run_git(
+        &fx.native,
+        &fx.jail,
+        &["update-index", "--add", "--cacheinfo", &cacheinfo],
+    )
+    .await;
+    assert!(
+        run_git(&fx.native, &fx.jail, &["ls-files"])
+            .await
+            .lines()
+            .any(|line| line == rel),
+        "{rel} must be tracked for this test to mean anything"
+    );
+}
+
 fn modify_request(old: &str, new: &str) -> EditRequest {
     EditRequest::TextPatch {
         patch: PatchSet {
@@ -326,6 +356,35 @@ impl SandboxBroker for FailpointBroker {
             }
         }
         self.inner.exec(req).await
+    }
+
+    fn profile(&self) -> &SandboxProfile {
+        self.inner.profile()
+    }
+
+    fn capabilities(&self) -> &SandboxCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Broker decorator that reports truncated stdout for one git subcommand.
+///
+/// The sandbox caps captured stdout, so the engine has to treat a truncated
+/// answer as unusable rather than as a smaller result.
+struct TruncatingBroker {
+    inner: Arc<NativeSandboxBroker>,
+    subcommand: String,
+}
+
+#[async_trait]
+impl SandboxBroker for TruncatingBroker {
+    async fn exec(&self, req: SandboxExecRequest) -> Result<SandboxExecResult, SandboxError> {
+        let matched = req.argv.contains(&self.subcommand);
+        let mut result = self.inner.exec(req).await?;
+        if matched {
+            result.stdout_truncated = true;
+        }
+        Ok(result)
     }
 
     fn profile(&self) -> &SandboxProfile {
@@ -908,6 +967,176 @@ async fn modify_preserves_executable_mode() {
             & 0o777,
         0o755
     );
+    fx.close().await;
+}
+
+/// AC 44: a truncated `ls-files` would under-report the tracked set, so the
+/// engine must fail closed with the operator-facing cap hint before mutating.
+#[tokio::test]
+async fn truncated_ls_files_stdout_is_environment_error_before_mutate() {
+    let Some(fx) = Fixture::build().await else {
+        return;
+    };
+    let engine = fx.engine_with(
+        Arc::new(TruncatingBroker {
+            inner: fx.native.clone(),
+            subcommand: "ls-files".into(),
+        }),
+        fx.storage.artifacts() as Arc<dyn ArtifactStore>,
+        None,
+    );
+
+    let error = engine
+        .apply(modify_request("one", "two"), &fx.ctx(edit_token()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        EditError::Environment(ref message)
+            if message == "git stdout truncated; raise sandbox stdout_cap"
+    ));
+    assert_eq!(
+        std::fs::read_to_string(fx.jail.join("a.txt")).unwrap(),
+        "one\n"
+    );
+    assert!(checkpoint_refs(&fx).await.is_empty());
+    fx.close().await;
+}
+
+/// AC 36: `git add .env` after a committed edit makes a deny-glob path tracked,
+/// and a whole-tree restore would rewrite it — so rollback must refuse instead.
+#[tokio::test]
+async fn deny_glob_path_tracked_after_commit_blocks_rollback() {
+    let Some(fx) = Fixture::build().await else {
+        return;
+    };
+    let engine = fx.engine();
+    let tx = engine
+        .apply(modify_request("one", "two"), &fx.ctx(edit_token()))
+        .await
+        .unwrap();
+
+    std::fs::write(fx.jail.join(".env"), "SECRET=keep\n").unwrap();
+    track_deny_path(&fx, ".env").await;
+
+    let error = engine
+        .rollback(tx.id, &fx.ctx(edit_token()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, EditError::TrackedDeniedPath { ref path } if path == ".env"));
+    assert_eq!(
+        std::fs::read_to_string(fx.jail.join("a.txt")).unwrap(),
+        "two\n",
+        "the refused rollback must leave the committed edit in place"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.jail.join(".env")).unwrap(),
+        "SECRET=keep\n"
+    );
+    fx.close().await;
+}
+
+/// AC 22: an unborn HEAD has no tree for `stash create` to checkpoint against,
+/// which is a permanent environment problem the operator has to fix.
+#[tokio::test]
+async fn unborn_head_is_environment_error() {
+    let Some(fx) = Fixture::build_with_initial_commit(false).await else {
+        return;
+    };
+
+    let error = fx
+        .engine()
+        .apply(create_request("new.txt", "hello"), &fx.ctx(edit_token()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        EditError::Environment(ref message)
+            if message == "empty repository: make initial commit"
+    ));
+    assert!(!fx.jail.join("new.txt").exists());
+    fx.close().await;
+}
+
+/// AC 45: a `.git` gitfile means a linked worktree, whose checkpoint refs would
+/// live in a repository the engine never probed.
+#[tokio::test]
+async fn gitfile_instead_of_git_dir_is_environment_error() {
+    let Some(fx) = Fixture::build().await else {
+        return;
+    };
+    std::fs::rename(fx.jail.join(".git"), fx.jail.join("real.git")).unwrap();
+    std::fs::write(fx.jail.join(".git"), "gitdir: real.git\n").unwrap();
+
+    let error = fx
+        .engine()
+        .apply(modify_request("one", "two"), &fx.ctx(edit_token()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        EditError::Environment(ref message) if message == "linked worktree not supported"
+    ));
+    assert_eq!(
+        std::fs::read_to_string(fx.jail.join("a.txt")).unwrap(),
+        "one\n"
+    );
+    fx.close().await;
+}
+
+/// AC 15: `session_id: None` has nowhere to send `EditApplied`, which must skip
+/// the event rather than fail the apply.
+#[tokio::test]
+async fn apply_without_session_id_commits_and_emits_no_event() {
+    let Some(fx) = Fixture::build().await else {
+        return;
+    };
+    let engine = fx.engine();
+    let perms = edit_token();
+    let sessionless = EditContext {
+        session_id: None,
+        run_id: Some(perms.run_id),
+        perms,
+    };
+
+    let tx = engine
+        .apply(modify_request("one", "two"), &sessionless)
+        .await
+        .unwrap();
+
+    assert_eq!(tx.state, TxState::Committed);
+    assert!(tx.patch_artifact_id.is_some());
+    assert_eq!(
+        std::fs::read_to_string(fx.jail.join("a.txt")).unwrap(),
+        "two\n"
+    );
+    assert!(
+        fx.storage
+            .events()
+            .list_session_events(fx.session, None, 16)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a sessionless apply must not emit EditApplied"
+    );
+
+    // The same engine still emits the event once a session is attached, so the
+    // empty log above is the missing session and not a broken event path.
+    engine
+        .apply(modify_request("two", "three"), &fx.ctx(edit_token()))
+        .await
+        .unwrap();
+    let events = fx
+        .storage
+        .events()
+        .list_session_events(fx.session, None, 16)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
     fx.close().await;
 }
 
