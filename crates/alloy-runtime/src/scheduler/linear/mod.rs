@@ -3,6 +3,11 @@
 //! Non-`pub`: only the types re-exported from [`crate::scheduler`] escape this
 //! module tree (RFC-0010 §4.1 rule M1).
 
+// checkpoint::Checkpoint is exercised directly by its own unit tests; the
+// serial loop (RFC-0010 P4) is what wires it into LinearScheduler and
+// removes this allowance.
+#[allow(dead_code)]
+mod checkpoint;
 mod metrics;
 mod own;
 mod ready;

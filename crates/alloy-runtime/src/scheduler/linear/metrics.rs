@@ -89,6 +89,16 @@ impl SchedulerCounters {
         Self::default()
     }
 
+    /// A `put_if_generation` CAS lost the generation race (§5.8.4 step 4).
+    pub(super) fn inc_cas_conflicts(&self) {
+        self.cas_conflicts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An RF3/RF6/RF7 crash-repair event was appended (§5.3.3).
+    pub(super) fn inc_event_repairs(&self) {
+        self.event_repairs.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn snapshot(&self) -> SchedulerMetrics {
         let l = |c: &AtomicU64| c.load(Ordering::Relaxed);
         SchedulerMetrics {
