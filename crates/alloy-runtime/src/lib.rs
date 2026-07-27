@@ -45,9 +45,10 @@ pub mod storage;
 pub mod types;
 
 pub use adapters::{
-    Approval, GateHumanAdapter, NodeExecContext, NodeExecRef, UnavailableGateHuman,
-    UnavailableVerifyCompile, UnavailableVerifyTest, VerifyCompileAdapter, VerifyOutcome,
-    VerifyTestAdapter,
+    Approval, CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityOutcome,
+    GateHumanAdapter, NodeExecContext, NodeExecRef, UnavailableCapabilityExecutor,
+    UnavailableGateHuman, UnavailableVerifyCompile, UnavailableVerifyTest, VerifyCompileAdapter,
+    VerifyOutcome, VerifyTestAdapter,
 };
 pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
 pub use dag::{
@@ -73,10 +74,10 @@ pub use obs::{
     apply_prompt_retention, apply_tool_retention, hash_content, hash_prompt, hash_tool_body,
     list_decision_events, maybe_signal_budget_warning, parse_decision_event,
     parse_model_call_event, parse_tool_call_event, reaccumulate_cost_from_events,
-    redact_json_strings, redact_secrets, BudgetCheck, CostByTier, CostMeter, CostSnapshot,
-    DecisionKind, DecisionLog, DecisionPage, DecisionRecord, EventDecisionLog, ModelCallRecord,
-    ModelUsdSource, ObsError, RecordingDecisionLog, RetentionPolicy, SharedCostMeter, TierCost,
-    ToolCallRecord,
+    redact_json_strings, redact_secrets, BudgetCheck, CostByTier, CostMeter, CostMeterFactory,
+    CostSnapshot, DecisionKind, DecisionLog, DecisionPage, DecisionRecord, EventDecisionLog,
+    ModelCallRecord, ModelUsdSource, ObsError, ProcessCostMeterFactory, RecordingDecisionLog,
+    RetentionPolicy, SharedCostMeter, TierCost, ToolCallRecord,
 };
 pub use planner::{
     DisabledLlmPlanService, PlanContext, PlanError, PlanProducedPayload, PlanResult, PlanService,
@@ -93,7 +94,10 @@ pub use router::{
 #[cfg(feature = "http-provider")]
 pub use router::{OpenAiCompatibleProvider, OpenAiCompatibleSpec};
 pub use runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
-pub use scheduler::{DagOutcome, DagState, NullScheduler, Scheduler};
+pub use scheduler::{
+    DagOutcome, DagState, LinearScheduler, LinearSchedulerDeps, NullScheduler, SchedConfig,
+    Scheduler, SchedulerMetrics,
+};
 pub use session::{
     clamp_events_page_limit, ReplanReason, RunControlState, RunController, RunGoalRecord, Session,
     SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE,
