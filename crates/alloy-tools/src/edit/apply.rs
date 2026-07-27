@@ -53,7 +53,7 @@ where
     let mut out = FileApplyOutcome::default();
     for file in &patch.files {
         let result = match file {
-            FilePatch::Delete { path } => apply_delete(path, policy, perms, &mut out),
+            FilePatch::Delete { path, .. } => apply_delete(path, policy, perms, &mut out),
             FilePatch::Modify { path, hunks } => {
                 apply_modify(path, hunks, policy, perms, tx, &mut out, &mut progress)
             }
@@ -83,11 +83,15 @@ pub(crate) fn apply_hunks_to_text(
     old_text: &str,
     hunks: &[Hunk],
 ) -> Result<Vec<u8>, EditError> {
-    let (old_lines, _old_eof_newline) = split_lines(old_text);
+    let (old_lines, old_eof_newline) = split_lines(old_text);
     let mut new_lines = Vec::new();
     let mut old_idx = 0_usize;
     let mut final_eof_newline = true;
+    let mut saw_old_no_newline_assert = false;
     for hunk in hunks {
+        if hunk.old_eof_no_newline {
+            saw_old_no_newline_assert = true;
+        }
         let start = if hunk.old_start == 0 {
             0
         } else {
@@ -143,6 +147,12 @@ pub(crate) fn apply_hunks_to_text(
         final_eof_newline = hunk.eof_newline;
     }
     new_lines.extend_from_slice(&old_lines[old_idx..]);
+    if saw_old_no_newline_assert && old_eof_newline {
+        return Err(EditError::ContextMismatch {
+            path: rel.to_string(),
+            detail: "old file has trailing newline".into(),
+        });
+    }
     Ok(join_lines(&new_lines, final_eof_newline))
 }
 
@@ -435,6 +445,7 @@ mod tests {
                 .count() as u32,
             lines: lines.into_iter().map(str::to_string).collect(),
             eof_newline: true,
+            old_eof_no_newline: false,
         }
     }
 
@@ -476,6 +487,7 @@ mod tests {
                     new_lines: 1,
                     lines: vec!["+hi".into()],
                     eof_newline: true,
+                    old_eof_no_newline: false,
                 }],
             }],
         };

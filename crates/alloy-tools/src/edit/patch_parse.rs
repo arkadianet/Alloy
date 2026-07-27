@@ -134,6 +134,7 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
             i += 1;
             let mut lines = Vec::new();
             let mut eof_newline = true;
+            let mut old_eof_no_newline = false;
             let mut last_side = None;
             while i < raw_lines.len() {
                 let l = strip_cr(raw_lines[i]);
@@ -144,8 +145,14 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
                     break;
                 }
                 if l == r"\ No newline at end of file" {
-                    if last_side == Some('+') {
-                        eof_newline = false;
+                    match last_side {
+                        Some('+') => eof_newline = false,
+                        Some(' ' | '-') => old_eof_no_newline = true,
+                        _ => {
+                            return Err(EditError::InvalidPatch(
+                                "no-newline marker without prior hunk line".into(),
+                            ))
+                        }
                     }
                     i += 1;
                     continue;
@@ -167,13 +174,14 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
                 new_lines,
                 lines,
                 eof_newline,
+                old_eof_no_newline,
             });
         }
         validate_hunk_shapes_for_action(&path, is_create, is_delete, &hunks)?;
         if is_create {
             files.push(FilePatch::Create { path, hunks });
         } else if is_delete {
-            files.push(FilePatch::Delete { path });
+            files.push(FilePatch::Delete { path, hunks });
         } else {
             files.push(FilePatch::Modify { path, hunks });
         }
@@ -223,8 +231,18 @@ pub(crate) fn validate_patchset_local(
                     return Err(EditError::Conflict("create exists".into()));
                 }
             }
-            FilePatch::Delete { path } => {
+            FilePatch::Delete { path, hunks } => {
                 validate_existing_file_shape(policy, path, false)?;
+                if !hunks.is_empty() {
+                    let old = std::fs::read_to_string(policy.jail().join(path))
+                        .map_err(|e| EditError::Io(e.to_string()))?;
+                    let new_bytes = crate::edit::apply::apply_hunks_to_text(path, &old, hunks)?;
+                    if !new_bytes.is_empty() {
+                        return Err(EditError::InvalidPatch(
+                            "delete must remove entire file".into(),
+                        ));
+                    }
+                }
             }
         }
         paths.push(path.to_string());
@@ -346,11 +364,19 @@ fn authorize_patch_path(
 }
 
 fn authorize_create_path(policy: &PathPolicy, rel: &str) -> Result<(), EditError> {
+    if policy.deny_matches_rel(rel) {
+        return Err(EditError::PathDenied {
+            path: rel.to_string(),
+            reason: "path denied".into(),
+        });
+    }
     let mut cur = policy.jail().to_path_buf();
     let mut missing_seen = false;
-    for segment in rel.split('/') {
+    let segments: Vec<&str> = rel.split('/').collect();
+    for (idx, segment) in segments.iter().enumerate() {
         validate_rel_path(segment)?;
         let next = cur.join(segment);
+        let is_final = idx + 1 == segments.len();
         if !missing_seen {
             match std::fs::symlink_metadata(&next) {
                 Ok(meta) if meta.file_type().is_symlink() => {
@@ -377,6 +403,14 @@ fn authorize_create_path(policy: &PathPolicy, rel: &str) -> Result<(), EditError
                         .map(|_| ())
                         .map_err(|e| path_policy_error(e, rel))?;
                     missing_seen = true;
+                    // Single missing leaf under an existing parent: PathPolicy can
+                    // authorize the prospective path (missing-final-component rule).
+                    if is_final {
+                        policy
+                            .authorize(&next, PathAccess::Write)
+                            .map(|_| ())
+                            .map_err(|e| path_policy_error(e, rel))?;
+                    }
                 }
             }
         }
@@ -726,6 +760,7 @@ mod tests {
             new_lines: 1,
             lines: vec![" x".into()],
             eof_newline: true,
+            old_eof_no_newline: false,
         };
         assert!(matches!(
             validate_create_hunks(&[h]),
@@ -741,9 +776,11 @@ mod tests {
             files: vec![
                 FilePatch::Delete {
                     path: "a.txt".into(),
+                    hunks: vec![],
                 },
                 FilePatch::Delete {
                     path: "a.txt".into(),
+                    hunks: vec![],
                 },
             ],
         };
@@ -754,6 +791,7 @@ mod tests {
         let patch = PatchSet {
             files: vec![FilePatch::Delete {
                 path: "a.txt".into(),
+                hunks: vec![],
             }],
         };
         assert!(matches!(
@@ -771,11 +809,147 @@ mod tests {
     }
 
     #[test]
-    fn semantic_ops_fail_closed() {
-        let empty = EditRequest::SemanticOps { ops: vec![] };
+    fn eof_old_side_marker_context_mismatch() {
+        let diff = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-one
+\\ No newline at end of file
++two
+";
+        let patch = parse_unified_diff(diff).unwrap();
+        let FilePatch::Modify { hunks, .. } = &patch.files[0] else {
+            panic!("expected modify");
+        };
+        // File currently HAS trailing newline → old-side marker must fail.
+        let err = crate::edit::apply::apply_hunks_to_text("a.txt", "one\n", hunks).unwrap_err();
+        assert!(matches!(err, EditError::ContextMismatch { .. }));
+
+        // File truly lacks trailing newline → applies.
+        let bytes = crate::edit::apply::apply_hunks_to_text("a.txt", "one", hunks).unwrap();
+        assert_eq!(bytes, b"two\n");
+    }
+
+    #[test]
+    fn dotenv_create_denied_on_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = PatchSet {
+            files: vec![FilePatch::Create {
+                path: ".env".into(),
+                hunks: vec![Hunk {
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec!["+SECRET=1".into()],
+                    eof_newline: true,
+                    old_eof_no_newline: false,
+                }],
+            }],
+        };
         assert!(matches!(
-            reject_semantic(&empty),
-            Err(EditError::InvalidRequest(ref m)) if m == "semantic_ops empty"
+            validate_patchset_local(
+                &patch,
+                &policy(dir.path()),
+                &token(vec![Grant::FsWrite(Glob("**".into()))])
+            ),
+            Err(EditError::PathDenied { ref path, .. }) if path == ".env"
         ));
+    }
+
+    #[test]
+    fn overlapping_hunks_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
+        let patch = PatchSet {
+            files: vec![FilePatch::Modify {
+                path: "a.txt".into(),
+                hunks: vec![
+                    Hunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 1,
+                        lines: vec!["-a".into(), "+A".into()],
+                        eof_newline: true,
+                        old_eof_no_newline: false,
+                    },
+                    Hunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 1,
+                        lines: vec!["-a".into(), "+Z".into()],
+                        eof_newline: true,
+                        old_eof_no_newline: false,
+                    },
+                ],
+            }],
+        };
+        assert!(matches!(
+            validate_patchset_local(
+                &patch,
+                &policy(dir.path()),
+                &token(vec![Grant::FsWrite(Glob("**".into()))])
+            ),
+            Err(EditError::OverlappingHunks { .. })
+        ));
+    }
+
+    #[test]
+    fn semantic_ops_all_variants_unsupported() {
+        use alloy_runtime::SemanticEditOp;
+        let ops = vec![
+            SemanticEditOp::RenameType {
+                from_path: "a".into(),
+                to_name: "B".into(),
+                update_references: true,
+            },
+            SemanticEditOp::UpdateImports {
+                file: "a".into(),
+                add: vec![],
+                remove: vec![],
+            },
+            SemanticEditOp::ReplaceBody {
+                item_path: "a".into(),
+                new_body: "b".into(),
+            },
+            SemanticEditOp::InsertImpl {
+                file: "a".into(),
+                type_path: "T".into(),
+                body: "{}".into(),
+            },
+            SemanticEditOp::AddMethod {
+                item_path: "a".into(),
+                method_source: "fn x() {}".into(),
+            },
+            SemanticEditOp::MoveModule {
+                from_path: "a".into(),
+                to_path: "b".into(),
+            },
+            SemanticEditOp::ExtractTrait {
+                type_path: "T".into(),
+                trait_name: "Tr".into(),
+                method_names: vec![],
+            },
+            SemanticEditOp::SplitCrate {
+                source_crate: "a".into(),
+                new_crate: "b".into(),
+                move_paths: vec![],
+            },
+            SemanticEditOp::AddField {
+                type_path: "T".into(),
+                field_source: "x: u8".into(),
+            },
+        ];
+        for op in ops {
+            let tag = op.op_tag().to_string();
+            let req = EditRequest::SemanticOps { ops: vec![op] };
+            assert!(matches!(
+                reject_semantic(&req),
+                Err(EditError::UnsupportedOp { op: ref got }) if got == &tag
+            ));
+        }
     }
 }

@@ -17,8 +17,8 @@ use serde_json::json;
 
 use crate::edit::apply::{apply_file_patches, ApplyProgress, FileApplyOutcome};
 use crate::edit::checkpoint::{
-    create_checkpoint, preflight_git, resolve_checkpoint, restore_checkpoint, tracked_set,
-    CreatedCheckpoint,
+    create_checkpoint, preflight_git, prepare_repo_for_edit, resolve_checkpoint,
+    restore_checkpoint, tracked_set, CreatedCheckpoint,
 };
 use crate::edit::digest::compute_workspace_digest;
 use crate::edit::map_error::map_store;
@@ -346,8 +346,20 @@ impl EditEngine for GitEditEngine {
         let files_touched = validate_patchset_local(&patch, &self.path_policy, &ctx.perms)?;
         self.require_git(&ctx.perms)?;
 
+        let (head_sha, tracked) =
+            prepare_repo_for_edit(self.broker.as_ref(), &self.path_policy, &ctx.perms, &patch)
+                .await?;
+        let pre_digest = compute_workspace_digest(
+            &self.path_policy,
+            &tracked,
+            &[],
+            self.max_digest_files,
+            self.max_digest_bytes,
+        )?;
+
         let tx_id = TransactionId::new();
         let checkpoint_id = CheckpointId::new();
+        check_expiry(&ctx.perms)?;
         let CreatedCheckpoint {
             checkpoint_sha,
             head_sha,
@@ -357,16 +369,10 @@ impl EditEngine for GitEditEngine {
             &self.path_policy,
             &ctx.perms,
             checkpoint_id,
-            &patch,
+            &head_sha,
+            tracked,
         )
         .await?;
-        let pre_digest = compute_workspace_digest(
-            &self.path_policy,
-            &tracked,
-            &[],
-            self.max_digest_files,
-            self.max_digest_bytes,
-        )?;
         let created_at = Timestamp::now();
         let record = TxRecord {
             id: tx_id,
@@ -413,7 +419,7 @@ impl EditEngine for GitEditEngine {
             Ok(out) => out,
             Err(err) => {
                 let partial = err.partial;
-                let _ = self
+                match self
                     .restore_after_failure(
                         tx_id,
                         checkpoint_id,
@@ -421,8 +427,11 @@ impl EditEngine for GitEditEngine {
                         &partial,
                         &ctx.perms,
                     )
-                    .await;
-                return Err(err.error);
+                    .await
+                {
+                    Ok(()) => return Err(err.error),
+                    Err(restore_err) => return Err(restore_err),
+                }
             }
         };
         update_record_paths(&self.tx_store, tx_id, &file_out)?;
@@ -436,15 +445,19 @@ impl EditEngine for GitEditEngine {
         ) {
             Ok(d) => d,
             Err(err) => {
-                self.restore_after_failure(
-                    tx_id,
-                    checkpoint_id,
-                    &checkpoint_sha,
-                    &file_out,
-                    &ctx.perms,
-                )
-                .await?;
-                return Err(err);
+                match self
+                    .restore_after_failure(
+                        tx_id,
+                        checkpoint_id,
+                        &checkpoint_sha,
+                        &file_out,
+                        &ctx.perms,
+                    )
+                    .await
+                {
+                    Ok(()) => return Err(err),
+                    Err(restore_err) => return Err(restore_err),
+                }
             }
         };
 
@@ -471,15 +484,19 @@ impl EditEngine for GitEditEngine {
         {
             Ok(id) => id,
             Err(err) => {
-                self.restore_after_failure(
-                    tx_id,
-                    checkpoint_id,
-                    &checkpoint_sha,
-                    &file_out,
-                    &ctx.perms,
-                )
-                .await?;
-                return Err(map_store(err));
+                match self
+                    .restore_after_failure(
+                        tx_id,
+                        checkpoint_id,
+                        &checkpoint_sha,
+                        &file_out,
+                        &ctx.perms,
+                    )
+                    .await
+                {
+                    Ok(()) => return Err(map_store(err)),
+                    Err(restore_err) => return Err(restore_err),
+                }
             }
         };
 
@@ -622,7 +639,7 @@ impl GitEditEngine {
         paths: &FileApplyOutcome,
         perms: &alloy_runtime::PermissionToken,
     ) -> Result<(), EditError> {
-        if let Err(err) = restore_checkpoint(
+        match restore_checkpoint(
             self.broker.as_ref(),
             &self.path_policy,
             perms,
@@ -633,17 +650,26 @@ impl GitEditEngine {
         )
         .await
         {
-            return Err(EditError::RollbackFailed {
-                tx,
-                checkpoint_id,
-                detail: err.to_string(),
-            });
+            Ok(()) => {
+                if let Some(record) = lock(&self.tx_store)?.get_mut(&tx) {
+                    record.state = TxState::RolledBack;
+                }
+                *lock(&self.abandoned)? = None;
+                Ok(())
+            }
+            Err(EditError::TokenExpired) => {
+                // FailedDirty: leave Open + abandoned + checkpoint ref.
+                Err(EditError::TokenExpired)
+            }
+            Err(err) => {
+                // FailedDirty: leave Open + abandoned + checkpoint ref.
+                Err(EditError::RollbackFailed {
+                    tx,
+                    checkpoint_id,
+                    detail: err.to_string(),
+                })
+            }
         }
-        if let Some(record) = lock(&self.tx_store)?.get_mut(&tx) {
-            record.state = TxState::RolledBack;
-        }
-        *lock(&self.abandoned)? = None;
-        Ok(())
     }
 }
 

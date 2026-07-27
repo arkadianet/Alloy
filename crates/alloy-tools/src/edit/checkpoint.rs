@@ -60,14 +60,13 @@ pub(crate) fn preflight_git(
     Ok(())
 }
 
-/// Create a git checkpoint ref after repo guard checks.
-pub(crate) async fn create_checkpoint(
+/// Probe repo invariants and return HEAD SHA + tracked set (no checkpoint yet).
+pub(crate) async fn prepare_repo_for_edit(
     broker: &dyn SandboxBroker,
     policy: &PathPolicy,
     perms: &PermissionToken,
-    id: CheckpointId,
     patch: &PatchSet,
-) -> Result<CreatedCheckpoint, EditError> {
+) -> Result<(String, BTreeSet<String>), EditError> {
     ensure_git_version(broker, policy, perms).await?;
     ensure_inside_work_tree(broker, policy, perms).await?;
     let head_sha = rev_parse_head(broker, policy, perms).await?;
@@ -75,10 +74,21 @@ pub(crate) async fn create_checkpoint(
     ensure_repo_state_clean(broker, policy, perms).await?;
     let tracked = tracked_set(broker, policy, perms).await?;
     ensure_tracked_policy(policy, &tracked, patch)?;
+    Ok((head_sha, tracked))
+}
 
+/// Create a git checkpoint ref after [`prepare_repo_for_edit`].
+pub(crate) async fn create_checkpoint(
+    broker: &dyn SandboxBroker,
+    policy: &PathPolicy,
+    perms: &PermissionToken,
+    id: CheckpointId,
+    head_sha: &str,
+    tracked: BTreeSet<String>,
+) -> Result<CreatedCheckpoint, EditError> {
     let stash = git_stdout(broker, policy, perms, &["stash", "create"]).await?;
     let checkpoint_sha = if stash.trim().is_empty() {
-        head_sha.clone()
+        head_sha.to_string()
     } else {
         stash.trim().to_string()
     };
@@ -98,7 +108,7 @@ pub(crate) async fn create_checkpoint(
     }
     Ok(CreatedCheckpoint {
         checkpoint_sha,
-        head_sha,
+        head_sha: head_sha.to_string(),
         tracked,
     })
 }

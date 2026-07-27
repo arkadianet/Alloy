@@ -58,6 +58,11 @@ pub enum FilePatch {
     Delete {
         /// Jail-relative path.
         path: String,
+        /// Optional hunks retained from unified-diff parse for context validation
+        /// (RFC-0008 V5/V9). Structured JSON omits this (default empty); apply
+        /// ignores hunks and unlinks the path.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hunks: Vec<Hunk>,
     },
 }
 
@@ -66,7 +71,9 @@ impl FilePatch {
     #[must_use]
     pub fn path(&self) -> &str {
         match self {
-            Self::Modify { path, .. } | Self::Create { path, .. } | Self::Delete { path } => path,
+            Self::Modify { path, .. } | Self::Create { path, .. } | Self::Delete { path, .. } => {
+                path
+            }
         }
     }
 }
@@ -88,6 +95,11 @@ pub struct Hunk {
     /// the last hunk that contributes new-side lines).
     #[serde(default = "default_true")]
     pub eof_newline: bool,
+    /// When true, the current (old) file must lack a trailing newline at EOF
+    /// (unified-diff `\ No newline at end of file` after a `-` or context line).
+    /// Structured JSON patches omit this (default `false`).
+    #[serde(default)]
+    pub old_eof_no_newline: bool,
 }
 
 /// Semantic edit ops (V2 §13). Serde-stable; MVP returns UnsupportedOp for all.
@@ -399,7 +411,8 @@ mod tests {
     fn file_patch_path_accessor() {
         assert_eq!(
             FilePatch::Delete {
-                path: "a.rs".into()
+                path: "a.rs".into(),
+                hunks: vec![],
             }
             .path(),
             "a.rs"
