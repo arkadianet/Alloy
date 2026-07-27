@@ -71,7 +71,7 @@ Seven RFCs have built substrate — storage, sessions, observability, sandbox, t
 ### 1.5 Day-1 MVP (normative)
 
 1. `LinearScheduler` MUST implement `Scheduler` and MUST be constructed from `LinearSchedulerDeps` (§3.10) with **no** `RuntimeHandle`.
-2. Execution MUST be **serial**: at most one node in `NodeState::Running` per process. `BudgetPolicy.max_parallel_nodes`, `max_parallel_cargo`, and `max_parallel_edits` MUST all be `1`; any other value MUST fail construction with `SchedError::Config`.
+2. Execution MUST be **serial per DAG**: at most one node in `NodeState::Running` per owned DAG. Through `RuntimeHandle::run_dag`, at most one DAG run is admitted process-wide (§4.7 K2). `BudgetPolicy.max_parallel_nodes`, `max_parallel_cargo`, and `max_parallel_edits` MUST all be `1`; any other value MUST fail construction with `SchedError::Config`.
 3. Ready-set derivation MUST apply RFC-0009 §5.3.1 exactly. `EdgeKind::Hint` MUST be ignored. More than one Ready node MUST fail closed with `SchedError::Invariant`; the scheduler MUST NOT pick arbitrarily and MUST NOT run two nodes concurrently.
 4. `VerifyCompile` / `VerifyTest` MUST reach `cargo_check` / `cargo_test` through `ToolCaller` (§3.4). Exit `101` returned as `Ok(ToolResult)` with `ToolError::ExecutionFailed` MUST become `VerifyOutcome { ok: false, .. }` (**normal outcome**). A sandbox denial MUST become `AdapterError::PermissionDenied` (**error**), never a compile/test failure.
 5. `GateHuman` MUST checkpoint `NodeState::WaitingApproval` + `DagState::WaitingApproval`, emit `ApprovalRequested`, register a gate waiter, and **block inside `Scheduler::run`** until an approval arrives, cancel fires, or the node `timeout_ms` elapses. `Scheduler::run` MUST NOT return `DagState::WaitingApproval`.
@@ -215,7 +215,8 @@ Each amendment is additive and MUST land with this RFC.
 | A5 | 0003 | `apply_start_outcome` MUST NOT suppress a terminal scheduler outcome when durable state is `waiting_approval`: for `Ok(DagOutcome { state: Failed \| Cancelled, .. })` it MUST apply the terminal transition (events before row) instead of merging. `Running` / `WaitingApproval` / `ReplanRequired` outcomes keep merging. `replan_requested` / `cancelling` / `cancelled` keep winning. | Gate deny/expiry can terminalize the DAG while the row still says `waiting_approval` (expiry write failed, or the scheduler observed the resolution first); merging would strand the run non-terminal forever. |
 | A6 | 0003 | `SessionService::resume` MUST call `RuntimeHandle::reconcile_terminal_run(dag_id, terminal)` (best effort, warn on error, never abort resume) for every run row whose durable state is terminal (`failed` / `cancelled` / `succeeded`) and whose `goal_json` yields a `dag_id`. | Closes the crash window where the control row is `failed` (Deny/expiry) but the DAG blob is still `WaitingApproval` — no `start` will ever be dispatched for a terminal row, so nothing else would terminalize the DAG. |
 | A7 | 0003 | `expire_gate` MUST be idempotent with respect to a missing waiter (no `UnknownGate`), because the timeout races waiter removal. | The scheduler cannot distinguish "waiter already taken" from "gate never registered" without a durable waiter table. |
-| A8 | 0003 | Every `ApprovalResolved` payload (from `approve` and from `expire_gate`) MUST include `generation: u64` equal to the DAG generation at resolution time. Scans (§5.7.2) MUST match `payload.generation == dag.generation`. `expire_gate` / `approve` resolve generation via the run's `goal_json.dag_id` → `DagStore::get` (missing DAG ⇒ `Internal`). | Without generation, a reused `GateId` after replan cannot be filtered; today's payload is only `{ gate_id, decision }`. |
+| A8 | 0003 | Every `ApprovalResolved` payload (from `approve` and from `expire_gate`) MUST include `generation: u64` equal to the DAG generation at resolution time. Scans (§5.7.2) MUST match `payload.generation == dag.generation`. `expire_gate` / `approve` resolve generation via the run's `goal_json.dag_id` → `DagStore::get` (missing DAG ⇒ `Internal`). Resume-repair emitters that append `ApprovalResolved` without `gate_id`/`generation` (RFC-0003 §5.3) are **out of scope for the gate scan** and MUST NOT be matched by §5.7.2. | Without generation, a reused `GateId` after replan cannot be filtered; today's payload is only `{ gate_id, decision }`. |
+| A9 | 0009 | RFC-0009 Appendix C's "unowned `Running` ⇒ move to `Failed`/`ReplanRequired` before accepting new work" is **amended**: a `LinearScheduler` that acquires ownership of a foreign `Running` DAG MUST adopt per §5.3.2 (lost-attempt accounting) rather than force-terminalize. Force-terminalization remains available via `reconcile_terminal_run` / operator cancel. | Adoption preserves retry budgets and avoids discarding in-flight work the control plane still owns. |
 
 ### 2.8 Trust boundary on load
 
@@ -588,6 +589,15 @@ pub struct SessionVerifyPermissions {
     compile_args_glob: Option<String>,
     test_args_glob: Option<String>,
 }
+
+impl SessionVerifyPermissions {
+    #[must_use]
+    pub fn new(
+        sessions: Arc<dyn SessionRows>,
+        compile_args_glob: Option<String>,
+        test_args_glob: Option<String>,
+    ) -> Self;
+}
 ```
 
 `token_for` (`await`) loads the session row, sets `PermissionToken.profile` from `Session.profile`, and mints `Grant::Exec(ExecAllow { binary: "cargo", args_glob })` from the class glob. Missing session or missing glob for the class ⇒ `PermissionDenied`. A glob-only struct without session access is **not** sufficient. `SessionVerifyPermissions` MUST live in `alloy-runtime::adapters::perms` and be re-exported from the crate root alongside `VerifyPermissions`. Adapters still MUST NOT invent grants.
@@ -656,9 +666,9 @@ pub struct UnavailableCapabilityExecutor;
 | CE1 | `CapabilityOutcome` MUST be the enum above. The previous struct-with-`Option<FailureIr>` shape made "succeeded and failed" representable. |
 | CE2 | The scheduler MUST overwrite `failure.node` with the dispatched `NodeId` before persisting, whatever the worker set. |
 | CE3 | `CapabilityExecContext.attempt` MUST equal `meta.attempt`; the scheduler sets both from the same counter and MUST NOT diverge. |
-| CE3 | Workers MUST NOT retry, sleep for backoff, escalate tiers, write `TaskNode` fields, or write `NodeState` events. |
-| CE4 | `UnavailableCapabilityExecutor::execute` MUST return `Err(CapabilityExecError::Unavailable)`. |
-| CE5 | `CapabilityExecContext.timeout` is advisory to the worker; the scheduler enforces it independently (§5.19). |
+| CE4 | Workers MUST NOT retry, sleep for backoff, escalate tiers, write `TaskNode` fields, or write `NodeState` events. |
+| CE5 | `UnavailableCapabilityExecutor::execute` MUST return `Err(CapabilityExecError::Unavailable)`. |
+| CE6 | `CapabilityExecContext.timeout` is advisory to the worker; the scheduler enforces it independently (§5.19). |
 
 ### 3.9 `CostMeterFactory` (new)
 
@@ -1080,7 +1090,7 @@ struct OwnershipLock {
 
 | # | Rule |
 | --- | --- |
-| L1 | `new` MUST `create_dir_all(data_dir)`, then `OpenOptions::new().read(true).write(true).create(true).open(data_dir.join("scheduler.lock"))`. |
+| L1 | `new` MUST `create_dir_all(data_dir)`, then `OpenOptions::new().read(true).write(true).create(true).truncate(false).open(data_dir.join("scheduler.lock"))` (`.truncate(false)` keeps `clippy::suspicious_open_options` clean under `-D warnings`). |
 | L2 | `new` MUST call `std::fs::File::try_lock` → `Result<(), std::fs::TryLockError>` (stable since 1.89.0; present on the pinned 1.97.1 toolchain — verified). The `fs4` / `fs2` crates MUST NOT be added. |
 | L3 | `std::fs::TryLockError::WouldBlock` MUST map to `Ownership("scheduler.lock held by another process: {path}")`. `TryLockError::Error(e)` MUST map to `Ownership("scheduler.lock: {e}")`. |
 | L4 | The lock file MUST NOT be deleted on drop (deleting it races a second process that already opened the same inode). It MAY be truncated and MAY have the owning pid written for debugging; correctness MUST NOT depend on its contents. |
@@ -1211,6 +1221,7 @@ Because the write order is artifacts → CAS → events (§5.8.1), a crash can l
 | RF5 | Repair appends MUST be idempotent: at most one repair event per `(node, generation, to)`; existence is probed with the RF2 filter. |
 | RF6 | C9 committed with a missing `ApprovalRequested`: the scheduler MUST append a repair `ApprovalRequested` with `repaired: true`, `gate_id`, `node_id`, `generation: dag.generation`, and `ts = now` before GR4 deadline math. GR3's "MUST NOT re-emit" applies only to non-repair duplicates. |
 | RF7 | Gate deny/expiry CAS committed with a missing `NodeState`/`failure_ref` event: RF3 repairs the `NodeState`; if the `failure_ir` artifact is also missing, put a synthetic `Approval` `failure_ir` (`notes: "repaired after crash"`) before FN2 selection so FO2/FO6 hold. |
+| RF8 | Repair/`NodeState` events MUST carry the `attempt` (and `next_attempt` when applicable) derived by §5.3.1 **before** adoption continues. A lost C3 or C8 event pair MUST NOT reset `attempts_started` below the durable counter; AC 24 / AC 78 remain binding. |
 
 ### 5.4 Ready-set derivation and selection
 
@@ -1226,7 +1237,7 @@ Because the write order is artifacts → CAS → events (§5.8.1), a crash can l
 | --- | --- |
 | RS1 | `n` is promotable iff `n.state == Pending` and every Data and Sequence predecessor is satisfied. |
 | RS2 | A `Skipped` predecessor MUST NOT satisfy a Data edge. The successor stays `Pending` and eventually becomes `Skipped` (§5.15). |
-| RS3 | A predecessor in `Succeeded` **without** `output_ref` on a Data edge MUST fail closed: `Err(Invariant("succeeded node {id} has no output_ref"))` (RFC-0009 §5.3.2 invariant owned by this RFC). |
+| RS3 | A predecessor in `Succeeded` **without** `output_ref` on a Data edge MUST fail closed: `Err(Invariant("succeeded node {id} has no output_ref"))` (RFC-0009 §5.3.2 invariant owned by this RFC). This check is performed by the **scheduler loop** immediately before L7 promotion (ordered over `promotable_nodes`); `promotable_nodes` itself remains pure and infallible (`Vec<NodeId>`). |
 | RS4 | `ready_nodes` returns nodes already in `Ready`, ascending `NodeId`. Both helpers are deterministic and total. |
 | RS5 | `ready_nodes(&dag).len() > 1` after promotion MUST fail closed (fix: no arbitrary pick, no concurrency). |
 | RS6 | Promotion MUST be a single CAS covering all promotable nodes, so a crash cannot leave a half-promoted frontier. |
@@ -1304,7 +1315,7 @@ Scanning MUST match on `payload.gate_id == gate_id` **and** `payload.generation 
 | --- | --- |
 | GR1 | The scheduler MUST re-register the waiter (`SessionPlane::register_gate_waiter`) and await it. |
 | GR2 | The scheduler MUST NOT re-checkpoint `NodeState::WaitingApproval` / `DagState::WaitingApproval` — they are already durable. |
-| GR3 | The scheduler MUST NOT re-emit `ApprovalRequested` except RF6 repair. Existence is probed with `has_session_event_for_run(session, run, ApprovalRequested)` plus `gate_id` **and** `generation == dag.generation`. |
+| GR3 | The scheduler MUST NOT re-emit `ApprovalRequested` except RF6 repair. Existence / payload filters use paged `list_session_events` (§5.3.1); match `gate_id` **and** `generation == dag.generation`. |
 | GR4 | The remaining gate deadline MUST be recomputed as `timeout_ms - elapsed_since(first generation-matched ApprovalRequested.ts)`, clamped at `>= 0`. A non-positive remainder MUST go straight to §5.7.8 expiry. Events from other generations MUST be ignored. |
 | GR5 | `register_gate_waiter` returning `Err(RunError::InvalidPhase(..))` for a terminal row MUST be classified through §5.7.9 (crash window), not treated as an internal error. |
 
@@ -1681,10 +1692,10 @@ delay = min(max(raw, 0), max_backoff)
 
 | Step | Action |
 | --- | --- |
-| 1 | `dags.get(dag_id)` ⇒ `None` ⇒ `Err(DagNotFound)` |
-| 2 | Terminal state ⇒ `Ok(())` with no write |
-| 3 | Insert an `OwnedDag` (transient) — occupied ⇒ fall through to the owned path |
-| 4 | Resolve the run binding for event attribution; missing ⇒ still write C6, log at `warn`, skip events |
+| 1 | Resolve the run binding for event attribution (may be missing) |
+| 2 | Insert an `OwnedDag` (transient) — occupied ⇒ fall through to the owned path |
+| 3 | **Re-load** `dags.get(dag_id)` under ownership ⇒ `None` ⇒ `Err(DagNotFound)`; terminal ⇒ `Ok(())` with no write. Same-generation CAS cannot detect a concurrent same-gen writer that already terminalized — the reload closes that window. |
+| 4 | Missing run binding ⇒ still write C6, log at `warn`, skip events |
 | 5 | C6 markings + `DagState::Cancelled` |
 | 6 | Append `NodeState` events |
 | 7 | Write `cancel_result = Some(Ok(Cancelled))` (or `Some(Err(..))` on CAS failure), then drop the guard (releases ownership, notifies) |
@@ -1929,6 +1940,7 @@ Evaluated in order over the post-CAS blob plus `DeriveFlags`:
 | FO2 | When `failed_node` is `Some(id)` and its `failure_ref` artifact is missing, degrade to `FailureIr { node: id, error_class, retry: NonRetryable, diagnostics: [], notes: "failure detail unavailable" }` reconstructed from the matching `NodeState` event when present. If **no** matching event exists either, use `error_class: Internal`, `retry: NonRetryable`, `notes: "failure detail unavailable; event missing"`. |
 | FO3 | R9 short-circuit MUST apply FO1/FO2 **without** requiring RF3 repair to succeed first. Best-effort RF3 repair MAY still append missing events after the outcome is assembled, but MUST NOT block returning `Ok(DagOutcome)`. |
 | FO4 | `state == Failed` with `failed_node == None` is permitted only for D8 (all-skipped) and MUST carry `failure = None`. FO2 does **not** apply to D8. |
+| FO4a | `reconcile_terminal_run(..., Failed)` that did **not** arise from a gate decision (RC4/RC5) MUST still put a synthetic `Internal` `failure_ir` on the lowest cancelled-or-failed node so FO6 holds when R9 later surfaces the outcome. |
 | FO5 | `state == Cancelled` MUST carry `failed_node = None` and `failure = None`. |
 | FO6 | When `state == Failed` and `failed_node` is `Some(_)`, `failure` MUST be `Some(_)` (FO1/FO2). |
 
@@ -1968,8 +1980,8 @@ async fn reconcile_terminal_run(&self, dag_id: DagId, terminal: DagState) -> Res
 | RC1 | `terminal` MUST be `Succeeded` \| `Failed` \| `Cancelled`; anything else ⇒ `Err(Config("reconcile_terminal_run requires a terminal state"))`. |
 | RC2 | Missing DAG ⇒ `Err(DagNotFound)`. Already-terminal DAG ⇒ `Ok(())` with no write (idempotent). |
 | RC3 | A DAG owned by a live run in this process ⇒ `Ok(())` with no write: the run owns terminalization. |
-| RC4 | Otherwise: acquire ownership, then a single CAS marking non-terminal nodes (`WaitingApproval`/`Running`/`Ready` → `Cancelled` for `Cancelled`/`Failed` targets; the rest → `Skipped`), set `DagState = terminal`, append `NodeState` events, release ownership. |
-| RC5 | For `terminal == Failed` arising from a gate decision, the reconciler MUST put an `Approval` `failure_ir` for the gate node so `failed_node` selection (FN2) still works. |
+| RC4 | Otherwise: acquire ownership, **re-load** the DAG, then a single CAS marking non-terminal nodes (`WaitingApproval`/`Running`/`Ready` → `Cancelled` for `Cancelled`/`Failed` targets; the rest → `Skipped`), set `DagState = terminal`, append `NodeState` events, release ownership. |
+| RC5 | For `terminal == Failed` arising from a gate decision, the reconciler MUST put an `Approval` `failure_ir` for the gate node so `failed_node` selection (FN2) still works. For other `Failed` reconciles, put a synthetic `Internal` `failure_ir` on the lowest cancelled node (FO4a). |
 | RC6 | For `terminal == Succeeded` with non-terminal nodes remaining, the reconciler MUST NOT invent success: it MUST write `Failed` with `notes: "control row succeeded with unfinished nodes"` and log at `warn`. |
 | RC7 | `Conflict` ⇒ `Err(Conflict { dag_id })`; callers (resume) log and continue. |
 | RC8 | The method MUST be safe to call concurrently with `cancel` for the same DAG: whichever acquires ownership first wins, the other observes a terminal state and returns `Ok(())`. |
@@ -2047,9 +2059,9 @@ RFC-0008 MVP durability: **in-process edit-transaction map only** + durable chec
 | ER1 | DAG node state is durable (`put_if_generation`). Edit transaction state is **not**. After restart the two MAY disagree: an `Edit` node can be durably `Succeeded` while no in-memory tx exists and workspace creates may be untracked leftovers. |
 | ER2 | The scheduler MUST NOT assume a `Succeeded` `Edit` node implies a clean, known, or exclusive workspace. |
 | ER3 | The scheduler MUST NOT call `EditEngine::rollback`, `EditEngine::apply`, or `GitEditEngine::recover_checkpoint`. Those belong to the write stack / operator (RFC-0008 §2.5 / §6.5; RFC-0015). |
-| ER4 | **Resume rule (re-verify).** After restart, before dispatching any further `Edit` / capability node that consumes the edited tree, if any `Edit` node in this generation is durably `Succeeded` and a Data or Sequence successor `VerifyCompile` or `VerifyTest` exists that is not yet `Succeeded`/`CachedHit`, the scheduler MUST run that verify path next (promote + dispatch under normal L-steps). Forward-only (§8.5): verification failure drives another patch later, never an undo. |
-| ER5 | If a `Succeeded` `Edit` has **no** verify successor in the DAG, the scheduler MUST stop: durable `Failed` with `FailureIr { error_class: Internal, retry: NonRetryable, notes: "edit succeeded without verify successor; workspace unverified after restart" }` and `Ok(DagOutcome { state: Failed, .. })`. |
-| ER6 | A crash with an `Edit` node durably `Running` follows §5.3.2 adoption (lost attempt). Re-dispatch produces a **new** forward `apply_patch`, not a replay of the lost tx (§8.5 RT6). |
+| ER4 | **Resume-only re-verify.** On `run` entry after restart (not mid-loop), before dispatching any further `Edit` / capability node that consumes the edited tree: if any `Edit` in this generation is durably `Succeeded` and any **reachable** Data∪Sequence successor `VerifyCompile`/`VerifyTest` (not only the immediate out-neighbor) is still non-terminal (`Pending`/`Ready`/`Running` — not `Succeeded`/`CachedHit`/`Failed`/`Cancelled`/`Skipped`), the scheduler MUST prefer that verify frontier next via normal L-steps. Forward-only (§8.5). |
+| ER5 | If a `Succeeded` `Edit` has **no** such non-terminal verify successor in the DAG, the scheduler MUST stop: durable `Failed` with `FailureIr { error_class: Internal, retry: NonRetryable, notes: "edit succeeded without verify successor; workspace unverified after restart" }` and `Ok(DagOutcome { state: Failed, .. })`. |
+| ER6 | A crash with an `Edit` node durably `Running` follows §5.3.2 adoption (lost attempt). Re-dispatch produces a **new** forward `apply_patch`, not a replay of the lost tx (§5.8.3 RT6 / §8.5 FOW4). |
 | ER7 | Operator cleanup of untracked creates after crash is out of band (RFC-0008 / RFC-0015). The scheduler MUST NOT invent cleanup. |
 
 **Assumptions (stated, not silent):**
@@ -2443,7 +2455,7 @@ Each AC is a test name or a CI check.
 | 1 | Every AC in §13 is implemented as a passing test or CI check. |
 | 2 | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace` are green. |
 | 3 | `LinearScheduler` is the production default; `NullScheduler` remains for pre-wiring, shutdown parking, and tests. |
-| 4 | Amendments A1–A8 have landed with their own tests. |
+| 4 | Amendments A1–A9 have landed with their own tests. |
 | 5 | `#![forbid(unsafe_code)]` holds; no new external dependency. |
 | 6 | Public items in §3.17 are re-exported and documented with `#[must_use]` where applicable. |
 | 7 | No `.env` writes; `example.env` comments updated. |
