@@ -11,7 +11,7 @@ use super::RuntimePhase;
 use crate::config::RuntimeConfig;
 use crate::error::{RuntimeError, SchedError};
 use crate::events::{EventSink, HandoffSnapshot, InMemoryEventSink, NewSessionEvent, RuntimeEvent};
-use crate::scheduler::{DagOutcome, Scheduler};
+use crate::scheduler::{DagOutcome, DagState, Scheduler};
 use crate::storage::StoreError;
 use crate::types::ids::{DagId, EventSeq};
 use crate::types::metrics::RuntimeMetrics;
@@ -282,6 +282,34 @@ impl RuntimeHandle {
         }
         self.scheduler()
             .cancel(dag_id)
+            .await
+            .map_err(RuntimeError::Scheduler)
+    }
+
+    /// Forward to [`Scheduler::reconcile_terminal_run`] (amendment A2).
+    ///
+    /// Phase: `Running` | `Draining`. Deliberately **not** admitted through
+    /// the single-flight `run_dag` gate (K5-style: reachable concurrently
+    /// with an in-flight `run_dag`/`cancel_dag`, even for the same
+    /// `dag_id` — RC8 makes that race safe on the scheduler side). Lets
+    /// `SessionService::resume` (amendment A6) reconcile a terminal run row
+    /// without needing to become scheduler-aware itself.
+    pub async fn reconcile_terminal_run(
+        &self,
+        dag_id: DagId,
+        terminal: DagState,
+    ) -> Result<(), RuntimeError> {
+        match self.phase() {
+            RuntimePhase::Running | RuntimePhase::Draining => {}
+            other => {
+                return Err(RuntimeError::InvalidPhase {
+                    current: other,
+                    op: "reconcile_terminal_run",
+                });
+            }
+        }
+        self.scheduler()
+            .reconcile_terminal_run(dag_id, terminal)
             .await
             .map_err(RuntimeError::Scheduler)
     }
