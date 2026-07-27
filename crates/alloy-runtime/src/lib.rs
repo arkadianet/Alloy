@@ -48,12 +48,13 @@ pub use adapters::{
 };
 pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
 pub use dag::{
-    allocate_ids, build_topology, compute_cache_key, mvp_compiler_fingerprint_digest,
-    mvp_policy_hash_digest, mvp_tool_versions_digest, ApprovalSpec, Backoff, BuildTopology,
-    CacheKey, CacheKeyMaterials, DagValidationError, DagValidator, DependencyEdge, EdgeKind,
-    NodeInputEnvelope, NodeInputPayload, NodeKind, NodeOutputEnvelope, NodeState,
-    PredecessorOutput, RetryIncoherence, RetryPolicy, TaskDag, TaskNode, TemplateCatalog,
-    TemplateId, TemplateIdMap, TemplateManifest, ValidateOpts,
+    allocate_ids, build_topology, compute_cache_key, goal_content_digest,
+    mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest,
+    ApprovalSpec, Backoff, BuildTopology, CacheKey, CacheKeyMaterials, DagValidationError,
+    DagValidator, DependencyEdge, EdgeKind, NodeInputEnvelope, NodeInputPayload, NodeKind,
+    NodeOutputEnvelope, NodeState, PredecessorOutput, RetryIncoherence, RetryPolicy, TaskDag,
+    TaskNode, TemplateCatalog, TemplateId, TemplateIdMap, TemplateManifest, ValidateOpts,
+    ENVELOPE_SCHEMA_VERSION,
 };
 pub use error::{AdapterError, RunError, RuntimeError, SchedError, SessionError};
 pub use events::{

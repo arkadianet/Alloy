@@ -12,9 +12,10 @@ pub use cache::{
     compute_cache_key, goal_content_digest, mvp_compiler_fingerprint_digest,
     mvp_policy_hash_digest, mvp_tool_versions_digest, CacheKeyMaterials,
 };
+pub(crate) use io::{encode_json, PendingPredPlaceholder};
 pub use io::{
-    encode_json, NodeInputEnvelope, NodeInputPayload, NodeOutputEnvelope, PendingPredPlaceholder,
-    PredecessorOutput,
+    NodeInputEnvelope, NodeInputPayload, NodeOutputEnvelope, PredecessorOutput,
+    ENVELOPE_SCHEMA_VERSION,
 };
 pub use templates::{
     allocate_ids, build_topology, BuildTopology, TemplateApprovalSpec, TemplateCatalog,

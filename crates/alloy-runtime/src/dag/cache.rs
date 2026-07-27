@@ -1,4 +1,8 @@
 //! Cache-key builder (RFC-0009 §5.8). Day-1 templates leave `cache_key = None`.
+//!
+//! `PlanContext` fingerprint fields (`policy_hash`, `tool_versions`,
+//! `compiler_fingerprint`) are reserved for templates with `enable_cache = true`
+//! (RFC-0010); day-1 instantiation never calls [`compute_cache_key`].
 
 use crate::dag::types::{CacheKey, NodeKind};
 use crate::types::ids::{CapabilityId, Digest};
@@ -74,6 +78,7 @@ pub fn mvp_policy_hash_digest() -> Digest {
 }
 
 /// Content digest for a root [`crate::types::budget::Goal`] (JSON of the Goal only).
+#[must_use = "digest is the cache content input"]
 pub fn goal_content_digest(goal: &crate::types::budget::Goal) -> Result<Digest, serde_json::Error> {
     let bytes = serde_json::to_vec(goal)?;
     Ok(Digest::sha256(&bytes))
@@ -85,6 +90,12 @@ mod tests {
     use crate::types::budget::Goal;
     use crate::types::ids::CapabilityId;
 
+    /// Fixed Goal fixture — digests pinned offline for AC 20 / §5.8.
+    const GOLDEN_GOAL_CONTENT: &str =
+        "400fa50ee08a1e97765ebb6157d7c71f18dbbc5dc979c5b4554f6f6f272d84d6";
+    const GOLDEN_CACHE_KEY: &str =
+        "108879d360b11bd4c3b7ef44690ce02b6b647e57e41a9fa13eb7c52d948eb2ef";
+
     #[test]
     fn cache_key_stable() {
         let goal = Goal {
@@ -93,6 +104,7 @@ mod tests {
             attachments: vec![],
         };
         let content = goal_content_digest(&goal).unwrap();
+        assert_eq!(content.as_hex(), GOLDEN_GOAL_CONTENT);
         let policy = mvp_policy_hash_digest();
         let tools = mvp_tool_versions_digest();
         let compiler = mvp_compiler_fingerprint_digest();
@@ -105,25 +117,7 @@ mod tests {
             tool_versions: &tools,
             compiler_fingerprint: &compiler,
         });
-        // Golden: pinned for this fixed Goal fixture (root/content path only).
-        let expected = Digest::sha256(&{
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(b"alloy.cache_key.v1");
-            bytes.push(0x00);
-            bytes.extend_from_slice(b"analyze");
-            bytes.push(0x00);
-            bytes.extend_from_slice(b"repair");
-            bytes.push(0x00);
-            bytes.extend_from_slice(content.as_hex().as_bytes());
-            bytes.push(0x00);
-            bytes.extend_from_slice(policy.as_hex().as_bytes());
-            bytes.push(0x00);
-            bytes.extend_from_slice(tools.as_hex().as_bytes());
-            bytes.push(0x00);
-            bytes.extend_from_slice(compiler.as_hex().as_bytes());
-            bytes
-        });
-        assert_eq!(key.0, expected);
+        assert_eq!(key.0.as_hex(), GOLDEN_CACHE_KEY);
         // Identity fields excluded: same content → same key regardless of dag/node.
         let key2 = compute_cache_key(CacheKeyMaterials {
             kind: NodeKind::Analyze,
@@ -137,10 +131,20 @@ mod tests {
     }
 
     #[test]
-    fn kind_snake_case_matches_serde() {
-        let k = NodeKind::VerifyCompile;
-        let s = serde_json::to_string(&k).unwrap();
-        assert_eq!(s, "\"verify_compile\"");
-        assert_eq!(kind_serde_snake_case(k), "verify_compile");
+    fn kind_snake_case_matches_serde_all_variants() {
+        for kind in [
+            NodeKind::Plan,
+            NodeKind::Analyze,
+            NodeKind::Edit,
+            NodeKind::VerifyCompile,
+            NodeKind::VerifyTest,
+            NodeKind::Review,
+            NodeKind::GateHuman,
+            NodeKind::Aggregate,
+        ] {
+            let s = serde_json::to_string(&kind).unwrap();
+            let expected = format!("\"{}\"", kind_serde_snake_case(kind));
+            assert_eq!(s, expected, "mismatch for {kind:?}");
+        }
     }
 }

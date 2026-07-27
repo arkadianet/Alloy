@@ -155,11 +155,25 @@ pub trait PlanService: Send + Sync {
     ) -> Result<PlanResult, PlanError>;
 
     /// Replan: atomic replace, re-instantiate, snapshot, PlanProduced.
+    ///
+    /// Production callers MUST invoke [`crate::RunController::request_replan`]
+    /// first so gate waiters clear. The owning scheduler MUST checkpoint a
+    /// non-[`crate::DagState::Running`] state (typically `ReplanRequired`) at the
+    /// same generation before this call; otherwise [`PlanError::DagBusy`] is
+    /// permanent (RFC-0009 Appendix C).
     async fn replan(&self, reason: ReplanReason, ctx: PlanContext)
         -> Result<PlanResult, PlanError>;
 }
 
-/// Template-backed planner (day-1 production wiring).
+/// Template-backed planner (day-1 production implementation of [`PlanService`]).
+///
+/// # Production wiring
+///
+/// Construct via [`Self::from_storage`] (or [`Self::new`]) after
+/// [`crate::AlloyStorage::open`], then inject as `Arc<dyn PlanService>` into the
+/// PlanningWorker (RFC-0013) or CLI `alloy run` (RFC-0015). This crate does not
+/// change [`crate::RunController`] signatures (RFC-0009 §2.4); callers build
+/// [`PlanContext`] from [`crate::RunGoalRecord`] and call [`PlanService::plan`].
 pub struct TemplatePlanService {
     dags: Arc<dyn DagStore>,
     artifacts: Arc<dyn ArtifactStore>,
@@ -181,6 +195,16 @@ impl TemplatePlanService {
         }
     }
 
+    /// Production helper: wire dags + artifacts + durable SQLite event sink.
+    #[must_use]
+    pub fn from_storage(storage: &crate::storage::AlloyStorage) -> Self {
+        Self::new(
+            storage.dags() as Arc<dyn DagStore>,
+            storage.artifacts() as Arc<dyn ArtifactStore>,
+            storage.events() as Arc<dyn EventSink>,
+        )
+    }
+
     fn select(ctx: &PlanContext) -> TemplateId {
         ctx.template_override
             .unwrap_or(TemplateId::RepairLocalDiagnostic)
@@ -191,10 +215,16 @@ impl TemplatePlanService {
         template_id: TemplateId,
         ctx: &PlanContext,
         generation: u64,
-        replan: bool,
         reason: Option<ReplanReason>,
         expected_for_cas: CasExpected,
     ) -> Result<PlanResult, PlanError> {
+        let replan = matches!(expected_for_cas, CasExpected::Replan { .. });
+        // Day-1 never enables cache; fingerprints reserved for RFC-0010.
+        let _ = (
+            &ctx.policy_hash,
+            &ctx.tool_versions,
+            &ctx.compiler_fingerprint,
+        );
         let manifest = TemplateCatalog::get(template_id);
 
         // Phase A
@@ -232,6 +262,7 @@ impl TemplatePlanService {
             ids: &ids,
             input_refs: &input_refs,
         });
+        DagValidator::validate(&dag, ValidateOpts::default())?;
 
         // Snapshot
         let snapshot_bytes = serde_json::to_vec(&dag)
@@ -390,14 +421,10 @@ impl TemplatePlanService {
                 .unwrap_or(&[]);
 
             let payload = if preds.is_empty() {
-                // Root (no Data∪Sequence preds for readiness; plan uses Data preds only for
-                // FromPredecessors — Sequence-only roots still get Goal). Also treat zero
-                // Data preds as root input.
                 let has_sched_pred = manifest.edges.iter().any(|e| {
                     e.to == spec.name && matches!(e.kind, EdgeKind::Data | EdgeKind::Sequence)
                 });
                 if has_sched_pred {
-                    // Non-root with only Sequence preds → empty FromPredecessors
                     NodeInputPayload::FromPredecessors { preds: vec![] }
                 } else {
                     NodeInputPayload::Goal(ctx.goal.clone())
@@ -428,14 +455,8 @@ impl TemplatePlanService {
                 NodeInputPayload::FromPredecessors { preds: pred_outs }
             };
 
-            let envelope = NodeInputEnvelope {
-                schema_version: 1,
-                dag_id: ctx.dag_id,
-                node_id,
-                kind: spec.kind,
-                generation,
-                payload,
-            };
+            let envelope =
+                NodeInputEnvelope::new(ctx.dag_id, node_id, spec.kind, generation, payload);
             let bytes = encode_json(&envelope)
                 .map_err(|e| PlanError::Internal(format!("input envelope serde: {e}")))?;
             let art_id = self.put_labeled(bytes, ctx, "node_input").await?;
@@ -471,16 +492,27 @@ impl PlanService for TemplatePlanService {
     async fn plan(&self, ctx: PlanContext) -> Result<PlanResult, PlanError> {
         let template_id = Self::select(&ctx);
         tracing::Span::current().record("template", template_id.as_str());
-        self.instantiate_and_persist(template_id, &ctx, 1, false, None, CasExpected::InsertOnly)
+        self.instantiate_and_persist(template_id, &ctx, 1, None, CasExpected::InsertOnly)
             .await
     }
 
+    #[tracing::instrument(
+        skip(self, ctx),
+        fields(
+            session_id = %ctx.session_id,
+            run_id = %ctx.run_id,
+            dag_id = %ctx.dag_id,
+            template = tracing::field::Empty
+        ),
+        name = "planner.load_template"
+    )]
     async fn load_template(
         &self,
         id: TemplateId,
         ctx: PlanContext,
     ) -> Result<PlanResult, PlanError> {
-        self.instantiate_and_persist(id, &ctx, 1, false, None, CasExpected::InsertOnly)
+        tracing::Span::current().record("template", id.as_str());
+        self.instantiate_and_persist(id, &ctx, 1, None, CasExpected::InsertOnly)
             .await
     }
 
@@ -538,7 +570,6 @@ impl PlanService for TemplatePlanService {
             template_id,
             &ctx,
             next_gen,
-            true,
             Some(reason),
             CasExpected::Replan {
                 expected_generation: probe.generation,
@@ -548,7 +579,7 @@ impl PlanService for TemplatePlanService {
     }
 }
 
-// Re-export TemplateId for llm_stub convenience via planner — actually llm_stub imports from dag.
+// (llm_stub imports TemplateId from crate::dag)
 
 #[cfg(test)]
 mod tests {
@@ -558,7 +589,7 @@ mod tests {
         mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest,
     };
     use crate::events::InMemoryEventSink;
-    use crate::storage::{AlloyStorage, StorageOpenOptions};
+    use crate::storage::{AlloyStorage, EventStore, StorageOpenOptions};
     use std::sync::Mutex;
 
     fn fingerprints() -> (Digest, Digest, Digest) {
@@ -631,16 +662,25 @@ mod tests {
         sorted.sort();
         assert_eq!(payload.node_ids, sorted);
 
-        // Every input_ref resolves
+        // Every input_ref resolves with required attribution / labels
         for node in result.dag.nodes.values() {
             let blob = storage.artifacts().get(node.input_ref).await.unwrap();
             assert_eq!(blob.meta.content_type.as_deref(), Some("application/json"));
+            assert_eq!(blob.meta.session_id, Some(session));
+            assert_eq!(blob.meta.run_id, Some(run));
             assert_eq!(
                 blob.meta
                     .labels
                     .get("alloy.envelope")
                     .and_then(|v| v.as_str()),
                 Some("node_input")
+            );
+            assert_eq!(
+                blob.meta
+                    .labels
+                    .get("alloy.dag_id")
+                    .and_then(|v| v.as_str()),
+                Some(dag_id.to_string().as_str())
             );
         }
         let snap = storage
@@ -650,6 +690,70 @@ mod tests {
             .unwrap();
         let round: TaskDag = serde_json::from_slice(&snap.bytes).unwrap();
         assert_eq!(round.id, dag_id);
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_template_ignores_override() {
+        let (_dir, storage, svc, _) = service().await;
+        let mut ctx = plan_ctx(SessionId::new(), RunId::new(), DagId::new());
+        // Even if override were somehow set to the only template, load_template
+        // must use the explicit id argument (day-1 catalog has one entry).
+        ctx.template_override = Some(TemplateId::RepairLocalDiagnostic);
+        let result = svc
+            .load_template(TemplateId::RepairLocalDiagnostic, ctx)
+            .await
+            .unwrap();
+        assert_eq!(result.template_id, TemplateId::RepairLocalDiagnostic);
+        assert_eq!(result.dag.generation, 1);
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn from_storage_wires_durable_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
+            .await
+            .unwrap();
+        let svc = TemplatePlanService::from_storage(&storage);
+        let session = SessionId::new();
+        let run = RunId::new();
+        let dag_id = DagId::new();
+        let result = svc.plan(plan_ctx(session, run, dag_id)).await.unwrap();
+        assert_eq!(result.dag.id, dag_id);
+        let evs = storage
+            .events()
+            .list_session_events(session, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].type_, SessionEventType::PlanProduced);
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replan_session_mismatch_and_not_found() {
+        let (_dir, storage, svc, _) = service().await;
+        let session = SessionId::new();
+        let run = RunId::new();
+        let dag_id = DagId::new();
+        svc.plan(plan_ctx(session, run, dag_id)).await.unwrap();
+
+        let mut bad = plan_ctx(SessionId::new(), run, dag_id);
+        let err = svc
+            .replan(ReplanReason::UserRequested, bad.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PlanError::SessionMismatch { .. }));
+
+        bad.dag_id = DagId::new();
+        bad.session_id = session;
+        let err = svc
+            .replan(ReplanReason::UserRequested, bad)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PlanError::DagNotFound(_)));
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]

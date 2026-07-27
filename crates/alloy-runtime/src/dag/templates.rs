@@ -277,21 +277,22 @@ fn build_catalog() -> Vec<TemplateManifest> {
     };
 
     // Validate catalog integrity at init (crate bug → panic).
-    for m in std::slice::from_ref(&repair) {
-        let mut names = std::collections::HashSet::new();
-        for n in &m.nodes {
-            if !names.insert(n.name.as_str()) {
-                panic!("duplicate template node name {} in {:?}", n.name, m.id);
-            }
-        }
-        for e in &m.edges {
-            if !names.contains(e.from.as_str()) || !names.contains(e.to.as_str()) {
-                panic!("unresolvable edge in {:?}: {} -> {}", m.id, e.from, e.to);
-            }
+    validate_manifest(&repair);
+    vec![repair]
+}
+
+fn validate_manifest(m: &TemplateManifest) {
+    let mut names = std::collections::HashSet::new();
+    for n in &m.nodes {
+        if !names.insert(n.name.as_str()) {
+            panic!("duplicate template node name {} in {:?}", n.name, m.id);
         }
     }
-
-    vec![repair]
+    for e in &m.edges {
+        if !names.contains(e.from.as_str()) || !names.contains(e.to.as_str()) {
+            panic!("unresolvable edge in {:?}: {} -> {}", m.id, e.from, e.to);
+        }
+    }
 }
 
 /// Phase A — sync. Allocate fresh node/gate ids for a manifest.
@@ -354,13 +355,27 @@ pub fn build_topology(args: BuildTopology<'_>) -> TaskDag {
                 output_ref: None,
                 state: NodeState::Pending,
                 retry: spec.retry.clone(),
-                cache_key: None, // day-1 templates set enable_cache=false; hits owned by 0010
+                cache_key: None,
                 budget: spec.budget.clone(),
                 model_tier: spec.model_tier,
                 approval,
                 timeout_ms: spec.timeout_ms,
             },
         );
+        // Day-1 / until RFC-0010 supplies cache materials: enable_cache must be false.
+        debug_assert!(
+            !spec.enable_cache,
+            "enable_cache=true requires cache materialization (RFC-0010); template node {}",
+            spec.name
+        );
+        if spec.enable_cache {
+            // Soft guard for release builds: never silently invent keys.
+            // Future: compute_cache_key materials must be plumbed here.
+            tracing::error!(
+                node = %spec.name,
+                "template enable_cache=true ignored; cache_key left None until RFC-0010"
+            );
+        }
     }
 
     let mut edges = Vec::with_capacity(args.manifest.edges.len());

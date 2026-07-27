@@ -273,7 +273,7 @@ impl DagValidator {
             });
         }
 
-        // V4 + V5 (edge vector order)
+        // V4 — every edge endpoint exists (full pass before V5)
         for edge in &dag.edges {
             if !dag.nodes.contains_key(&edge.from) {
                 return Err(DagValidationError::MissingEndpoint { node: edge.from });
@@ -281,6 +281,10 @@ impl DagValidator {
             if !dag.nodes.contains_key(&edge.to) {
                 return Err(DagValidationError::MissingEndpoint { node: edge.to });
             }
+        }
+
+        // V5 — no self-loops
+        for edge in &dag.edges {
             if edge.from == edge.to {
                 return Err(DagValidationError::SelfLoop { node: edge.from });
             }
@@ -292,13 +296,16 @@ impl DagValidator {
             .filter(|e| matches!(e.kind, EdgeKind::Data | EdgeKind::Sequence))
             .collect();
 
-        // V6 — cycle (DFS from lowest NodeId; first back-edge `to`)
-        if let Some(node) = detect_cycle(&dag.nodes, &sched_edges) {
+        // Adjacency once: distinct sets for V7/V15; ordered vec for V6 DFS.
+        let (preds, succs_set) = build_adj(&sched_edges);
+        let succs_ordered = build_succs_ordered(&sched_edges);
+
+        // V6 — cycle (iterative DFS from lowest NodeId; first back-edge `to`)
+        if let Some(node) = detect_cycle(&dag.nodes, &succs_ordered) {
             return Err(DagValidationError::Cycle { node });
         }
 
         // V7 — unique root + reachability
-        let (preds, succs) = build_adj(&sched_edges);
         let roots: Vec<NodeId> = dag
             .nodes
             .keys()
@@ -309,7 +316,7 @@ impl DagValidator {
             return Err(DagValidationError::MultipleRoots { count: roots.len() });
         }
         let root = roots[0];
-        let reachable = bfs_reachable(root, &succs);
+        let reachable = bfs_reachable(root, &succs_set);
         for id in dag.nodes.keys() {
             if !reachable.contains(id) {
                 return Err(DagValidationError::Unreachable { node: *id });
@@ -318,17 +325,16 @@ impl DagValidator {
 
         // V8 — unique (from, to, kind) among all edges including Hint
         {
-            let mut seen: Vec<(NodeId, NodeId, EdgeKind)> = Vec::with_capacity(dag.edges.len());
+            let mut seen = HashSet::with_capacity(dag.edges.len());
             for edge in &dag.edges {
                 let key = (edge.from, edge.to, edge.kind);
-                if seen.contains(&key) {
+                if !seen.insert(key) {
                     return Err(DagValidationError::DuplicateEdge {
                         from: edge.from,
                         to: edge.to,
                         kind: edge.kind,
                     });
                 }
-                seen.push(key);
             }
         }
 
@@ -385,7 +391,7 @@ impl DagValidator {
 
         // V15 — linear MVP
         if opts.enforce_linear_mvp {
-            if let Some((a, b)) = check_linear(&dag.nodes, &preds, &succs) {
+            if let Some((a, b)) = check_linear(&dag.nodes, &preds, &succs_set) {
                 return Err(DagValidationError::NonLinearTopology { a, b });
             }
         }
@@ -413,13 +419,6 @@ impl DagValidator {
     }
 }
 
-fn is_llm(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::Plan | NodeKind::Analyze | NodeKind::Edit | NodeKind::Review
-    )
-}
-
 fn expected_capability(kind: NodeKind) -> Option<&'static str> {
     match kind {
         NodeKind::Plan => Some("planning"),
@@ -434,19 +433,19 @@ fn check_node_contract(id: NodeId, node: &TaskNode) -> Result<(), DagValidationE
     let kind = node.kind;
 
     // capability
-    if is_llm(kind) {
-        let expected_str = expected_capability(kind).expect("llm kinds have capability");
-        let expected = CapabilityId::new(expected_str).expect("static capability id");
-        match &node.capability {
-            Some(got) if got.as_str() == expected_str => {}
-            other => {
-                return Err(DagValidationError::CapabilityRequired {
-                    node: id,
-                    kind,
-                    expected,
-                    got: other.clone(),
-                });
-            }
+    if let Some(expected_str) = expected_capability(kind) {
+        let matches = node
+            .capability
+            .as_ref()
+            .is_some_and(|c| c.as_str() == expected_str);
+        if !matches {
+            let expected = CapabilityId::new(expected_str).expect("static capability id");
+            return Err(DagValidationError::CapabilityRequired {
+                node: id,
+                kind,
+                expected,
+                got: node.capability.clone(),
+            });
         }
     } else if node.capability.is_some() {
         return Err(DagValidationError::CapabilityForbidden { node: id, kind });
@@ -467,12 +466,12 @@ fn check_node_contract(id: NodeId, node: &TaskNode) -> Result<(), DagValidationE
     }
 
     // cache_key
-    if !is_llm(kind) && node.cache_key.is_some() {
+    if expected_capability(kind).is_none() && node.cache_key.is_some() {
         return Err(DagValidationError::CacheKeyForbidden { node: id, kind });
     }
 
     // budget
-    if is_llm(kind) {
+    if expected_capability(kind).is_some() {
         if node.budget.max_input == 0 && node.budget.max_output == 0 {
             return Err(DagValidationError::BudgetZero { node: id });
         }
@@ -481,7 +480,7 @@ fn check_node_contract(id: NodeId, node: &TaskNode) -> Result<(), DagValidationE
     }
 
     // escalate-on-non-LLM (part of V9 before V14)
-    if !is_llm(kind)
+    if expected_capability(kind).is_none()
         && (node.retry.escalate_after.is_some() || node.retry.escalate_to_tier.is_some())
     {
         return Err(DagValidationError::RetryIncoherent {
@@ -532,6 +531,18 @@ fn build_adj(
     (preds, succs)
 }
 
+/// Successor lists in Data∪Sequence **edge-vector order** (first occurrence wins).
+fn build_succs_ordered(edges: &[&DependencyEdge]) -> HashMap<NodeId, Vec<NodeId>> {
+    let mut succs: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    let mut seen_pair: HashSet<(NodeId, NodeId)> = HashSet::new();
+    for e in edges {
+        if seen_pair.insert((e.from, e.to)) {
+            succs.entry(e.from).or_default().push(e.to);
+        }
+    }
+    succs
+}
+
 fn bfs_reachable(root: NodeId, succs: &HashMap<NodeId, BTreeSet<NodeId>>) -> HashSet<NodeId> {
     let mut seen = HashSet::new();
     let mut q = VecDeque::new();
@@ -549,42 +560,41 @@ fn bfs_reachable(root: NodeId, succs: &HashMap<NodeId, BTreeSet<NodeId>>) -> Has
     seen
 }
 
-/// DFS cycle detection: start from each unvisited node in ascending id order.
-/// Returns `to` of the first back-edge discovered.
-fn detect_cycle(nodes: &BTreeMap<NodeId, TaskNode>, edges: &[&DependencyEdge]) -> Option<NodeId> {
-    let (_, succs) = build_adj(edges);
+/// Iterative DFS cycle detection: start from each unvisited node in ascending id order.
+/// Successors are visited in edge-vector order. Returns `to` of the first back-edge.
+fn detect_cycle(
+    nodes: &BTreeMap<NodeId, TaskNode>,
+    succs: &HashMap<NodeId, Vec<NodeId>>,
+) -> Option<NodeId> {
     let mut color: HashMap<NodeId, u8> = HashMap::new(); // 0 white, 1 gray, 2 black
     for id in nodes.keys() {
         color.insert(*id, 0);
     }
 
-    fn dfs(
-        u: NodeId,
-        succs: &HashMap<NodeId, BTreeSet<NodeId>>,
-        color: &mut HashMap<NodeId, u8>,
-    ) -> Option<NodeId> {
-        color.insert(u, 1);
-        if let Some(next) = succs.get(&u) {
-            for &v in next {
+    // Frame: (node, next successor index)
+    let mut stack: Vec<(NodeId, usize)> = Vec::new();
+
+    for &start in nodes.keys() {
+        if color.get(&start).copied() != Some(0) {
+            continue;
+        }
+        color.insert(start, 1);
+        stack.push((start, 0));
+        while let Some((u, i)) = stack.pop() {
+            let outs = succs.get(&u).map(Vec::as_slice).unwrap_or(&[]);
+            if i < outs.len() {
+                stack.push((u, i + 1));
+                let v = outs[i];
                 match color.get(&v).copied().unwrap_or(0) {
-                    1 => return Some(v), // back-edge to
+                    1 => return Some(v),
                     0 => {
-                        if let Some(c) = dfs(v, succs, color) {
-                            return Some(c);
-                        }
+                        color.insert(v, 1);
+                        stack.push((v, 0));
                     }
                     _ => {}
                 }
-            }
-        }
-        color.insert(u, 2);
-        None
-    }
-
-    for id in nodes.keys() {
-        if color.get(id).copied() == Some(0) {
-            if let Some(c) = dfs(*id, &succs, &mut color) {
-                return Some(c);
+            } else {
+                color.insert(u, 2);
             }
         }
     }
@@ -597,14 +607,24 @@ fn check_linear(
     succs: &HashMap<NodeId, BTreeSet<NodeId>>,
 ) -> Option<(NodeId, NodeId)> {
     for id in nodes.keys() {
-        let p = preds.get(id).map(|s| s.len()).unwrap_or(0);
-        let s = succs.get(id).map(|s| s.len()).unwrap_or(0);
+        let pred_set = preds.get(id);
+        let succ_set = succs.get(id);
+        let p = pred_set.map(|s| s.len()).unwrap_or(0);
+        let s = succ_set.map(|s| s.len()).unwrap_or(0);
         if p > 1 {
-            let b = *preds.get(id)?.iter().next()?;
+            let b = *pred_set
+                .expect("p>1 implies preds entry")
+                .iter()
+                .next()
+                .expect("non-empty");
             return Some((*id, b));
         }
         if s > 1 {
-            let b = *succs.get(id)?.iter().next()?;
+            let b = *succ_set
+                .expect("s>1 implies succs entry")
+                .iter()
+                .next()
+                .expect("non-empty");
             return Some((*id, b));
         }
     }
@@ -619,7 +639,7 @@ fn check_linear(
 /// Runtime Ready transitions remain RFC-0010; this helper ships for unit tests
 /// and for the scheduler to reuse without inventing a second rule set.
 #[must_use]
-#[allow(dead_code)] // exercised in unit tests; consumed by RFC-0010
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn preds_satisfied(dag: &TaskDag, node: NodeId) -> bool {
     for edge in &dag.edges {
         if edge.to != node {
@@ -832,6 +852,57 @@ mod tests {
         assert_eq!(
             DagValidator::validate(&dag, ValidateOpts::default()),
             Err(DagValidationError::InvalidGeneration { got: 0 })
+        );
+    }
+
+    #[test]
+    fn invalid_generation_above_i64_max() {
+        let (mut dag, _, _, _) = valid_chain();
+        dag.generation = (i64::MAX as u64) + 1;
+        assert_eq!(
+            DagValidator::validate(&dag, ValidateOpts::default()),
+            Err(DagValidationError::InvalidGeneration {
+                got: (i64::MAX as u64) + 1
+            })
+        );
+    }
+
+    #[test]
+    fn v4_missing_endpoint_before_v5_self_loop() {
+        let (mut dag, a, _, _) = valid_chain();
+        let missing = NodeId::new();
+        // Self-loop first in vector, missing endpoint later — V4 must win.
+        dag.edges.insert(
+            0,
+            DependencyEdge {
+                from: a,
+                to: a,
+                kind: EdgeKind::Hint,
+            },
+        );
+        dag.edges.push(DependencyEdge {
+            from: a,
+            to: missing,
+            kind: EdgeKind::Hint,
+        });
+        assert_eq!(
+            DagValidator::validate(&dag, ValidateOpts::default()),
+            Err(DagValidationError::MissingEndpoint { node: missing })
+        );
+    }
+
+    #[test]
+    fn missing_endpoint_prefers_from() {
+        let (mut dag, _, e, _) = valid_chain();
+        let missing = NodeId::new();
+        dag.edges.push(DependencyEdge {
+            from: missing,
+            to: e,
+            kind: EdgeKind::Hint,
+        });
+        assert_eq!(
+            DagValidator::validate(&dag, ValidateOpts::default()),
+            Err(DagValidationError::MissingEndpoint { node: missing })
         );
     }
 

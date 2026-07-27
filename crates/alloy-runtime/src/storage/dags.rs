@@ -15,6 +15,12 @@ use crate::scheduler::DagState;
 use crate::types::ids::{DagId, SessionId, Timestamp};
 
 /// Errors from atomic [`DagStore::replace_for_replan`].
+///
+/// Production callers MUST clear gate waiters via
+/// [`crate::RunController::request_replan`] first, and the owning scheduler MUST
+/// checkpoint a non-[`DagState::Running`] state (typically
+/// [`DagState::ReplanRequired`]) at the same generation before replan can
+/// succeed — otherwise [`Self::DagBusy`] is permanent (RFC-0009 Appendix C).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReplanReplaceError {
@@ -39,35 +45,72 @@ pub enum ReplanReplaceError {
 }
 
 /// Durable DAG blob API over `dag_blobs`.
+///
+/// All production writes MUST use compare-and-set SQL inside a single
+/// `BEGIN IMMEDIATE` transaction (RFC-0009 §6.6). Implementations MUST NOT run
+/// [`crate::DagValidator`].
 #[async_trait]
 pub trait DagStore: Send + Sync {
     /// Unconditional insert-or-overwrite by `dag.id`.
     ///
-    /// MUST NOT run `DagValidator`. Documented for tests/admin only.
-    /// Production plan uses [`Self::put_if_generation`]; production replan uses
-    /// [`Self::replace_for_replan`]; scheduler checkpoints use
-    /// [`Self::put_if_generation`].
+    /// Tests/admin only. Production plan uses [`Self::put_if_generation`];
+    /// production replan uses [`Self::replace_for_replan`]; scheduler
+    /// checkpoints use [`Self::put_if_generation`].
+    ///
+    /// MUST reject `dag.generation > i64::MAX as u64` with [`StoreError::Internal`].
+    /// MUST reject rewriting an existing row to a different `session_id` with
+    /// [`StoreError::Internal`].
+    #[doc(hidden)]
     async fn put(&self, dag: &TaskDag) -> Result<(), StoreError>;
 
-    /// Compare-and-set write inside a single `spawn_db` closure.
+    /// Compare-and-set write inside a single immediate SQLite transaction.
     ///
     /// - `expected = None` — insert only; existing row → [`StoreError::Conflict`].
-    /// - `expected = Some(g)` — update only if stored generation equals `g`;
+    /// - `expected = Some(g)` — update only if the stored generation equals `g`;
     ///   missing row → [`StoreError::Conflict`] (not NotFound).
+    ///
+    /// **Monotonicity:** when `expected = Some(g)`, require
+    /// `dag.generation >= g`; otherwise [`StoreError::Internal`]. Scheduler
+    /// checkpoints use `dag.generation == g`; replan MUST use
+    /// [`Self::replace_for_replan`].
+    ///
+    /// MUST reject `dag.generation > i64::MAX as u64` or
+    /// `expected.is_some_and(|g| g > i64::MAX as u64)` with [`StoreError::Internal`].
+    /// MUST reject rewriting an existing row to a different `session_id` with
+    /// [`StoreError::Internal`].
+    /// MUST NOT run `DagValidator`.
     async fn put_if_generation(
         &self,
         dag: &TaskDag,
         expected: Option<u64>,
     ) -> Result<(), StoreError>;
 
-    /// Atomic replan replace: SELECT → checks → UPDATE in one `spawn_db` closure.
+    /// Atomic replan replace inside a single immediate SQLite transaction:
+    /// `SELECT` → checks → `UPDATE`.
+    ///
+    /// Check order (RFC-0009 §3.6):
+    /// 1. Generation bound overflow → [`ReplanReplaceError::Store`](`Internal`)
+    /// 2. Missing row → [`ReplanReplaceError::NotFound`]
+    /// 3. Column/blob integrity → [`ReplanReplaceError::Store`](`Corrupt`|…)
+    /// 4. Stored generation ≠ `expected_generation` → [`GenerationMismatch`]
+    /// 5. Decoded `state == Running` → [`DagBusy`]
+    /// 6. `dag.generation != expected_generation + 1` → Store(`Internal`)
+    /// 7. `dag.session_id` differs from stored → Store(`Internal`)
+    /// 8. Else write and `Ok(())`
+    ///
+    /// Callers: clear gate waiters via `RunController::request_replan` first;
+    /// scheduler must leave a non-`Running` checkpoint or [`DagBusy`] persists.
     async fn replace_for_replan(
         &self,
         dag: &TaskDag,
         expected_generation: u64,
     ) -> Result<(), ReplanReplaceError>;
 
-    /// Load by primary key. Does not run `DagValidator`.
+    /// Load by primary key.
+    ///
+    /// Decode/serde failure, negative generation, or mismatch between column
+    /// `generation`/`dag_id`/`session_id` and blob fields →
+    /// [`StoreError::Corrupt`]. Does **not** run `DagValidator`.
     async fn get(&self, dag_id: DagId) -> Result<Option<TaskDag>, StoreError>;
 
     /// Delete by primary key. Missing row → `Ok(())` (idempotent).
@@ -98,6 +141,16 @@ impl SqliteDagStore {
             self.metrics.inc_busy_errors();
         }
         err
+    }
+
+    fn map_replan_busy(&self, err: ReplanReplaceError) -> ReplanReplaceError {
+        match err {
+            ReplanReplaceError::Store(StoreError::Busy) => {
+                self.metrics.inc_busy_errors();
+                ReplanReplaceError::Store(StoreError::Busy)
+            }
+            other => other,
+        }
     }
 }
 
@@ -156,62 +209,96 @@ fn decode_row(
     Ok(dag)
 }
 
-fn upsert_row(
-    conn: &rusqlite::Connection,
-    dag: &TaskDag,
-    overwrite: bool,
-) -> Result<(), StoreError> {
+/// Prepared write payload moved into `spawn_blocking` (avoids cloning `TaskDag`).
+struct PreparedDagWrite {
+    dag_id: String,
+    session_id: String,
+    generation: u64,
+    blob: String,
+    updated_at: String,
+    /// Decoded state needed only by `replace_for_replan` Busy check path when
+    /// validating the *incoming* dag.generation / session invariants already
+    /// encoded above; retained for put overwrite identity checks.
+    session_id_typed: SessionId,
+    generation_typed: u64,
+}
+
+fn prepare_write(dag: &TaskDag) -> Result<PreparedDagWrite, StoreError> {
     reject_generation_bound(dag.generation)?;
-    let blob = encode_blob(dag)?;
-    let updated = updated_at_rfc3339(&Timestamp::now())?;
-    let dag_id = dag.id.to_string();
-    let session_id = dag.session_id.to_string();
-    let generation = dag.generation as i64;
+    Ok(PreparedDagWrite {
+        dag_id: dag.id.to_string(),
+        session_id: dag.session_id.to_string(),
+        generation: dag.generation,
+        blob: encode_blob(dag)?,
+        updated_at: updated_at_rfc3339(&Timestamp::now())?,
+        session_id_typed: dag.session_id,
+        generation_typed: dag.generation,
+    })
+}
 
-    if overwrite {
-        // Reject rewriting an existing row to a different session_id.
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT session_id FROM dag_blobs WHERE dag_id = ?1",
-                [&dag_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(prev) = existing {
-            if prev != session_id {
-                return Err(StoreError::Internal(format!(
-                    "refusing session_id rewrite: {prev} -> {session_id}"
-                )));
-            }
-            conn.execute(
-                "UPDATE dag_blobs SET session_id = ?2, generation = ?3, blob_json = ?4, updated_at = ?5
-                 WHERE dag_id = ?1",
-                params![dag_id, session_id, generation, blob, updated],
-            )?;
-        } else {
-            conn.execute(
-                "INSERT INTO dag_blobs (dag_id, session_id, generation, blob_json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![dag_id, session_id, generation, blob, updated],
-            )?;
+fn put_overwrite_tx(
+    conn: &mut rusqlite::Connection,
+    w: &PreparedDagWrite,
+) -> Result<(), StoreError> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(StoreError::from)?;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT session_id FROM dag_blobs WHERE dag_id = ?1",
+            [&w.dag_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(prev) = existing {
+        if prev != w.session_id {
+            return Err(StoreError::Internal(format!(
+                "refusing session_id rewrite: {prev} -> {}",
+                w.session_id
+            )));
         }
-        return Ok(());
+        tx.execute(
+            "UPDATE dag_blobs SET session_id = ?2, generation = ?3, blob_json = ?4, updated_at = ?5
+             WHERE dag_id = ?1",
+            params![
+                w.dag_id,
+                w.session_id,
+                w.generation as i64,
+                w.blob,
+                w.updated_at
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO dag_blobs (dag_id, session_id, generation, blob_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                w.dag_id,
+                w.session_id,
+                w.generation as i64,
+                w.blob,
+                w.updated_at
+            ],
+        )?;
     }
-
-    // Unreachable for put path — kept for clarity.
+    tx.commit()?;
     Ok(())
 }
 
 #[async_trait]
 impl DagStore for SqliteDagStore {
-    #[tracing::instrument(skip(self, dag), fields(dag_id = %dag.id, generation = dag.generation), name = "dag.store_put", level = "debug")]
+    #[tracing::instrument(
+        skip(self, dag),
+        fields(dag_id = %dag.id, generation = dag.generation),
+        name = "dag.store_put",
+        level = "debug"
+    )]
     async fn put(&self, dag: &TaskDag) -> Result<(), StoreError> {
         let _permit = self.gate.enter()?;
-        reject_generation_bound(dag.generation)?;
+        let prepared = prepare_write(dag)?;
         let db = Arc::clone(&self.db);
-        let dag = dag.clone();
         spawn_db(db, move |handle| {
-            handle.with(|conn| upsert_row(conn, &dag, true))
+            handle.with_mut(|conn| put_overwrite_tx(conn, &prepared))
         })
         .await
         .map_err(|e| self.map_busy(e))
@@ -229,7 +316,6 @@ impl DagStore for SqliteDagStore {
         expected: Option<u64>,
     ) -> Result<(), StoreError> {
         let _permit = self.gate.enter()?;
-        reject_generation_bound(dag.generation)?;
         if let Some(g) = expected {
             reject_generation_bound(g)?;
             if dag.generation < g {
@@ -239,16 +325,17 @@ impl DagStore for SqliteDagStore {
                 )));
             }
         }
+        let prepared = prepare_write(dag)?;
         let db = Arc::clone(&self.db);
-        let dag = dag.clone();
         spawn_db(db, move |handle| {
-            handle.with(|conn| {
-                let dag_id = dag.id.to_string();
-                let session_id = dag.session_id.to_string();
-                let row: Option<(String, i64)> = conn
+            handle.with_mut(|conn| {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(StoreError::from)?;
+                let row: Option<(String, i64)> = tx
                     .query_row(
                         "SELECT session_id, generation FROM dag_blobs WHERE dag_id = ?1",
-                        [&dag_id],
+                        [&prepared.dag_id],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()?;
@@ -256,12 +343,14 @@ impl DagStore for SqliteDagStore {
                 match (expected, row) {
                     (None, Some(_)) => {
                         return Err(StoreError::Conflict(format!(
-                            "dag {dag_id} already exists"
+                            "dag {} already exists",
+                            prepared.dag_id
                         )));
                     }
                     (Some(_), None) => {
                         return Err(StoreError::Conflict(format!(
-                            "dag {dag_id} missing for expected generation"
+                            "dag {} missing for expected generation",
+                            prepared.dag_id
                         )));
                     }
                     (Some(g), Some((stored_session, stored_gen))) => {
@@ -275,35 +364,45 @@ impl DagStore for SqliteDagStore {
                                 "generation mismatch: expected {g}, actual {stored_gen}"
                             )));
                         }
-                        if stored_session != session_id {
+                        if stored_session != prepared.session_id {
                             return Err(StoreError::Internal(format!(
-                                "refusing session_id rewrite: {stored_session} -> {session_id}"
+                                "refusing session_id rewrite: {stored_session} -> {}",
+                                prepared.session_id
                             )));
                         }
-                        let blob = encode_blob(&dag)?;
-                        let updated = updated_at_rfc3339(&Timestamp::now())?;
-                        conn.execute(
+                        let n = tx.execute(
                             "UPDATE dag_blobs SET generation = ?2, blob_json = ?3, updated_at = ?4
-                             WHERE dag_id = ?1",
-                            params![dag_id, dag.generation as i64, blob, updated],
+                             WHERE dag_id = ?1 AND generation = ?5",
+                            params![
+                                prepared.dag_id,
+                                prepared.generation as i64,
+                                prepared.blob,
+                                prepared.updated_at,
+                                g as i64
+                            ],
                         )?;
+                        if n != 1 {
+                            return Err(StoreError::Conflict(format!(
+                                "cas lost race for dag {}",
+                                prepared.dag_id
+                            )));
+                        }
                     }
                     (None, None) => {
-                        let blob = encode_blob(&dag)?;
-                        let updated = updated_at_rfc3339(&Timestamp::now())?;
-                        conn.execute(
+                        tx.execute(
                             "INSERT INTO dag_blobs (dag_id, session_id, generation, blob_json, updated_at)
                              VALUES (?1, ?2, ?3, ?4, ?5)",
                             params![
-                                dag_id,
-                                session_id,
-                                dag.generation as i64,
-                                blob,
-                                updated
+                                prepared.dag_id,
+                                prepared.session_id,
+                                prepared.generation as i64,
+                                prepared.blob,
+                                prepared.updated_at
                             ],
                         )?;
                     }
                 }
+                tx.commit()?;
                 Ok(())
             })
         })
@@ -311,6 +410,16 @@ impl DagStore for SqliteDagStore {
         .map_err(|e| self.map_busy(e))
     }
 
+    #[tracing::instrument(
+        skip(self, dag),
+        fields(
+            dag_id = %dag.id,
+            expected_generation,
+            generation = dag.generation
+        ),
+        name = "dag.store_replace_replan",
+        level = "debug"
+    )]
     async fn replace_for_replan(
         &self,
         dag: &TaskDag,
@@ -322,15 +431,21 @@ impl DagStore for SqliteDagStore {
                 "generation exceeds i64::MAX".into(),
             )));
         }
+        let prepared = prepare_write(dag).map_err(ReplanReplaceError::Store)?;
+        // Capture incoming invariants for checks that need typed values.
+        let incoming_session = prepared.session_id_typed;
+        let incoming_generation = prepared.generation_typed;
         let db = Arc::clone(&self.db);
-        let dag = dag.clone();
         let result = spawn_db(db, move |handle| {
-            handle.with(|conn| {
-                let dag_id = dag.id.to_string();
-                let row: Option<(String, i64, String)> = conn
+            handle.with_mut(|conn| {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(StoreError::from)?;
+
+                let row: Option<(String, i64, String)> = tx
                     .query_row(
                         "SELECT session_id, generation, blob_json FROM dag_blobs WHERE dag_id = ?1",
-                        [&dag_id],
+                        [&prepared.dag_id],
                         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()
@@ -340,7 +455,7 @@ impl DagStore for SqliteDagStore {
                     return Ok(Err(ReplanReplaceError::NotFound));
                 };
 
-                let stored = match decode_row(&dag_id, &session_col, gen_col, &blob_json) {
+                let stored = match decode_row(&prepared.dag_id, &session_col, gen_col, &blob_json) {
                     Ok(d) => d,
                     Err(e) => return Ok(Err(ReplanReplaceError::Store(e))),
                 };
@@ -355,37 +470,45 @@ impl DagStore for SqliteDagStore {
                         state: DagState::Running,
                     }));
                 }
-                if dag.generation != expected_generation + 1 {
+                if incoming_generation != expected_generation + 1 {
                     return Ok(Err(ReplanReplaceError::Store(StoreError::Internal(
                         format!(
-                            "replan generation must be expected+1: got {}, expected {}",
-                            dag.generation,
+                            "replan generation must be expected+1: got {incoming_generation}, expected {}",
                             expected_generation + 1
                         ),
                     ))));
                 }
-                if dag.session_id != stored.session_id {
+                if incoming_session != stored.session_id {
                     return Ok(Err(ReplanReplaceError::Store(StoreError::Internal(
                         format!(
-                            "session_id mismatch on replan: {} != {}",
-                            dag.session_id, stored.session_id
+                            "session_id mismatch on replan: {incoming_session} != {}",
+                            stored.session_id
                         ),
                     ))));
                 }
 
-                let blob = match encode_blob(&dag) {
-                    Ok(b) => b,
-                    Err(e) => return Ok(Err(ReplanReplaceError::Store(e))),
-                };
-                let updated = match updated_at_rfc3339(&Timestamp::now()) {
-                    Ok(u) => u,
-                    Err(e) => return Ok(Err(ReplanReplaceError::Store(e))),
-                };
-                if let Err(e) = conn.execute(
+                let n = match tx.execute(
                     "UPDATE dag_blobs SET generation = ?2, blob_json = ?3, updated_at = ?4
-                     WHERE dag_id = ?1",
-                    params![dag_id, dag.generation as i64, blob, updated],
+                     WHERE dag_id = ?1 AND generation = ?5",
+                    params![
+                        prepared.dag_id,
+                        prepared.generation as i64,
+                        prepared.blob,
+                        prepared.updated_at,
+                        expected_generation as i64
+                    ],
                 ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Ok(Err(ReplanReplaceError::Store(StoreError::from(e))));
+                    }
+                };
+                if n != 1 {
+                    return Ok(Err(ReplanReplaceError::GenerationMismatch {
+                        actual: expected_generation, // best-effort; race lost
+                    }));
+                }
+                if let Err(e) = tx.commit() {
                     return Ok(Err(ReplanReplaceError::Store(StoreError::from(e))));
                 }
                 Ok(Ok(()))
@@ -394,12 +517,8 @@ impl DagStore for SqliteDagStore {
         .await;
 
         match result {
-            Ok(inner) => inner,
-            Err(StoreError::Busy) => {
-                self.metrics.inc_busy_errors();
-                Err(ReplanReplaceError::Store(StoreError::Busy))
-            }
-            Err(e) => Err(ReplanReplaceError::Store(e)),
+            Ok(inner) => inner.map_err(|e| self.map_replan_busy(e)),
+            Err(e) => Err(self.map_replan_busy(ReplanReplaceError::Store(e))),
         }
     }
 
@@ -469,11 +588,10 @@ impl DagStore for SqliteDagStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::{ApprovalSpec, Backoff, EdgeKind, NodeKind, NodeState, RetryPolicy, TaskNode};
+    use crate::dag::{ApprovalSpec, Backoff, NodeKind, NodeState, RetryPolicy, TaskNode};
     use crate::storage::{AlloyStorage, StorageOpenOptions};
     use crate::types::budget::{ModelTier, TokenBudget};
-    use crate::types::diagnostic::ErrorClass;
-    use crate::types::ids::{ArtifactId, CapabilityId, GateId, NodeId};
+    use crate::types::ids::{ArtifactId, GateId, NodeId};
     use std::collections::BTreeMap;
 
     fn sample_dag(session: SessionId, generation: u64) -> TaskDag {
@@ -509,12 +627,6 @@ mod tests {
                 timeout_ms: 1000,
             },
         );
-        // Minimal single-node dag for store tests (validator not required).
-        let _ = (
-            CapabilityId::new("repair"),
-            EdgeKind::Data,
-            ErrorClass::Model,
-        );
         TaskDag {
             id: DagId::new(),
             session_id: session,
@@ -542,33 +654,55 @@ mod tests {
         dags.put(&dag).await.unwrap();
         let got = dags.get(dag.id).await.unwrap().unwrap();
         assert_eq!(got, dag);
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn put_if_generation_insert_and_conflict() {
         let (_dir, storage) = open_store().await;
         let dags = storage.dags();
-        let session = SessionId::new();
-        let dag = sample_dag(session, 1);
+        let dag = sample_dag(SessionId::new(), 1);
         dags.put_if_generation(&dag, None).await.unwrap();
         let err = dags.put_if_generation(&dag, None).await.unwrap_err();
         assert!(matches!(err, StoreError::Conflict(_)));
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn put_if_generation_update_and_mismatch() {
         let (_dir, storage) = open_store().await;
         let dags = storage.dags();
-        let session = SessionId::new();
-        let mut dag = sample_dag(session, 1);
+        let mut dag = sample_dag(SessionId::new(), 1);
         dags.put_if_generation(&dag, None).await.unwrap();
         dag.state = DagState::Failed;
         dags.put_if_generation(&dag, Some(1)).await.unwrap();
         let got = dags.get(dag.id).await.unwrap().unwrap();
         assert_eq!(got.state, DagState::Failed);
-        // Stale expected generation → Conflict
         let err = dags.put_if_generation(&dag, Some(0)).await.unwrap_err();
         assert!(matches!(err, StoreError::Conflict(_)));
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_if_generation_missing_row_is_conflict() {
+        let (_dir, storage) = open_store().await;
+        let dags = storage.dags();
+        let dag = sample_dag(SessionId::new(), 1);
+        let err = dags.put_if_generation(&dag, Some(1)).await.unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)));
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_if_generation_non_monotonic_is_internal() {
+        let (_dir, storage) = open_store().await;
+        let dags = storage.dags();
+        let mut dag = sample_dag(SessionId::new(), 1);
+        dags.put_if_generation(&dag, None).await.unwrap();
+        dag.generation = 0;
+        let err = dags.put_if_generation(&dag, Some(1)).await.unwrap_err();
+        assert!(matches!(err, StoreError::Internal(_)));
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -596,18 +730,36 @@ mod tests {
                 state: DagState::Running
             }
         ));
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn corrupt_blob_and_generation_mismatch() {
+    async fn replace_for_replan_not_found_and_mismatch() {
+        let (_dir, storage) = open_store().await;
+        let dags = storage.dags();
+        let dag = sample_dag(SessionId::new(), 2);
+        let err = dags.replace_for_replan(&dag, 1).await.unwrap_err();
+        assert!(matches!(err, ReplanReplaceError::NotFound));
+
+        let mut base = sample_dag(SessionId::new(), 1);
+        dags.put_if_generation(&base, None).await.unwrap();
+        base.generation = 2;
+        let err = dags.replace_for_replan(&base, 99).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ReplanReplaceError::GenerationMismatch { actual: 1 }
+        ));
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_blob_json() {
         let (dir, storage) = open_store().await;
         let dags = storage.dags();
-        let session = SessionId::new();
-        let dag = sample_dag(session, 1);
+        let dag = sample_dag(SessionId::new(), 1);
         dags.put(&dag).await.unwrap();
         storage.close().await.unwrap();
 
-        // Corrupt via raw SQL on the closed file, then reopen.
         {
             let conn = rusqlite::Connection::open(dir.path().join("alloy.sqlite")).unwrap();
             conn.execute(
@@ -621,50 +773,150 @@ mod tests {
             .unwrap();
         let err = storage.dags().get(dag.id).await.unwrap_err();
         assert!(matches!(err, StoreError::Corrupt(_)));
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_generation_column_mismatch() {
+        let (dir, storage) = open_store().await;
+        let dags = storage.dags();
+        let dag = sample_dag(SessionId::new(), 1);
+        dags.put(&dag).await.unwrap();
+        storage.close().await.unwrap();
+
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("alloy.sqlite")).unwrap();
+            conn.execute(
+                "UPDATE dag_blobs SET generation = generation + 1 WHERE dag_id = ?1",
+                params![dag.id.to_string()],
+            )
+            .unwrap();
+        }
+        let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
+            .await
+            .unwrap();
+        let err = storage.dags().get(dag.id).await.unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)));
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_negative_generation_column() {
+        let (dir, storage) = open_store().await;
+        let dags = storage.dags();
+        let dag = sample_dag(SessionId::new(), 1);
+        dags.put(&dag).await.unwrap();
+        storage.close().await.unwrap();
+
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("alloy.sqlite")).unwrap();
+            conn.execute(
+                "UPDATE dag_blobs SET generation = -1 WHERE dag_id = ?1",
+                params![dag.id.to_string()],
+            )
+            .unwrap();
+        }
+        let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
+            .await
+            .unwrap();
+        let err = storage.dags().get(dag.id).await.unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)));
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn closed_after_close() {
         let (_dir, storage) = open_store().await;
         let dags = storage.dags();
-        let session = SessionId::new();
-        let dag = sample_dag(session, 1);
+        let dag = sample_dag(SessionId::new(), 1);
         storage.close().await.unwrap();
-        let err = dags.put(&dag).await.unwrap_err();
-        assert!(matches!(err, StoreError::Closed));
+        assert!(matches!(
+            dags.put(&dag).await.unwrap_err(),
+            StoreError::Closed
+        ));
+        assert!(matches!(
+            dags.get(dag.id).await.unwrap_err(),
+            StoreError::Closed
+        ));
+        assert!(matches!(
+            dags.put_if_generation(&dag, None).await.unwrap_err(),
+            StoreError::Closed
+        ));
+        assert!(matches!(
+            dags.replace_for_replan(&dag, 0).await.unwrap_err(),
+            ReplanReplaceError::Store(StoreError::Closed)
+        ));
     }
 
     #[tokio::test]
-    async fn reject_generation_above_i64_max() {
+    async fn reject_generation_above_i64_max_all_writes() {
         let (_dir, storage) = open_store().await;
         let dags = storage.dags();
         let mut dag = sample_dag(SessionId::new(), 1);
         dag.generation = (i64::MAX as u64) + 1;
-        let err = dags.put(&dag).await.unwrap_err();
+        assert!(matches!(
+            dags.put(&dag).await.unwrap_err(),
+            StoreError::Internal(_)
+        ));
+        assert!(matches!(
+            dags.put_if_generation(&dag, None).await.unwrap_err(),
+            StoreError::Internal(_)
+        ));
+        assert!(matches!(
+            dags.replace_for_replan(&dag, 1).await.unwrap_err(),
+            ReplanReplaceError::Store(StoreError::Internal(_))
+        ));
+
+        let mut ok = sample_dag(SessionId::new(), 1);
+        dags.put_if_generation(&ok, None).await.unwrap();
+        ok.generation = 1;
+        let err = dags
+            .put_if_generation(&ok, Some((i64::MAX as u64) + 1))
+            .await
+            .unwrap_err();
         assert!(matches!(err, StoreError::Internal(_)));
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn reject_session_id_rewrite() {
+    async fn reject_session_id_rewrite_all_writes() {
         let (_dir, storage) = open_store().await;
         let dags = storage.dags();
         let mut dag = sample_dag(SessionId::new(), 1);
         dags.put(&dag).await.unwrap();
         dag.session_id = SessionId::new();
-        let err = dags.put(&dag).await.unwrap_err();
-        assert!(matches!(err, StoreError::Internal(_)));
+        assert!(matches!(
+            dags.put(&dag).await.unwrap_err(),
+            StoreError::Internal(_)
+        ));
+        assert!(matches!(
+            dags.put_if_generation(&dag, Some(1)).await.unwrap_err(),
+            StoreError::Internal(_)
+        ));
+        dag.generation = 2;
+        assert!(matches!(
+            dags.replace_for_replan(&dag, 1).await.unwrap_err(),
+            ReplanReplaceError::Store(StoreError::Internal(_))
+        ));
+        storage.close().await.unwrap();
     }
 
     #[tokio::test]
-    async fn delete_idempotent_and_list() {
+    async fn delete_idempotent_and_list_order() {
         let (_dir, storage) = open_store().await;
         let dags = storage.dags();
         let session = SessionId::new();
-        let dag = sample_dag(session, 1);
-        dags.put(&dag).await.unwrap();
-        assert_eq!(dags.list_by_session(session).await.unwrap(), vec![dag.id]);
-        dags.delete(dag.id).await.unwrap();
-        dags.delete(dag.id).await.unwrap();
-        assert!(dags.get(dag.id).await.unwrap().is_none());
+        let a = sample_dag(session, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let b = sample_dag(session, 1);
+        dags.put(&a).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        dags.put(&b).await.unwrap();
+        let listed = dags.list_by_session(session).await.unwrap();
+        assert_eq!(listed, vec![a.id, b.id]);
+        dags.delete(a.id).await.unwrap();
+        dags.delete(a.id).await.unwrap();
+        assert!(dags.get(a.id).await.unwrap().is_none());
+        storage.close().await.unwrap();
     }
 }

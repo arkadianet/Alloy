@@ -9,7 +9,7 @@ use crate::types::budget::{ModelTier, TokenBudget};
 use crate::types::diagnostic::ErrorClass;
 use crate::types::ids::{ArtifactId, CapabilityId, DagId, Digest, GateId, NodeId, SessionId};
 
-/// Explicit task DAG (store lands in RFC-0009).
+/// Explicit task DAG (validated/planned in RFC-0009; executed in RFC-0010).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskDag {
     /// DAG id.
@@ -102,7 +102,7 @@ pub enum NodeState {
 }
 
 /// Edge kind. `Hint` is schema-only in MVP (ignored by scheduler).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// Data dependency.

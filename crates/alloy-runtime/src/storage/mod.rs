@@ -1,6 +1,7 @@
-//! Durable storage: SQLite session event log, artifact CAS, and thin session rows.
+//! Durable storage: SQLite session event log, artifact CAS, DAG blobs, and thin session rows.
 //!
-//! Implements **RFC-0002**. Lives inside `alloy-runtime` (no sixth crate).
+//! Implements **RFC-0002** (events/artifacts/sessions) and **RFC-0009** (`dag_blobs` /
+//! [`DagStore`]). Lives inside `alloy-runtime` (no sixth crate).
 //!
 //! # Lifecycle
 //!
