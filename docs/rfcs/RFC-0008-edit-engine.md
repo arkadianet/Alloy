@@ -741,12 +741,18 @@ pub enum PatchApplyError {
 Add to `crates/alloy-tools/src/mcp/authz.rs` (see also §8.2):
 
 ```rust
+#[derive(Debug, Error)]
+pub(crate) enum GrantGlobError {
+    #[error("grant glob: {0}")]
+    Invalid(String),
+}
+
 pub(crate) fn authorize_git_write(perms: &PermissionToken) -> Result<(), McpError>;
 pub(crate) fn fs_write_covers(perms: &PermissionToken, rel: &str) -> Result<bool, GrantGlobError>;
 pub(crate) fn authorize_fs_write_path(perms: &PermissionToken, rel: &str) -> Result<(), McpError>;
 ```
 
-Share one private expansion helper for FsRead and FsWrite. Keep existing `authorize_fs_write` (presence check) for prepare step 2.
+`edit/` calls `fs_write_covers` only (maps `Err` → `InvalidRequest("grant glob")`, `Ok(false)` → `PathNotCovered`). Host prepare uses `authorize_fs_write_path` → `InvalidToken` / `PermissionDenied`. Share one private expansion helper for FsRead and FsWrite. Keep existing `authorize_fs_write` (presence check) for prepare step 2.
 
 #### 3.8.4 `apply_patch` prepare amendment
 
@@ -798,7 +804,7 @@ pub(crate) async fn execute(
 
 Touch points: `mcp/patch.rs`, `mcp/builtins/apply_patch.rs`, `mcp/builtins/mod.rs`, `mcp/host.rs`, stub unit tests, any out-of-tree `PatchApplyBackend` implementors.
 
-**Run attribution:** If both `run` and `perms.run_id` are `Some` and differ, backend MUST return `InvalidPatch("run_id mismatch")`. Prefer `run` when building `EditContext.run_id`; else `Some(perms.run_id)`.
+**Run attribution:** `PermissionToken.run_id` is always present. If `run == Some(r)` and `r != perms.run_id`, return `InvalidPatch("run_id mismatch")`. Else `EditContext.run_id = run.unwrap_or(perms.run_id)` wrapped as `Some`.
 
 #### 3.8.6 Effective patch size ceiling
 
@@ -952,7 +958,7 @@ pub(crate) struct AbandonedCheckpoint {
 ```
 
 After a failed apply that successfully restored, `TxRecord.state = RolledBack`.
-After `RollbackFailed` (FailedDirty), `TxRecord.state` remains `Open` and the checkpoint ref is retained; operator uses `recover_checkpoint`. `Open` records that are not the abandon target are not “latest eligible” for user rollback (§5.11).
+After `RollbackFailed` (FailedDirty), `TxRecord.state` remains `Open`, `abandoned` stays set, and the checkpoint ref is retained. In-process recovery: next `apply`/`rollback` reconcile (§6.4). Post-restart / operator: `recover_checkpoint` (§6.5). `Open` records that are not the abandon target are not “latest eligible” for user rollback (§5.11).
 
 **MVP durability:** in-process map only + durable checkpoint refs + `EditApplied` events. No SQLite `edit_transactions` table in this RFC. After process restart, in-memory records are gone; orphan refs are **not** auto-restored (§6.5).
 
@@ -1028,7 +1034,7 @@ Ordering inside Persisting:
 2. Reject `SemanticOps` → `UnsupportedOp` (§5.10 / V15).
 3. Normalize/validate local `PatchSet` rules (V1–V11, V18–V19, V22). No git yet.
 4. Check token expiry → `TokenExpired` (V21). Clone `ctx.perms` into a local `perms` used for all subsequent grant checks and `SandboxExecRequest`s. Re-check expiry immediately before checkpoint create. **If the broker returns `TokenExpired` during a post-mutation restore**, leave `abandoned = Some`, leave `TxRecord` `Open`, return `EditError::TokenExpired` (mapped Permission/Unsupported at MCP — see §8.3). Recovery is the next `apply`/`rollback` reconcile under a **fresh** non-expired token (§6.4). Do not claim restore can succeed with an expired token — the broker will deny it.
-5. Authorize `GitWrite` (V12) and preflight **all** git argv shapes (§5.6.2) via `match_exec_grant(perms, argv, Check backend, jail cwd, trusted_path)` → V13 `MissingGrant("exec:git")` on any failure (no fork).
+5. Authorize `GitWrite` (V12) and preflight **all** git argv shapes (§5.6.2) via `match_exec_grant(&perms, &argv, broker.profile().backend_for(ExecClass::Check), jail_cwd, &trusted_path)` → V13 `MissingGrant("exec:git")` on any failure (no fork).
 6. Run repo/jail + tracked-deny + untracked-in-patch git probes (§5.6.1) — V14, V16, V17.
 7. Compute `pre_digest` (§5.8). On limit → `DigestLimitExceeded` (V20; no mutate).
 8. Allocate `TransactionId::new()`, `CheckpointId::new()`.
@@ -1117,7 +1123,7 @@ CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention a
 | V21 | Token expired at preflight / pre-checkpoint / pre-restore check | `TokenExpired` |
 | V22 | `FilePatch::Modify` target missing | `Conflict("modify missing file")` |
 | V23 | Empty hunks on `Modify` | `InvalidPatch("empty hunks")` |
-| V24 | Conflicted index / merge/rebase/bisect in progress | `Git("repo state not clean for checkpoint")` (permanent) |
+| V24 | Conflicted index / merge/rebase/bisect in progress | `Conflict("repo state not clean for checkpoint")` (permanent) |
 | V25 | `index.lock` present | `Git("index.lock present")` (retryable) |
 
 ### 5.5 `dry_run` semantics
@@ -1152,14 +1158,14 @@ The adapter MUST invoke `EditEngine::validate`, never `apply`, when `dry_run` is
 | Dirty tree capture | `git stash create` (non-mutating worktree). Empty stdout (clean tree) → use `HEAD` SHA. |
 | Index vs worktree | MVP captures **worktree tree** via `stash create`. Restore applies that tree to **both** index and worktree (`git restore --source --staged --worktree`). Staged-only vs unstaged distinction is **not** preserved across rollback in MVP (documented limitation; AC asserts branch tip/HEAD unchanged, not index/worktree split). |
 | Restore | `git restore --source=<sha> --staged --worktree -- :/` plus unlink `created_paths`/`temp_paths`/`created_dirs` (§5.6.1) |
-| Sandbox | `SandboxExecRequest { argv, cwd: jail, perms: ctx.perms.clone(), class: ExecClass::Check }` |
+| Sandbox | `SandboxExecRequest::new(argv, jail_cwd, perms.clone(), ExecClass::Check)` (empty `env_allow`) |
 | Failure | Non-zero exit → `CheckpointFailed` / `Git` / `RollbackFailed` |
 
 **Identity + EOL pins (every git argv):** prefix with
 `git -c user.name=alloy -c user.email=alloy@localhost -c core.autocrlf=false -c core.eol=lf -c filter.lfs.smudge= -c filter.lfs.clean= -c filter.lfs.process=`.
 Without identity, `stash create` fails in the broker’s ephemeral HOME. Filtered/LFS repos: filters neutralized; if restore still cannot reproduce bytes, digest mismatch → `RollbackFailed` (operator must not use LFS in MVP jails).
 
-**Minimum git:** ≥ **2.22** (builtin `stash`; avoids `/bin/sh` scripted stash under Landlock). Probe failure → `CheckpointFailed`.
+**Minimum git:** ≥ **2.23** (builtin `stash`; avoids `/bin/sh` scripted stash under Landlock). Probe failure → `CheckpointFailed`.
 
 **Create steps (normative):**
 
@@ -1167,7 +1173,7 @@ Without identity, `stash create` fails in the broker’s ephemeral HOME. Filtere
 2. Prefixed `rev-parse -q --verify HEAD` — else `Git("empty repository: make initial commit")`.
 3. Prefixed `diff --name-only --diff-filter=U` non-empty → V24. Prefixed test for `.git/index.lock` → V25.
 4. Prefixed `stash create` — 40-hex → `checkpoint_sha`; empty → `HEAD`.
-5. Prefixed `update-ref refs/alloy/checkpoints/<uuid> <checkpoint_sha>` — if ref exists, `CheckpointFailed("checkpoint ref exists")`.
+5. Prefixed `update-ref --stdin` with line `create refs/alloy/checkpoints/<uuid> <checkpoint_sha>` (create-only; existing ref → non-zero → `CheckpointFailed("checkpoint ref exists")`).
 6. Persist `checkpoint_sha` on Open `TxRecord`.
 
 #### 5.6.2 Preflighted argv shapes (exact)
@@ -1181,7 +1187,7 @@ All shapes include the `-c` identity/EOL prefix above as leading argv elements a
 5. `git … status --porcelain=v1 -uall`
 6. `git … diff --name-only --diff-filter=U`
 7. `git … stash create`
-8. `git … update-ref refs/alloy/checkpoints/<uuid> <sha>`
+8. `git … update-ref --stdin` (create-only stdin as in create step 5)
 9. `git … restore --source=<sha> --staged --worktree -- :/`
 10. `git … rev-parse refs/alloy/checkpoints/<uuid>`
 
@@ -1293,7 +1299,7 @@ Every variant in §3.2 MUST have a unit test asserting `UnsupportedOp { op }` eq
 | `Committed` | Eligible **only if** it is the newest `Committed` by `created_at` **and** current digest equals `post_digest` (no drift). Then restore; unlink `created_paths` that still exist and `created_dirs` (deepest first); mark `RolledBack` |
 | `RolledBack` | If current digest == `pre_digest` → `Ok(())`. Else → `WorkspaceDrifted` |
 
-**Ordering source:** `TxRecord.created_at` ascending (UUID is not an order). Newest = max `created_at`.
+**Ordering source:** `(created_at.0 /* OffsetDateTime */, id.as_uuid())` ascending. Newest = max pair. `Timestamp` compares via inner `OffsetDateTime`; UUID breaks ties.
 
 **Drift:** For `Committed`, if current digest ≠ `post_digest` → `WorkspaceDrifted` (MUST NOT restore). Digest coverage matches §5.8 (symlinks/non-UTF-8 excluded consistently; MVP does not claim to protect excluded paths).
 
@@ -1340,7 +1346,7 @@ Normative mechanism:
    `abandoned = Some(AbandonedCheckpoint { transaction_id, checkpoint_id, checkpoint_sha, created_paths: [], temp_paths: [], created_dirs: [], pre_digest })`.
 2. As applies write files/dirs, **update** the abandon record’s path lists in place (same mutex).
 3. On handled failure that already restored: mark `TxRecord` `RolledBack`, set `abandoned = None`.
-4. On successful `EditApplied` append: set `abandoned = None` **before** returning (§5.2 step 14). Never reconcile a committed edit.
+4. On successful CAS commit point (§5.1 step 2): set `abandoned = None` **before** awaiting EditApplied. Never reconcile a committed edit.
 5. If the `apply` future is dropped mid-mutate, `abandoned` remains `Some`.
 6. At the start of the next **`apply` or `rollback` only** (not `validate`), while holding `write_lock`, call `reconcile_abandoned(&ctx.perms)`:
    * Require `GitWrite` + Exec(git) (Appendix A restore row).
@@ -1373,7 +1379,18 @@ impl GitEditEngine {
 }
 ```
 
-`recover_checkpoint` requires GitWrite+Exec(git), verifies ref exists, runs §5.6.1 restore, does not invent a TransactionId.
+`recover_checkpoint` normative contract:
+
+1. Acquire `write_lock` (same as apply/rollback).
+2. Check expiry; require `GitWrite` + Exec(git) preflight (§5.6.2 restore shapes).
+3. V17 tracked-deny scan — fail closed with `TrackedDeniedPath` before restore.
+4. Resolve `refs/alloy/checkpoints/<id>`; missing → `UnknownTransaction` is wrong — use `Git("checkpoint ref not found")`.
+5. Run §5.6.1 restore (tracked tree only; no `created_paths`/`created_dirs` unlink — those lists are gone after restart).
+6. If an in-memory `TxRecord` or `abandoned` matches this `checkpoint_id` (FailedDirty / Open): on success mark `RolledBack` and clear `abandoned`.
+7. No digest equality check (pre_digest may be lost); success = restore exit 0.
+8. Does not allocate a new `TransactionId`.
+
+**In-process FailedDirty path:** prefer next `apply`/`rollback` reconcile (§6.4) when `abandoned` is still set. `recover_checkpoint` is for post-restart / operator recovery when the in-memory abandon record is gone **or** as an explicit operator tool when reconcile is unavailable. §4.4’s “operator uses `recover_checkpoint`” refers to this helper.
 
 Committed edits after restart are evidenced by `EditApplied` in the session log + CAS artifact; no engine action required.
 
@@ -1476,7 +1493,7 @@ pub(crate) fn authorize_fs_write_path(perms: &PermissionToken, rel: &str) -> Res
 pub(crate) fn authorize_git_write(perms: &PermissionToken) -> Result<(), McpError>;
 ```
 
-`edit/` calls `fs_write_covers` (or a twin returning `EditError`) — NEVER `McpError`-returning helpers. Uncompilable globs → `GrantGlobError` → engine `InvalidRequest("grant glob")` / host `InvalidToken`. Zero `FsWrite` grants → `MissingGrant("fs_write")`.
+`edit/` calls `fs_write_covers` only — NEVER `McpError`-returning helpers. Uncompilable globs → `GrantGlobError` → engine `InvalidRequest("grant glob")` / host `InvalidToken`. Zero `FsWrite` grants → `MissingGrant("fs_write")`.
 
 ### 8.3 Total mapping `EditError` → `PatchApplyError`
 
@@ -1507,7 +1524,7 @@ Permission-class errors MUST become `PatchApplyError::PermissionDenied` so execu
 | `RollbackNotEligible` | `InvalidPatch(msg)` | no |
 | `WorkspaceDrifted` | `Conflict(msg)` | no |
 | `Event` | `Internal(msg)` | no |
-| `TokenExpired` | *(execute should not see — host checks expiry first; defensive)* `Unsupported("token expired")` | no |
+| `TokenExpired` | `PermissionDenied(MissingGrant("token_expired"))` elevated to `McpError::TokenExpired` when host maps it; if only seen as ToolResult path use `Unsupported("token expired")` | no |
 | `Busy` | `Conflict("edit busy")` | yes, but unused on production MCP path (§6.3) |
 | `Internal` | `Internal(msg)` | no |
 
@@ -1716,7 +1733,7 @@ Every criterion is independently testable by a named test or mechanical check.
 | 29 | `PatchApplyBackend::apply` has perms+session+run; stub updated | compile |
 | 30 | Engine messages ≠ unwired stub string | unit |
 | 31 | WorkspaceDigest pre/post on committed transaction | unit |
-| 32 | CAS/event failure after mutate triggers rollback (before EditApplied) | unit |
+| 32 | CAS failure after mutate triggers rollback; Event failure after commit returns Err without rollback (§5.1) | unit |
 | 33 | Single glob-expansion implementation shared by FsRead/FsWrite | `rg` / unit |
 
 ---
@@ -1758,7 +1775,7 @@ Production path queues on `write_lock` (§6.3); `Busy` is test-helper-only. **Cl
 
 ### 15.4 Git version
 
-Require git **≥ 2.22** (builtin stash; no `/bin/sh`). Probe failure → `CheckpointFailed` with stderr summary (redacted).
+Require git **≥ 2.23** (builtin stash + `git restore`; no `/bin/sh`). Probe failure → `CheckpointFailed` with stderr summary (redacted).
 
 ### 15.5 Empty / unborn HEAD
 
@@ -1791,7 +1808,7 @@ Require git **≥ 2.22** (builtin stash; no `/bin/sh`). Probe failure → `Check
 | --- | --- | --- | --- |
 | dry_run / validate | required (≥1) + path match | not required | not required |
 | mutating apply | required + path match | required | required (all argv shapes preflighted) |
-| rollback / recover_checkpoint / reconcile | **not checked per-path** (whole-tree restore is gated by `GitWrite` alone; justified because restore rewrites the entire tracked tree to a prior checkpoint and cannot be expressed as a path glob) | required | required |
+| rollback / recover_checkpoint / reconcile | **not required** (whole-tree restore gated by `GitWrite` alone; cannot be expressed as a path glob) | required | required |
 
 ## Appendix B — Single write stack diagram
 
