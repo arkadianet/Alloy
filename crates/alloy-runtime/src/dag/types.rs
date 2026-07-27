@@ -10,7 +10,7 @@ use crate::types::diagnostic::ErrorClass;
 use crate::types::ids::{ArtifactId, CapabilityId, DagId, Digest, GateId, NodeId, SessionId};
 
 /// Explicit task DAG (store lands in RFC-0009).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskDag {
     /// DAG id.
     pub id: DagId,
@@ -27,7 +27,7 @@ pub struct TaskDag {
 }
 
 /// Single DAG node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskNode {
     /// Node id.
     pub id: NodeId,
@@ -114,7 +114,7 @@ pub enum EdgeKind {
 }
 
 /// DAG edge.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DependencyEdge {
     /// Predecessor.
     pub from: NodeId,
@@ -125,7 +125,7 @@ pub struct DependencyEdge {
 }
 
 /// Retry policy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetryPolicy {
     /// Max attempts.
     pub max_attempts: u32,
@@ -140,7 +140,7 @@ pub struct RetryPolicy {
 }
 
 /// Backoff policy using millisecond fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backoff {
     /// Fixed delay.
@@ -162,7 +162,7 @@ pub enum Backoff {
 pub struct CacheKey(pub Digest);
 
 /// Approval requirement on a node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalSpec {
     /// Gate id.
     pub gate: GateId,
