@@ -217,6 +217,7 @@ Each amendment is additive and MUST land with this RFC.
 | A7 | 0003 | `expire_gate` MUST be idempotent with respect to a missing waiter (no `UnknownGate`), because the timeout races waiter removal. | The scheduler cannot distinguish "waiter already taken" from "gate never registered" without a durable waiter table. |
 | A8 | 0003 | Every `ApprovalResolved` payload (from `approve` and from `expire_gate`) MUST include `generation: u64` equal to the DAG generation at resolution time. Scans (§5.7.2) MUST match `payload.generation == dag.generation`. `expire_gate` / `approve` resolve generation via the run's `goal_json.dag_id` → `DagStore::get` (missing DAG ⇒ `Internal`). Resume-repair emitters that append `ApprovalResolved` without `gate_id`/`generation` (RFC-0003 §5.3) are **out of scope for the gate scan** and MUST NOT be matched by §5.7.2. | Without generation, a reused `GateId` after replan cannot be filtered; today's payload is only `{ gate_id, decision }`. |
 | A9 | 0009 | RFC-0009 Appendix C's "unowned `Running` ⇒ move to `Failed`/`ReplanRequired` before accepting new work" is **amended**: a `LinearScheduler` that acquires ownership of a foreign `Running` DAG MUST adopt per §5.3.2 (lost-attempt accounting) rather than force-terminalize. Force-terminalization remains available via `reconcile_terminal_run` / operator cancel. | Adoption preserves retry budgets and avoids discarding in-flight work the control plane still owns. |
+| A10 | 0009 | RFC-0009 §5.3.2 gains legal edges `Pending → Failed` and `Ready → Failed`, owned by RFC-0010 checkpoint C7. | Pre-dispatch attribution (run timeout T8, budget L6, non-gate RC4, ER5) MUST mark a never-dispatched node `Failed`; the merged diagram only had `Running → Failed`. |
 
 ### 2.8 Trust boundary on load
 
@@ -740,6 +741,7 @@ impl LinearScheduler {
     pub(crate) fn new_for_test(deps: LinearSchedulerDeps) -> Result<Self, SchedError>;
 
     /// Additive scheduler-owned reconciliation for a terminal control row (§5.20).
+    /// The `Scheduler` trait method MUST delegate to this inherent method (one body).
     pub async fn reconcile_terminal_run(
         &self,
         dag_id: DagId,
@@ -755,6 +757,7 @@ impl LinearScheduler {
 impl Scheduler for LinearScheduler {
     async fn run(&self, dag_id: DagId) -> Result<DagOutcome, SchedError>;
     async fn cancel(&self, dag_id: DagId) -> Result<(), SchedError>;
+    /// Delegates to the inherent `LinearScheduler::reconcile_terminal_run`.
     async fn reconcile_terminal_run(
         &self,
         dag_id: DagId,
@@ -1140,21 +1143,21 @@ struct OwnershipLock {
 | R2 | If `config.validate_on_load`: `DagValidator::validate(&dag, config.validate_opts)` (`ValidateOpts` is `Copy`, taken **by value** on `main`) | `Err(e)` ⇒ `Err(Invariant("dag {id} failed load validation: {e}"))` |
 | R3 | Resolve the run binding (Appendix F) | `None` ⇒ `Err(RunBindingMissing(dag_id))` |
 | R4 | Insert `OwnedDag` into `owned` (insert-if-absent) and build `OwnedGuard` | occupied ⇒ `Err(AlreadyOwned(dag_id))`; poisoned ⇒ `Err(Ownership(..))` |
-| R4b | **Re-load** `dags.get(dag_id)` under ownership (mirrors §5.12.4 / RC4). Same-generation CAS cannot see a concurrent unowned cancel/reconcile that already terminalized. | `None` ⇒ `Err(DagNotFound)`; durable terminal ⇒ continue at R9; `ReplanRequired` ⇒ R10; else replace in-memory `dag` with the fresh blob |
+| R4b | **Re-load** `dags.get(dag_id)` under ownership (mirrors §5.12.4 / RC4). Same-generation CAS cannot see a concurrent unowned cancel/reconcile that already terminalized. If `validate_on_load` and the blob is non-terminal / non-`ReplanRequired`, **re-validate** the fresh blob (same as R2). | `None` ⇒ `Err(DagNotFound)`; durable terminal ⇒ continue at R9; `ReplanRequired` ⇒ R10; validation fail ⇒ `Err(Invariant)`; else replace in-memory `dag` with the fresh blob |
 | R5 | Take `dag_id` out of `pending_cancels`; if it was present, fire `run_cancel` immediately | — |
 | R6 | `sessions.get_session(dag.session_id)` for `workspace_root`, `profile`, `budget` | `None` ⇒ `Err(Invariant("session row missing for dag {id}"))` |
 | R7 | Compute effective budget ceilings (§5.16.1) | non-fatal; degenerate ceilings recorded as a `Budget` decision |
 | R8 | Rebuild the run cost meter from events (§5.16.2) | `ObsError` ⇒ `Err(Store(..))` |
-| R9 | If `dag.state ∈ {Succeeded, Failed, Cancelled}` ⇒ return `Ok` with `state = dag.state` verbatim (do **not** re-run §5.17 — DeriveFlags are unset on a fresh entry and would mis-classify a gate-denied `Failed` blob as `Cancelled`). Assemble `failed_node` / `failure` via §5.18 FO1–FO6 only. **No** CAS. | — |
+| R9 | If `dag.state ∈ {Succeeded, Failed, Cancelled}` ⇒ return `Ok` with `state = dag.state` verbatim (do **not** re-run §5.17 — DeriveFlags are unset on a fresh entry and would mis-classify a gate-denied `Failed` blob as `Cancelled`). **Before** FO assembly: if `state == Failed`, apply RF7 (and RF3 as needed) so FN2 can see an `Approval` failure on a gate `Cancelled` node. Then assemble `failed_node` / `failure` via §5.18 FO1–FO6. **No** CAS of node/DAG state. | — |
 | R10 | If `dag.state == ReplanRequired` ⇒ return `Ok(DagOutcome { state: ReplanRequired, .. })` with no CAS | — |
 | R11 | Reconstruct per-node attempt counters (§5.3.1) | `Err(Store(..))` on event read failure |
 | R12 | Start the run clock; `gate_wait_total = 0` (§5.19) — **before** adoption so A6/backoff remaining-budget checks have a defined clock | — |
 | R13 | Adopt any node durably `Running` (§5.3.2) | — |
-| R14 | Gate resume decision (§5.7.2 / §5.7.3) when `dag.state == WaitingApproval` | — |
-| R15 | C1: if `dag.state == Pending` CAS `DagState::Running`. Gate allow MUST NOT use C1 — it uses C9b (GA3). | `Conflict` ⇒ §5.8.4 |
-| R15b | **Edit-tx resume (§6.5).** After restart only (not a fresh first start of a never-started DAG): evaluate ER4 `needs_reverify` and ER5 stop. ER5 ⇒ durable C7 `Failed` + `Ok(DagOutcome { state: Failed, .. })` without entering the loop. | — |
-| R16 | Enter the loop (§5.2); L14 honour ER4 while `needs_reverify` | — |
-| R17 | On loop exit: derive the terminal `DagState` (§5.17), commit C7, assemble `DagOutcome` (§5.18), drop `OwnedGuard` | — |
+| R14 | C1: if `dag.state == Pending` CAS `DagState::Running`. Gate allow MUST NOT use C1 — it uses C9b (GA3). Record `performed_c1` for R15. | `Conflict` ⇒ §5.8.4 |
+| R15 | **Edit-tx resume (§6.5).** Skip entirely when `performed_c1` (fresh start of a `Pending` DAG). Otherwise evaluate ER4 `needs_reverify` and ER5 stop **before** any gate wait. ER5 ⇒ durable C7 `Failed` + `Ok(DagOutcome { state: Failed, .. })` without entering the loop. If every node is already terminal, skip ER4/ER5 and continue toward derive (R17 / §6.3 all-terminal row) — **never** mutate a terminal node. | — |
+| R16 | Gate resume decision (§5.7.2 / §5.7.3) when `dag.state == WaitingApproval` (after R15 so ER5 does not wait on a human) | — |
+| R17 | Enter the loop (§5.2); L14 honour ER4 while `needs_reverify` | — |
+| R18 | On loop exit: derive the terminal `DagState` (§5.17), commit C7, assemble `DagOutcome` (§5.18), drop `OwnedGuard` | — |
 
 `run` MUST NOT return `Ok` with `state ∈ {Pending, Running, WaitingApproval}` (fix 24). Producing one is an `Invariant` bug and MUST be caught by AC 43.
 
@@ -1175,7 +1178,7 @@ struct OwnershipLock {
 | L11 | Assemble input | build the envelope, put it, C5 rewrite `input_ref` if changed (§5.5) |
 | L12 | Escalate | apply tier escalation + `Retry` decision when admitted (§5.11.4) — before C3 |
 | L13 | Gate route | if selected node is `NodeKind::GateHuman`, enter §5.7 **before** any C3 while unresolved — the allow path (§5.7.6) later performs C3 |
-| L14 | Dispatch | for non-gate nodes: if ER4 `needs_reverify` and the selected node is an `Edit` or other capability consumer of the edited tree, **do not** C3 — leave Ready and continue (serial MVP: expect a verify/gate/aggregate Ready instead; if none Ready ⇒ `Err(Invariant("needs_reverify but verify not ready; blocked={id}"))`). Otherwise C3 (`Ready → Running`, attempt++), then dispatch under the node deadline (§5.6 / §5.19) |
+| L14 | Dispatch | for non-gate nodes: if ER4 `needs_reverify` and the selected node's `kind ∈ {Plan, Analyze, Edit, Review}` (**capability consumers** — blocked set), **do not** C3. Under serial MVP at most one Ready exists: if that Ready is blocked, durable-C7 `Failed` on it with `FailureIr { error_class: Internal, retry: NonRetryable, notes: "needs_reverify but verify not ready" }` and return `Ok(Failed)` (same posture as ER5 — do **not** `Err(Invariant)`, which would strand resume). Allowed while `needs_reverify`: `VerifyCompile`, `VerifyTest`, `GateHuman`, `Aggregate`. Otherwise C3 (`Ready → Running`, attempt++), then dispatch under the node deadline (§5.6 / §5.19) |
 | L15 | Apply | success ⇒ C4; soft failure ⇒ retry admission (§5.11) ⇒ C8 or durable C7 failure |
 | L16 | Keep local | `DagStore::put_if_generation` returns `()` on success (`main`). After `Ok(())`, the scheduler's **already-mutated in-memory** `TaskDag` is authoritative. On `Conflict`, stop per §5.8.4 — do **not** reload a "fresher blob" (the API does not return one). |
 
@@ -1222,8 +1225,8 @@ Because the write order is artifacts → CAS → events (§5.8.1), a crash can l
 | RF4 | The scheduler MUST NOT roll a blob backwards to match an event. |
 | RF5 | Repair appends MUST be idempotent: at most one repair event per `(node, generation, to)`; existence is probed with the RF2 filter. |
 | RF6 | C9 committed with a missing `ApprovalRequested`: the scheduler MUST append a repair `ApprovalRequested` with `repaired: true`, `gate_id`, `node_id`, `generation: dag.generation`, and `ts = now` before GR4 deadline math. GR3's "MUST NOT re-emit" applies only to non-repair duplicates. |
-| RF7 | Gate deny/expiry CAS committed with a missing `NodeState`/`failure_ref` event: RF3 repairs the `NodeState`; if the `failure_ir` artifact is also missing, put a synthetic `Approval` `failure_ir` (`notes: "repaired after crash"`) before FN2 selection so FO2/FO6 hold. |
-| RF8 | Repair/`NodeState` events MUST carry the `attempt` (and `next_attempt` when applicable) derived by §5.3.1 **before** adoption continues. A lost C3 or C8 event pair MUST NOT reset `attempts_started` below the durable counter; AC 24 / AC 78 remain binding. |
+| RF7 | Gate deny/expiry CAS committed with a missing `NodeState`/`failure_ref` event: RF3 repairs the `NodeState`; if the `failure_ir` artifact is also missing, put a synthetic `Approval` `failure_ir` (`notes: "repaired after crash"`) **before** FN2 selection so FO2/FO6 hold. R9 MUST run RF7 before FO assembly on a durable `Failed` blob (not only mid-loop recovery). |
+| RF8 | Repair/`NodeState` events MUST carry the `attempt` (and `next_attempt` when applicable) derived by §5.3.1 **before** adoption continues. A lost C3 or C8 event pair MUST NOT reset `attempts_started` below the durable counter; AC 24 / AC 78 remain binding. **C8 crash pin:** the C3 `NodeState{to:running, attempt:k}` event (written before dispatch) is the attempt anchor. After a C8 CAS with lost (c)/(d) events, §5.3.1 still yields `attempts_started = k` from that C3 event, so the next C3 is `k+1` (RT4). |
 
 ### 5.4 Ready-set derivation and selection
 
@@ -1529,6 +1532,7 @@ Both events MUST be appended **after** the CAS, in order (c) then (d).
 | RT4 | On restart with the node `Ready` and `attempts_started = k` (a failed attempt recorded), the scheduler MUST continue the remaining backoff (§5.11.3 rule B4) and then perform C3 for attempt `k + 1`. |
 | RT5 | The `Failed → Ready` transition MUST NOT be used for non-admitted failures. Non-admitted failures go straight to durable `Failed` via C7. |
 | RT6 | Retry of an `Edit` node (when admitted) MUST produce a **new forward** patch via a fresh worker/`apply_patch` call. The scheduler MUST NOT reapply, replay, or revert the previous transaction (§8.5). |
+| RT7 | C8 recovery MUST NOT invent an attempt counter on the `Ready` blob. Attempt identity comes from §5.3.1 events (C3 `attempt` and C8 `next_attempt`). A C8 CAS whose events were lost still has the prior C3 event for `k` (RF8). |
 
 #### 5.8.4 Conflict handling
 
@@ -1940,7 +1944,7 @@ Evaluated in order over the post-CAS blob plus `DeriveFlags`:
 | --- | --- |
 | FO1 | `failure` MUST be recovered from the durable `failure_ref` artifact when the in-memory value is unavailable (crash resume), so a resumed terminal run still reports a structured failure. |
 | FO2 | When `failed_node` is `Some(id)` and its `failure_ref` artifact is missing, degrade to `FailureIr { node: id, error_class, retry: NonRetryable, diagnostics: [], notes: "failure detail unavailable" }` reconstructed from the matching `NodeState` event when present. If **no** matching event exists either, use `error_class: Internal`, `retry: NonRetryable`, `notes: "failure detail unavailable; event missing"`. |
-| FO3 | R9 short-circuit MUST apply FO1/FO2 **without** requiring RF3 repair to succeed first. Best-effort RF3 repair MAY still append missing events after the outcome is assembled, but MUST NOT block returning `Ok(DagOutcome)`. |
+| FO3 | R9 short-circuit MUST apply RF7 (when `state == Failed`) then FO1/FO2 **without** requiring a full RF3 sweep of unrelated nodes first. Best-effort RF3 repair of other missing events MAY still append after the outcome is assembled, but MUST NOT block returning `Ok(DagOutcome)`. |
 | FO4 | `state == Failed` with `failed_node == None` is permitted only for D8 (all-skipped) and MUST carry `failure = None`. FO2 does **not** apply to D8. |
 | FO4a | Non-gate `reconcile_terminal_run(..., Failed)` MUST leave the attributed node in `NodeState::Failed` with a synthetic `Internal` `failure_ir` (RC4/RC5), so FN1 + FO6 hold on R9. Gate-origin uses Cancelled+`Approval` (FN2) instead. |
 | FO5 | `state == Cancelled` MUST carry `failed_node = None` and `failure = None`. |
@@ -1982,9 +1986,9 @@ async fn reconcile_terminal_run(&self, dag_id: DagId, terminal: DagState) -> Res
 | RC1 | `terminal` MUST be `Succeeded` \| `Failed` \| `Cancelled`; anything else ⇒ `Err(Config("reconcile_terminal_run requires a terminal state"))`. |
 | RC2 | Missing DAG ⇒ `Err(DagNotFound)`. Already-terminal DAG ⇒ `Ok(())` with no write (idempotent). |
 | RC3 | A DAG owned by a live run in this process ⇒ `Ok(())` with no write: the run owns terminalization. |
-| RC4 | Otherwise: acquire ownership, **re-load** the DAG, then a single CAS. **Gate-origin** `Failed` (predicate: a `GateHuman` node is still `WaitingApproval`, or a generation-matched durable `ApprovalResolved` with `decision ∈ {deny, expired}` exists): mark the gate `Cancelled` with an `Approval` `failure_ir`, every other non-terminal → `Skipped`, `DagState → Failed` (C9c / FN2). **Non-gate** `Failed`: mark the attributed node (lowest non-terminal `NodeId`) **`Failed`** with an `Internal` `failure_ir`, every other non-terminal → `Skipped`, `DagState → Failed` (FN1 / FO4a). **`Cancelled` terminal:** non-terminal `WaitingApproval`/`Running`/`Ready` → `Cancelled`; rest → `Skipped`; `DagState → Cancelled`. Append events; release ownership. |
+| RC4 | Otherwise: acquire ownership, **re-load** the DAG, then a single CAS. **Gate-origin** `Failed` (predicate: a `GateHuman` node is still `WaitingApproval`, or a generation-matched durable `ApprovalResolved` with `decision ∈ {deny, expired}` exists): mark the gate `Cancelled` with an `Approval` `failure_ir`, every other non-terminal → `Skipped`, `DagState → Failed` (C9c / FN2). **Non-gate** `Failed`: if no non-terminal node remains, only CAS `DagState → Failed` (do **not** mutate terminals; FN1/FO6 then rely on any existing `Failed` node, else FO4/D8). Otherwise mark the attributed node (lowest non-terminal `NodeId`) **`Failed`** with an `Internal` `failure_ir`, every other non-terminal → `Skipped`, `DagState → Failed` (FN1 / FO4a). **`Cancelled` terminal:** non-terminal `WaitingApproval`/`Running`/`Ready` → `Cancelled`; rest → `Skipped`; `DagState → Cancelled`. Append events; release ownership. |
 | RC5 | Gate-origin uses FN2 (`Cancelled` + `Approval`). Non-gate uses FN1 (`Failed` + `Internal`). Never attribute a non-gate Failed reconcile solely via a `Cancelled` node. |
-| RC6 | For `terminal == Succeeded` with non-terminal nodes remaining, the reconciler MUST NOT invent success: it MUST write `Failed` with `notes: "control row succeeded with unfinished nodes"` and log at `warn`. |
+| RC6 | For `terminal == Succeeded` with non-terminal nodes remaining, the reconciler MUST NOT invent success: it MUST write `Failed` using **non-gate** RC4 attribution (lowest non-terminal → `Failed` + `Internal`, notes `"control row succeeded with unfinished nodes"`) and log at `warn`. If no non-terminal remains, only CAS `DagState → Failed` with that notes string on a synthetic event (no terminal-node rewrite). |
 | RC7 | `Conflict` ⇒ `Err(Conflict { dag_id })`; callers (resume) log and continue. |
 | RC8 | The method MUST be safe to call concurrently with `cancel` for the same DAG: whichever acquires ownership first wins, the other observes a terminal state and returns `Ok(())`. |
 
@@ -2061,8 +2065,8 @@ RFC-0008 MVP durability: **in-process edit-transaction map only** + durable chec
 | ER1 | DAG node state is durable (`put_if_generation`). Edit transaction state is **not**. After restart the two MAY disagree: an `Edit` node can be durably `Succeeded` while no in-memory tx exists and workspace creates may be untracked leftovers. |
 | ER2 | The scheduler MUST NOT assume a `Succeeded` `Edit` node implies a clean, known, or exclusive workspace. |
 | ER3 | The scheduler MUST NOT call `EditEngine::rollback`, `EditEngine::apply`, or `GitEditEngine::recover_checkpoint`. Those belong to the write stack / operator (RFC-0008 §2.5 / §6.5; RFC-0015). |
-| ER4 | **Resume-only re-verify flag** (R15b). On `run` entry after restart: let `needs_reverify` be true iff some `Edit` in this generation is `Succeeded` and some Data∪Sequence-reachable `VerifyCompile`/`VerifyTest` is still non-terminal (`Pending`/`Ready`/`Running`). Cleared when any such verify reaches `Succeeded`/`CachedHit`. While `needs_reverify`, L14 MUST NOT dispatch `Edit` or other capability nodes that consume the edited tree — only verify / gate / aggregate / already-safe nodes via normal ready-set rules. When a verify becomes Ready, dispatch it. If the only Ready node is blocked by this filter and no verify is Ready, fail closed with `Err(Invariant("needs_reverify but verify not ready; blocked={id}"))`. Forward-only (§8.5). Under serial MVP (`enforce_linear_mvp`), at most one Ready exists, so this is a dispatch filter, not a second scheduler. |
-| ER5 | **On `run` entry after restart only** (R15b; not a fresh first start of a verify-less DAG): if some `Edit` is `Succeeded` and **every** Data∪Sequence-reachable verify is absent **or** already terminal without any of them being `Succeeded`/`CachedHit` after this generation's edits (i.e. no verify successor exists at all, or all verifies are `Failed`/`Cancelled`/`Skipped` with none ever `Succeeded` post-edit and none still runnable), the scheduler MUST stop with durable `Failed` on the **lowest non-terminal** `NodeId` (else the lowest `Succeeded` `Edit`): `FailureIr { error_class: Internal, retry: NonRetryable, notes: "edit succeeded without successful verify after restart" }` and `Ok(DagOutcome { state: Failed, .. })`. A verify that already `Succeeded` clears `needs_reverify` and MUST NOT trigger ER5. |
+| ER4 | **Resume-only re-verify flag** (R15; skipped when `performed_c1`). On resume entry: let `needs_reverify` be true iff some `Edit` in this generation is `Succeeded` **and** some Data∪Sequence-reachable `VerifyCompile`/`VerifyTest` is still non-terminal (`Pending`/`Ready`/`Running`). Cleared when any such verify reaches `Succeeded`/`CachedHit`. While `needs_reverify`, L14 MUST NOT dispatch kinds in `{Plan, Analyze, Edit, Review}`; it MAY dispatch `{VerifyCompile, VerifyTest, GateHuman, Aggregate}`. When a verify becomes Ready, dispatch it. If the only Ready node is in the blocked set, durable-fail that node per L14 (not `Err`). Forward-only (§8.5). Under serial MVP this is a dispatch filter, not a second scheduler. |
+| ER5 | **On resume entry only** (R15; skipped when `performed_c1`). If **every** node is already terminal: MUST NOT fire — leave to §6.3 all-terminal → derive + C7 (e.g. D7 `Succeeded`); MUST NOT write `Succeeded → Failed`. Else if some `Edit` is `Succeeded` **and** at least one Data∪Sequence-reachable verify exists **and** every such verify is already terminal without any `Succeeded`/`CachedHit` and none still runnable: durable `Failed` on the **lowest non-terminal** `NodeId` with `FailureIr { error_class: Internal, retry: NonRetryable, notes: "edit succeeded without successful verify after restart" }` and `Ok(DagOutcome { state: Failed, .. })`. **Verify-less DAGs** (no reachable verify from the Succeeded Edit — e.g. `Edit → GateHuman`) MUST NOT trigger ER5; human/gate is the check. A verify that already `Succeeded` clears `needs_reverify` and MUST NOT trigger ER5. |
 | ER6 | A crash with an `Edit` node durably `Running` follows §5.3.2 adoption (lost attempt). Re-dispatch produces a **new** forward `apply_patch`, not a replay of the lost tx (§5.8.3 RT6 / §8.5 FOW4). |
 | ER7 | Operator cleanup of untracked creates after crash is out of band (RFC-0008 / RFC-0015). The scheduler MUST NOT invent cleanup. |
 
@@ -2183,7 +2187,7 @@ The MCP bus exposes `ApplyPatch | CargoCheck | CargoTest | FsRead` — **no roll
 | FOW2 | Recovery is **forward-only**. A failed `VerifyCompile` / `VerifyTest` after a successful `Edit` drives another patch (replan or a later Edit attempt), never an undo. |
 | FOW3 | A `Failed` node after a successful earlier `Edit` leaves an **applied, unverified patch** on disk. That is a **normal terminal workspace state**, not store corruption and not an `Invariant`. |
 | FOW4 | Retry of an `Edit` node (when §5.11 admits it) MUST issue a **new** forward `apply_patch` (RT6). Reapplying or reverting the previous transaction is forbidden. |
-| FOW5 | **`DagOutcome` / workspace signal (no new fields).** `DagOutcome` stays as on `main`. RFC-0015 MUST treat the workspace as modified for a run iff any `Edit` node in that generation reached `Succeeded` **or** any `EditApplied` session event exists for the run. On `Failed` / `Cancelled` / `ReplanRequired`, that inference is how the CLI tells an operator the tree was touched. |
+| FOW5 | **`DagOutcome` / workspace signal (no new fields).** `DagOutcome` stays as on `main`. RFC-0015 MUST treat the workspace as **possibly modified** (dirty-if / sufficient, **not** `iff`) when any of: (a) an `Edit` node in that generation reached `Succeeded`; (b) any `EditApplied` session event exists for the run; (c) any `NodeState` event with `to == running` for an `Edit` node in this generation (covers apply-before-commit crash where the node never became `Succeeded` and no `EditApplied` was emitted — RFC-0008 best-effort events). Absence of all three MUST NOT be treated as proof the tree is untouched. |
 
 ---
 
@@ -2331,6 +2335,7 @@ The e2e MUST live in `alloy-tools` (which already depends on `alloy-runtime` and
 | TD2 | Tests MUST NOT assert on wall-clock durations. |
 | TD3 | Every test creating a scheduler MUST use a per-test temp `data_dir` (the OS lock is per directory). |
 | TD4 | `new_for_test` MAY relax only `validate_on_load` and `host_parallel_honesty`. |
+| TD5 | `new_for_test` is `#[cfg(test)] pub(crate)`: fixtures that need `validate_on_load = false` (ACs 8, 15, 63, 64) MUST live in in-crate `#[cfg(test)]` modules under `alloy-runtime`, not `crates/alloy-runtime/tests/*` or `alloy-tools`. |
 
 ---
 
@@ -2443,13 +2448,16 @@ Each AC is a test name or a CI check.
 | 81 | Negative finite `MaxUsd` clamps to `0.0` and trips BG3 with a direct `BudgetWarning`. |
 | 82 | DecisionLog/`ObsError` after a committed CAS does not abort the durable outcome (BE4); before the CAS it maps to `Store`. |
 | 83 | Scheduler code paths never call `EditEngine::{apply,rollback}` or `recover_checkpoint` (CI grep / unit). |
-| 84 | After a simulated restart with `Edit=Succeeded` and `VerifyCompile=Pending`, resume dispatches verify next (ER4); with no verify successor, returns `Ok(Failed)` per ER5. |
-| 85 | Admitted Edit retry issues a distinct new `apply_patch` call_id / attempt (RT6 / FOW4), not a replay of the prior tx. |
+| 84 | After a simulated restart with `Edit=Succeeded` and `VerifyCompile=Pending`, resume dispatches verify next (ER4); with reachable verifies all terminal without success and a non-terminal remaining, returns `Ok(Failed)` per ER5; verify-less `Edit→GateHuman` resume does **not** ER5. |
+| 85 | Admitted Edit retry issues a fresh `CapabilityExecutor::execute` with `CapabilityExecContext.attempt == k + 1` (RT6 / FOW4), not a replay of the prior tx. |
 | 86 | BG3 exhaustion calls `SessionPlane::signal_budget_warning` with RFC-0004 `{snapshot, message}` shape. |
 | 87 | `new` rejects `deps.runs` that is not `session_plane.runs()` (D6). |
-| 88 | After R4 ownership, R4b re-load observes an unowned-cancel terminal blob and short-circuits at R9 (no same-gen overwrite). |
+| 88 | After R4 ownership, R4b re-load observes an unowned-cancel terminal blob and short-circuits at R9 (no same-gen overwrite); non-terminal re-load re-validates when `validate_on_load`. |
 | 89 | Non-gate `reconcile_terminal_run(..., Failed)` yields R9 `failed_node = Some(_)` via FN1 (attributed node is `Failed`, not merely `Cancelled`). |
-| 90 | ER5 does not fire when a reachable verify already `Succeeded`; ER4 blocks Edit/capability dispatch while `needs_reverify`. |
+| 90 | ER5 does not fire when a reachable verify already `Succeeded`, when every node is already terminal, or when `performed_c1`; ER4 blocks `{Plan,Analyze,Edit,Review}` while `needs_reverify`. |
+| 91 | Resume with all nodes `Succeeded` and `dag.state == Running` on a verify-less DAG returns `Ok(Succeeded)` via derive+C7 (no `Succeeded → Failed`). |
+| 92 | Gate-origin `reconcile_terminal_run(..., Failed)` yields gate `Cancelled` + `Approval` and R9 `failed_node` via FN2; R9+RF7 still attributes when the Approval event was lost after CAS. |
+| 93 | Pre-dispatch C7 may legally take `Pending → Failed` / `Ready → Failed` (A10 / Appendix B); L14 needs_reverify block durable-fails rather than `Err(Invariant)`. |
 
 ---
 
@@ -2460,7 +2468,7 @@ Each AC is a test name or a CI check.
 | 1 | Every AC in §13 is implemented as a passing test or CI check. |
 | 2 | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace` are green. |
 | 3 | `LinearScheduler` is the production default; `NullScheduler` remains for pre-wiring, shutdown parking, and tests. |
-| 4 | Amendments A1–A9 have landed with their own tests. |
+| 4 | Amendments A1–A10 have landed with their own tests. |
 | 5 | `#![forbid(unsafe_code)]` holds; no new external dependency. |
 | 6 | Public items in §3.17 are re-exported and documented with `#[must_use]` where applicable. |
 | 7 | No `.env` writes; `example.env` comments updated. |
@@ -2495,7 +2503,7 @@ Each AC is a test name or a CI check.
 | P5 | Retry / backoff / escalation + decisions | 0.75 pd |
 | P6 | `ToolCaller` seam, `map_mcp_error`, verify adapters, diagnostics parser + fingerprint | 1.25 pd |
 | P7 | Gate: scheduler orchestration, adapter, `expire_gate`, resume, reconcile | 1.25 pd |
-| P8 | Cancel / drain / amendments A1–A9 | 0.75 pd |
+| P8 | Cancel / drain / amendments A1–A10 | 0.75 pd |
 | P9 | Budgets, meter rebuild, observability | 0.5 pd |
 | P10 | Cross-subsystem e2e + CI greps | 0.75 pd |
 | **Total** | | **~8.5 pd raw → 5–8 pd with overlap** |
@@ -2538,10 +2546,12 @@ Legal transitions (superset of RFC-0009 §5.3.2, with the RFC-0010 owner named):
 | `Pending` | `Ready` | C2 |
 | `Pending` | `Skipped` | C6 / C7 |
 | `Pending` | `Cancelled` | C6 (cancel before start) |
+| `Pending` | `Failed` | C7 (pre-dispatch attribution: T8 / L6 budget / non-gate RC4 / ER5 / L14 needs_reverify) — amendment A10 |
 | `Ready` | `Running` | C3 |
 | `Ready` | `WaitingApproval` | C9a (gate only) |
 | `Ready` | `Skipped` | C6 / C7 |
 | `Ready` | `Cancelled` | C6 |
+| `Ready` | `Failed` | C7 (same pre-dispatch attribution owners as `Pending → Failed`) — amendment A10 |
 | `Ready` | `CachedHit` | **deferred** — MUST NOT be produced |
 | `Running` | `Succeeded` | C4 |
 | `Running` | `Ready` | C8 (retry admitted) |
@@ -2549,12 +2559,13 @@ Legal transitions (superset of RFC-0009 §5.3.2, with the RFC-0010 owner named):
 | `Running` | `Cancelled` | C6 |
 | `WaitingApproval` | `Ready` | C9b (allow) |
 | `WaitingApproval` | `Cancelled` | C9c (deny / expiry) or C6 (cancel) |
-| `Succeeded` / `Failed` / `Cancelled` / `Skipped` / `CachedHit` | — | terminal |
+| `Succeeded` / `Failed` / `Cancelled` / `Skipped` / `CachedHit` | — | terminal (SK2: MUST NOT re-mark) |
 
 | Reconciliation note |
 | --- |
 | RFC-0009's diagram shows `WaitingApproval → Failed: timeout (0010)`. This RFC refines it: the **node** becomes `Cancelled` and the **DAG** becomes `Failed` (D5). One shape for deny and expiry keeps `failed_node` selection (FN2) uniform. The `ErrorClass::Approval` failure record carries the distinction (`"approval denied"` vs `"approval timeout"`). |
 | RFC-0009's `Failed → Ready: retry admitted` edge is preserved as a **logical** transition: the durable blob goes `Running → Ready` in one CAS (C8), and the event pair records the `failed` waypoint. Durable `Failed` therefore means "exhausted", which is what §1.5 rule 8 requires. |
+| Amendment A10 adds `Pending → Failed` and `Ready → Failed` for pre-dispatch C7 attribution. Implementers MUST treat those edges as legal here even though the pre-A10 RFC-0009 diagram omitted them. |
 
 ## Appendix C — Gate decision matrix
 
