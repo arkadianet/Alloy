@@ -80,7 +80,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | 0015 | 0003, 0004, 0010, 0013 |
 | 0016 | 0001, 0007 |
 
-No cycles. **Critical path (M1 vertical slice):** 0001 → (0002∥0005) → (0003∥0004∥0006∥0009) → (0007∥0008) → 0010 → (0011∥0012 thin) → 0013 → 0015, with **0016 skeleton** starting as soon as 0007 exists. Note: 0010 does **not** depend on 0007 in the dependency table (retry/scheduler uses `ErrorClass` + adapters); 0007 and 0010 are sequenced on the calendar path because the vertical slice needs both, while 0013 binds the router into workers.
+No cycles. **Critical path (M1 vertical slice):** 0001 → (0002∥0005) → (0003∥0004∥0006∥0009) → (0007∥0008) → 0010 → (0011∥0012 thin) → 0013 → 0015, with **0016 skeleton** starting as soon as 0007 exists. Note: 0010 depends on **0008** for the single-write-stack / no-scheduler-EditEngine constraint (forward-only repair, edit-tx vs DAG resume); it does **not** depend on 0007 in the dependency table (retry uses `ErrorClass` + adapters). 0007 and 0010 are still sequenced on the calendar path because the vertical slice needs both, while 0013 binds the router into workers.
 
 ## Mermaid dependency graph
 
@@ -122,6 +122,7 @@ flowchart TB
   R4 --> R7
   R4 --> R10
   R9 --> R10
+  R8 --> R10
   R7 --> R13
   R7 --> R16
   R8 --> R13
