@@ -49,7 +49,11 @@ pub(crate) fn compute_workspace_digest(
         let path = policy.jail().join(&rel);
         let meta = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
-            Err(_) => continue,
+            // A tracked path may legitimately be absent (deleted by this patch);
+            // anything else is a real I/O fault and must not silently shrink the
+            // digest into a false match.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(EditError::Io(e.to_string())),
         };
         if meta.file_type().is_symlink() || !meta.is_file() {
             continue;
@@ -162,6 +166,31 @@ mod tests {
         assert_eq!(digest.tree, Digest::sha256(expected.as_bytes()));
         assert_eq!(digest.file_count, 2);
         assert_eq!(digest.total_bytes, 1 + big.len() as u64);
+    }
+
+    /// A vanished tracked path is normal (the patch may have deleted it), but any
+    /// other metadata failure must surface instead of silently shrinking the
+    /// digest into a false pre-image match.
+    #[test]
+    fn missing_path_is_skipped_but_other_io_errors_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+
+        let with_missing = ["a.txt", "gone.txt"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let digest =
+            compute_workspace_digest(&policy(dir.path()), &with_missing, &[], 10, 10).unwrap();
+        assert_eq!(digest.file_count, 1);
+
+        // An interior NUL can never name a file: the OS rejects the metadata
+        // call outright rather than reporting "not found".
+        let unnameable = ["bad\0name".to_string()].into_iter().collect();
+        assert!(matches!(
+            compute_workspace_digest(&policy(dir.path()), &unnameable, &[], 10, 10),
+            Err(EditError::Io(_))
+        ));
     }
 
     #[test]
