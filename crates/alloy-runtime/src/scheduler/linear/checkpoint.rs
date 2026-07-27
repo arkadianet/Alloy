@@ -95,6 +95,11 @@ pub(crate) enum GateDecision {
     /// Explicit denial.
     Deny,
     /// `timeout_ms` elapsed unresolved.
+    ///
+    /// Not yet produced: the real deadline/`expire_gate` path (RFC-0010
+    /// §5.7.8) lands in P7. `c9c_gate_deny` and `gate_decision_str` already
+    /// handle it correctly; only the caller that would select it is missing.
+    #[allow(dead_code)]
     Expired,
 }
 
@@ -902,7 +907,12 @@ impl Checkpoint {
     /// already matches the RF5 dedup key, no new event is appended and
     /// `Ok(false)` is returned; otherwise a `repaired: true` event is
     /// appended and `Ok(true)` is returned (and `event_repairs` bumped).
+    ///
+    /// Exercised directly by its own unit tests (crash-window simulation);
+    /// not yet called from `loop_.rs` — wiring crash-repair-on-resume into
+    /// R4b/R11's adoption path is not part of P4's charter.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) async fn repair_node_state(
         &self,
         dag_id: DagId,
@@ -955,7 +965,10 @@ impl Checkpoint {
     /// RF6: repair a missing `ApprovalRequested` for a committed C9a. Same
     /// idempotence contract as [`Self::repair_node_state`], keyed on
     /// `(gate_id, generation)`.
+    ///
+    /// Not yet wired into `loop_.rs` — see [`Self::repair_node_state`]'s doc.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) async fn repair_approval_requested(
         &self,
         dag_id: DagId,
@@ -1020,6 +1033,9 @@ impl Checkpoint {
     /// `failure_ref` cannot be resolved, puts a synthetic `Approval`
     /// `failure_ir` (`notes: "repaired after crash"`) so FN2/FO2/FO6 hold.
     /// Returns the `failure_ir` artifact id in use (existing or synthesized).
+    ///
+    /// Not yet wired into `loop_.rs` — see [`Self::repair_node_state`]'s doc.
+    #[allow(dead_code)]
     pub(crate) async fn repair_gate_terminal(
         &self,
         dag_id: DagId,

@@ -3,11 +3,9 @@
 //! Non-`pub`: only the types re-exported from [`crate::scheduler`] escape this
 //! module tree (RFC-0010 §4.1 rule M1).
 
-// checkpoint::Checkpoint is exercised directly by its own unit tests; the
-// serial loop (RFC-0010 P4) is what wires it into LinearScheduler and
-// removes this allowance.
-#[allow(dead_code)]
 mod checkpoint;
+mod envelopes;
+mod loop_;
 mod metrics;
 mod own;
 mod ready;
@@ -124,11 +122,21 @@ pub struct LinearSchedulerDeps {
 /// [`crate::NodeState::Running`] at a time. See [`crate::scheduler`] module
 /// docs for the merged [`crate::Scheduler`] trait this implements.
 pub struct LinearScheduler {
-    #[allow(dead_code)] // consumed starting the serial loop phase
     deps: LinearSchedulerDeps,
     /// Held for the process lifetime; released on `Drop`.
     _lock: OwnershipLock,
     metrics: Arc<SchedulerCounters>,
+    /// DAG-level ownership: one in-process `run` per [`crate::DagId`]
+    /// (§4.5). Minimal insert-if-absent set for R4 / `AlreadyOwned`. The
+    /// full `OwnedDag`/`OwnedGuard` race-free `Notify`-based cancel wait
+    /// (§4.3-4.4) lands in P8; this set only tracks membership.
+    pub(super) owned: std::sync::Mutex<std::collections::HashSet<crate::types::ids::DagId>>,
+    /// Cancels observed for DAGs this process does not (yet) own, or whose
+    /// live loop has not reached its next L2 check yet (§5.12.1). Full
+    /// `pending_cancels` + forced-C6-after-grace semantics (§5.12.3) land in
+    /// P8; for now this only drives the loop's own L1/L2 cancel path.
+    pub(super) pending_cancels:
+        std::sync::Mutex<std::collections::HashSet<crate::types::ids::DagId>>,
 }
 
 impl std::fmt::Debug for LinearScheduler {
@@ -206,6 +214,8 @@ impl LinearScheduler {
             deps,
             _lock: lock,
             metrics: Arc::new(SchedulerCounters::new()),
+            owned: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pending_cancels: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 

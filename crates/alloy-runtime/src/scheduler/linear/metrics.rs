@@ -95,6 +95,12 @@ impl SchedulerCounters {
     }
 
     /// An RF3/RF6/RF7 crash-repair event was appended (§5.3.3).
+    ///
+    /// Called by `checkpoint::Checkpoint::repair_*`, which are themselves
+    /// not yet called from `loop_.rs` (see their doc comments) — hence
+    /// unreachable from a production root until crash-repair-on-resume is
+    /// wired in.
+    #[allow(dead_code)]
     pub(super) fn inc_event_repairs(&self) {
         self.event_repairs.fetch_add(1, Ordering::Relaxed);
     }
