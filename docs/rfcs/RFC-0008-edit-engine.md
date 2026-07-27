@@ -499,8 +499,8 @@ pub struct EditValidation {
 pub trait EditEngine: Send + Sync {
     /// Validate `req` without mutating the workspace or creating a checkpoint.
     ///
-    /// MUST enforce the **validate** column of §5.5.1 (V1–V11, V15, V18–V19, V22–V23).
-    /// MUST NOT enforce V12–V14, V16–V17, V20–V21, V24–V25 and MUST NOT exec git.
+    /// MUST enforce the **validate** column of §5.5.1 (V1–V11, V8b–V8c, V15, V18–V19, V22–V23, V26–V28, V30).
+    /// MUST NOT enforce V12–V14, V16–V17, V20–V21, V24–V25, V29 and MUST NOT exec git.
     /// MUST NOT write files, refs, CAS edit artifacts, or session events.
     /// MUST NOT run abandon reconcile (that is `apply`/`rollback` only — §6.4).
     /// MUST take the same write lock as `apply`/`rollback` for single-writer honesty.
@@ -591,7 +591,7 @@ pub enum EditError {
     RollbackNotEligible {
         tx: TransactionId,
         state: TxState,
-        /// Static reason: `"not newest"` | `"not abandon target"` | `"wrong state"`.
+        /// Static reason: `"not newest"` | `"not abandon target"`.
         reason: &'static str,
     },
 
@@ -1083,12 +1083,15 @@ Ordering inside Persisting:
 
 ### 5.2 Apply pipeline (mutating, normative order)
 
-0. **Common locked preamble (apply / rollback / recover_checkpoint):** acquire `write_lock` → check token expiry (V21) → enforce run attribution (§3.8.5) → **then** abandon reconcile (§6.4). Expiry / run mismatch MUST NOT run reconcile (no restore side effects on a rejected call). `validate` acquires the lock but **MUST NOT** check V21 / run attribution / reconcile (matrix §5.5.1); host `run_call` already expired-checks on the MCP path. Direct `validate` callers may see an expired token succeed dry-run — documented MVP limitation.
-1. After preamble: abandon reconcile using `ctx.perms` (**apply/rollback only** — not validate).
+0. **Per-method locked preamble:**
+   * `validate`: acquire `write_lock` only. **MUST NOT** check V21, run attribution, or reconcile (§5.5.1). Host `run_call` already expiry-checks on the MCP path; direct dry-run with an expired token may succeed — documented MVP limitation.
+   * `apply` / `rollback`: acquire `write_lock` → expiry (V21) → run attribution (§3.8.5) → **then** abandon reconcile (§6.4). Expiry / run mismatch MUST NOT reconcile.
+   * `recover_checkpoint`: acquire `write_lock` → expiry (V21) → run attribution → **MUST NOT** run §6.4 reconcile (operator chose an explicit checkpoint; §6.5 step 6 still clears matching in-memory Open/abandoned state after a successful restore of that id). Reconcile remains **apply/rollback only** (AC 18).
+1. *(apply/rollback only)* After preamble step 0: abandon reconcile using `ctx.perms`.
 2. Reject `SemanticOps` → `UnsupportedOp` (§5.10 / V15).
-3. Normalize/validate local `PatchSet` rules (V1–V11, V18–V19, V22, V26–V28). No git yet.
+3. Normalize/validate local `PatchSet` rules (V1–V11, V8b–V8c, V18–V19, V22–V23, V26–V28, plus digest-excluded path rule V30). No git yet.
 4. Clone `ctx.perms` into a local `perms` used for all subsequent grant checks and `SandboxExecRequest`s. Re-check expiry immediately before checkpoint create. **If the broker returns `TokenExpired` during a post-mutation restore**, leave `abandoned = Some`, leave `TxRecord` `Open`, return `EditError::TokenExpired` (→ `PatchApplyError::TokenExpired` → `McpError::TokenExpired` per §8.3) — FailedDirty by Day-1 item 5. Recovery is the next `apply`/`rollback` reconcile under a **fresh** non-expired token (§6.4).
-5. Authorize `GitWrite` (V12) and preflight **all** git argv shapes (§5.6.2) via `match_exec_grant(...)` → V13 on any failure (no fork). **MVP ExecAllow for git MUST use `args_glob: None`** (preflight placeholders cannot authorize later concrete SHA/UUID args if a narrow glob is used). Profiles with a non-`None` `args_glob` for `git` are unsupported in MVP → treat match failure as V13.
+5. Authorize `GitWrite` (V12) and preflight **all** git argv shapes (§5.6.2) via `match_exec_grant(&perms, &argv, broker.profile().backend_for(ExecClass::Check), jail_cwd, &trusted_path)` → V13 on any failure (no fork). **MVP normative:** every `ExecAllow` for `git` MUST have `args_glob: None`. Non-`None` is unsupported (placeholder preflight cannot authorize concrete SHA/UUID args). If the token’s git ExecAllow has `Some(_)`, fail closed at preflight with `MissingGrant("exec:git args")` before mutate — do not attempt shape matching against placeholders.
 6. Run repo/jail + tracked-deny + untracked-in-patch git probes (§5.6.1) — V14, V16, V17.
 7. Compute `pre_digest` (§5.8). On limit → `DigestLimitExceeded` (V20; no mutate).
 8. Allocate `TransactionId::new()`, `CheckpointId::new()`.
@@ -1186,12 +1189,13 @@ CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention a
 | V27 | `Create` hunk shape invalid (≠1 hunk, or `old_start`/`old_lines` ≠ 0, or non-`+` lines) | `InvalidPatch("create hunk shape")` |
 | V28 | Hunks not sorted by ascending `old_start` | `InvalidPatch("hunk order")` |
 | V29 | Object format is not SHA-1 (e.g. SHA-256 repo) or SHA length ≠ 40 hex | `Environment("unsupported object format")` |
+| V30 | Patch path under `target/**` or matching `.**.alloy-tmp-**` | `InvalidPatch("path excluded from digest")` |
 
 ### 5.5 `dry_run` semantics
 
 | Action | dry_run=true (`validate`) | dry_run=false (`apply`) |
 | --- | --- | --- |
-| V1–V11, V8b–V8c, V15, V18–V19, V22–V23, V26–V28 | Yes | Yes |
+| V1–V11, V8b–V8c, V15, V18–V19, V22–V23, V26–V28, V30 | Yes | Yes |
 | V16 tracked-set (needs `git ls-files`) | **Skip** (no git exec) | Yes |
 | V12–V14, V17, V20, V21, V24–V25, V29 | **Skip** | Yes |
 | Digest / checkpoint / mutate / CAS / EditApplied | **MUST NOT** | Yes |
@@ -1203,13 +1207,20 @@ CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention a
 
 The adapter MUST invoke `EditEngine::validate`, never `apply`, when `dry_run` is true. Dry-run context matching reads the current workspace for V9/V10/V11/V18/V19/V22 **without** git exec.
 
-**Nested Create authorization on `validate` (no mkdir):** For each missing path segment of a `Create` target, authorize Write on the prospective jail-relative directory/file path using PathPolicy’s missing-final-component canonicalize against the **deepest existing ancestor** (recompute ancestor per segment without creating it). Symlink on any existing prefix → V18-style `PathDenied`. This mirrors §5.9.1 step 3 without calling `create_dir`. If PathPolicy cannot express a multi-segment missing path in one call, the engine MUST loop segment-by-segment as specified — do not invent a new PathPolicy API in MVP.
+**Nested Create authorization on `validate` (no mkdir):** Do **not** invent a new PathPolicy API. Algorithm:
+
+1. Resolve the deepest existing ancestor directory of the Create target under the jail (walk prefixes with `symlink_metadata`; symlink → `PathDenied`).
+2. Authorize Write on that deepest existing ancestor via `PathPolicy::authorize` (existing API).
+3. For each **missing** segment after that ancestor (including the final file), perform **lexical** checks only: reject empty / `.` / `..` / NUL / overlong / absolute (V2); reject `.git` / `.alloy-sbx` components (V26); do **not** call `authorize` again on non-existent paths (PathPolicy’s missing-final-component rule only covers one missing leaf under an existing parent — multi-segment creates exceed that).
+4. On `apply`, §5.9.1 step 3 still authorize-before-mkdir **incrementally** as each directory is created (one missing leaf at a time), which is expressible with today’s PathPolicy.
+
+`validate` therefore proves: ancestor is writable + lexical safety of the remainder. `apply` re-checks each segment at creation time.
 
 #### 5.5.1 Validation matrix (normative)
 
 | Rule | `validate` | `apply` |
 | --- | --- | --- |
-| V1–V11, V8b–V8c, V15, V18–V19, V22–V23, V26–V28 | yes | yes |
+| V1–V11, V8b–V8c, V15, V18–V19, V22–V23, V26–V28, V30 | yes | yes |
 | V12–V14, V16–V17, V20–V21, V24–V25, V29 | no | yes |
 
 ### 5.6 Git checkpoint backend
@@ -1248,7 +1259,7 @@ Without identity, `stash create` fails in the broker’s ephemeral HOME. Filtere
 
 #### 5.6.2 Preflighted argv shapes (exact)
 
-All shapes include the `-c` identity/EOL prefix above as leading argv elements after `git`. Preflight each of (placeholder `<sha>` / `<uuid>` use fixed test values during preflight — grant matching is shape-based):
+All shapes include the `-c` identity/EOL prefix above as leading argv elements after `git`. Preflight each of (placeholder `<sha>` = 40 ASCII `'0'` chars; `<uuid>` = `00000000-0000-0000-0000-000000000000` — grant matching is shape-based; MVP requires `args_glob: None` so placeholders cannot diverge from later concrete args):
 
 1. `git … --version`
 2. `git … rev-parse --is-inside-work-tree`
@@ -1265,7 +1276,7 @@ All shapes include the `-c` identity/EOL prefix above as leading argv elements a
 
 **Not preflighted via broker (host metadata only):** V25 `index.lock` and V24 operation-state files under `.git/` (§5.6 create steps).
 
-**ExecAllow:** `ExecAllow { binary: "git", args_glob: None }` in tests (or a glob covering the above, including the `-c` prefix which is part of `argv[1..]` for `args_glob` matching). Resolution uses `config.trusted_path`. Path-form `ExecAllow.binary` is unsupported when the Check backend is containerized — use basename `"git"` (RFC-0015 / profile note).
+**ExecAllow (MVP):** `ExecAllow { binary: "git", args_glob: None }` only (§5.2 step 5). Resolution uses `config.trusted_path`. Path-form `ExecAllow.binary` is unsupported when the Check backend is containerized — use basename `"git"` (RFC-0015 / profile note).
 
 **Forbidden:** `git add`, `git commit`, mutating `stash push`, `checkout`, `reset --hard` on the branch tip, broad `clean -fd`, `update-ref --stdin`.
 
@@ -1280,7 +1291,7 @@ Before checkpoint on the mutating path:
 3. `git ls-files -z` → build the **tracked-path set** (NUL-delimited). **Non-UTF-8 tracked paths:** if any NUL-separated entry is not valid UTF-8 → `Environment("non-utf8 tracked path")` (fail closed; `deny_matches_rel` is `&str`). Otherwise any tracked path with `path_policy.deny_matches_rel` → `TrackedDeniedPath` (V17).
 4. **Tracked-set invariant (V16):** every `Modify` and `Delete` path MUST be in the tracked-path set; every `Create` path MUST NOT be. Violation → `UntrackedPath` (covers untracked **and** git-ignored paths). Paths outside the patch are left untouched.
 5. Nested `.git` directories below jail (submodules) are not walked by digest; patch paths inside submodules → `Environment("submodule path not supported")`.
-6. Patch paths under excluded digest prefixes `target/**` or matching `.**.alloy-tmp-**` → `InvalidPatch("path excluded from digest")` (edits there would be invisible to drift checks).
+6. V30 digest-excluded patch paths (§5.4) — also enforced here as a final pre-checkpoint guard.
 
 **Restore MUST NOT** run broad `git clean -fd` over the jail (would delete untracked `.env` and user files). Restore uses:
 
@@ -1390,10 +1401,10 @@ Every variant in §3.2 MUST have a unit test asserting `UnsupportedOp { op }` eq
 
 **Algorithm:**
 
-1. `write_lock.lock().await`; reconcile abandoned (§6.4).
+1. Locked preamble for `rollback` (§5.2 step 0): lock → expiry → run attribution → reconcile abandoned (§6.4).
 2. Load `TxRecord` by id. Missing → `UnknownTransaction`.
 3. Enforce eligibility table above.
-4. Require `GitWrite` + preflighted Exec(git) on `ctx.perms`; check expiry.
+4. Require `GitWrite` + preflighted Exec(git) on `ctx.perms` (expiry already checked in preamble; re-check immediately before restore).
 5. Set `abandoned = Some(...)` from the `TxRecord` **before** restore begins (so a dropped rollback future is reconciled later like a dropped apply).
 6. Restore per §5.6.1 (`git restore --source=...`, unlink `created_paths`/`temp_paths`/`created_dirs`).
 7. Verify digest == `pre_digest` else `RollbackFailed` (keep abandon for retry).
@@ -1510,7 +1521,7 @@ Engine is process-lifetime, session-agnostic (§3.5). Dropping the engine MUST N
 | `Conflict` | create exists / delete missing | Cannot apply cleanly | no |
 | `ContextMismatch` | hunk context | Drift | no |
 | `OverlappingHunks` | validation | Bad patch | no |
-| `UntrackedPath` | status porcelain | Untracked modify | no |
+| `UntrackedPath` | ls-files tracked-set miss | Untracked/ignored modify | no |
 | `TrackedDeniedPath` | ls-files ∩ deny | Secrets tracked | no |
 | `CheckpointFailed` | transient git create (e.g. ref race) | Fail closed pre-mutate | yes |
 | `Environment` | git < 2.23 / unborn HEAD / jail mismatch / backend unavailable / SHA-256 | Permanent misconfig | no |
@@ -1744,6 +1755,9 @@ Git argv MUST be spawned only through `SandboxBroker` → `sandbox::process`. Ed
 | `run_id_mismatch_rejected` | `InvalidRequest("run_id mismatch")` |
 | `event_fail_after_commit_still_ok` | failing EventSink after commit → `Ok(EditTransaction)`; no rollback |
 | `update_ref_argv_no_stdin` | checkpoint create uses argv old-oid form (no `--stdin`) |
+| `stdout_truncated_fail_closed` | injected truncated ls-files → Environment |
+| `linked_worktree_rejected` | `.git` file → Environment |
+| `target_path_in_patch_rejected` | InvalidPatch path excluded from digest |
 
 ### 11.2 Adapter / MCP mapping
 
@@ -1850,6 +1864,10 @@ Every criterion is independently testable by a named test or mechanical check.
 | 41 | V27 Create hunk shape; V28 hunk order; V29 unsupported object format | unit |
 | 42 | Rollback/recover require GitWrite+Exec but not FsWrite (Appendix A) | unit |
 | 43 | Every git argv carries `-c` identity/EOL/LFS-neutralization prefix | unit |
+| 44 | `stdout_truncated` on `ls-files` / `diff` → `Environment("git stdout truncated; raise sandbox stdout_cap")` | unit |
+| 45 | Linked worktree (`.git` file) → `Environment("linked worktree not supported")` | unit |
+| 46 | Non-UTF-8 tracked path → `Environment("non-utf8 tracked path")` | unit |
+| 47 | Patch path under `target/**` or temp pattern → `InvalidPatch("path excluded from digest")` | unit |
 
 ---
 
