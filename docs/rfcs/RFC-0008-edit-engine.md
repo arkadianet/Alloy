@@ -967,9 +967,9 @@ crates/alloy-tools/src/
 | `trusted_path` | `Vec<PathBuf>` | `match_exec_grant` roots |
 | `artifacts` | `Arc<dyn ArtifactStore>` | patch CAS |
 | `events` | `Arc<dyn EventSink>` | EditApplied (append-only) |
-| `tx_store` | `Mutex<HashMap<TransactionId, TxRecord>>` | in-process registry |
-| `abandoned` | `Mutex<Option<AbandonedCheckpoint>>` | cancel/drop reconcile (§6.4) |
-| `write_lock` | `tokio::sync::Mutex<()>` | single-writer for validate/apply/rollback |
+| `tx_store` | `Mutex<HashMap<TransactionId, TxRecord>>` | in-process registry (bounded, §4.4) |
+| `abandoned` | `Arc<Mutex<Option<AbandonedCheckpoint>>>` | cancel/drop reconcile (§6.4); shared with the blocking apply task |
+| `write_lock` | `Arc<tokio::sync::Mutex<()>>` | single-writer for validate/apply/rollback; `apply` hands an owned guard to its blocking task so a cancelled future cannot release it early |
 | `max_digest_*` | u64 | digest caps |
 
 No session/run fields on the engine. No ambient `PermissionToken` slot.
@@ -1013,6 +1013,8 @@ After a failed apply that successfully restored, `TxRecord.state = RolledBack`.
 After `RollbackFailed` (FailedDirty), `TxRecord.state` remains `Open`, `abandoned` stays set, and the checkpoint ref is retained. In-process recovery: next `apply`/`rollback` reconcile (§6.4). Post-restart / operator: `recover_checkpoint` (§6.5). `Open` records that are not the abandon target are not “latest eligible” for user rollback (§5.11).
 
 **MVP durability:** in-process map only + durable checkpoint refs + `EditApplied` events. No SQLite `edit_transactions` table in this RFC. After process restart, in-memory records are gone; orphan refs are **not** auto-restored (§6.5).
+
+**Retention:** after each successful commit the map keeps every `Open` record plus the newest 32 records in each closed state (`Committed`, `RolledBack`), so a long-lived session does not accumulate history for the whole process lifetime. Rollback eligibility is unaffected: only the newest transaction in a state is ever eligible (§5.11), and `rollback` of a pruned transaction returns `UnknownTransaction`.
 
 ### 4.5 PathPolicy deny accessor (additive)
 
@@ -1313,13 +1315,21 @@ MVP: in-process `TxRecord` map only (§4.4). Durable audit = checkpoint refs + `
 | Include | Regular files in the **tracked set** (`git ls-files -z`), minus excludes below, **plus** (for `post_digest` only) still-existing `created_paths` from the open/committed tx. Untracked and git-ignored files are never hashed. Tracked paths that are missing on disk, non-regular, or become non-regular mid-tx are **omitted** from the encoding (e.g. after `Delete` while still listed by `ls-files` until the next index refresh — MVP hashes worktree bytes only). |
 | Exclude | `.git/**`, `.alloy-sbx/**`, `target/**`, paths matching deny-globs, temp files matching `.**.alloy-tmp-**`, symlinks (do not follow). Skip non-UTF-8 path names without hashing them. Rationale: `target/` and ignore rules routinely exceed digest caps and would make post-verify rollback impossible after `cargo check` (RFC-0010). |
 | Encoding | Sorted jail-relative paths; for each: `path\0` + `Digest::sha256(contents).as_hex()` + `\n`; `tree = Digest::sha256(concat)` |
-| Caps | Exceed → `DigestLimitExceeded` **before** mutate (pre) or trigger rollback (post) |
-| When | Mutating apply: pre and post. `validate`/dry_run: **skip**. |
+| Caps | Exceed → `DigestLimitExceeded` **before** mutate (pre) or trigger rollback (post). A file whose recorded length already exceeds the remaining byte budget is refused **before** it is opened; the budget is re-checked while reading, since the recorded length is only a hint. |
+| Memory | Contents are hashed in chunks and the tree encoding is streamed into the hasher: neither a single file's bytes nor the whole encoding is buffered. |
+| When | Mutating apply: pre and post. `validate`/dry_run: **skip**. Runs on the blocking pool (`spawn_blocking`) with `write_lock` held by the caller. |
 | Consumers | `EditTransaction`, `EditAppliedPayload`, rollback eligibility digest check |
 
 ### 5.9 Apply mechanics (no partial commit)
 
 #### 5.9.1 Per-file algorithm
+
+Application is synchronous file I/O, so it runs on the blocking pool
+(`spawn_blocking`). Blocking work cannot be aborted, so the task owns both the
+abandon record (`Arc<Mutex<…>>`, updated as paths are created) and the
+`write_lock` guard: a cancelled `apply` future therefore cannot let a second
+mutation start while the orphaned task is still writing. The guard returns to the
+caller for the commit steps.
 
 For each `FilePatch` in vector order:
 
@@ -1569,13 +1579,20 @@ fn map_sandbox(err: SandboxError) -> EditError {
 }
 
 fn map_store(err: StoreError) -> EditError {
-    EditError::Storage(format!("{err}")) // redact paths
+    EditError::Storage(redact_abs_paths(&err.to_string()))
 }
 
 fn map_event(err: EventSinkError) -> EditError {
-    EditError::Event(format!("{err}"))
+    EditError::Event(redact_abs_paths(&err.to_string()))
 }
 ```
+
+`redact_abs_paths` (`alloy_tools::redact`) replaces absolute Unix and Windows
+drive path spans with `<path>`; it is the same implementation the MCP output
+boundary uses (RFC-0006 §5.9), so a string redacted on one path is redacted
+identically on the other. Non-zero-exit git failures carry a redacted,
+whitespace-collapsed, 200-byte-capped stderr snippet in the `CheckpointFailed` /
+`Git` / `RollbackFailed` detail so operators see the actual git complaint.
 
 **Authz layering (normative):** Transport-neutral matcher in `alloy_tools::authz`; MCP wrappers in `mcp::authz` (§3.8.3).
 
@@ -1584,10 +1601,26 @@ fn map_event(err: EventSinkError) -> EditError {
 pub(crate) fn fs_write_covers(perms: &PermissionToken, rel: &str) -> Result<bool, GrantGlobError>;
 pub(crate) fn expand_grant_glob(pattern: &str) -> Result<GlobSet, GrantGlobError>;
 
+/// Grant globs of one kind compiled once for a whole authorization pass.
+/// `validate` and `apply` hold one instead of recompiling per patch path;
+/// `fs_write_covers` / `fs_read_covers` are the one-shot wrappers over it.
+pub(crate) struct GrantMatcher { /* … */ }
+impl GrantMatcher {
+    pub(crate) fn fs_write(perms: &PermissionToken) -> Result<Self, GrantGlobError>;
+    pub(crate) fn fs_read(perms: &PermissionToken) -> Result<Self, GrantGlobError>;
+    pub(crate) fn has_grant(&self) -> bool;
+    pub(crate) fn covers(&self, rel: &str) -> bool;
+}
+
 // mcp/authz.rs
 pub(crate) fn authorize_fs_write_path(perms: &PermissionToken, rel: &str) -> Result<(), McpError>; // wraps authz::fs_write_covers
 pub(crate) fn authorize_git_write(perms: &PermissionToken) -> Result<(), McpError>;
 ```
+
+`apply_patch`'s output boundary re-checks every returned `files_touched` path with
+`authorize_fs_write_path`: fine-grained authorization is the backend's job, so a
+path outside the grant is a backend contract violation and is elevated to
+`McpError::PermissionDenied` rather than forwarded.
 
 `edit/` calls `crate::authz::fs_write_covers` only — NEVER `McpError`-returning helpers. Uncompilable globs → `GrantGlobError` → engine `InvalidRequest("grant glob")` / host `InvalidToken`. Zero `FsWrite` grants → `MissingGrant("fs_write")` (V4a). Some grants, no match → `PathNotCovered` (V4b).
 
