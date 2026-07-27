@@ -42,6 +42,10 @@ path = "tests/sandbox_rfc0005.rs"
 name = "mcp_rfc0006"
 path = "tests/mcp_rfc0006.rs"
 
+[[test]]
+name = "edit_rfc0008"
+path = "tests/edit_rfc0008.rs"
+
 # Not RFC-scoped by design: proves the merged subsystems compose.
 [[test]]
 name = "cross_subsystem"

@@ -221,7 +221,13 @@ struct PendingPatchBackend;
 
 #[async_trait]
 impl PatchApplyBackend for PendingPatchBackend {
-    async fn apply(&self, _args: ApplyPatchArgs) -> Result<ApplyPatchOutcome, PatchApplyError> {
+    async fn apply(
+        &self,
+        _args: ApplyPatchArgs,
+        _perms: &alloy_runtime::PermissionToken,
+        _session: Option<alloy_runtime::SessionId>,
+        _run: Option<alloy_runtime::RunId>,
+    ) -> Result<ApplyPatchOutcome, PatchApplyError> {
         std::future::pending().await
     }
 }
@@ -272,7 +278,13 @@ struct OkPatchBackend {
 
 #[async_trait]
 impl PatchApplyBackend for OkPatchBackend {
-    async fn apply(&self, args: ApplyPatchArgs) -> Result<ApplyPatchOutcome, PatchApplyError> {
+    async fn apply(
+        &self,
+        args: ApplyPatchArgs,
+        _perms: &alloy_runtime::PermissionToken,
+        _session: Option<alloy_runtime::SessionId>,
+        _run: Option<alloy_runtime::RunId>,
+    ) -> Result<ApplyPatchOutcome, PatchApplyError> {
         Ok(ApplyPatchOutcome {
             dry_run: args.dry_run,
             files_touched: self.files_touched.clone(),
@@ -980,9 +992,10 @@ async fn apply_patch_stub_is_deterministic() {
     let fx = Fixture::new();
     let broker = fx.broker();
     let host = fx.host(Arc::clone(&broker));
-    let perms = token(vec![Grant::FsWrite(Glob("**".into()))]);
+    let mutate_perms = token(vec![Grant::FsWrite(Glob("**".into())), Grant::GitWrite]);
+    let dry_perms = token(vec![Grant::FsWrite(Glob("**".into()))]);
 
-    for dry_run in [false, true] {
+    for (dry_run, perms) in [(false, &mutate_perms), (true, &dry_perms)] {
         let result = host
             .call(
                 call(
@@ -1021,7 +1034,7 @@ async fn stub_never_writes() {
 
     host.call(
         call("apply_patch", json!({ "patch": "--- a\n+++ b\n" })),
-        token(vec![Grant::FsWrite(Glob("**".into()))]),
+        token(vec![Grant::FsWrite(Glob("**".into())), Grant::GitWrite]),
     )
     .await
     .unwrap();
@@ -1050,9 +1063,35 @@ async fn apply_patch_requires_fs_write() {
 }
 
 #[tokio::test]
+async fn apply_patch_requires_git_write_when_mutating() {
+    let fx = Fixture::new();
+    let host = fx.host(fx.broker());
+    let err = host
+        .call(
+            call("apply_patch", json!({ "patch": "diff", "dry_run": false })),
+            token(vec![Grant::FsWrite(Glob("**".into()))]),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        McpError::PermissionDenied(PermissionDenial::MissingGrant(ref k)) if k == "git_write"
+    ));
+    // dry_run still only needs FsWrite
+    let result = host
+        .call(
+            call("apply_patch", json!({ "patch": "diff", "dry_run": true })),
+            token(vec![Grant::FsWrite(Glob("**".into()))]),
+        )
+        .await
+        .unwrap();
+    assert!(result.is_error()); // stub still refuses
+}
+
+#[tokio::test]
 async fn apply_patch_success_and_unsafe_output() {
     let fx = Fixture::new();
-    let perms = token(vec![Grant::FsWrite(Glob("**".into()))]);
+    let perms = token(vec![Grant::FsWrite(Glob("**".into())), Grant::GitWrite]);
 
     let ok_host = fx.host_with(
         fx.broker(),
@@ -1103,7 +1142,7 @@ async fn drain_grace_then_cancel() {
         caller
             .call(
                 call("apply_patch", json!({ "patch": "diff" })),
-                token(vec![Grant::FsWrite(Glob("**".into()))]),
+                token(vec![Grant::FsWrite(Glob("**".into())), Grant::GitWrite]),
             )
             .await
     });
@@ -1182,7 +1221,7 @@ async fn host_timeout_apply_patch() {
     let err = host
         .call(
             call("apply_patch", json!({ "patch": "diff" })),
-            token(vec![Grant::FsWrite(Glob("**".into()))]),
+            token(vec![Grant::FsWrite(Glob("**".into())), Grant::GitWrite]),
         )
         .await
         .unwrap_err();

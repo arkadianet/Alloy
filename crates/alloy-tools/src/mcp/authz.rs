@@ -1,16 +1,19 @@
-//! Token expiry and per-tool grant checks (RFC-0006 §5.5).
+//! Token expiry and per-tool grant checks (RFC-0006 §5.5, RFC-0008 §3.8).
 //!
 //! Exec authorization reuses the RFC-0005 matcher (`sandbox::grant`) rather
 //! than duplicating it: one authorization implementation, so a host pre-check
 //! and the broker can never disagree about what a grant means.
+//!
+//! Filesystem grant-glob expansion lives in transport-neutral
+//! [`crate::authz`] so EditEngine and MCP share one dialect (RFC-0008 AC 33).
 //!
 //! Author: arkadianet
 
 use std::path::{Path, PathBuf};
 
 use alloy_runtime::{token_expired, Grant, PermissionToken};
-use globset::{GlobBuilder, GlobSetBuilder};
 
+use crate::authz::{self, GrantGlobError};
 use crate::mcp::error::{map_sandbox_error, McpError, PermissionDenial};
 use crate::sandbox::grant::match_exec_grant;
 use crate::sandbox::SandboxBackend;
@@ -40,41 +43,27 @@ pub(crate) fn authorize_exec(
 }
 
 /// Require at least one `Grant::FsRead` glob covering `rel` (jail-relative).
-///
-/// All `FsRead` grant patterns are compiled into a single [`GlobSet`] so a
-/// token with N grants pays one `build()`, not N, and an uncompilable pattern
-/// fails independently of grant order.
 pub(crate) fn authorize_fs_read(perms: &PermissionToken, rel: &str) -> Result<(), McpError> {
-    let mut builder = GlobSetBuilder::new();
-    let mut saw_grant = false;
-    for grant in &perms.grants {
-        let Grant::FsRead(glob) = grant else {
-            continue;
-        };
-        saw_grant = true;
-        add_fs_read_patterns(&mut builder, &glob.0)?;
-    }
-    if !saw_grant {
+    if !authz::has_fs_read_grant(perms) {
         return Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(
             "fs_read".into(),
         )));
     }
-    let set = builder
-        .build()
-        .map_err(|e| McpError::InvalidToken(format!("grant glob: {e}")))?;
-    if set.is_match(rel) {
-        return Ok(());
+    match authz::fs_read_covers(perms, rel) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(McpError::PermissionDenied(
+            PermissionDenial::PathNotCovered(rel.to_string()),
+        )),
+        Err(GrantGlobError::Invalid(msg)) => {
+            Err(McpError::InvalidToken(format!("grant glob: {msg}")))
+        }
     }
-    // `rel` is jail-relative, so echoing it leaks no operator layout.
-    Err(McpError::PermissionDenied(
-        PermissionDenial::PathNotCovered(rel.to_string()),
-    ))
 }
 
 /// Require at least one `Grant::FsWrite`.
 ///
-/// Fine-grained per-path write grants need patch-body path extraction and are
-/// owned by RFC-0008.
+/// Fine-grained per-path write grants are enforced via
+/// [`authorize_fs_write_path`] after patch path extraction (RFC-0008).
 pub(crate) fn authorize_fs_write(perms: &PermissionToken) -> Result<(), McpError> {
     if perms.grants.iter().any(|g| matches!(g, Grant::FsWrite(_))) {
         return Ok(());
@@ -84,32 +73,33 @@ pub(crate) fn authorize_fs_write(perms: &PermissionToken) -> Result<(), McpError
     )))
 }
 
-/// Expand one `FsRead` grant glob under the RFC-0006 §5.5 dialect into `builder`.
-///
-/// Expansion mirrors the RFC-0005 deny-glob expansion so a grant and a deny
-/// pattern spelled the same way cover the same jail-relative paths.
-fn add_fs_read_patterns(builder: &mut GlobSetBuilder, pattern: &str) -> Result<(), McpError> {
-    if pattern.contains('/') {
-        add_glob(builder, pattern)?;
-        if !pattern.starts_with("**/") {
-            add_glob(builder, &format!("**/{pattern}"))?;
-        }
-    } else {
-        add_glob(builder, pattern)?;
-        add_glob(builder, &format!("**/{pattern}"))?;
+/// Require `Grant::GitWrite` (RFC-0008 §3.8.4 — mutating `apply_patch` only).
+pub(crate) fn authorize_git_write(perms: &PermissionToken) -> Result<(), McpError> {
+    if perms.grants.iter().any(|g| matches!(g, Grant::GitWrite)) {
+        return Ok(());
     }
-    Ok(())
+    Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(
+        "git_write".into(),
+    )))
 }
 
-fn add_glob(builder: &mut GlobSetBuilder, pattern: &str) -> Result<(), McpError> {
-    let glob = GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .case_insensitive(cfg!(target_os = "macos"))
-        .backslash_escape(true)
-        .build()
-        .map_err(|e| McpError::InvalidToken(format!("grant glob `{pattern}`: {e}")))?;
-    builder.add(glob);
-    Ok(())
+/// Require an `FsWrite` grant covering the jail-relative path `rel`.
+#[allow(dead_code)]
+pub(crate) fn authorize_fs_write_path(perms: &PermissionToken, rel: &str) -> Result<(), McpError> {
+    if !authz::has_fs_write_grant(perms) {
+        return Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(
+            "fs_write".into(),
+        )));
+    }
+    match authz::fs_write_covers(perms, rel) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(McpError::PermissionDenied(
+            PermissionDenial::PathNotCovered(rel.to_string()),
+        )),
+        Err(GrantGlobError::Invalid(msg)) => {
+            Err(McpError::InvalidToken(format!("grant glob: {msg}")))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -142,7 +132,6 @@ mod tests {
 
     #[test]
     fn fs_read_grant_examples_table() {
-        // (grant glob, jail-relative path, expected match)
         let cases: &[(&str, &str, bool)] = &[
             ("src/main.rs", "src/main.rs", true),
             ("src/**", "src/main.rs", true),
@@ -156,9 +145,6 @@ mod tests {
             let got = authorize_fs_read(&t, rel).is_ok();
             assert_eq!(got, *expect, "glob={pattern:?} rel={rel:?}");
         }
-        // §5.5 final row: grant glob `.env` covers the relative path, but
-        // PathPolicy deny globs win first in the fs_read pipeline (integration:
-        // `fs_read_dotenv_denied_integration`).
         let dotenv = token(vec![Grant::FsRead(Glob(".env".into()))]);
         assert!(
             authorize_fs_read(&dotenv, ".env").is_ok(),
@@ -206,5 +192,34 @@ mod tests {
             ))) if k == "fs_write"
         ));
         assert!(authorize_fs_write(&token(vec![Grant::FsWrite(Glob("**".into()))])).is_ok());
+    }
+
+    #[test]
+    fn git_write_required() {
+        assert!(matches!(
+            authorize_git_write(&token(vec![Grant::FsWrite(Glob("**".into()))])),
+            Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(
+                ref k
+            ))) if k == "git_write"
+        ));
+        assert!(authorize_git_write(&token(vec![Grant::GitWrite])).is_ok());
+    }
+
+    #[test]
+    fn fs_write_path_v4a_v4b() {
+        assert!(matches!(
+            authorize_fs_write_path(&token(vec![]), "a.rs"),
+            Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(
+                ref k
+            ))) if k == "fs_write"
+        ));
+        let t = token(vec![Grant::FsWrite(Glob("src/**".into()))]);
+        assert!(authorize_fs_write_path(&t, "src/lib.rs").is_ok());
+        assert!(matches!(
+            authorize_fs_write_path(&t, "README.md"),
+            Err(McpError::PermissionDenied(
+                PermissionDenial::PathNotCovered(ref p)
+            )) if p == "README.md"
+        ));
     }
 }

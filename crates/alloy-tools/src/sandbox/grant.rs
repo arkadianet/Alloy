@@ -409,6 +409,21 @@ pub(crate) fn trusted_roots(cargo_home: Option<&Path>, rustup_home: Option<&Path
     roots
 }
 
+/// Same PATH union `InProcessMcpHost::new` builds from [`crate::OperatorHomes`].
+///
+/// Integration tests and CLI MUST use this helper when constructing
+/// [`crate::edit::GitEditEngine`] (RFC-0008 §3.7) — no host accessor required.
+#[must_use]
+pub fn trusted_exec_path(homes: &crate::sandbox::env::OperatorHomes) -> Vec<PathBuf> {
+    let mut trusted = trusted_path_dirs(Some(&homes.cargo_home), Some(&homes.rustup_home));
+    for root in trusted_roots(Some(&homes.cargo_home), Some(&homes.rustup_home)) {
+        if !trusted.contains(&root) {
+            trusted.push(root);
+        }
+    }
+    trusted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

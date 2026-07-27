@@ -141,6 +141,15 @@ impl PathPolicy {
         &self.jail
     }
 
+    /// True when `jail_relative` matches the profile deny-glob set.
+    ///
+    /// Additive accessor for EditEngine tracked-deny / digest / rollback unlink
+    /// checks (RFC-0008 §4.5). Callers MUST NOT compile a second deny GlobSet.
+    #[must_use]
+    pub(crate) fn deny_matches_rel(&self, jail_relative: &str) -> bool {
+        deny_matches(&self.deny, jail_relative)
+    }
+
     fn check_deny(&self, canon: &Path, root: &Path) -> Result<(), SandboxError> {
         let rel = relative_for_matching(canon, root)?;
         if deny_matches(&self.deny, &rel) {

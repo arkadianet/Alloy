@@ -43,13 +43,16 @@ pub(crate) fn parse(arguments: &Value) -> Result<ApplyPatchArgs, McpError> {
     })
 }
 
-/// Parse then require at least one `FsWrite` grant.
+/// Parse then require FsWrite; GitWrite when mutating (RFC-0008 §3.8.4).
 pub(crate) fn prepare(
     arguments: &Value,
     perms: &PermissionToken,
 ) -> Result<ApplyPatchArgs, McpError> {
     let args = parse(arguments)?;
     authz::authorize_fs_write(perms)?;
+    if !args.dry_run {
+        authz::authorize_git_write(perms)?;
+    }
     Ok(args)
 }
 
@@ -57,12 +60,19 @@ pub(crate) fn prepare(
 pub(crate) async fn execute(
     ctx: &BuiltinCtx<'_>,
     args: ApplyPatchArgs,
+    perms: PermissionToken,
+    session: Option<alloy_runtime::SessionId>,
+    run: Option<alloy_runtime::RunId>,
 ) -> Result<ToolResult, McpError> {
     let started = Instant::now();
     let dry_run = args.dry_run;
-    let outcome = ctx.patch_backend.apply(args).await;
+    let outcome = ctx.patch_backend.apply(args, &perms, session, run).await;
     let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    Ok(map_outcome(outcome, dry_run, elapsed))
+    match outcome {
+        Err(PatchApplyError::PermissionDenied(d)) => Err(McpError::PermissionDenied(d)),
+        Err(PatchApplyError::TokenExpired) => Err(McpError::TokenExpired),
+        other => Ok(map_outcome(other, dry_run, elapsed)),
+    }
 }
 
 fn map_outcome(
@@ -143,6 +153,21 @@ fn map_backend_error(err: PatchApplyError) -> (&'static str, ToolError) {
             ToolError::Permanent {
                 code: "internal".into(),
                 message: "apply_patch internal error".into(),
+            },
+        ),
+        // Elevated in `execute` — defensive only if map_outcome sees them.
+        PatchApplyError::PermissionDenied(_) => (
+            "permission_denied",
+            ToolError::Permanent {
+                code: "permission_denied".into(),
+                message: "permission denied".into(),
+            },
+        ),
+        PatchApplyError::TokenExpired => (
+            "token_expired",
+            ToolError::Permanent {
+                code: "token_expired".into(),
+                message: "token expired".into(),
             },
         ),
     }

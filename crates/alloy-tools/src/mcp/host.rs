@@ -442,7 +442,7 @@ impl InProcessMcpHost {
         let outcome = match builtins::prepare(id, &ctx, call, &perms) {
             Err(err) => Err(err),
             Ok(prepared) => {
-                let dispatch = builtins::execute(&ctx, prepared, perms);
+                let dispatch = builtins::execute(&ctx, prepared, perms, call.session, call.run);
                 tokio::select! {
                     () = self.cancel_guard.0.cancelled() => Err(McpError::Cancelled),
                     result = tokio::time::timeout(state.call_timeout, dispatch) => match result {

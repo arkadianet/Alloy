@@ -14,8 +14,9 @@
 //!   dispatch, and `InvalidArguments` precedes `PermissionDenied`.
 //! - Every exec path runs through the RFC-0005 sandbox broker; `fs_read` goes
 //!   through `PathPolicy::authorize`. Builtins never spawn a process directly.
-//! - `apply_patch` calls an injected [`PatchApplyBackend`]; MVP ships the
-//!   deterministic [`StubPatchApplyBackend`] until RFC-0008 wires EditEngine.
+//! - `apply_patch` calls an injected [`PatchApplyBackend`]; production wiring
+//!   uses RFC-0008's [`crate::edit::EditEnginePatchBackend`], while
+//!   [`StubPatchApplyBackend`] remains available for explicit tests.
 //!
 //! # Module map
 //!
