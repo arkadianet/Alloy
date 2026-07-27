@@ -2,15 +2,12 @@
 //! dispatch table, §5.9 success path, §5.14 `Aggregate` fold).
 //!
 //! [`LinearScheduler::run`]/[`LinearScheduler::cancel`] land on the
-//! [`crate::Scheduler`] trait here for the first time. Three seams are
-//! intentionally deferred to later phases; each is a private method with a
+//! [`crate::Scheduler`] trait here for the first time. `admit_retry` (§5.11
+//! A1-A6 admission, tier escalation, interruptible backoff) is complete as
+//! of P5 — see `retry.rs` for the pure decision logic it calls into. Two
+//! seams remain, deferred to later phases; each is a private method with a
 //! doc comment pointing at the RFC section that completes it:
 //!
-//! - [`LinearScheduler::admit_retry`] — §5.11 A1-A6 admission, tier
-//!   escalation, interruptible backoff (**P5**). This phase implements only
-//!   the A1/A2/A3 admission conditions plus a real (non-interruptible)
-//!   [`super::backoff_delay`] sleep, so C8's dispatch-table edge is
-//!   exercised for real rather than faked.
 //! - [`LinearScheduler::dispatch_gate`] — §5.7's full state machine:
 //!   deadline/expiry (§5.7.8), durable-resolution resume scans
 //!   (§5.7.2/§5.7.3), and closed-receiver reclassification (§5.7.9)
@@ -47,7 +44,8 @@ use super::checkpoint::{
     map_store_error, map_store_error_on_load, Checkpoint, CheckpointCtx, GateDecision,
 };
 use super::envelopes::{self, InputShape};
-use super::ready::{backoff_delay, derive_dag_state, promotable_nodes, ready_nodes, DeriveFlags};
+use super::ready::{derive_dag_state, promotable_nodes, ready_nodes, DeriveFlags};
+use super::retry::{self, Admission, Escalation};
 use super::LinearScheduler;
 use crate::adapters::{
     Approval, CapabilityExecContext, CapabilityExecError, CapabilityOutcome, NodeExecContext,
@@ -55,10 +53,11 @@ use crate::adapters::{
 };
 use crate::dag::{DagValidator, NodeKind, NodeOutputEnvelope, NodeState, TaskDag};
 use crate::error::{AdapterError, SchedError};
-use crate::obs::reaccumulate_cost_from_events;
+use crate::obs::{reaccumulate_cost_from_events, DecisionKind, DecisionRecord};
 use crate::scheduler::{DagOutcome, DagState, Scheduler};
 use crate::session::{RunControlState, RunGoalRecord, Session};
 use crate::storage::RunRow;
+use crate::types::budget::ModelTier;
 use crate::types::diagnostic::{ErrorClass, FailureIr, RetryDisposition};
 use crate::types::ids::{DagId, NodeId, RunId};
 
@@ -584,14 +583,26 @@ impl LinearScheduler {
             envelopes::assemble_input(rc.checkpoint, &*self.deps.artifacts, dag, rc.ctx, node_id)
                 .await?;
 
-        // L12: escalation is identity in P4 (§5.11.4 ES1-ES6 land in P5).
-        let effective_tier = dag.nodes[&node_id].model_tier;
-
         let attempts_started = rc
             .checkpoint
             .rebuild_attempts_started(dag.id, rc.session.id, node_id, dag.generation, false)
             .await?;
         let attempt = attempts_started + 1;
+
+        // L12 (§5.11.4 ES1-ES6): decided before C3 (ES4).
+        let kind_for_escalation = dag.nodes[&node_id].kind;
+        let effective_tier = if is_capability_kind(kind_for_escalation) {
+            match retry::escalation_for_attempt(&dag.nodes[&node_id].retry, attempt) {
+                Escalation::To(tier) => tier,
+                Escalation::SkippedNoTarget => {
+                    self.record_escalation_skipped(rc, node_id, attempt).await;
+                    dag.nodes[&node_id].model_tier
+                }
+                Escalation::None => dag.nodes[&node_id].model_tier,
+            }
+        } else {
+            dag.nodes[&node_id].model_tier // ES5: adapter kinds never escalate.
+        };
 
         let node_timeout_ms = dag.nodes[&node_id].timeout_ms;
         let node_budget_timeout = Duration::from_millis(node_timeout_ms);
@@ -834,14 +845,8 @@ impl LinearScheduler {
         }
     }
 
-    /// **P5 seam** (§5.11 A1-A6, tier escalation, interruptible backoff).
-    ///
-    /// This phase implements a simplified admission: A1 (`retry ==
-    /// Retryable`), A2 (`error_class ∈ retry_on`), A3
-    /// (`attempts_started < max_attempts`). A4 (cancel-aware), A5 (budget),
-    /// A6 (remaining-budget-vs-backoff-slice) are not evaluated — P5 adds
-    /// them. Backoff uses the real [`backoff_delay`] (§5.11.3) with a plain
-    /// `tokio::time::sleep` (not yet interruptible by cancel — B3 is P5's).
+    /// §5.11.1 A1-A6 admission, §5.8.3 C8, §5.11.2 the `Retry` decision
+    /// record, and §5.11.3 B3's interruptible backoff sleep.
     async fn admit_retry(
         &self,
         dag: &mut TaskDag,
@@ -851,39 +856,158 @@ impl LinearScheduler {
         failure: FailureIr,
     ) -> Result<StepOutcome, SchedError> {
         let node = &dag.nodes[&node_id];
-        let admitted = failure.retry == RetryDisposition::Retryable // A1
-            && node.retry.retry_on.contains(&failure.error_class) // A2
-            && attempt < node.retry.max_attempts; // A3
+        let retry_policy = node.retry.clone();
+        let kind = node.kind;
+        let cancelled = rc.run_cancel.is_cancelled(); // A4 (child of runtime_cancel — §4.3 O1)
+        let meter = self.deps.cost_meters.meter_for(rc.run_id);
+        // A5 (§5.16.3): the same check_budget mechanism L6 uses. Full
+        // effective-ceiling computation (BG1-BG6) is P9's charter; here we
+        // only need "is the run budget already exhausted", which
+        // deps.budget_policy already answers.
+        let budget_exhausted = meter.check_budget(&self.deps.budget_policy).is_exhausted();
+        let remaining_run = rc.remaining_run(); // A6
 
-        if !admitted {
-            return Ok(StepOutcome::Terminal(
-                self.terminal_failed(dag, rc, node_id, Some(attempt), failure)
-                    .await?,
-            ));
-        }
+        let decision = retry::admit(
+            attempt,
+            retry::AdmissionInput {
+                retry_disposition: failure.retry,
+                error_class: failure.error_class,
+                retry_on: &retry_policy.retry_on,
+                max_attempts: retry_policy.max_attempts,
+                cancelled,
+                budget_exhausted,
+                remaining_run,
+                backoff: &retry_policy.backoff,
+                max_backoff: self.deps.config.max_backoff,
+            },
+        );
 
-        let backoff = dag.nodes[&node_id].retry.backoff.clone();
-        let max_backoff = self.deps.config.max_backoff;
-        let next_attempt = attempt + 1;
-        let delay = backoff_delay(&backoff, attempt, max_backoff);
-        let backoff_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-
-        rc.checkpoint
-            .c8_retry(
-                dag,
-                rc.ctx,
-                node_id,
-                attempt,
-                &failure,
+        match decision {
+            Admission::Reject(reason) => {
+                self.record_retry_rejected(rc, node_id, attempt, &failure, reason)
+                    .await;
+                Ok(StepOutcome::Terminal(
+                    self.terminal_failed(dag, rc, node_id, Some(attempt), failure)
+                        .await?,
+                ))
+            }
+            Admission::Admit {
                 next_attempt,
-                backoff_ms,
-            )
-            .await?;
+                delay,
+            } => {
+                let escalated_to = if is_capability_kind(kind) {
+                    match retry::escalation_for_attempt(&retry_policy, next_attempt) {
+                        Escalation::To(tier) => Some(tier),
+                        Escalation::None | Escalation::SkippedNoTarget => None,
+                    }
+                } else {
+                    None // ES5
+                };
+                let backoff_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                self.record_retry_admitted(
+                    rc,
+                    node_id,
+                    attempt,
+                    next_attempt,
+                    &failure,
+                    backoff_ms,
+                    escalated_to,
+                )
+                .await;
 
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
+                rc.checkpoint
+                    .c8_retry(
+                        dag,
+                        rc.ctx,
+                        node_id,
+                        attempt,
+                        &failure,
+                        next_attempt,
+                        backoff_ms,
+                    )
+                    .await?;
+
+                if !delay.is_zero() {
+                    // B3: cancel during backoff is immediate.
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = rc.run_cancel.cancelled() => {
+                            return self.cancel_path(dag, rc).await;
+                        }
+                    }
+                }
+                Ok(StepOutcome::Continue)
+            }
         }
-        Ok(StepOutcome::Continue)
+    }
+
+    /// §5.11.2: one `DecisionKind::Retry` record per admission decision.
+    /// Best-effort (BE4-style posture): a logging failure here MUST NOT
+    /// undo the C7/C8 checkpoint it describes.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_retry_admitted(
+        &self,
+        rc: &RunCtx<'_>,
+        node_id: NodeId,
+        attempt: u32,
+        next_attempt: u32,
+        failure: &FailureIr,
+        backoff_ms: u64,
+        escalated_to: Option<ModelTier>,
+    ) {
+        let metadata = serde_json::json!({
+            "node_id": node_id.to_string(),
+            "attempt": attempt,
+            "next_attempt": next_attempt,
+            "error_class": failure.error_class,
+            "retry_admitted": true,
+            "backoff_ms": backoff_ms,
+            "escalated_to": escalated_to,
+        });
+        self.record_decision(rc, node_id, metadata).await;
+    }
+
+    async fn record_retry_rejected(
+        &self,
+        rc: &RunCtx<'_>,
+        node_id: NodeId,
+        attempt: u32,
+        failure: &FailureIr,
+        reason: retry::RejectReason,
+    ) {
+        let metadata = serde_json::json!({
+            "node_id": node_id.to_string(),
+            "attempt": attempt,
+            "error_class": failure.error_class,
+            "retry_admitted": false,
+            "reason": reason.as_str(),
+        });
+        self.record_decision(rc, node_id, metadata).await;
+    }
+
+    /// ES2: `escalate_after` is due but no `escalate_to_tier` is configured.
+    async fn record_escalation_skipped(&self, rc: &RunCtx<'_>, node_id: NodeId, attempt: u32) {
+        let metadata = serde_json::json!({
+            "node_id": node_id.to_string(),
+            "attempt": attempt,
+            "escalation_skipped": "no target tier",
+        });
+        self.record_decision(rc, node_id, metadata).await;
+    }
+
+    async fn record_decision(&self, rc: &RunCtx<'_>, node_id: NodeId, metadata: serde_json::Value) {
+        let rec = DecisionRecord {
+            session: rc.ctx.session_id,
+            run: rc.ctx.run_id,
+            node: Some(node_id),
+            kind: DecisionKind::Retry,
+            metadata,
+            content_hash: None,
+            prompt_body: None,
+        };
+        if let Err(e) = self.deps.decisions.record(rec).await {
+            tracing::warn!(error = %e, %node_id, "retry/escalation decision record failed");
+        }
     }
 
     /// Wraps [`Checkpoint::c7_terminal_failed`] with the SK3 "every other
@@ -1410,6 +1534,16 @@ fn gate_decision_str(d: GateDecision) -> &'static str {
     }
 }
 
+/// §5.11.4 ES5: escalation only applies to capability-worker node kinds.
+/// `VerifyCompile`/`VerifyTest`/`GateHuman`/`Aggregate` have no model call
+/// to escalate.
+fn is_capability_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Plan | NodeKind::Analyze | NodeKind::Edit | NodeKind::Review
+    )
+}
+
 /// Every node not `except` and not already terminal (SK3: reachability is
 /// not consulted in MVP).
 fn non_terminal_except(dag: &TaskDag, except: NodeId) -> Vec<NodeId> {
@@ -1780,6 +1914,36 @@ mod tests {
             budget_policy: BudgetPolicy,
             run_timeout: Duration,
         ) -> LinearScheduler {
+            self.build_scheduler_full(
+                sched_dir,
+                capabilities,
+                verify_compile,
+                verify_test,
+                gate_human,
+                budget_policy,
+                run_timeout,
+                CancellationToken::new(),
+            )
+            .0
+        }
+
+        /// Full variant exposing the [`RecordingDecisionLog`] (so tests can
+        /// assert on §5.11.2's `Retry` decision records) and the
+        /// `runtime_cancel` token (so tests can simulate a process-wide
+        /// drain interrupting an in-flight backoff sleep, B3).
+        #[allow(clippy::too_many_arguments)]
+        fn build_scheduler_full(
+            &self,
+            sched_dir: std::path::PathBuf,
+            capabilities: Arc<dyn CapabilityExecutor>,
+            verify_compile: Arc<dyn VerifyCompileAdapter>,
+            verify_test: Arc<dyn VerifyTestAdapter>,
+            gate_human: Arc<dyn GateHumanAdapter>,
+            budget_policy: BudgetPolicy,
+            run_timeout: Duration,
+            runtime_cancel: CancellationToken,
+        ) -> (LinearScheduler, Arc<RecordingDecisionLog>) {
+            let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
             let deps = LinearSchedulerDeps {
                 dags: self.storage.dags(),
                 artifacts: self.storage.artifacts(),
@@ -1791,9 +1955,9 @@ mod tests {
                 verify_test,
                 gate_human,
                 capabilities,
-                decisions: Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults())),
+                decisions: Arc::clone(&decisions) as Arc<dyn crate::obs::DecisionLog>,
                 cost_meters: Arc::new(ProcessCostMeterFactory::new()),
-                runtime_cancel: CancellationToken::new(),
+                runtime_cancel,
                 budget_policy,
                 run_timeout,
                 config: {
@@ -1806,7 +1970,7 @@ mod tests {
                     c
                 },
             };
-            LinearScheduler::new_for_test(deps).unwrap()
+            (LinearScheduler::new_for_test(deps).unwrap(), decisions)
         }
     }
 
@@ -2607,6 +2771,462 @@ mod tests {
         let failure = outcome.failure.unwrap();
         assert_eq!(failure.error_class, ErrorClass::Timeout);
         assert_eq!(failure.retry, RetryDisposition::NonRetryable);
+        fx.close().await;
+    }
+
+    // ---- P5: retry admission, escalation, interruptible backoff ----
+
+    /// Records the `effective_tier` seen on every call, then returns the
+    /// queued outcomes in order — lets escalation tests assert what tier
+    /// each attempt actually dispatched under.
+    struct RecordingCapability {
+        seen_tiers: StdMutex<Vec<ModelTier>>,
+        outcomes: StdMutex<VecDeque<Result<CapabilityOutcome, CapabilityExecError>>>,
+    }
+    impl RecordingCapability {
+        fn new(outcomes: Vec<Result<CapabilityOutcome, CapabilityExecError>>) -> Arc<Self> {
+            Arc::new(Self {
+                seen_tiers: StdMutex::new(Vec::new()),
+                outcomes: StdMutex::new(VecDeque::from(outcomes)),
+            })
+        }
+        fn tiers(&self) -> Vec<ModelTier> {
+            self.seen_tiers.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl CapabilityExecutor for RecordingCapability {
+        async fn execute(
+            &self,
+            ctx: &CapabilityExecContext,
+        ) -> Result<CapabilityOutcome, CapabilityExecError> {
+            self.seen_tiers.lock().unwrap().push(ctx.effective_tier);
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(CapabilityExecError::Internal("exhausted".into())))
+        }
+    }
+
+    fn retryable_model_failure(node: NodeId, notes: &str) -> FailureIr {
+        FailureIr {
+            node,
+            error_class: ErrorClass::Model,
+            retry: RetryDisposition::Retryable,
+            diagnostics: vec![],
+            notes: notes.into(),
+        }
+    }
+
+    fn escalating_retry(max_attempts: u32, escalate_after: u32, tier: ModelTier) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            backoff: Backoff::Fixed { delay_ms: 0 },
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: Some(escalate_after),
+            escalate_to_tier: Some(tier),
+        }
+    }
+
+    #[tokio::test]
+    async fn es1_escalation_applies_to_capability_context_after_threshold() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.model_tier = ModelTier::Economy;
+        node.retry = escalating_retry(3, 1, ModelTier::Premium); // escalate once attempt > 1
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = RecordingCapability::new(vec![
+            Ok(CapabilityOutcome::Failed {
+                failure: retryable_model_failure(a, "attempt 1 fails"),
+            }),
+            Ok(CapabilityOutcome::Succeeded {
+                payload: serde_json::json!({"ok": true}),
+            }),
+        ]);
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s1"),
+            Arc::clone(&capabilities) as Arc<dyn CapabilityExecutor>,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        // Attempt 1 (k=1, not > escalate_after=1) uses the base tier;
+        // attempt 2 (k=2 > 1) escalates to Premium (ES1/ES3/ES4).
+        assert_eq!(
+            capabilities.tiers(),
+            vec![ModelTier::Economy, ModelTier::Premium]
+        );
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn es2_escalation_skipped_no_target_tier_records_decision() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        // escalate_after already satisfied on the very first dispatch
+        // (k=1 > 0), but no target tier is configured.
+        node.retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed { delay_ms: 0 },
+            retry_on: vec![],
+            escalate_after: Some(0),
+            escalate_to_tier: None,
+        };
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = StaticCapability::new(vec![Ok(CapabilityOutcome::Succeeded {
+            payload: serde_json::json!({}),
+        })]);
+        let (sched, decisions) = fx.build_scheduler_full(
+            fx._dir.path().join("s1"),
+            capabilities,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        let recorded = decisions.recorded_decisions();
+        let skipped = recorded
+            .iter()
+            .find(|d| d.metadata.get("escalation_skipped").is_some())
+            .expect("ES2 decision must be recorded");
+        assert_eq!(skipped.metadata["escalation_skipped"], "no target tier");
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn retry_admitted_decision_has_full_511_2_shape() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.retry = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::Fixed { delay_ms: 0 },
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: None,
+            escalate_to_tier: None,
+        };
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = StaticCapability::new(vec![
+            Ok(CapabilityOutcome::Failed {
+                failure: retryable_model_failure(a, "transient"),
+            }),
+            Ok(CapabilityOutcome::Succeeded {
+                payload: serde_json::json!({}),
+            }),
+        ]);
+        let (sched, decisions) = fx.build_scheduler_full(
+            fx._dir.path().join("s1"),
+            capabilities,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        let recorded = decisions.recorded_decisions();
+        let admitted = recorded
+            .iter()
+            .find(|d| d.metadata.get("retry_admitted") == Some(&serde_json::Value::Bool(true)))
+            .expect("admitted retry decision must be recorded");
+        assert_eq!(admitted.kind, DecisionKind::Retry);
+        assert_eq!(admitted.metadata["node_id"], a.to_string());
+        assert_eq!(admitted.metadata["attempt"], 1);
+        assert_eq!(admitted.metadata["next_attempt"], 2);
+        assert_eq!(admitted.metadata["error_class"], "model");
+        assert_eq!(admitted.metadata["backoff_ms"], 0);
+        assert!(admitted.metadata["escalated_to"].is_null());
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn retry_rejected_decision_has_reason() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let node = llm_node(a, NodeKind::Analyze, input, adapter_retry()); // retry_on empty -> A2 rejects
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = StaticCapability::new(vec![Ok(CapabilityOutcome::Failed {
+            failure: retryable_model_failure(a, "will be rejected"),
+        })]);
+        let (sched, decisions) = fx.build_scheduler_full(
+            fx._dir.path().join("s1"),
+            capabilities,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+
+        let recorded = decisions.recorded_decisions();
+        let rejected = recorded
+            .iter()
+            .find(|d| d.metadata.get("retry_admitted") == Some(&serde_json::Value::Bool(false)))
+            .expect("rejected retry decision must be recorded");
+        assert_eq!(rejected.metadata["reason"], "error_class_not_retryable");
+        fx.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a4_cancel_during_backoff_interrupts_immediately() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.retry = RetryPolicy {
+            max_attempts: 5,
+            backoff: Backoff::Fixed { delay_ms: 10_000 }, // long enough that only cancel ends it
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: None,
+            escalate_to_tier: None,
+        };
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = StaticCapability::new(vec![Ok(CapabilityOutcome::Failed {
+            failure: retryable_model_failure(a, "will retry then get cancelled mid-backoff"),
+        })]);
+        let runtime_cancel = CancellationToken::new();
+        let (sched, _decisions) = fx.build_scheduler_full(
+            fx._dir.path().join("s1"),
+            capabilities,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(3600),
+            runtime_cancel.clone(),
+        );
+        let sched = Arc::new(sched);
+        let sched2 = Arc::clone(&sched);
+        let handle = tokio::spawn(async move { sched2.run(dag_id).await });
+
+        // Give the run task a chance to reach the backoff sleep, then cancel
+        // the process-wide token without ever advancing the (paused) clock —
+        // if the sleep were not interruptible this would hang forever.
+        tokio::task::yield_now().await;
+        runtime_cancel.cancel();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run must return promptly on cancel, not wait out the 10s backoff")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.state, DagState::Cancelled);
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn a6_insufficient_remaining_budget_rejects_retry() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.retry = RetryPolicy {
+            max_attempts: 5,
+            // 1000ms backoff + 250ms RETRY_BUDGET_SLICE > the ~500ms run
+            // budget remaining right after the first (near-instant) attempt.
+            backoff: Backoff::Fixed { delay_ms: 1000 },
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: None,
+            escalate_to_tier: None,
+        };
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = StaticCapability::new(vec![Ok(CapabilityOutcome::Failed {
+            failure: retryable_model_failure(a, "would retry but budget is too tight"),
+        })]);
+        let (sched, decisions) = fx.build_scheduler_full(
+            fx._dir.path().join("s1"),
+            capabilities,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_millis(500),
+            CancellationToken::new(),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(a));
+
+        let recorded = decisions.recorded_decisions();
+        let rejected = recorded
+            .iter()
+            .find(|d| d.metadata.get("retry_admitted") == Some(&serde_json::Value::Bool(false)))
+            .expect("rejected retry decision must be recorded");
+        assert_eq!(rejected.metadata["reason"], "insufficient_remaining_budget");
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn a5_budget_exhausted_by_the_attempt_itself_rejects_retry() {
+        struct BudgetBustingCapability {
+            outcomes: StdMutex<VecDeque<Result<CapabilityOutcome, CapabilityExecError>>>,
+        }
+        #[async_trait]
+        impl CapabilityExecutor for BudgetBustingCapability {
+            async fn execute(
+                &self,
+                ctx: &CapabilityExecContext,
+            ) -> Result<CapabilityOutcome, CapabilityExecError> {
+                // Blow through the token ceiling as a side effect of this
+                // (failed) attempt, so A5 sees an already-exhausted budget
+                // when the retry it would otherwise admit is considered.
+                ctx.cost_meter
+                    .add_model_usage(ModelTier::Economy, Some(1000), Some(1000), None);
+                self.outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Err(CapabilityExecError::Internal("exhausted".into())))
+            }
+        }
+
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.retry = RetryPolicy {
+            max_attempts: 5,
+            backoff: Backoff::Fixed { delay_ms: 0 },
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: None,
+            escalate_to_tier: None,
+        };
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = Arc::new(BudgetBustingCapability {
+            outcomes: StdMutex::new(VecDeque::from(vec![Ok(CapabilityOutcome::Failed {
+                failure: retryable_model_failure(a, "used up the budget on the way out"),
+            })])),
+        });
+        let policy = BudgetPolicy {
+            max_tokens_per_run: 1500, // survives L6's pre-dispatch check, not the attempt's own usage
+            ..BudgetPolicy::default()
+        };
+        let (sched, decisions) = fx.build_scheduler_full(
+            fx._dir.path().join("s1"),
+            capabilities,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            policy,
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+
+        let recorded = decisions.recorded_decisions();
+        let rejected = recorded
+            .iter()
+            .find(|d| d.metadata.get("retry_admitted") == Some(&serde_json::Value::Bool(false)))
+            .expect("rejected retry decision must be recorded");
+        assert_eq!(rejected.metadata["reason"], "budget_exhausted");
         fx.close().await;
     }
 }
