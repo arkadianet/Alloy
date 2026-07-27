@@ -40,6 +40,7 @@ use tokio::time::Instant;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use super::budget;
 use super::checkpoint::{map_store_error, map_store_error_on_load, Checkpoint, CheckpointCtx};
 use super::envelopes::{self, InputShape};
 use super::ready::{derive_dag_state, promotable_nodes, ready_nodes, DeriveFlags};
@@ -51,7 +52,9 @@ use crate::adapters::{
 };
 use crate::dag::{DagValidator, NodeKind, NodeOutputEnvelope, NodeState, TaskDag};
 use crate::error::{AdapterError, SchedError};
-use crate::obs::{reaccumulate_cost_from_events, DecisionKind, DecisionRecord};
+use crate::obs::{
+    maybe_signal_budget_warning, reaccumulate_cost_from_events, DecisionKind, DecisionRecord,
+};
 use crate::scheduler::{DagOutcome, DagState, Scheduler};
 use crate::session::{RunControlState, RunGoalRecord, Session};
 use crate::storage::RunRow;
@@ -85,6 +88,10 @@ pub(super) struct RunCtx<'a> {
     pub(super) run_id: RunId,
     pub(super) run_started: Instant,
     pub(super) run_timeout: Duration,
+    /// §5.16.1 BG1-BG6: folded once at R8, before any budget check or
+    /// dispatch (B7). Every enforcement point (L6, A5, the post-node
+    /// warning) uses this, never `deps.budget_policy` directly.
+    pub(super) effective_budget: crate::types::budget::BudgetPolicy,
     /// §5.19 T1: wall time spent inside gate waits, excluded from the
     /// charged run elapsed. `std::sync::Mutex` (not `Cell`) because `&RunCtx`
     /// crosses `.await` points and the held future must stay `Send`, which
@@ -221,6 +228,7 @@ impl LinearScheduler {
 
         // R4: real DAG ownership (§4.3-4.4) — `AlreadyOwned` if contended.
         let guard = self.try_acquire_dag(dag_id, Some(run_id), session_id)?;
+        self.metrics.inc_runs_started();
 
         // O3: `cancel_result` MUST be written before `guard` drops (notifying
         // any waiting `cancel`), on every exit — success, planned terminal,
@@ -230,6 +238,9 @@ impl LinearScheduler {
         let result = self
             .run_owned(&checkpoint, dag_id, run_id, &guard.owned)
             .await;
+        if let Ok(outcome) = &result {
+            self.metrics.inc_run_terminal(outcome.state);
+        }
         guard.owned.set_cancel_result(match &result {
             Ok(outcome) => Ok(outcome.state),
             Err(e) => Err(e.clone()),
@@ -241,6 +252,16 @@ impl LinearScheduler {
     /// runs it to a terminal `DagOutcome` or a propagated `SchedError`.
     /// Every return here is captured by [`Self::run_impl`]'s O3 chokepoint —
     /// this function itself MUST NOT touch `cancel_result`.
+    #[tracing::instrument(
+        name = "sched.run",
+        skip_all,
+        fields(
+            dag_id = %dag_id,
+            run_id = %run_id,
+            session_id = tracing::field::Empty,
+            generation = tracing::field::Empty,
+        )
+    )]
     async fn run_owned(
         &self,
         checkpoint: &Checkpoint,
@@ -256,6 +277,7 @@ impl LinearScheduler {
             .await
             .map_err(|e| map_store_error_on_load(e, dag_id))?
             .ok_or(SchedError::DagNotFound(dag_id))?;
+        tracing::Span::current().record("generation", dag.generation);
         if self.deps.config.validate_on_load
             && !matches!(
                 dag.state,
@@ -316,6 +338,7 @@ impl LinearScheduler {
             .ok_or_else(|| {
                 SchedError::Invariant(format!("session row missing for dag {dag_id}"))
             })?;
+        tracing::Span::current().record("session_id", tracing::field::display(session.id));
 
         // R8 (rebuild before any budget check, B7/B8).
         let rebuilt = reaccumulate_cost_from_events(&*self.deps.events, session.id, Some(run_id))
@@ -323,6 +346,19 @@ impl LinearScheduler {
             .map_err(|e| SchedError::Store(e.to_string()))?; // B10
         let meter = self.deps.cost_meters.meter_for(run_id);
         meter.with_mut(|m| *m = rebuilt);
+
+        // §5.16.1 BG1-BG6: fold the effective budget once, before any check.
+        let run_row = self
+            .deps
+            .sessions
+            .get_run(run_id)
+            .await
+            .map_err(|e| map_store_error(e, dag_id))?
+            .ok_or_else(|| SchedError::Invariant(format!("run row missing for dag {dag_id}")))?;
+        let goal = serde_json::from_value::<RunGoalRecord>(run_row.goal_json)
+            .map_err(|e| SchedError::Invariant(format!("corrupt goal_json for run {run_id}: {e}")))?
+            .goal;
+        let effective = budget::effective_budget(&self.deps.budget_policy, &session.budget, &goal);
 
         let ctx = CheckpointCtx {
             session_id: session.id,
@@ -336,10 +372,13 @@ impl LinearScheduler {
             run_id,
             run_started: Instant::now(), // R12
             run_timeout: self.deps.run_timeout,
+            effective_budget: effective.policy.clone(),
             gate_wait_total: std::sync::Mutex::new(Duration::ZERO),
             expired_gates: std::sync::Mutex::new(std::collections::HashSet::new()),
             gate_reregister_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
+        // BG1/BG5: record once, now that `rc` exists to record through.
+        self.record_budget_ignored(&rc, &effective).await;
 
         // R13: adopt any node durably Running (crash resume).
         if let Some(outcome) = self.adopt_running(&mut dag, &rc).await? {
@@ -602,9 +641,14 @@ impl LinearScheduler {
             }
         }
 
-        // L6 (P9 seam: effective policy is deps.budget_policy verbatim).
+        // L6: BG3 (effective_usd <= 0 is exhausted before `check_budget` can
+        // ever see it — `spent` starts `None`) OR'd with the ordinary check
+        // against the effective ceiling (BG4), never `deps.budget_policy`
+        // directly.
         let meter = self.deps.cost_meters.meter_for(rc.run_id);
-        if meter.check_budget(&self.deps.budget_policy).is_exhausted() {
+        if budget::is_pre_dispatch_exhausted(&rc.effective_budget)
+            || meter.check_budget(&rc.effective_budget).is_exhausted()
+        {
             return self
                 .budget_exhausted_path(dag, rc, ready_before.first().copied())
                 .await;
@@ -636,6 +680,16 @@ impl LinearScheduler {
     }
 
     /// L11-L15 for a non-gate node.
+    #[tracing::instrument(
+        name = "sched.node",
+        skip_all,
+        fields(
+            node_id = %node_id,
+            kind = tracing::field::Empty,
+            attempt = tracing::field::Empty,
+            effective_tier = tracing::field::Empty,
+        )
+    )]
     async fn dispatch_node(
         &self,
         dag: &mut TaskDag,
@@ -657,7 +711,10 @@ impl LinearScheduler {
         let kind_for_escalation = dag.nodes[&node_id].kind;
         let effective_tier = if is_capability_kind(kind_for_escalation) {
             match retry::escalation_for_attempt(&dag.nodes[&node_id].retry, attempt) {
-                Escalation::To(tier) => tier,
+                Escalation::To(tier) => {
+                    self.metrics.inc_escalations();
+                    tier
+                }
                 Escalation::SkippedNoTarget => {
                     self.record_escalation_skipped(rc, node_id, attempt).await;
                     dag.nodes[&node_id].model_tier
@@ -667,6 +724,10 @@ impl LinearScheduler {
         } else {
             dag.nodes[&node_id].model_tier // ES5: adapter kinds never escalate.
         };
+        let span = tracing::Span::current();
+        span.record("kind", tracing::field::debug(kind_for_escalation));
+        span.record("attempt", attempt);
+        span.record("effective_tier", tracing::field::debug(effective_tier));
 
         let node_timeout_ms = dag.nodes[&node_id].timeout_ms;
         let node_budget_timeout = Duration::from_millis(node_timeout_ms);
@@ -720,6 +781,7 @@ impl LinearScheduler {
                                 diagnostics: vec![],
                                 notes: format!("node timeout after {}ms", node_deadline.as_millis()),
                             };
+                            self.metrics.inc_node_timeouts();
                             self.apply_soft_failure(dag, rc, node_id, attempt, failure).await
                         };
                     }
@@ -729,6 +791,10 @@ impl LinearScheduler {
                 return self.cancel_path(dag, rc).await;
             }
         };
+
+        // §5.16.3 "after each node completes": best-effort, whether this
+        // dispatch succeeded or failed — cost was incurred either way.
+        self.signal_post_node_budget_warning(rc).await;
 
         match outcome {
             DispatchResult::Succeeded(payload) => {
@@ -786,17 +852,38 @@ impl LinearScheduler {
                     ))),
                 }
             }
+            // §9.1 `sched.verify` OB2: counts and codes only, never stdout —
+            // `VerifyOutcome` doesn't carry exit_code/signal/truncated (the
+            // MCP adapter consumes those internally to decide the outcome
+            // shape; they never reach this layer), so only `tool` and a
+            // `diagnostics` count are populated.
             NodeKind::VerifyCompile => {
                 let ctx = NodeExecContext {
                     meta: meta.clone(),
                     cancellation: rc.run_cancel.clone(),
                 };
-                match self.deps.verify_compile.check(&ctx).await {
-                    Ok(outcome) => Ok(verify_outcome_to_result(
-                        outcome,
-                        ErrorClass::Compile,
-                        "cargo check failed",
-                    )),
+                let span = tracing::info_span!(
+                    "sched.verify",
+                    tool = "cargo_check",
+                    diagnostics = tracing::field::Empty
+                );
+                let result = {
+                    use tracing::Instrument;
+                    self.deps
+                        .verify_compile
+                        .check(&ctx)
+                        .instrument(span.clone())
+                        .await
+                };
+                match result {
+                    Ok(outcome) => {
+                        span.record("diagnostics", outcome.diagnostics.len());
+                        Ok(verify_outcome_to_result(
+                            outcome,
+                            ErrorClass::Compile,
+                            "cargo check failed",
+                        ))
+                    }
                     Err(e) => Ok(DispatchResult::Failed(failure_from_adapter_error(
                         meta.node_id,
                         e,
@@ -808,12 +895,28 @@ impl LinearScheduler {
                     meta: meta.clone(),
                     cancellation: rc.run_cancel.clone(),
                 };
-                match self.deps.verify_test.test(&ctx).await {
-                    Ok(outcome) => Ok(verify_outcome_to_result(
-                        outcome,
-                        ErrorClass::Test,
-                        "cargo test failed",
-                    )),
+                let span = tracing::info_span!(
+                    "sched.verify",
+                    tool = "cargo_test",
+                    diagnostics = tracing::field::Empty
+                );
+                let result = {
+                    use tracing::Instrument;
+                    self.deps
+                        .verify_test
+                        .test(&ctx)
+                        .instrument(span.clone())
+                        .await
+                };
+                match result {
+                    Ok(outcome) => {
+                        span.record("diagnostics", outcome.diagnostics.len());
+                        Ok(verify_outcome_to_result(
+                            outcome,
+                            ErrorClass::Test,
+                            "cargo test failed",
+                        ))
+                    }
                     Err(e) => Ok(DispatchResult::Failed(failure_from_adapter_error(
                         meta.node_id,
                         e,
@@ -926,11 +1029,10 @@ impl LinearScheduler {
         let kind = node.kind;
         let cancelled = rc.run_cancel.is_cancelled(); // A4 (child of runtime_cancel — §4.3 O1)
         let meter = self.deps.cost_meters.meter_for(rc.run_id);
-        // A5 (§5.16.3): the same check_budget mechanism L6 uses. Full
-        // effective-ceiling computation (BG1-BG6) is P9's charter; here we
-        // only need "is the run budget already exhausted", which
-        // deps.budget_policy already answers.
-        let budget_exhausted = meter.check_budget(&self.deps.budget_policy).is_exhausted();
+        // A5 (§5.16.3): the same BG3-or-check_budget test L6 uses, against
+        // the effective ceiling (BG4).
+        let budget_exhausted = budget::is_pre_dispatch_exhausted(&rc.effective_budget)
+            || meter.check_budget(&rc.effective_budget).is_exhausted();
         let remaining_run = rc.remaining_run(); // A6
 
         let decision = retry::admit(
@@ -952,6 +1054,7 @@ impl LinearScheduler {
             Admission::Reject(reason) => {
                 self.record_retry_rejected(rc, node_id, attempt, &failure, reason)
                     .await;
+                self.metrics.inc_retries_rejected();
                 Ok(StepOutcome::Terminal(
                     self.terminal_failed(dag, rc, node_id, Some(attempt), failure)
                         .await?,
@@ -1166,23 +1269,138 @@ impl LinearScheduler {
                 "budget exhausted with no node to attribute".into(),
             ));
         };
+        let check = self
+            .deps
+            .cost_meters
+            .meter_for(rc.run_id)
+            .check_budget(&rc.effective_budget);
+        // BE1: one Budget decision + a BudgetWarning, before terminalizing.
+        self.signal_budget_exhaustion(rc, Some(node_id), check)
+            .await;
+        self.metrics.inc_budget_stops();
         let failure = FailureIr {
             node: node_id,
             error_class: ErrorClass::Budget,
             retry: RetryDisposition::NonRetryable,
             diagnostics: vec![],
-            notes: format!(
-                "budget exhausted: {:?}",
-                self.deps
-                    .cost_meters
-                    .meter_for(rc.run_id)
-                    .check_budget(&self.deps.budget_policy)
-            ),
+            notes: format!("budget exhausted: {check:?}"),
         };
         Ok(StepOutcome::Terminal(
             self.terminal_failed(dag, rc, node_id, None, failure)
                 .await?,
         ))
+    }
+
+    /// BE1: append one `DecisionKind::Budget` record and a `BudgetWarning`.
+    /// `check` is `meter.check_budget(&rc.effective_budget)` at the moment
+    /// of exhaustion, so the caller doesn't compute it twice.
+    async fn signal_budget_exhaustion(
+        &self,
+        rc: &RunCtx<'_>,
+        node_id: Option<NodeId>,
+        check: crate::obs::BudgetCheck,
+    ) {
+        let metadata = serde_json::json!({
+            "check": format!("{check:?}"),
+            "effective_usd": rc.effective_budget.max_usd_per_run,
+            "effective_tokens": rc.effective_budget.max_tokens_per_run,
+        });
+        self.record_budget_decision(rc, node_id, metadata).await;
+
+        let meter = self.deps.cost_meters.meter_for(rc.run_id);
+        if budget::is_pre_dispatch_exhausted(&rc.effective_budget) && !check.is_exhausted() {
+            // BG3: effective_usd <= 0 but `spent` is still `None`, so
+            // `maybe_signal_budget_warning`'s own `check_budget` call
+            // wouldn't fire — signal directly with that specific message.
+            let snapshot = meter.with_mut(|m| m.to_budget_snapshot());
+            if let Err(e) = self
+                .deps
+                .session_plane
+                .signal_budget_warning(
+                    rc.ctx.session_id,
+                    Some(rc.run_id),
+                    snapshot,
+                    "budget exhausted: effective_usd <= 0 (pre-dispatch)",
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "budget warning (pre-dispatch) failed");
+            }
+        } else if let Err(e) = maybe_signal_budget_warning(
+            &self.deps.session_plane,
+            rc.ctx.session_id,
+            Some(rc.run_id),
+            &meter,
+            &rc.effective_budget,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "budget warning failed");
+        }
+    }
+
+    /// §5.16.3 "after each node completes": best-effort spend-accrual
+    /// warning, against the effective ceiling (BG4), not `deps.budget_policy`.
+    async fn signal_post_node_budget_warning(&self, rc: &RunCtx<'_>) {
+        let meter = self.deps.cost_meters.meter_for(rc.run_id);
+        if let Err(e) = maybe_signal_budget_warning(
+            &self.deps.session_plane,
+            rc.ctx.session_id,
+            Some(rc.run_id),
+            &meter,
+            &rc.effective_budget,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "post-node budget warning failed");
+        }
+    }
+
+    /// BG1/BG5: record once per run, right after `rc` is constructed.
+    async fn record_budget_ignored(&self, rc: &RunCtx<'_>, effective: &budget::EffectiveBudget) {
+        if !effective.ignored_max_usd_non_finite && effective.ignored_parallelism.is_empty() {
+            return;
+        }
+        let mut metadata = serde_json::json!({
+            "check": "ignored",
+            "effective_usd": effective.policy.max_usd_per_run,
+            "effective_tokens": effective.policy.max_tokens_per_run,
+        });
+        if effective.ignored_max_usd_non_finite {
+            metadata["ignored_max_usd"] = serde_json::json!("non_finite");
+        }
+        if !effective.ignored_parallelism.is_empty() {
+            let ignored: serde_json::Map<String, serde_json::Value> = effective
+                .ignored_parallelism
+                .iter()
+                .map(|p| (p.field.to_string(), serde_json::Value::from(p.value)))
+                .collect();
+            metadata["ignored_parallelism"] = serde_json::Value::Object(ignored);
+        }
+        self.record_budget_decision(rc, None, metadata).await;
+    }
+
+    /// Shared `DecisionKind::Budget` recorder (BE1/BG1/BG5). `node_id` is
+    /// `None` for run-level notes (BG1/BG5), `Some` for an exhaustion
+    /// attribution (BE1).
+    async fn record_budget_decision(
+        &self,
+        rc: &RunCtx<'_>,
+        node_id: Option<NodeId>,
+        metadata: serde_json::Value,
+    ) {
+        let rec = DecisionRecord {
+            session: rc.ctx.session_id,
+            run: rc.ctx.run_id,
+            node: node_id,
+            kind: DecisionKind::Budget,
+            metadata,
+            content_hash: None,
+            prompt_body: None,
+        };
+        if let Err(e) = self.deps.decisions.record(rec).await {
+            tracing::warn!(error = %e, ?node_id, "budget decision record failed");
+        }
     }
 
     /// §5.19 T8: run timeout with no `Running` node in the general case
@@ -1208,6 +1426,7 @@ impl LinearScheduler {
             diagnostics: vec![],
             notes: format!("run timeout after {}ms", rc.run_timeout.as_millis()),
         };
+        self.metrics.inc_run_timeouts();
         Ok(StepOutcome::Terminal(
             self.terminal_failed(dag, rc, node_id, None, failure)
                 .await?,
@@ -1247,6 +1466,11 @@ impl LinearScheduler {
     // `cancel` (§5.12 — full return table + race-free O4 wait)
     // -----------------------------------------------------------------
 
+    #[tracing::instrument(
+        name = "sched.cancel",
+        skip_all,
+        fields(dag_id = %dag_id, owned = tracing::field::Empty, forced = tracing::field::Empty)
+    )]
     async fn cancel_impl(&self, dag_id: DagId) -> Result<(), SchedError> {
         self.metrics.inc_cancels(); // §5.12.2 step 1
 
@@ -1258,11 +1482,13 @@ impl LinearScheduler {
         // small bound is simpler and just as correct).
         for _ in 0..2 {
             if let Some(owned) = self.lookup_owned(dag_id)? {
+                tracing::Span::current().record("owned", true);
                 // §5.12.2: fire the run's own token; L1/L2 or the in-flight
                 // `select!` (dispatch_node) observes it and writes C6.
                 owned.run_cancel.cancel();
                 return self.wait_for_cancel_result(&owned).await;
             }
+            tracing::Span::current().record("owned", false);
 
             // Unowned (§5.12.4).
             {
@@ -1797,11 +2023,24 @@ mod tests {
         }
 
         async fn seed_run(&self, session_id: SessionId, dag_id: DagId, state: &str) -> RunId {
+            self.seed_run_with_constraints(session_id, dag_id, state, vec![])
+                .await
+        }
+
+        /// §5.16.1 BG1/BG2 test hook: `seed_run` with an explicit
+        /// `goal.constraints` list (e.g. `Constraint::MaxUsd(_)`).
+        async fn seed_run_with_constraints(
+            &self,
+            session_id: SessionId,
+            dag_id: DagId,
+            state: &str,
+            constraints: Vec<crate::types::budget::Constraint>,
+        ) -> RunId {
             let run_id = RunId::new();
             let goal = RunGoalRecord {
                 goal: Goal {
                     text: "fix it".into(),
-                    constraints: vec![],
+                    constraints,
                     attachments: vec![],
                 },
                 dag_id,
@@ -2608,6 +2847,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_metrics_count_a_retry_then_success_run() {
+        // §9.3: the same shape as `soft_failure_retries_then_succeeds`,
+        // asserting on `SchedulerMetrics` instead of the event log — proves
+        // the counters wired in P9 actually increment on a real run, not
+        // just that they compile.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.retry = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::Fixed { delay_ms: 0 },
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: None,
+            escalate_to_tier: None,
+        };
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = StaticCapability::new(vec![
+            Ok(CapabilityOutcome::Failed {
+                failure: FailureIr {
+                    node: a,
+                    error_class: ErrorClass::Model,
+                    retry: RetryDisposition::Retryable,
+                    diagnostics: vec![],
+                    notes: "transient model error".into(),
+                },
+            }),
+            Ok(CapabilityOutcome::Succeeded {
+                payload: serde_json::json!({"ok": true}),
+            }),
+        ]);
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s1"),
+            capabilities,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        let m = sched.metrics();
+        assert_eq!(m.runs_started, 1);
+        assert_eq!(m.runs_succeeded, 1);
+        assert_eq!(m.runs_failed, 0);
+        assert_eq!(m.nodes_dispatched, 2); // C3 fires once per attempt
+        assert_eq!(m.nodes_succeeded, 1); // only the final attempt reaches C4
+        assert_eq!(m.retries_admitted, 1);
+        assert_eq!(m.retries_rejected, 0);
+        fx.close().await;
+    }
+
+    #[tokio::test]
     async fn soft_failure_non_retryable_terminalizes_failed() {
         let fx = Fixture::new().await;
         let session = fx.seed_session().await;
@@ -2726,6 +3032,87 @@ mod tests {
         assert_eq!(outcome.failure.unwrap().error_class, ErrorClass::Budget);
         fx.close().await;
     }
+
+    #[tokio::test]
+    async fn bg3_goal_max_usd_zero_terminalizes_before_dispatch() {
+        // §5.16.1 BG2/BG3: a goal `MaxUsd(0.0)` cap must win the effective-
+        // ceiling min even though `deps.budget_policy`'s own ceiling (5.0
+        // default) is nowhere near exhausted, and the pre-dispatch BG3 check
+        // must catch it before the capability is ever called — proven here
+        // by using `UnavailableCapabilityExecutor` (which would fail with a
+        // *different* error_class than `Budget` if ever reached).
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run_with_constraints(
+            session,
+            dag_id,
+            "running",
+            vec![crate::types::budget::Constraint::MaxUsd(0.0)],
+        )
+        .await;
+
+        let (sched, decisions) = fx.build_scheduler_full(
+            fx._dir.path().join("s1"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(a));
+        assert_eq!(outcome.failure.unwrap().error_class, ErrorClass::Budget);
+
+        // BE1: a Budget decision lands even though `usd_spent` was still
+        // `None` (the pre-dispatch BG3 case `maybe_signal_budget_warning`
+        // alone would have missed).
+        let recorded = decisions.recorded_decisions();
+        let exhaustion = recorded
+            .iter()
+            .find(|d| d.kind == DecisionKind::Budget && d.node == Some(a))
+            .expect("budget exhaustion decision must be recorded");
+        assert_eq!(exhaustion.metadata["effective_usd"], 0.0);
+
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(
+                |e| e.type_ == crate::events::SessionEventType::BudgetWarning
+                    && e.payload["message"]
+                        == serde_json::json!("budget exhausted: effective_usd <= 0 (pre-dispatch)")
+            ),
+            "BE1's pre-dispatch BudgetWarning must land with the BG3-specific message"
+        );
+        fx.close().await;
+    }
+
+    // BG1 (non-finite goal `MaxUsd` ignored + recorded) has no end-to-end
+    // test here: JSON cannot represent NaN/Infinity, so a goal carrying one
+    // never survives the `goal_json` round trip at all — `resolve_run_binding`
+    // (R3, upstream of anything this phase touches) already fails the run
+    // with `RunBindingMissing` before the scheduler's own BG1 logic could
+    // ever run. `budget::effective_budget`'s pure unit tests (this file's
+    // `budget` module) cover BG1 directly against an in-memory `Goal`,
+    // which is the only way a non-finite `MaxUsd` can actually reach it.
 
     // ---- cancel (unowned path, §5.12.4 simplified) ----
 

@@ -93,6 +93,11 @@ impl LinearScheduler {
     /// §5.7 entry point. `resuming = true` when called from R16 (the DAG was
     /// durably `WaitingApproval` on `run` entry); `false` for a fresh L13
     /// dispatch of a `Ready` gate node.
+    #[tracing::instrument(
+        name = "sched.gate",
+        skip_all,
+        fields(gate_id = tracing::field::Empty, node_id = %node_id, remaining_ms = tracing::field::Empty)
+    )]
     pub(super) async fn gate_route(
         &self,
         dag: &mut TaskDag,
@@ -105,6 +110,7 @@ impl LinearScheduler {
             .clone()
             .ok_or_else(|| SchedError::Invariant(format!("gate node {node_id} has no approval")))?;
         let gate_id = approval.gate;
+        tracing::Span::current().record("gate_id", tracing::field::display(gate_id));
 
         if !resuming {
             // §5.7.7 steps 1-3: first schedule.
@@ -165,6 +171,7 @@ impl LinearScheduler {
         Box<dyn std::future::Future<Output = Result<StepOutcome, SchedError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            tracing::Span::current().record("remaining_ms", deadline.as_millis() as u64);
             let meta = NodeExecRef {
                 session_id: rc.session.id,
                 run_id: rc.run_id,

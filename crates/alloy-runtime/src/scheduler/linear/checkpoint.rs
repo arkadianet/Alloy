@@ -258,6 +258,11 @@ impl Checkpoint {
     /// C1: `Pending → Running` DAG state on first start. No node
     /// transitions, no events (Appendix A). Adopting an already-`Running`
     /// DAG (crash resume) is not a checkpoint — it is a no-op read.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c1", generation = dag.generation, nodes_changed = 0)
+    )]
     pub(crate) async fn c1_start(&self, dag: &mut TaskDag) -> Result<(), SchedError> {
         dag.state = crate::scheduler::DagState::Running;
         self.cas(dag).await
@@ -268,6 +273,11 @@ impl Checkpoint {
     /// C2: `Pending → Ready` for every node in `promote`, one CAS, one
     /// `NodeState` event per node (RS6: single CAS covering the whole
     /// frontier so a crash cannot half-promote it).
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c2", generation = dag.generation, nodes_changed = promote.len())
+    )]
     pub(crate) async fn c2_promote(
         &self,
         dag: &mut TaskDag,
@@ -309,6 +319,11 @@ impl Checkpoint {
     /// `NodeState{to:running, attempt:k}` event is **load-bearing** (W4a):
     /// its failure propagates so the caller does not dispatch the node
     /// future.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c3", generation = dag.generation, nodes_changed = 1)
+    )]
     pub(crate) async fn c3_dispatch(
         &self,
         dag: &mut TaskDag,
@@ -328,6 +343,7 @@ impl Checkpoint {
         node.state = NodeState::Running;
         let generation = dag.generation;
         self.cas(dag).await?;
+        self.metrics.inc_nodes_dispatched();
         let mut extra = serde_json::Map::new();
         extra.insert("attempt".into(), Value::from(attempt));
         let ev = Self::node_state_event(
@@ -347,6 +363,11 @@ impl Checkpoint {
     /// C4: `Running → Succeeded`, `output_ref = Some(id)` in the same CAS
     /// (OU1). Puts the [`crate::dag::NodeOutputEnvelope`] artifact first
     /// (W1) so the CAS never references a dangling id.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c4", generation = dag.generation, nodes_changed = 1)
+    )]
     pub(crate) async fn c4_succeed(
         &self,
         dag: &mut TaskDag,
@@ -380,6 +401,7 @@ impl Checkpoint {
         node.state = NodeState::Succeeded;
         node.output_ref = Some(artifact_id);
         self.cas(dag).await?;
+        self.metrics.inc_nodes_succeeded();
         let mut extra = serde_json::Map::new();
         extra.insert("attempt".into(), Value::from(attempt));
         self.append_best_effort(Self::node_state_event(
@@ -398,6 +420,11 @@ impl Checkpoint {
 
     /// C5: rewrite `input_ref` to a new artifact; node state is unchanged
     /// (stays `Ready`). No events (Appendix A: "artifact provenance only").
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c5", generation = dag.generation, nodes_changed = 0)
+    )]
     pub(crate) async fn c5_rewrite_input(
         &self,
         dag: &mut TaskDag,
@@ -433,6 +460,11 @@ impl Checkpoint {
     /// which set is the cancel path's decision (§5.12, P8) — this method
     /// only validates the transitions are legal (Appendix B) and persists
     /// them in order.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c6", generation = dag.generation, nodes_changed = cancelled.len() + skipped.len())
+    )]
     pub(crate) async fn c6_cancel(
         &self,
         dag: &mut TaskDag,
@@ -462,6 +494,7 @@ impl Checkpoint {
         }
         dag.state = crate::scheduler::DagState::Cancelled;
         self.cas(dag).await?;
+        self.metrics.inc_nodes_skipped_by(skipped.len());
         for (id, from, to) in froms {
             self.append_best_effort(Self::node_state_event(
                 ctx,
@@ -481,6 +514,11 @@ impl Checkpoint {
     /// C7 (failing path): `failed` node → `Failed`, `skipped` nodes →
     /// `Skipped`, `DagState → Failed`. Puts the `failure_ir` artifact first
     /// (F3) so `NodeState.failure_ref` never dangles.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c7", generation = dag.generation, nodes_changed = skipped.len() + 1)
+    )]
     pub(crate) async fn c7_terminal_failed(
         &self,
         dag: &mut TaskDag,
@@ -524,6 +562,8 @@ impl Checkpoint {
         }
         dag.state = crate::scheduler::DagState::Failed;
         self.cas(dag).await?;
+        self.metrics.inc_nodes_failed();
+        self.metrics.inc_nodes_skipped_by(skipped.len());
 
         for (id, from, to) in froms {
             let mut extra = serde_json::Map::new();
@@ -550,6 +590,11 @@ impl Checkpoint {
     /// C7 (success path): every node already reached `Succeeded`/`CachedHit`
     /// via its own C4; this checkpoint only commits `DagState → Succeeded`
     /// (Appendix A). No node transitions, no events.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c7", generation = dag.generation, nodes_changed = 0)
+    )]
     pub(crate) async fn c7_terminal_succeeded(&self, dag: &mut TaskDag) -> Result<(), SchedError> {
         dag.state = crate::scheduler::DagState::Succeeded;
         self.cas(dag).await
@@ -563,6 +608,11 @@ impl Checkpoint {
     /// `to:ready` with `next_attempt` (W4a). Puts the `failure_ir` artifact
     /// first (RT2) so the event pair can reference `failure_ref`.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c8", generation = dag.generation, nodes_changed = 1)
+    )]
     pub(crate) async fn c8_retry(
         &self,
         dag: &mut TaskDag,
@@ -601,6 +651,7 @@ impl Checkpoint {
         }
         node.state = NodeState::Ready; // RT1: the node never becomes durably Failed.
         self.cas(dag).await?;
+        self.metrics.inc_retries_admitted();
 
         // (c) logical waypoint, best-effort (RT1; never RF3-repairable while Ready — RF5).
         let mut c_extra = serde_json::Map::new();
@@ -645,6 +696,11 @@ impl Checkpoint {
     /// C9a: `Ready → WaitingApproval`; events `NodeState` then
     /// `ApprovalRequested` (H.2).
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c9a", generation = dag.generation, nodes_changed = 1)
+    )]
     pub(crate) async fn c9a_gate_schedule(
         &self,
         dag: &mut TaskDag,
@@ -667,6 +723,7 @@ impl Checkpoint {
         node.state = NodeState::WaitingApproval;
         dag.state = crate::scheduler::DagState::WaitingApproval;
         self.cas(dag).await?;
+        self.metrics.inc_gates_opened();
 
         self.append_best_effort(Self::node_state_event(
             ctx,
@@ -696,6 +753,11 @@ impl Checkpoint {
 
     /// C9b: `WaitingApproval → Ready` (allow / allow_once); `DagState`
     /// becomes `Running`.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c9b", generation = dag.generation, nodes_changed = 1)
+    )]
     pub(crate) async fn c9b_gate_allow(
         &self,
         dag: &mut TaskDag,
@@ -716,6 +778,7 @@ impl Checkpoint {
         node.state = NodeState::Ready;
         dag.state = crate::scheduler::DagState::Running;
         self.cas(dag).await?;
+        self.metrics.inc_gates_allowed();
 
         let mut extra = serde_json::Map::new();
         extra.insert(
@@ -738,6 +801,11 @@ impl Checkpoint {
     /// `Skipped`; `DagState → Failed` (deny/expiry are both attributed as a
     /// gate-origin failure via the `Approval` error class — reconciliation
     /// note under Appendix B). Puts an `Approval`-class `failure_ir` first.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c9c", generation = dag.generation, nodes_changed = skipped.len() + 1)
+    )]
     pub(crate) async fn c9c_gate_deny(
         &self,
         dag: &mut TaskDag,
@@ -785,6 +853,15 @@ impl Checkpoint {
         }
         dag.state = crate::scheduler::DagState::Failed;
         self.cas(dag).await?;
+        match decision {
+            GateDecision::Deny => self.metrics.inc_gates_denied(),
+            GateDecision::Expired => self.metrics.inc_gates_expired(),
+            // `c9c_gate_deny` is deny/expiry only (WaitingApproval precondition,
+            // matching the caller's contract); Allow/AllowOnce go through
+            // `c9b_gate_allow` and never reach this method.
+            GateDecision::Allow | GateDecision::AllowOnce => {}
+        }
+        self.metrics.inc_nodes_skipped_by(skipped.len());
 
         for (id, from, to) in froms {
             let mut extra = serde_json::Map::new();
@@ -813,6 +890,11 @@ impl Checkpoint {
 
     /// C10: `DagState → ReplanRequired`. Node states are untouched (RP2: no
     /// in-flight future at an attempt boundary); no events.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c10", generation = dag.generation, nodes_changed = 0)
+    )]
     pub(crate) async fn c10_replan(&self, dag: &mut TaskDag) -> Result<(), SchedError> {
         dag.state = crate::scheduler::DagState::ReplanRequired;
         self.cas(dag).await
@@ -825,6 +907,11 @@ impl Checkpoint {
     /// `to` with **no** `TaskNode.state` mutation, plus a best-effort
     /// `Error`-typed synthetic event carrying `notes` (there is no node to
     /// attach a `NodeState` event to).
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "reconcile_bare", generation = dag.generation, nodes_changed = 0)
+    )]
     pub(crate) async fn c_reconcile_bare(
         &self,
         dag: &mut TaskDag,

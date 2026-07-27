@@ -115,6 +115,105 @@ impl SchedulerCounters {
         self.forced_cancel_writes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// R4: a `run` invocation acquired ownership and is proceeding.
+    pub(super) fn inc_runs_started(&self) {
+        self.runs_started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// R18/R9: a `run` invocation is returning `DagOutcome { state, .. }`.
+    pub(super) fn inc_run_terminal(&self, state: crate::scheduler::DagState) {
+        match state {
+            crate::scheduler::DagState::Succeeded => {
+                self.runs_succeeded.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::scheduler::DagState::Failed => {
+                self.runs_failed.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::scheduler::DagState::Cancelled => {
+                self.runs_cancelled.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::scheduler::DagState::ReplanRequired => {
+                self.runs_replan_required.fetch_add(1, Ordering::Relaxed);
+            }
+            // Loop-internal only (D6); `run` never returns these (fix 24).
+            crate::scheduler::DagState::Pending
+            | crate::scheduler::DagState::Running
+            | crate::scheduler::DagState::WaitingApproval => {}
+        }
+    }
+
+    /// C3: a node was dispatched (`Ready`/`Pending` → `Running`).
+    pub(super) fn inc_nodes_dispatched(&self) {
+        self.nodes_dispatched.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// C4: a node reached `Succeeded`.
+    pub(super) fn inc_nodes_succeeded(&self) {
+        self.nodes_succeeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// C7/RC4: a node reached durable `Failed`.
+    pub(super) fn inc_nodes_failed(&self) {
+        self.nodes_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// C6/C7/C9c/RC4: a node was marked `Skipped`.
+    pub(super) fn inc_nodes_skipped_by(&self, n: usize) {
+        if n > 0 {
+            self.nodes_skipped.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// C8: a retry was admitted.
+    pub(super) fn inc_retries_admitted(&self) {
+        self.retries_admitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A1-A6: a retry was rejected by admission.
+    pub(super) fn inc_retries_rejected(&self) {
+        self.retries_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// ES1: a tier escalation was applied to a dispatch.
+    pub(super) fn inc_escalations(&self) {
+        self.escalations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// C9a: a gate was opened (first schedule).
+    pub(super) fn inc_gates_opened(&self) {
+        self.gates_opened.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// C9b: a gate resolved `allow` / `allow_once`.
+    pub(super) fn inc_gates_allowed(&self) {
+        self.gates_allowed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// C9c: a gate resolved `deny`.
+    pub(super) fn inc_gates_denied(&self) {
+        self.gates_denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// C9c (§5.7.8 expiry): a gate resolved `expired`.
+    pub(super) fn inc_gates_expired(&self) {
+        self.gates_expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// BE1: the run stopped on budget exhaustion.
+    pub(super) fn inc_budget_stops(&self) {
+        self.budget_stops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// T3/T7: a node-level timeout fired.
+    pub(super) fn inc_node_timeouts(&self) {
+        self.node_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// T7/T8: a run-level timeout fired.
+    pub(super) fn inc_run_timeouts(&self) {
+        self.run_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn snapshot(&self) -> SchedulerMetrics {
         let l = |c: &AtomicU64| c.load(Ordering::Relaxed);
         SchedulerMetrics {

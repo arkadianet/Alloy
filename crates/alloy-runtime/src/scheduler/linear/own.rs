@@ -198,7 +198,9 @@ impl LinearScheduler {
         let deadline = started + self.cancel_grace();
         match owned.wait_for_completion(deadline).await {
             Some(Ok(_state)) => {
-                if started.elapsed() > self.deps.config.cancel_drain_grace {
+                let forced = started.elapsed() > self.deps.config.cancel_drain_grace;
+                tracing::Span::current().record("forced", forced);
+                if forced {
                     self.metrics.inc_forced_cancel_writes();
                 }
                 Ok(())

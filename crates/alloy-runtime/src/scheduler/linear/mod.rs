@@ -3,6 +3,7 @@
 //! Non-`pub`: only the types re-exported from [`crate::scheduler`] escape this
 //! module tree (RFC-0010 §4.1 rule M1).
 
+mod budget;
 mod checkpoint;
 mod envelopes;
 mod gate;
