@@ -41,6 +41,24 @@ impl TemplateId {
     }
 }
 
+#[cfg(test)]
+mod template_id_tests {
+    use super::TemplateId;
+
+    /// Keep in sync when adding `TemplateId` variants.
+    #[test]
+    fn template_id_wire_names_match_serde() {
+        let all = [TemplateId::RepairLocalDiagnostic];
+        for id in all {
+            let json = serde_json::to_string(&id).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", id.as_str()));
+            assert_eq!(TemplateId::parse(id.as_str()), Some(id));
+            let back: TemplateId = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, id);
+        }
+    }
+}
+
 /// Embedded template manifest (not the runtime [`TaskDag`]).
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(any(test, feature = "template-json"), derive(serde::Deserialize))]

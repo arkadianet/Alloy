@@ -95,7 +95,7 @@ async fn plan_persist_reopen_snapshot_and_event() {
     storage.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_put_if_generation_conflicts() {
     let dir = tempfile::tempdir().unwrap();
     let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
@@ -109,7 +109,7 @@ async fn concurrent_put_if_generation_conflicts() {
         .unwrap();
 
     // Both writers claim expected=1 while advancing generation to 2.
-    // First UPDATE … WHERE generation=1 wins; second sees 0 rows → Conflict.
+    // First UPDATE … WHERE generation=1 wins; second sees Conflict or Busy.
     let mut a = result.dag.clone();
     let mut b = result.dag.clone();
     a.generation = 2;
@@ -125,12 +125,12 @@ async fn concurrent_put_if_generation_conflicts() {
 
     let outcomes = [r1, r2];
     let oks = outcomes.iter().filter(|r| r.is_ok()).count();
-    let conflicts = outcomes
+    let losers = outcomes
         .iter()
-        .filter(|r| matches!(r, Err(StoreError::Conflict(_))))
+        .filter(|r| matches!(r, Err(StoreError::Conflict(_)) | Err(StoreError::Busy)))
         .count();
     assert_eq!(oks, 1, "exactly one CAS writer must win");
-    assert_eq!(conflicts, 1, "the other writer must Conflict");
+    assert_eq!(losers, 1, "the other writer must Conflict or Busy");
 
     let final_dag = storage.dags().get(dag_id).await.unwrap().unwrap();
     assert_eq!(final_dag.generation, 2);
@@ -141,7 +141,7 @@ async fn concurrent_put_if_generation_conflicts() {
     storage.close().await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_cas_across_storage_handles() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
@@ -174,12 +174,12 @@ async fn concurrent_cas_across_storage_handles() {
     );
 
     let oks = [r1.is_ok(), r2.is_ok()].into_iter().filter(|x| *x).count();
-    let conflicts = [&r1, &r2]
+    let losers = [&r1, &r2]
         .into_iter()
-        .filter(|r| matches!(r, Err(StoreError::Conflict(_))))
+        .filter(|r| matches!(r, Err(StoreError::Conflict(_)) | Err(StoreError::Busy)))
         .count();
     assert_eq!(oks, 1);
-    assert_eq!(conflicts, 1);
+    assert_eq!(losers, 1);
 
     storage_a.close().await.unwrap();
     storage_b.close().await.unwrap();

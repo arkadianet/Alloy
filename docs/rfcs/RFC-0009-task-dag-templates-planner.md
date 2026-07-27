@@ -825,9 +825,7 @@ impl PlanService for DisabledLlmPlanService {
 
 ### 3.18 Crate-root re-exports
 
-MUST re-export: `DagStore`, `SqliteDagStore`, `ReplanReplaceError`, `DagValidator`, `ValidateOpts`, `DagValidationError`, `RetryIncoherence`, `TemplateId`, `TemplateManifest`, `TemplateCatalog`, `TemplateIdMap`, `BuildTopology`, `allocate_ids`, `build_topology`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput`, `ENVELOPE_SCHEMA_VERSION`, `CacheKeyMaterials`, `compute_cache_key`, `goal_content_digest`, `mvp_*_digest`, `PlanService`, `PlanContext`, `PlanResult`, `PlanProducedPayload`, `PlanError`, `TemplatePlanService`, `DisabledLlmPlanService`.
-
-Template DTO specs (`TemplateNodeSpec`, …) MAY stay module-public without crate-root re-export.
+MUST re-export: `DagStore`, `SqliteDagStore`, `ReplanReplaceError`, `DagValidator`, `ValidateOpts`, `DagValidationError`, `RetryIncoherence`, `TemplateId`, `TemplateManifest`, `TemplateNodeSpec`, `TemplateEdgeSpec`, `TemplateApprovalSpec`, `TemplateCatalog`, `TemplateIdMap`, `BuildTopology`, `allocate_ids`, `build_topology`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput`, `ENVELOPE_SCHEMA_VERSION`, `CacheKeyMaterials`, `compute_cache_key`, `goal_content_digest`, `mvp_*_digest`, `PlanService`, `PlanContext`, `PlanResult`, `PlanProducedPayload`, `PlanError`, `TemplatePlanService`, `DisabledLlmPlanService`.
 
 ### 3.19 Visibility & construction summary
 
@@ -1185,7 +1183,7 @@ compiler_fingerprint.as_hex()
 
 | Payload | Bytes hashed |
 | --- | --- |
-| `Goal` | `serde_json::to_vec` of the `Goal` value only. **Note for RFC-0010:** `serde_json` encodes non-finite `f64` constraint values as `null`, so `MaxUsd(NaN)` and `MaxUsd(+Inf)` collide; reject non-finite constraint values before enabling cache hits |
+| `Goal` | `serde_json::to_vec` of the `Goal` value only. **Note for RFC-0010:** reject non-finite `Goal` constraint values before enabling cache hits |
 | `FromPredecessors` | **Deferred to RFC-0010** — day-1 templates never enable cache on non-roots. Framing (NodeId encoding, separators, edge order) MUST be specified in 0010 before any non-root `enable_cache = true` ships |
 
 Day-1 templates never set `cache_key`. Pin a golden expected digest in `cache_key_stable` for a fixed `Goal` fixture (root/content path only).
@@ -1586,7 +1584,7 @@ Replan: `"replan": true`, `"reason": "user_requested"` for unit variants, or `{"
 - Apply Data vs Sequence satisfaction per §5.3.1
 - Ignore `model_tier` / budgets on adapter nodes for routing
 - Specify `FromPredecessors` cache content-digest framing before enabling non-root cache
-- Reject non-finite `f64` values in `Goal` constraints before enabling cache hits (serde_json maps them to `null`, colliding digests)
+- Reject non-finite `Goal` constraint values before enabling cache hits
 
 **Concurrency note (normative for 0010):** Same-generation checkpoint CAS (`put_if_generation(..., Some(generation))` where the blob’s generation equals the expected generation) assumes a **single scheduler writer** per DAG. Generation alone does not serialize two concurrent same-generation updates that both pass the compare; ownership / leasing is RFC-0010’s responsibility.
 

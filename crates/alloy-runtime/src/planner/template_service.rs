@@ -270,6 +270,9 @@ impl TemplatePlanService {
             .await?;
 
         // Persist
+        // Reconciliation (deferred): a GC/retention sweep SHOULD reclaim
+        // node_input / pending_pred / dag_snapshot artifacts left unreferenced
+        // after failed or conflicting CAS attempts (blobs may already exist).
         match expected_for_cas {
             CasExpected::InsertOnly => match self.dags.put_if_generation(&dag, None).await {
                 Ok(()) => {}
@@ -318,6 +321,9 @@ impl TemplatePlanService {
         }
 
         // PlanProduced event
+        // Reconciliation (deferred): an outbox / replay path SHOULD append a
+        // missing PlanProduced for an already-persisted DAG generation when
+        // append_session fails after a durable CAS write (row is retained).
         let mut node_ids: Vec<NodeId> = dag.nodes.keys().copied().collect();
         node_ids.sort();
         let payload = PlanProducedPayload {
@@ -570,7 +576,7 @@ impl PlanService for TemplatePlanService {
         tracing::Span::current().record("generation_from", probe.generation);
         tracing::Span::current().record("generation_to", next_gen);
 
-        let template_id = ctx.template_override.unwrap_or_else(|| Self::select(&ctx));
+        let template_id = Self::select(&ctx);
 
         self.instantiate_and_persist(
             template_id,

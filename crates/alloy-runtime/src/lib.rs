@@ -53,8 +53,8 @@ pub use dag::{
     ApprovalSpec, Backoff, BuildTopology, CacheKey, CacheKeyMaterials, DagValidationError,
     DagValidator, DependencyEdge, EdgeKind, NodeInputEnvelope, NodeInputPayload, NodeKind,
     NodeOutputEnvelope, NodeState, PredecessorOutput, RetryIncoherence, RetryPolicy, TaskDag,
-    TaskNode, TemplateCatalog, TemplateId, TemplateIdMap, TemplateManifest, ValidateOpts,
-    ENVELOPE_SCHEMA_VERSION,
+    TaskNode, TemplateApprovalSpec, TemplateCatalog, TemplateEdgeSpec, TemplateId, TemplateIdMap,
+    TemplateManifest, TemplateNodeSpec, ValidateOpts, ENVELOPE_SCHEMA_VERSION,
 };
 pub use error::{AdapterError, RunError, RuntimeError, SchedError, SessionError};
 pub use events::{
