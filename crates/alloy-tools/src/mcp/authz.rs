@@ -84,7 +84,9 @@ pub(crate) fn authorize_git_write(perms: &PermissionToken) -> Result<(), McpErro
 }
 
 /// Require an `FsWrite` grant covering the jail-relative path `rel`.
-#[allow(dead_code)]
+///
+/// Compiles the token's globs per call; authorization passes over many paths
+/// should hold a `crate::authz::GrantMatcher` instead.
 pub(crate) fn authorize_fs_write_path(perms: &PermissionToken, rel: &str) -> Result<(), McpError> {
     if !authz::has_fs_write_grant(perms) {
         return Err(McpError::PermissionDenied(PermissionDenial::MissingGrant(

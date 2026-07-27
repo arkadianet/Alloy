@@ -1126,6 +1126,36 @@ async fn apply_patch_success_and_unsafe_output() {
     assert_eq!(result.content, json!({ "code": "unsafe_backend_output" }));
 }
 
+/// The backend owns per-path authorization, so a path outside the `FsWrite`
+/// grant is a backend contract violation the host must not forward.
+#[tokio::test]
+async fn apply_patch_rejects_files_touched_outside_grant() {
+    let fx = Fixture::new();
+    let host = fx.host_with(
+        fx.broker(),
+        Arc::new(OkPatchBackend {
+            files_touched: vec!["src/main.rs".into()],
+        }),
+        McpHostConfig::new(),
+    );
+
+    let err = host
+        .call(
+            call("apply_patch", json!({ "patch": "diff" })),
+            token(vec![
+                Grant::FsWrite(Glob("docs/**".into())),
+                Grant::GitWrite,
+            ]),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        McpError::PermissionDenied(PermissionDenial::PathNotCovered(ref p)) if p == "src/main.rs"
+    ));
+}
+
 // --- lifecycle ----------------------------------------------------------------
 
 #[tokio::test]
