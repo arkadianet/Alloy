@@ -1494,7 +1494,14 @@ struct OwnedDag {
 
 `workspace_root` MUST be the session workspace root string. Relative roots are resolved by the MCP builtin against the sandbox jail (RFC-0006).
 
-`ToolHandle` selectors for verify adapters MUST disclose the tool: at minimum `ToolSelector::tag("sel.compiler")` for `cargo_check`. For `cargo_test`, use the RFC-0006 registered tag for that builtin (same compiler/test disclosure set as published in the host registry — if tagged distinctly, include that tag). Construction failure (tool not disclosed) MUST surface as `AdapterError::PermissionDenied` / `NotDisclosed` mapping.
+`ToolHandle` selectors for verify adapters MUST disclose the tool:
+
+| Adapter | Required selectors |
+| --- | --- |
+| `McpVerifyCompileAdapter` | `ToolSelector::tag("sel.compiler")` (and/or `Name { cargo_check }`) |
+| `McpVerifyTestAdapter` | `ToolSelector::tag("sel.test")` (and/or `Name { cargo_test }`) |
+
+Construction / call-time non-disclosure MUST surface as `AdapterError::PermissionDenied` (mapping `PermissionDenial::NotDisclosed`).
 
 ---
 
