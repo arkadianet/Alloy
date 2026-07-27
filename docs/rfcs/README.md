@@ -49,7 +49,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | [RFC-0007](./RFC-0007-model-router-provider.md) | Model Router & Provider | Implemented | 7–9 pd | 0001, 0004 | **Yes** |
 | [RFC-0008](./RFC-0008-edit-engine.md) | EditEngine (TextPatch + Git Checkpoint) | Draft | 4–6 pd | 0001, 0005, 0006 | **Yes** |
 | [RFC-0009](./RFC-0009-task-dag-templates-planner.md) | Task DAG, Templates & Planner | Implemented | 4–6 pd | 0001, 0002 | **Yes** |
-| [RFC-0010](./RFC-0010-scheduler-runtime-adapters.md) | Scheduler & Runtime Adapters | Draft | 5–8 pd | 0003, 0004, 0006, 0009 | **Yes** |
+| [RFC-0010](./RFC-0010-scheduler-runtime-adapters.md) | Scheduler & Runtime Adapters | Draft | 5–8 pd | 0003, 0004, 0006, 0008 (draft), 0009 | **Yes** |
 | [RFC-0011](./RFC-0011-project-graph.md) | ProjectGraph (`alloy-index`) | Draft | 6–10 pd | 0001, 0002 | M2 path |
 | [RFC-0012](./RFC-0012-context-engine.md) | Context Engine | Draft | 4–6 pd | 0001, 0011 | M1 thin / M2 deep |
 | [RFC-0013](./RFC-0013-capability-registry-workers.md) | Capability Registry & MVP Workers | Draft | 6–10 pd | 0006, 0007, 0008, 0011, 0012 | **Yes** |
@@ -72,7 +72,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | 0007 | 0001, 0004 |
 | 0008 | 0001, 0005, 0006 |
 | 0009 | 0001, 0002 |
-| 0010 | 0003, 0004, 0006, 0009 |
+| 0010 | 0003, 0004, 0006, 0008, 0009 |
 | 0011 | 0001, 0002 |
 | 0012 | 0001, 0011 |
 | 0013 | 0006, 0007, 0008, 0011, 0012 |
@@ -80,7 +80,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | 0015 | 0003, 0004, 0010, 0013 |
 | 0016 | 0001, 0007 |
 
-No cycles. **Critical path (M1 vertical slice):** 0001 → (0002∥0005) → (0003∥0004∥0006∥0009) → (0007∥0008) → 0010 → (0011∥0012 thin) → 0013 → 0015, with **0016 skeleton** starting as soon as 0007 exists. Note: 0010 does **not** depend on 0007 in the dependency table (retry/scheduler uses `ErrorClass` + adapters); 0007 and 0010 are sequenced on the calendar path because the vertical slice needs both, while 0013 binds the router into workers.
+No cycles. **Critical path (M1 vertical slice):** 0001 → (0002∥0005) → (0003∥0004∥0006∥0009) → (0007∥0008) → 0010 → (0011∥0012 thin) → 0013 → 0015, with **0016 skeleton** starting as soon as 0007 exists. Note: 0010 depends on **0008** for the single-write-stack / no-scheduler-EditEngine constraint (forward-only repair, edit-tx vs DAG resume); it does **not** depend on 0007 in the dependency table (retry uses `ErrorClass` + adapters). 0007 and 0010 are still sequenced on the calendar path because the vertical slice needs both, while 0013 binds the router into workers.
 
 ## Mermaid dependency graph
 
@@ -122,6 +122,7 @@ flowchart TB
   R4 --> R7
   R4 --> R10
   R9 --> R10
+  R8 --> R10
   R7 --> R13
   R7 --> R16
   R8 --> R13
