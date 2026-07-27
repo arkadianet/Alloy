@@ -1,4 +1,5 @@
-//! RFC-0010 CI-enforceable source greps (§4.1 rules B6/M5, AC 57).
+//! RFC-0010 CI-enforceable source greps (§4.1 rules B6/M5, AC 57, AC 73,
+//! AC 83).
 //!
 //! Mechanised as ordinary `#[test]`s rather than a separate CI job: this
 //! crate's tests already run under `cargo test --workspace`
@@ -60,6 +61,56 @@ fn b6_scheduler_and_adapters_never_import_planner() {
         }
     }
     assert!(checked_any, "grep walk found zero files — test is broken");
+}
+
+#[test]
+fn ac73_no_artifact_kind_json_in_scheduler_or_adapters() {
+    // AC 73: "Structured artifacts use ArtifactKind::Blob + content_type:
+    // application/json; verify_raw uses Log; no ArtifactKind::Json appears
+    // in scheduler/adapter code."
+    let src = crate_root().join("src");
+    for sub in ["scheduler", "adapters"] {
+        let mut files = Vec::new();
+        walk_rs_files(&src.join(sub), &mut files);
+        for file in &files {
+            let content = std::fs::read_to_string(file)
+                .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+            for (i, line) in content.lines().enumerate() {
+                assert!(
+                    !line.contains("ArtifactKind::Json"),
+                    "AC73 violation: {}:{} uses ArtifactKind::Json — structured \
+                     artifacts MUST use Blob + content_type: application/json\n  {line}",
+                    file.display(),
+                    i + 1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ac83_scheduler_never_calls_edit_engine() {
+    // AC 83: "Scheduler code paths never call EditEngine::{apply,rollback}
+    // or recover_checkpoint." RFC-0008's EditEngine lives outside this
+    // RFC's ownership boundary entirely (R15's edit-tx resume is a no-op —
+    // see loop_.rs's module doc); this only needs to stay true, not become
+    // true, but it's cheap enough to make that an enforced fact rather than
+    // an assumption.
+    let mut files = Vec::new();
+    walk_rs_files(&crate_root().join("src/scheduler"), &mut files);
+    for file in &files {
+        let content = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        for (i, line) in content.lines().enumerate() {
+            assert!(
+                !line.contains("EditEngine") && !line.contains("recover_checkpoint"),
+                "AC83 violation: {}:{} references EditEngine/recover_checkpoint — \
+                 the scheduler MUST NOT call into EditEngine directly\n  {line}",
+                file.display(),
+                i + 1
+            );
+        }
+    }
 }
 
 #[test]

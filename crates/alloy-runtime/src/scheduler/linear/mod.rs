@@ -425,6 +425,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ac87_new_rejects_runs_that_is_not_session_plane_runs() {
+        // AC 87 / D6: `new` rejects `deps.runs` that isn't `session_plane.runs()`.
+        // A second, independent `SessionPlane` over the same storage gives a
+        // `RunController` with a different `Arc` identity than
+        // `fx.plane.runs()` — same shape, wrong pointer, which is exactly
+        // what D6 guards against (the scheduler and the control plane MUST
+        // observe gate/approval state through the same `RunController`).
+        let fx = Fixture::new().await;
+        let other_plane = SessionPlane::new(fx._rt.handle(), Arc::clone(&fx.storage));
+        let mut deps = fx.deps(sched_dir(fx._dir.path(), "s10c"));
+        deps.runs = other_plane.runs();
+        let err = LinearScheduler::new(deps).unwrap_err();
+        assert!(matches!(err, SchedError::Config(_)));
+        fx.close().await;
+    }
+
+    #[tokio::test]
     async fn new_for_test_relaxes_only_validate_and_honesty() {
         let fx = Fixture::new().await;
         let mut deps = fx.deps(sched_dir(fx._dir.path(), "s10"));

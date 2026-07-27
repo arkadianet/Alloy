@@ -3612,6 +3612,39 @@ mod tests {
         fx.close().await;
     }
 
+    #[tokio::test]
+    async fn ac48_pending_cancel_before_run_starts_fires_at_r5() {
+        // AC 48 / PC1-PC2: "A cancel arriving before `run` starts is
+        // captured in `pending_cancels` and cancels the run at R5."
+        //
+        // Reproducing the exact adversarial timing (`cancel`'s own unowned
+        // path racing a concurrent `run`'s R4) deterministically would need
+        // new test-only synchronization hooks in production code, which
+        // isn't worth adding just to exercise this. Instead this seeds
+        // `pending_cancels` directly — reachable from here because the
+        // field is `pub(in crate::scheduler::linear)` and this test module
+        // is a descendant — which is exactly the durable precondition R5
+        // itself consumes, so it tests R5's actual mechanism (not a
+        // simulation of it): a never-dispatched node with a pending-cancel
+        // entry present at `run` entry must terminalize `Cancelled` via C6
+        // before ever reaching L9/dispatch, with no capability call at all.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        seed_pending_single_node(&fx, session, dag_id).await;
+        fx.seed_run(session, dag_id, "running").await;
+        let sched = reconcile_scheduler(&fx); // Unavailable capability: dispatch must not happen.
+
+        sched.pending_cancels.lock().unwrap().insert(dag_id);
+
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Cancelled);
+
+        // PC4: consumed at R5, not left behind to wrongly cancel a later run.
+        assert!(!sched.pending_cancels.lock().unwrap().contains(&dag_id));
+        fx.close().await;
+    }
+
     // ---- Aggregate fold ----
 
     #[tokio::test]
