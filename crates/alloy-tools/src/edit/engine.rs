@@ -9,15 +9,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use alloy_runtime::{
     ArtifactId, ArtifactKind, ArtifactPut, ArtifactStore, CheckpointId, Digest, EditAppliedPayload,
     EditContext, EditEngine, EditError, EditRequest, EditRequestKind, EditTransaction,
-    EditValidation, EventSink, NewSessionEvent, PermissionToken, SessionEventType, SessionId,
-    Timestamp, TransactionId, TxState, WorkspaceDigest, EDIT_APPLIED_SCHEMA,
+    EditValidation, EventSink, NewSessionEvent, PatchSet, PermissionToken, SessionEventType,
+    SessionId, Timestamp, TransactionId, TxState, WorkspaceDigest, EDIT_APPLIED_SCHEMA,
 };
 use async_trait::async_trait;
 use serde_json::json;
 use tracing::field::{display, Empty};
 use tracing::Instrument;
 
-use crate::edit::apply::{apply_file_patches, ApplyProgress, FileApplyOutcome};
+use crate::edit::apply::{apply_file_patches, ApplyProgress, FileApplyError, FileApplyOutcome};
 use crate::edit::checkpoint::{
     create_checkpoint, ensure_no_tracked_denied, preflight_git, prepare_repo_for_edit,
     resolve_checkpoint, restore_checkpoint, tracked_set, CreatedCheckpoint,
@@ -41,8 +41,15 @@ pub struct GitEditEngine {
     artifacts: Arc<dyn ArtifactStore>,
     events: Arc<dyn EventSink>,
     tx_store: Mutex<HashMap<TransactionId, TxRecord>>,
-    abandoned: Mutex<Option<AbandonedCheckpoint>>,
-    write_lock: tokio::sync::Mutex<()>,
+    /// Shared with the blocking apply task so path bookkeeping survives a
+    /// cancelled `apply` future (RFC-0008 §5.11 step 5).
+    abandoned: Arc<Mutex<Option<AbandonedCheckpoint>>>,
+    /// Serializes every mutating operation.
+    ///
+    /// `Arc` because `apply` hands an owned guard to its blocking task: work on
+    /// the blocking pool cannot be aborted, so a cancelled `apply` future must
+    /// not release the lock while its task is still writing files.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
     max_digest_files: u64,
     max_digest_bytes: u64,
 }
@@ -125,8 +132,8 @@ impl GitEditEngine {
             artifacts: config.artifacts,
             events: config.events,
             tx_store: Mutex::new(HashMap::new()),
-            abandoned: Mutex::new(None),
-            write_lock: tokio::sync::Mutex::new(()),
+            abandoned: Arc::new(Mutex::new(None)),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             max_digest_files: config.max_digest_files,
             max_digest_bytes: config.max_digest_bytes,
         })
@@ -193,7 +200,12 @@ impl GitEditEngine {
     }
 
     /// Compute a workspace digest under an `edit.digest` span (RFC §9.1).
-    fn workspace_digest(
+    ///
+    /// Hashing walks every tracked file, so it runs on the blocking pool: an
+    /// engine sharing a runtime with request handlers must not stall them for the
+    /// length of a workspace walk. The caller's `write_lock` guard stays on the
+    /// async side across the await, so the serialization contract is unchanged.
+    async fn workspace_digest(
         &self,
         phase: &'static str,
         tracked: &BTreeSet<String>,
@@ -205,14 +217,18 @@ impl GitEditEngine {
             file_count = Empty,
             total_bytes = Empty
         );
-        let _entered = span.enter();
-        let digest = compute_workspace_digest(
-            &self.path_policy,
-            tracked,
-            created_paths,
-            self.max_digest_files,
-            self.max_digest_bytes,
-        )?;
+        let policy = self.path_policy.clone();
+        let tracked = tracked.clone();
+        let created_paths = created_paths.to_vec();
+        let max_files = self.max_digest_files;
+        let max_bytes = self.max_digest_bytes;
+        let task_span = span.clone();
+        let digest = tokio::task::spawn_blocking(move || {
+            let _entered = task_span.enter();
+            compute_workspace_digest(&policy, &tracked, &created_paths, max_files, max_bytes)
+        })
+        .await
+        .map_err(|err| EditError::Internal(format!("digest task: {err}")))??;
         span.record("file_count", digest.file_count);
         span.record("total_bytes", digest.total_bytes);
         Ok(digest)
@@ -402,6 +418,7 @@ impl GitEditEngine {
             .map_err(|err| rollback_failed(tx, checkpoint_id, err.to_string()))?;
         let digest = self
             .workspace_digest("post", &tracked, &[])
+            .await
             .map_err(|err| rollback_failed(tx, checkpoint_id, err.to_string()))?;
         if &digest != pre_digest {
             return Err(rollback_failed(
@@ -506,7 +523,7 @@ impl GitEditEngine {
         req: EditRequest,
         ctx: &EditContext,
     ) -> Result<EditTransaction, EditError> {
-        let _guard = self.write_lock.lock().await;
+        let guard = Arc::clone(&self.write_lock).lock_owned().await;
         check_expiry(&ctx.perms)?;
         check_run(ctx.run_id, &ctx.perms)?;
         self.reconcile_abandoned(&ctx.perms).await?;
@@ -528,7 +545,7 @@ impl GitEditEngine {
         let (head_sha, tracked) =
             prepare_repo_for_edit(self.broker.as_ref(), &self.path_policy, &ctx.perms, &patch)
                 .await?;
-        let pre_digest = self.workspace_digest("pre", &tracked, &[])?;
+        let pre_digest = self.workspace_digest("pre", &tracked, &[]).await?;
 
         let tx_id = TransactionId::new();
         let checkpoint_id = CheckpointId::new();
@@ -581,26 +598,24 @@ impl GitEditEngine {
             tracked,
         };
 
-        // From here the workspace is mutated: every failure restores first.
-        let mut progress_error: Option<EditError> = None;
-        let apply_result =
-            apply_file_patches(&patch, &self.path_policy, &ctx.perms, tx_id, |progress| {
-                if progress_error.is_some() {
-                    return;
+        // From here the workspace is mutated: every failure restores first. The
+        // write-lock guard round-trips through the blocking task, so it is still
+        // held for the commit steps below.
+        let (_guard, apply_result, progress_error) =
+            match self.spawn_apply(patch, &state, &ctx.perms, guard).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    // The task panicked, taking the guard with it: retake the
+                    // lock before touching the workspace again. Its progress
+                    // callbacks already recorded whatever it created, so restore
+                    // against the abandon record rather than nothing.
+                    let _guard = Arc::clone(&self.write_lock).lock_owned().await;
+                    let partial = self.partial_from_abandoned(tx_id);
+                    return Err(self
+                        .restore_after_failure(err, &state, &partial, &ctx.perms)
+                        .await);
                 }
-                match lock(&self.abandoned) {
-                    Ok(mut abandoned) => {
-                        if let Some(a) = abandoned.as_mut() {
-                            match progress {
-                                ApplyProgress::TempPath(path) => a.temp_paths.push(path),
-                                ApplyProgress::CreatedPath(path) => a.created_paths.push(path),
-                                ApplyProgress::CreatedDir(path) => a.created_dirs.push(path),
-                            }
-                        }
-                    }
-                    Err(err) => progress_error = Some(err),
-                }
-            });
+            };
         let file_out = match apply_result {
             Ok(out) => out,
             Err(failure) => {
@@ -686,7 +701,7 @@ impl GitEditEngine {
 
         match record.state {
             TxState::RolledBack => {
-                let digest = self.workspace_digest("post", &tracked, &[])?;
+                let digest = self.workspace_digest("post", &tracked, &[]).await?;
                 if digest == record.pre_digest {
                     return Ok(());
                 }
@@ -704,7 +719,9 @@ impl GitEditEngine {
                         reason: "not newest",
                     });
                 }
-                let digest = self.workspace_digest("post", &tracked, &record.created_paths)?;
+                let digest = self
+                    .workspace_digest("post", &tracked, &record.created_paths)
+                    .await?;
                 if Some(&digest) != record.post_digest.as_ref() {
                     return Err(EditError::WorkspaceDrifted(tx));
                 }
@@ -737,6 +754,89 @@ impl GitEditEngine {
         self.rollback_record(record, &ctx.perms).await
     }
 
+    /// Apply the patch on the blocking pool, keeping progress bookkeeping there.
+    ///
+    /// Patch application is synchronous file I/O over every patched file, so it
+    /// belongs off the async worker. Two things travel into the task because
+    /// blocking work cannot be aborted and may outlive a cancelled `apply`:
+    ///
+    /// - the abandon record (an `Arc`), so the task records the created / temp
+    ///   paths it is responsible for, and reconcile can clean up after it;
+    /// - the `write_lock` guard, so no other mutation starts while an orphaned
+    ///   task is still writing. It is returned to the caller for the commit steps.
+    #[allow(clippy::type_complexity)]
+    async fn spawn_apply(
+        &self,
+        patch: PatchSet,
+        state: &ApplyState,
+        perms: &PermissionToken,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<
+        (
+            tokio::sync::OwnedMutexGuard<()>,
+            Result<FileApplyOutcome, Box<FileApplyError>>,
+            Option<EditError>,
+        ),
+        EditError,
+    > {
+        let policy = self.path_policy.clone();
+        let perms = perms.clone();
+        let abandoned = Arc::clone(&self.abandoned);
+        let tx_id = state.tx_id;
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
+            let mut progress_error: Option<EditError> = None;
+            let result = apply_file_patches(&patch, &policy, &perms, tx_id, |progress| {
+                if progress_error.is_some() {
+                    return;
+                }
+                match lock(&abandoned) {
+                    Ok(mut abandoned) => {
+                        if let Some(a) = abandoned.as_mut() {
+                            match progress {
+                                ApplyProgress::TempPath(path) => a.temp_paths.push(path),
+                                ApplyProgress::CreatedPath(path) => a.created_paths.push(path),
+                                ApplyProgress::CreatedDir(path) => a.created_dirs.push(path),
+                            }
+                        }
+                    }
+                    Err(err) => progress_error = Some(err),
+                }
+            });
+            (guard, result, progress_error)
+        })
+        .await
+        .map_err(|err| EditError::Internal(format!("apply task: {err}")))
+    }
+
+    /// Paths the armed abandon record says this transaction created.
+    ///
+    /// Used when the apply task died without returning an outcome: a poisoned or
+    /// cleared record yields an empty set, which still restores tracked files.
+    fn partial_from_abandoned(&self, tx: TransactionId) -> FileApplyOutcome {
+        match lock(&self.abandoned) {
+            Ok(slot) => slot
+                .as_ref()
+                .filter(|a| a.transaction_id == tx)
+                .map(|a| FileApplyOutcome {
+                    files_touched: Vec::new(),
+                    created_paths: a.created_paths.clone(),
+                    temp_paths: a.temp_paths.clone(),
+                    created_dirs: a.created_dirs.clone(),
+                })
+                .unwrap_or_default(),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    tx = %tx,
+                    "apply path bookkeeping unreadable; restoring tracked files only"
+                );
+                FileApplyOutcome::default()
+            }
+        }
+    }
+
     /// Post-mutate, pre-commit work: record paths, post digest, CAS put.
     ///
     /// Every fallible step lives here so `apply` has exactly one restore-on-error
@@ -749,7 +849,9 @@ impl GitEditEngine {
         patch_bytes: Vec<u8>,
     ) -> Result<(WorkspaceDigest, ArtifactId), EditError> {
         update_record_paths(&self.tx_store, state.tx_id, file_out)?;
-        let post_digest = self.workspace_digest("post", &state.tracked, &file_out.created_paths)?;
+        let post_digest = self
+            .workspace_digest("post", &state.tracked, &file_out.created_paths)
+            .await?;
         let mut labels = serde_json::Map::new();
         labels.insert("transaction_id".into(), json!(state.tx_id.to_string()));
         labels.insert(
@@ -1150,9 +1252,10 @@ mod tests {
     }
 
     /// Digest of the current jail contents, as the engine would compute it.
-    fn jail_digest(fx: &Fixture, paths: &[&str]) -> WorkspaceDigest {
+    async fn jail_digest(fx: &Fixture, paths: &[&str]) -> WorkspaceDigest {
         fx.engine
             .workspace_digest("pre", &tracked(paths), &[])
+            .await
             .unwrap()
     }
 
@@ -1185,10 +1288,68 @@ mod tests {
         );
     }
 
+    /// The blocking apply task owns the write lock while it runs, so a cancelled
+    /// `apply` cannot let a second mutation start under an orphaned task.
+    #[tokio::test]
+    async fn apply_task_owns_the_write_lock_and_hands_it_back() {
+        let fx = fixture();
+        let record = tx_record(TxState::Open, jail_digest(&fx, &[]).await);
+        let state = ApplyState {
+            tx_id: record.id,
+            checkpoint_id: record.checkpoint_id,
+            checkpoint_sha: record.checkpoint_sha.clone(),
+            pre_digest: record.pre_digest.clone(),
+            tracked: BTreeSet::new(),
+        };
+        let guard = Arc::clone(&fx.engine.write_lock).lock_owned().await;
+
+        let (returned, result, progress_error) = fx
+            .engine
+            .spawn_apply(PatchSet { files: vec![] }, &state, &edit_token(), guard)
+            .await
+            .unwrap();
+
+        assert!(result.is_ok());
+        assert!(progress_error.is_none());
+        assert!(
+            fx.engine.write_lock.try_lock().is_err(),
+            "the guard must survive the round trip through the blocking task"
+        );
+        drop(returned);
+        assert!(fx.engine.write_lock.try_lock().is_ok());
+    }
+
+    /// A blocking apply task that dies mid-mutation leaves its progress in the
+    /// abandon record; the restore path has to use it or created files linger.
+    #[tokio::test]
+    async fn partial_paths_come_from_the_armed_abandon_record() {
+        let fx = fixture();
+        let record = tx_record(TxState::Open, jail_digest(&fx, &[]).await);
+        arm(&fx, &record);
+        {
+            let mut slot = fx.engine.abandoned.lock().unwrap();
+            let armed = slot.as_mut().unwrap();
+            armed.created_paths.push("new.txt".into());
+            armed.temp_paths.push(".new.txt.alloy-tmp-1".into());
+            armed.created_dirs.push("sub".into());
+        }
+
+        let partial = fx.engine.partial_from_abandoned(record.id);
+
+        assert_eq!(partial.created_paths, vec!["new.txt"]);
+        assert_eq!(partial.temp_paths, vec![".new.txt.alloy-tmp-1"]);
+        assert_eq!(partial.created_dirs, vec!["sub"]);
+        assert!(fx
+            .engine
+            .partial_from_abandoned(TransactionId::new())
+            .created_paths
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn reconcile_refuses_restore_when_deny_glob_path_is_tracked() {
         let fx = fixture();
-        let record = tx_record(TxState::Open, jail_digest(&fx, &[]));
+        let record = tx_record(TxState::Open, jail_digest(&fx, &[]).await);
         arm(&fx, &record);
         fx.broker.push(ls_files(b".env\0a.txt\0"));
 
@@ -1214,7 +1375,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_refuses_expired_token_before_any_git() {
         let fx = fixture();
-        let record = tx_record(TxState::Open, jail_digest(&fx, &[]));
+        let record = tx_record(TxState::Open, jail_digest(&fx, &[]).await);
         arm(&fx, &record);
         let perms = PermissionToken {
             expires: Some(Timestamp::now()),
@@ -1234,7 +1395,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_clears_without_restore_for_committed_tx() {
         let fx = fixture();
-        let record = tx_record(TxState::Committed, jail_digest(&fx, &[]));
+        let record = tx_record(TxState::Committed, jail_digest(&fx, &[]).await);
         arm(&fx, &record);
 
         fx.engine.reconcile_abandoned(&edit_token()).await.unwrap();
@@ -1251,7 +1412,7 @@ mod tests {
     async fn restore_after_mutate_requires_digest_match_before_clearing_abandon() {
         let fx = fixture();
         std::fs::write(fx.jail.join("a.txt"), b"restored\n").unwrap();
-        let mut record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]));
+        let mut record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]).await);
         // Pre-image the restore cannot reach: the file on disk says otherwise.
         record.pre_digest.total_bytes += 1;
         arm(&fx, &record);
@@ -1286,7 +1447,7 @@ mod tests {
     async fn restore_after_mutate_marks_rolled_back_on_verified_restore() {
         let fx = fixture();
         std::fs::write(fx.jail.join("a.txt"), b"restored\n").unwrap();
-        let record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]));
+        let record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]).await);
         arm(&fx, &record);
         let state = ApplyState {
             tx_id: record.id,
@@ -1310,7 +1471,7 @@ mod tests {
     #[tokio::test]
     async fn restore_after_mutate_refuses_expired_token_and_stays_dirty() {
         let fx = fixture();
-        let record = tx_record(TxState::Open, jail_digest(&fx, &[]));
+        let record = tx_record(TxState::Open, jail_digest(&fx, &[]).await);
         arm(&fx, &record);
         let state = ApplyState {
             tx_id: record.id,
@@ -1343,7 +1504,7 @@ mod tests {
     async fn failed_rollback_of_committed_tx_is_reconcilable() {
         let fx = fixture();
         std::fs::write(fx.jail.join("a.txt"), b"restored\n").unwrap();
-        let mut record = tx_record(TxState::Committed, jail_digest(&fx, &["a.txt"]));
+        let mut record = tx_record(TxState::Committed, jail_digest(&fx, &["a.txt"]).await);
         record.state = TxState::Committed;
         fx.engine
             .tx_store
@@ -1381,7 +1542,7 @@ mod tests {
     async fn rollback_clears_abandon_only_after_digest_verify() {
         let fx = fixture();
         std::fs::write(fx.jail.join("a.txt"), b"restored\n").unwrap();
-        let mut record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]));
+        let mut record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]).await);
         record.pre_digest.file_count += 1;
         fx.engine
             .tx_store
