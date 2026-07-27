@@ -36,8 +36,17 @@ pub(crate) fn compute_workspace_digest(
         }
     }
     for path in created_paths {
-        if include_path(policy, path) && policy.jail().join(path).exists() {
-            paths.insert(path.clone());
+        if !include_path(policy, path) {
+            continue;
+        }
+        let abs = policy.jail().join(path);
+        match fs::symlink_metadata(&abs) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                paths.insert(path.clone());
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(EditError::Io(e.to_string())),
         }
     }
 
@@ -191,6 +200,27 @@ mod tests {
             compute_workspace_digest(&policy(dir.path()), &unnameable, &[], 10, 10),
             Err(EditError::Io(_))
         ));
+
+        // The same classification applies to `created_paths` (post-digest).
+        assert!(matches!(
+            compute_workspace_digest(
+                &policy(dir.path()),
+                &BTreeSet::new(),
+                &["bad\0created".to_string()],
+                10,
+                10
+            ),
+            Err(EditError::Io(_))
+        ));
+        let digest = compute_workspace_digest(
+            &policy(dir.path()),
+            &BTreeSet::new(),
+            &["a.txt".to_string()],
+            10,
+            10,
+        )
+        .unwrap();
+        assert_eq!(digest.file_count, 1);
     }
 
     #[test]

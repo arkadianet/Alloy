@@ -520,7 +520,12 @@ impl GitEditEngine {
         let EditRequest::TextPatch { patch } = req else {
             unreachable!("semantic rejected");
         };
-        let files_touched = validate_patchset_local(&patch, &self.path_policy, &ctx.perms)?;
+        let policy = self.path_policy.clone();
+        let perms = ctx.perms.clone();
+        let files_touched =
+            tokio::task::spawn_blocking(move || validate_patchset_local(&patch, &policy, &perms))
+                .await
+                .map_err(|e| EditError::Internal(format!("validate task: {e}")))??;
         tracing::Span::current().record("file_count", files_touched.len());
         Ok(EditValidation { files_touched })
     }
@@ -538,7 +543,14 @@ impl GitEditEngine {
         let EditRequest::TextPatch { patch } = req else {
             unreachable!("semantic rejected");
         };
-        let files_touched = validate_patchset_local(&patch, &self.path_policy, &ctx.perms)?;
+        let policy = self.path_policy.clone();
+        let perms = ctx.perms.clone();
+        let patch_for_validate = patch.clone();
+        let files_touched = tokio::task::spawn_blocking(move || {
+            validate_patchset_local(&patch_for_validate, &policy, &perms)
+        })
+        .await
+        .map_err(|e| EditError::Internal(format!("validate task: {e}")))??;
         self.require_git(&ctx.perms)?;
         let span = tracing::Span::current();
         span.record("file_count", files_touched.len());

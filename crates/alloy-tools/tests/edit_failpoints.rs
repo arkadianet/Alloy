@@ -1004,6 +1004,39 @@ async fn truncated_ls_files_stdout_is_environment_error_before_mutate() {
     fx.close().await;
 }
 
+/// AC 44: truncated `diff --name-only` (merge-conflict probe) must likewise fail closed.
+#[tokio::test]
+async fn truncated_diff_stdout_is_environment_error_before_mutate() {
+    let Some(fx) = Fixture::build().await else {
+        return;
+    };
+    let engine = fx.engine_with(
+        Arc::new(TruncatingBroker {
+            inner: fx.native.clone(),
+            subcommand: "diff".into(),
+        }),
+        fx.storage.artifacts() as Arc<dyn ArtifactStore>,
+        None,
+    );
+
+    let error = engine
+        .apply(modify_request("one", "two"), &fx.ctx(edit_token()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        EditError::Environment(ref message)
+            if message == "git stdout truncated; raise sandbox stdout_cap"
+    ));
+    assert_eq!(
+        std::fs::read_to_string(fx.jail.join("a.txt")).unwrap(),
+        "one\n"
+    );
+    assert!(checkpoint_refs(&fx).await.is_empty());
+    fx.close().await;
+}
+
 /// AC 36: `git add .env` after a committed edit makes a deny-glob path tracked,
 /// and a whole-tree restore would rewrite it — so rollback must refuse instead.
 #[tokio::test]
