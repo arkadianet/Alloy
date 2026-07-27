@@ -818,6 +818,35 @@ impl Checkpoint {
         self.cas(dag).await
     }
 
+    // ---- reconcile_terminal_run: bare CAS, no node rewrite ----
+
+    /// RC4 (no non-terminal node remains to attribute) / RC6 (`Succeeded`
+    /// requested with non-terminal nodes still present): a single CAS to
+    /// `to` with **no** `TaskNode.state` mutation, plus a best-effort
+    /// `Error`-typed synthetic event carrying `notes` (there is no node to
+    /// attach a `NodeState` event to).
+    pub(crate) async fn c_reconcile_bare(
+        &self,
+        dag: &mut TaskDag,
+        ctx: CheckpointCtx,
+        to: crate::scheduler::DagState,
+        notes: &str,
+    ) -> Result<(), SchedError> {
+        dag.state = to;
+        self.cas(dag).await?;
+        self.append_best_effort(NewSessionEvent {
+            session_id: ctx.session_id,
+            run_id: ctx.run_id,
+            type_: SessionEventType::Error,
+            payload: serde_json::json!({
+                "reconciled_to": to,
+                "notes": notes,
+            }),
+        })
+        .await;
+        Ok(())
+    }
+
     // -------------------------------------------------------------
     // §5.3.1 attempt-counter rebuild
     // -------------------------------------------------------------

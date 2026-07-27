@@ -171,10 +171,18 @@ impl Scheduler for LinearScheduler {
     async fn cancel(&self, dag_id: DagId) -> Result<(), SchedError> {
         self.cancel_impl(dag_id).await
     }
+
+    async fn reconcile_terminal_run(
+        &self,
+        dag_id: DagId,
+        terminal: DagState,
+    ) -> Result<(), SchedError> {
+        self.reconcile_terminal_run_impl(dag_id, terminal).await
+    }
 }
 
 impl LinearScheduler {
-    fn checkpoint(&self) -> Checkpoint {
+    pub(super) fn checkpoint(&self) -> Checkpoint {
         Checkpoint::new(
             Arc::clone(&self.deps.dags),
             Arc::clone(&self.deps.artifacts),
@@ -1535,7 +1543,7 @@ pub(super) fn non_terminal_except(dag: &TaskDag, except: NodeId) -> Vec<NodeId> 
 /// first frontier promotion), every non-terminal node is `Skipped` and none
 /// is `Cancelled` — `c6_cancel` still forces `DagState::Cancelled` directly
 /// (it does not rely on derive_dag_state's "≥1 Cancelled" rule).
-fn cancel_targets(dag: &TaskDag) -> (Vec<NodeId>, Vec<NodeId>) {
+pub(super) fn cancel_targets(dag: &TaskDag) -> (Vec<NodeId>, Vec<NodeId>) {
     let in_flight = dag
         .nodes
         .values()
@@ -2876,6 +2884,344 @@ mod tests {
         );
         let err = sched.cancel(DagId::new()).await.unwrap_err();
         assert!(matches!(err, SchedError::DagNotFound(_)));
+        fx.close().await;
+    }
+
+    // ---- reconcile_terminal_run (§5.20 RC1-RC8) ----
+
+    async fn seed_pending_single_node(fx: &Fixture, session: SessionId, dag_id: DagId) -> NodeId {
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        a
+    }
+
+    fn reconcile_scheduler(fx: &Fixture) -> LinearScheduler {
+        fx.build_scheduler(
+            fx._dir.path().join("s1"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        )
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc1_rejects_non_terminal_target() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        seed_pending_single_node(&fx, session, dag_id).await;
+        let sched = reconcile_scheduler(&fx);
+
+        let err = sched
+            .reconcile_terminal_run(dag_id, DagState::Running)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SchedError::Config(_)));
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc2_missing_dag_errors() {
+        let fx = Fixture::new().await;
+        let sched = reconcile_scheduler(&fx);
+        let err = sched
+            .reconcile_terminal_run(DagId::new(), DagState::Failed)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SchedError::DagNotFound(_)));
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc2_already_terminal_is_idempotent_noop() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Succeeded,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let sched = reconcile_scheduler(&fx);
+
+        sched
+            .reconcile_terminal_run(dag_id, DagState::Failed)
+            .await
+            .unwrap();
+        let persisted = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, DagState::Succeeded); // untouched
+        assert_eq!(persisted.generation, 1); // no CAS at all
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc3_owned_by_live_run_is_noop() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        struct Never;
+        #[async_trait]
+        impl CapabilityExecutor for Never {
+            async fn execute(
+                &self,
+                _ctx: &CapabilityExecContext,
+            ) -> Result<CapabilityOutcome, CapabilityExecError> {
+                std::future::pending().await
+            }
+        }
+        let sched = Arc::new(fx.build_scheduler(
+            fx._dir.path().join("s1"),
+            Arc::new(Never),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        ));
+        let sched2 = Arc::clone(&sched);
+        let run_handle = tokio::spawn(async move { sched2.run(dag_id).await });
+        tokio::time::sleep(Duration::from_millis(50)).await; // let it reach dispatch
+
+        // RC3: a live run in this process owns terminalization — `Ok(())`,
+        // no write, and (unlike `cancel`) the run is left running.
+        sched
+            .reconcile_terminal_run(dag_id, DagState::Failed)
+            .await
+            .unwrap();
+        let mid = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(mid.state, DagState::Running); // C1 already ran; RC3 left it untouched
+
+        sched.cancel(dag_id).await.unwrap(); // clean up the still-running dispatch
+        run_handle.await.unwrap().unwrap();
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc4_cancelled_marks_non_terminal_nodes() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = seed_pending_single_node(&fx, session, dag_id).await;
+        let sched = reconcile_scheduler(&fx);
+
+        sched
+            .reconcile_terminal_run(dag_id, DagState::Cancelled)
+            .await
+            .unwrap();
+        let persisted = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, DagState::Cancelled);
+        assert_eq!(persisted.nodes[&a].state, NodeState::Skipped); // Pending, never in flight
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc4_failed_non_gate_attributes_lowest_non_terminal() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let input_lo = fx.put_goal_envelope(dag_id, lo, NodeKind::Analyze).await;
+        let input_hi = fx.put_goal_envelope(dag_id, hi, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([
+                (
+                    lo,
+                    llm_node(lo, NodeKind::Analyze, input_lo, adapter_retry()),
+                ),
+                (
+                    hi,
+                    llm_node(hi, NodeKind::Analyze, input_hi, adapter_retry()),
+                ),
+            ]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let sched = reconcile_scheduler(&fx);
+
+        sched
+            .reconcile_terminal_run(dag_id, DagState::Failed)
+            .await
+            .unwrap();
+        let persisted = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, DagState::Failed);
+        assert_eq!(persisted.nodes[&lo].state, NodeState::Failed); // FN1: lowest NodeId
+        assert_eq!(persisted.nodes[&hi].state, NodeState::Skipped);
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc4_failed_no_non_terminal_node_is_bare_cas() {
+        // A stale row: `dag.state` still `Pending` but every node already
+        // reached a terminal `NodeState` (a corruption/lag, not a scenario
+        // this scheduler's live loop can itself produce, but reconcile MUST
+        // NOT crash on it — RC4's "no non-terminal node remains" branch).
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.state = NodeState::Succeeded;
+        node.output_ref = Some(fx.put_pending_placeholder_artifact().await);
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending, // stale
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let sched = reconcile_scheduler(&fx);
+
+        sched
+            .reconcile_terminal_run(dag_id, DagState::Failed)
+            .await
+            .unwrap();
+        let persisted = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, DagState::Failed);
+        assert_eq!(persisted.nodes[&a].state, NodeState::Succeeded); // untouched
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc4_rc5_gate_origin_cancels_gate_with_approval_class() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let gate = NodeId::new();
+        let gate_id = GateId::new();
+        let gate_input = fx
+            .put_placeholder_input(dag_id, gate, NodeKind::GateHuman, vec![])
+            .await;
+        let mut gate_node_val = adapter_node(gate, NodeKind::GateHuman, gate_input);
+        gate_node_val.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "risky".into(),
+        });
+        gate_node_val.state = NodeState::WaitingApproval;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(gate, gate_node_val)]),
+            edges: vec![],
+            state: DagState::WaitingApproval,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let sched = reconcile_scheduler(&fx);
+
+        sched
+            .reconcile_terminal_run(dag_id, DagState::Failed)
+            .await
+            .unwrap();
+        let persisted = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, DagState::Failed);
+        assert_eq!(persisted.nodes[&gate].state, NodeState::Cancelled); // FN2, not Failed
+
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 50)
+            .await
+            .unwrap();
+        let gate_event = events
+            .iter()
+            .find(|e| {
+                e.type_ == crate::events::SessionEventType::NodeState
+                    && e.payload.get("error_class").is_some()
+            })
+            .expect("gate cancellation must carry an error_class");
+        assert_eq!(
+            gate_event.payload["error_class"],
+            serde_json::json!("approval")
+        );
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc6_succeeded_with_non_terminal_nodes_writes_failed_instead() {
+        // RC6: reconcile MUST NOT invent success.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = seed_pending_single_node(&fx, session, dag_id).await;
+        let sched = reconcile_scheduler(&fx);
+
+        sched
+            .reconcile_terminal_run(dag_id, DagState::Succeeded)
+            .await
+            .unwrap();
+        let persisted = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, DagState::Failed); // never Succeeded
+        assert_eq!(persisted.nodes[&a].state, NodeState::Failed);
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_rc8_racing_cancel_and_reconcile_agree_on_one_terminal_write() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        seed_pending_single_node(&fx, session, dag_id).await;
+        let sched = Arc::new(reconcile_scheduler(&fx));
+
+        // Neither call owns the DAG (no live run) — both `cancel` and
+        // `reconcile_terminal_run` take the §5.12.4/RC4 "unowned" transient-
+        // ownership path. Whichever wins the race writes once; the other
+        // MUST observe the resulting terminal state and return `Ok(())`
+        // (RC8), never error or double-write.
+        let s1 = Arc::clone(&sched);
+        let s2 = Arc::clone(&sched);
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { s1.cancel(dag_id).await }),
+            tokio::spawn(async move { s2.reconcile_terminal_run(dag_id, DagState::Failed).await }),
+        );
+        r1.unwrap().unwrap();
+        r2.unwrap().unwrap();
+
+        let persisted = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert!(matches!(
+            persisted.state,
+            DagState::Cancelled | DagState::Failed
+        ));
         fx.close().await;
     }
 

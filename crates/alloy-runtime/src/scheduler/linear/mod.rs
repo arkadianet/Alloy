@@ -10,6 +10,7 @@ mod loop_;
 mod metrics;
 mod own;
 mod ready;
+mod reconcile;
 mod retry;
 
 pub use metrics::SchedulerMetrics;
