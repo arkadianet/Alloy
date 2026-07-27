@@ -184,3 +184,64 @@ async fn concurrent_cas_across_storage_handles() {
     storage_a.close().await.unwrap();
     storage_b.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn replan_persists_prior_gen_via_snapshot_and_durable_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let session = SessionId::new();
+    let run = RunId::new();
+    let dag_id = DagId::new();
+    let gen1_snapshot;
+
+    {
+        let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(&data))
+            .await
+            .unwrap();
+        let svc = TemplatePlanService::from_storage(&storage);
+        let ctx = plan_ctx(session, run, dag_id);
+        let first = svc.plan(ctx.clone()).await.unwrap();
+        gen1_snapshot = first.snapshot_artifact;
+
+        let mut failed = first.dag.clone();
+        failed.state = alloy_runtime::DagState::Failed;
+        storage.dags().put(&failed).await.unwrap();
+
+        let mut replan_ctx = ctx;
+        replan_ctx.template_override = Some(first.template_id);
+        let second = svc
+            .replan(alloy_runtime::ReplanReason::UserRequested, replan_ctx)
+            .await
+            .unwrap();
+        assert_eq!(second.dag.generation, 2);
+
+        storage.close().await.unwrap();
+    }
+
+    let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(&data))
+        .await
+        .unwrap();
+    let got = storage.dags().get(dag_id).await.unwrap().unwrap();
+    assert_eq!(got.generation, 2);
+
+    let old_snap = storage.artifacts().get(gen1_snapshot).await.unwrap();
+    let prior: alloy_runtime::TaskDag = serde_json::from_slice(&old_snap.bytes).unwrap();
+    assert_eq!(prior.generation, 1);
+
+    let evs = storage
+        .events()
+        .list_session_events(session, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(evs.len(), 2);
+    assert!(evs
+        .iter()
+        .all(|e| e.type_ == SessionEventType::PlanProduced));
+    let replan_payload: PlanProducedPayload =
+        serde_json::from_value(evs[1].payload.clone()).unwrap();
+    assert!(replan_payload.replan);
+    assert_eq!(replan_payload.generation, 2);
+    assert_eq!(replan_payload.dag_id, dag_id);
+
+    storage.close().await.unwrap();
+}

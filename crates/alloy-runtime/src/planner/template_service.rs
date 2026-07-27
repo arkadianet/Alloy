@@ -219,12 +219,8 @@ impl TemplatePlanService {
         expected_for_cas: CasExpected,
     ) -> Result<PlanResult, PlanError> {
         let replan = matches!(expected_for_cas, CasExpected::Replan { .. });
-        // Day-1 never enables cache; fingerprints reserved for RFC-0010.
-        let _ = (
-            &ctx.policy_hash,
-            &ctx.tool_versions,
-            &ctx.compiler_fingerprint,
-        );
+        // Day-1 never enables cache; PlanContext fingerprints are reserved for RFC-0010
+        // (see dag/cache.rs module docs). They are intentionally unread here.
         let manifest = TemplateCatalog::get(template_id);
 
         // Phase A
@@ -262,6 +258,8 @@ impl TemplatePlanService {
             ids: &ids,
             input_refs: &input_refs,
         });
+        // Re-validate after real input_refs are bound. Validator does not inspect
+        // ArtifactId values, so this cannot fail if Phase A passed; kept as insurance.
         DagValidator::validate(&dag, ValidateOpts::default())?;
 
         // Snapshot
@@ -553,6 +551,14 @@ impl PlanService for TemplatePlanService {
             });
         }
 
+        // Cheap preflight: avoid orphan CAS blobs when scheduler hasn't checkpointed yet.
+        // Atomic `replace_for_replan` still rejects Running under the race.
+        if probe.state == DagState::Running {
+            return Err(PlanError::DagBusy {
+                state: DagState::Running,
+            });
+        }
+
         let next_gen = probe
             .generation
             .checked_add(1)
@@ -578,8 +584,6 @@ impl PlanService for TemplatePlanService {
         .await
     }
 }
-
-// (llm_stub imports TemplateId from crate::dag)
 
 #[cfg(test)]
 mod tests {
@@ -844,6 +848,22 @@ mod tests {
                 state: DagState::Running
             }
         ));
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replan_generation_overflow_at_i64_max() {
+        let (_dir, storage, svc, _) = service().await;
+        let ctx = plan_ctx(SessionId::new(), RunId::new(), DagId::new());
+        let first = svc.plan(ctx.clone()).await.unwrap();
+        let mut maxed = first.dag.clone();
+        maxed.generation = i64::MAX as u64;
+        storage.dags().put(&maxed).await.unwrap();
+        let err = svc
+            .replan(ReplanReason::UserRequested, ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PlanError::GenerationOverflow));
         storage.close().await.unwrap();
     }
 

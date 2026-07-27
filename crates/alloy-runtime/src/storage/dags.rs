@@ -165,8 +165,19 @@ fn reject_generation_bound(generation: u64) -> Result<(), StoreError> {
 }
 
 fn updated_at_rfc3339(ts: &Timestamp) -> Result<String, StoreError> {
-    ts.0.format(&time::format_description::well_known::Rfc3339)
-        .map_err(|e| StoreError::Internal(format!("rfc3339: {e}")))
+    // Fixed-width fractional seconds so ORDER BY updated_at ASC is chronological.
+    // Variable-precision RFC3339 (`…20.1Z` vs `…20.12Z`) is not lexicographic-safe.
+    let utc = ts.0.to_offset(time::UtcOffset::UTC);
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z",
+        year = utc.year(),
+        month = u8::from(utc.month()),
+        day = utc.day(),
+        hour = utc.hour(),
+        minute = utc.minute(),
+        second = utc.second(),
+        nanos = utc.nanosecond(),
+    ))
 }
 
 fn encode_blob(dag: &TaskDag) -> Result<String, StoreError> {
@@ -921,5 +932,46 @@ mod tests {
         dags.delete(a.id).await.unwrap();
         assert!(dags.get(a.id).await.unwrap().is_none());
         storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_mapping_increments_busy_errors() {
+        let (_dir, storage) = open_store().await;
+        let dags = storage.dags();
+        let before = storage.metrics().busy_errors;
+
+        let err = dags.map_busy(StoreError::Busy);
+        assert!(matches!(err, StoreError::Busy));
+        assert_eq!(storage.metrics().busy_errors, before + 1);
+
+        let err = dags.map_busy(StoreError::Closed);
+        assert!(matches!(err, StoreError::Closed));
+        assert_eq!(storage.metrics().busy_errors, before + 1);
+
+        let err = dags.map_replan_busy(ReplanReplaceError::Store(StoreError::Busy));
+        assert!(matches!(err, ReplanReplaceError::Store(StoreError::Busy)));
+        assert_eq!(storage.metrics().busy_errors, before + 2);
+
+        let err = dags.map_replan_busy(ReplanReplaceError::NotFound);
+        assert!(matches!(err, ReplanReplaceError::NotFound));
+        assert_eq!(storage.metrics().busy_errors, before + 2);
+
+        storage.close().await.unwrap();
+    }
+
+    #[test]
+    fn updated_at_fixed_width_sorts_chronologically() {
+        // Variable-precision RFC3339 would put …20.12Z before …20.1Z lexicographically.
+        let a = Timestamp(
+            time::OffsetDateTime::from_unix_timestamp_nanos(1_720_000_000_100_000_000).unwrap(),
+        );
+        let b = Timestamp(
+            time::OffsetDateTime::from_unix_timestamp_nanos(1_720_000_000_120_000_000).unwrap(),
+        );
+        let sa = updated_at_rfc3339(&a).unwrap();
+        let sb = updated_at_rfc3339(&b).unwrap();
+        assert!(sa.ends_with(".100000000Z"), "{sa}");
+        assert!(sb.ends_with(".120000000Z"), "{sb}");
+        assert!(sa < sb, "{sa} should sort before {sb}");
     }
 }

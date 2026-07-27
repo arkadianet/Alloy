@@ -825,8 +825,7 @@ mod tests {
         let g = gate_node(NodeId::new(), GateId::new());
         let gid = g.id;
         nodes.insert(gid, g);
-        // Need edge so we don't fail earlier for other reasons — actually Empty is fine,
-        // but we have two nodes. Without edges: MultipleRoots. Fix: connect them.
+        // Need edge so V7 MultipleRoots does not fire before V2 NodeIdMismatch.
         let edges = vec![DependencyEdge {
             from: a,
             to: gid,
@@ -1010,6 +1009,59 @@ mod tests {
         assert!(matches!(
             DagValidator::validate(&dag, ValidateOpts::default()),
             Err(DagValidationError::CapabilityRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn appendix_a_capability_ids_table_driven() {
+        let cases = [
+            (NodeKind::Plan, "planning"),
+            (NodeKind::Analyze, "repair"),
+            (NodeKind::Edit, "edit"),
+            (NodeKind::Review, "review"),
+        ];
+        for (kind, expected) in cases {
+            let id = NodeId::new();
+            let mut nodes = BTreeMap::new();
+            let mut n = llm_node(id, kind, "wrong");
+            n.capability = Some(CapabilityId::new("wrong").unwrap());
+            nodes.insert(id, n);
+            let g = gate_node(NodeId::new(), GateId::new());
+            let gid = g.id;
+            nodes.insert(gid, g);
+            let edges = vec![DependencyEdge {
+                from: id,
+                to: gid,
+                kind: EdgeKind::Sequence,
+            }];
+            let dag = dag_from(nodes, edges);
+            match DagValidator::validate(&dag, ValidateOpts::default()) {
+                Err(DagValidationError::CapabilityRequired {
+                    kind: k,
+                    expected: exp,
+                    ..
+                }) => {
+                    assert_eq!(k, kind);
+                    assert_eq!(exp.as_str(), expected);
+                }
+                other => panic!("kind {kind:?}: expected CapabilityRequired, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn v6_cycle_before_v9_capability() {
+        // Multi-fault: cycle (V6) must win over capability (V9).
+        let (mut dag, a, e, _) = valid_chain();
+        dag.nodes.get_mut(&a).unwrap().capability = None;
+        dag.edges.push(DependencyEdge {
+            from: e,
+            to: a,
+            kind: EdgeKind::Sequence,
+        });
+        assert!(matches!(
+            DagValidator::validate(&dag, ValidateOpts::default()),
+            Err(DagValidationError::Cycle { .. })
         ));
     }
 

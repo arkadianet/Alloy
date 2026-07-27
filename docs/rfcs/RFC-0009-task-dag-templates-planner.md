@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Draft |
+| **Status** | Implemented |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0002](./RFC-0002-storage-artifacts-session-events.md) (merged) |
@@ -107,7 +107,7 @@ Authoritative for: `TaskDag`, `TaskNode`, `NodeKind`, `NodeState`, `EdgeKind`, `
 
 **This RFC does not amend field shapes.** Behaviour and ownership around them are specified here.
 
-**Additive derive authorization (normative):** Implementation MAY add `PartialEq` (and `Eq` where sound) to `TaskDag`, `TaskNode`, `DependencyEdge`, `RetryPolicy`, `Backoff`, `ApprovalSpec`, and `CacheKey` for tests. This is not a field reshape.
+**Additive derive authorization (normative):** Implementation MAY add `PartialEq` (and `Eq` where sound) to `TaskDag`, `TaskNode`, `DependencyEdge`, `RetryPolicy`, `Backoff`, `ApprovalSpec`, and `CacheKey` for tests. Implementation MAY add `Hash` to `EdgeKind` (fieldless `Copy` enum; required for V8 `HashSet<(NodeId, NodeId, EdgeKind)>` keys). This is not a field reshape.
 
 **RFC-0003 additive derive (normative):** Implementation MUST add `PartialEq` to `ReplanReason` (sound: `FailureIr` already derives `PartialEq`) so `PlanProducedPayload` can derive `PartialEq`.
 
@@ -538,14 +538,31 @@ impl TemplateCatalog {
 ### 3.11 Node I/O artifact envelopes
 
 ```rust
+/// Wire schema version for node I/O envelopes (MUST be 1).
+pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeInputEnvelope {
-    pub schema_version: u32, // MUST be 1
+    pub schema_version: u32, // MUST be ENVELOPE_SCHEMA_VERSION
     pub dag_id: DagId,
     pub node_id: NodeId,
     pub kind: NodeKind,
     pub generation: u64,
     pub payload: NodeInputPayload,
+}
+
+impl NodeInputEnvelope {
+    /// Construct with `ENVELOPE_SCHEMA_VERSION`.
+    pub fn new(
+        dag_id: DagId,
+        node_id: NodeId,
+        kind: NodeKind,
+        generation: u64,
+        payload: NodeInputPayload,
+    ) -> Self;
+
+    /// True when `schema_version == ENVELOPE_SCHEMA_VERSION`.
+    pub fn is_supported_schema(&self) -> bool;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -567,7 +584,7 @@ pub struct PredecessorOutput {
 /// concern and MUST NOT be written into `TaskNode.output_ref` on failure.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeOutputEnvelope {
-    pub schema_version: u32, // MUST be 1
+    pub schema_version: u32, // MUST be ENVELOPE_SCHEMA_VERSION
     pub dag_id: DagId,
     pub node_id: NodeId,
     pub kind: NodeKind,
@@ -575,6 +592,21 @@ pub struct NodeOutputEnvelope {
     /// Attempt index starting at 1 for the producing attempt (writer: 0010).
     pub attempt: u32,
     pub payload: serde_json::Value,
+}
+
+impl NodeOutputEnvelope {
+    /// Construct with `ENVELOPE_SCHEMA_VERSION`.
+    pub fn new(
+        dag_id: DagId,
+        node_id: NodeId,
+        kind: NodeKind,
+        generation: u64,
+        attempt: u32,
+        payload: serde_json::Value,
+    ) -> Self;
+
+    /// True when `schema_version == ENVELOPE_SCHEMA_VERSION`.
+    pub fn is_supported_schema(&self) -> bool;
 }
 ```
 
@@ -613,6 +645,10 @@ pub fn compute_cache_key(m: CacheKeyMaterials<'_>) -> CacheKey;
 pub fn mvp_tool_versions_digest() -> Digest;      // sha256(b"alloy.mvp.tool_versions.v0")
 pub fn mvp_compiler_fingerprint_digest() -> Digest; // sha256(b"alloy.mvp.compiler_fingerprint.v0")
 pub fn mvp_policy_hash_digest() -> Digest;        // sha256(b"alloy.mvp.policy_hash.v0")
+
+/// Content-only digest for a `Goal` (§5.8 `Goal` row). MUST NOT include
+/// dag_id / node_id / generation.
+pub fn goal_content_digest(goal: &Goal) -> Digest;
 ```
 
 ### 3.13 `PlanContext` / `PlanResult` / `PlanProducedPayload`
@@ -751,6 +787,10 @@ impl TemplatePlanService {
         artifacts: Arc<dyn ArtifactStore>,
         events: Arc<dyn EventSink>,
     ) -> Self;
+
+    /// Day-1 production wiring (§1.5 item 7): inject dags + artifacts + the
+    /// durable SQLite `EventSink` from an open `AlloyStorage`.
+    pub fn from_storage(storage: &AlloyStorage) -> Self;
 }
 ```
 
@@ -784,7 +824,7 @@ impl PlanService for DisabledLlmPlanService {
 
 ### 3.18 Crate-root re-exports
 
-MUST re-export: `DagStore`, `SqliteDagStore`, `ReplanReplaceError`, `DagValidator`, `ValidateOpts`, `DagValidationError`, `RetryIncoherence`, `TemplateId`, `TemplateManifest`, `TemplateCatalog`, `TemplateIdMap`, `BuildTopology`, `allocate_ids`, `build_topology`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput`, `CacheKeyMaterials`, `compute_cache_key`, `mvp_*_digest`, `PlanService`, `PlanContext`, `PlanResult`, `PlanProducedPayload`, `PlanError`, `TemplatePlanService`, `DisabledLlmPlanService`.
+MUST re-export: `DagStore`, `SqliteDagStore`, `ReplanReplaceError`, `DagValidator`, `ValidateOpts`, `DagValidationError`, `RetryIncoherence`, `TemplateId`, `TemplateManifest`, `TemplateCatalog`, `TemplateIdMap`, `BuildTopology`, `allocate_ids`, `build_topology`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput`, `ENVELOPE_SCHEMA_VERSION`, `CacheKeyMaterials`, `compute_cache_key`, `goal_content_digest`, `mvp_*_digest`, `PlanService`, `PlanContext`, `PlanResult`, `PlanProducedPayload`, `PlanError`, `TemplatePlanService`, `DisabledLlmPlanService`.
 
 Template DTO specs (`TemplateNodeSpec`, …) MAY stay module-public without crate-root re-export.
 
@@ -795,7 +835,7 @@ Template DTO specs (`TemplateNodeSpec`, …) MAY stay module-public without crat
 | `DagValidator` | pub | unit / associated fn |
 | `SqliteDagStore` | pub type; fields private | `AlloyStorage::dags()` only |
 | `TemplateCatalog` | pub | static / OnceLock |
-| `TemplatePlanService` | pub | `new(dags, artifacts, events)` — events required |
+| `TemplatePlanService` | pub | `from_storage(&AlloyStorage)` (production) or `new(dags, artifacts, events)` — events required |
 | `DisabledLlmPlanService` | pub | unit; tests / future flag only |
 
 ---
@@ -1448,15 +1488,15 @@ Every criterion is independently testable by a named test or mechanical check.
 
 Merge only when the series [Definition of Done](./README.md#definition-of-done-merge-gate) is fully met:
 
-- [ ] Architecture compliance: **PASS**
-- [ ] RFC acceptance criteria: **100% satisfied**
-- [ ] Unit tests: **passing**
-- [ ] Integration tests: **passing** (if applicable)
-- [ ] Documentation: **complete**
-- [ ] Public APIs: **reviewed and stable**
-- [ ] Clippy: **clean**
-- [ ] Formatting: **clean**
-- [ ] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
+- [x] Architecture compliance: **PASS**
+- [x] RFC acceptance criteria: **100% satisfied**
+- [x] Unit tests: **passing**
+- [x] Integration tests: **passing** (if applicable)
+- [x] Documentation: **complete**
+- [x] Public APIs: **reviewed and stable**
+- [x] Clippy: **clean**
+- [x] Formatting: **clean**
+- [x] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
 - [ ] Code review: **approved**
 
 ---
@@ -1539,11 +1579,13 @@ Replan: `"replan": true`, `"reason": "user_requested"` for unit variants, or `{"
 - On scheduler start / reclaim: if a DAG is `Running` and this process does not own it, transition it via same-generation `put_if_generation` to `Failed` or `ReplanRequired` (crash recovery) before accepting new work
 - On observing `RunControlState::ReplanRequested` for a live run this process owns: stop dispatch and write a non-`Running` `DagState` (`ReplanRequired`) via same-generation `put_if_generation` **before** `PlanService::replan` can succeed (otherwise `DagBusy` is permanent)
 - Rewrite final `input_ref` per §5.3.0
-- Enforce output_ref invariants on Succeeded/CachedHit
+- Enforce output_ref invariants on Succeeded/CachedHit (including: `CachedHit` MUST carry `output_ref`; `Succeeded` without `output_ref` MUST fail closed on Data edges)
 - Enforce GateHuman timeout using `timeout_ms`
 - Apply Data vs Sequence satisfaction per §5.3.1
 - Ignore `model_tier` / budgets on adapter nodes for routing
 - Specify `FromPredecessors` cache content-digest framing before enabling non-root cache
+
+**Concurrency note (normative for 0010):** Same-generation checkpoint CAS (`put_if_generation(..., Some(generation))` where the blob’s generation equals the expected generation) assumes a **single scheduler writer** per DAG. Generation alone does not serialize two concurrent same-generation updates that both pass the compare; ownership / leasing is RFC-0010’s responsibility.
 
 ## Appendix D — What RFC-0013 may assume
 

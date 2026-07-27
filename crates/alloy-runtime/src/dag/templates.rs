@@ -362,15 +362,9 @@ pub fn build_topology(args: BuildTopology<'_>) -> TaskDag {
                 timeout_ms: spec.timeout_ms,
             },
         );
-        // Day-1 / until RFC-0010 supplies cache materials: enable_cache must be false.
-        debug_assert!(
-            !spec.enable_cache,
-            "enable_cache=true requires cache materialization (RFC-0010); template node {}",
-            spec.name
-        );
+        // Day-1 / until RFC-0010 supplies cache materials: never invent keys.
+        // Same path in debug and release so profiles agree (template data, not a code invariant).
         if spec.enable_cache {
-            // Soft guard for release builds: never silently invent keys.
-            // Future: compute_cache_key materials must be plumbed here.
             tracing::error!(
                 node = %spec.name,
                 "template enable_cache=true ignored; cache_key left None until RFC-0010"
