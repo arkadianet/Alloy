@@ -1140,6 +1140,7 @@ struct OwnershipLock {
 | R2 | If `config.validate_on_load`: `DagValidator::validate(&dag, config.validate_opts)` (`ValidateOpts` is `Copy`, taken **by value** on `main`) | `Err(e)` ⇒ `Err(Invariant("dag {id} failed load validation: {e}"))` |
 | R3 | Resolve the run binding (Appendix F) | `None` ⇒ `Err(RunBindingMissing(dag_id))` |
 | R4 | Insert `OwnedDag` into `owned` (insert-if-absent) and build `OwnedGuard` | occupied ⇒ `Err(AlreadyOwned(dag_id))`; poisoned ⇒ `Err(Ownership(..))` |
+| R4b | **Re-load** `dags.get(dag_id)` under ownership (mirrors §5.12.4 / RC4). Same-generation CAS cannot see a concurrent unowned cancel/reconcile that already terminalized. | `None` ⇒ `Err(DagNotFound)`; durable terminal ⇒ continue at R9; `ReplanRequired` ⇒ R10; else replace in-memory `dag` with the fresh blob |
 | R5 | Take `dag_id` out of `pending_cancels`; if it was present, fire `run_cancel` immediately | — |
 | R6 | `sessions.get_session(dag.session_id)` for `workspace_root`, `profile`, `budget` | `None` ⇒ `Err(Invariant("session row missing for dag {id}"))` |
 | R7 | Compute effective budget ceilings (§5.16.1) | non-fatal; degenerate ceilings recorded as a `Budget` decision |
@@ -1940,7 +1941,7 @@ Evaluated in order over the post-CAS blob plus `DeriveFlags`:
 | FO2 | When `failed_node` is `Some(id)` and its `failure_ref` artifact is missing, degrade to `FailureIr { node: id, error_class, retry: NonRetryable, diagnostics: [], notes: "failure detail unavailable" }` reconstructed from the matching `NodeState` event when present. If **no** matching event exists either, use `error_class: Internal`, `retry: NonRetryable`, `notes: "failure detail unavailable; event missing"`. |
 | FO3 | R9 short-circuit MUST apply FO1/FO2 **without** requiring RF3 repair to succeed first. Best-effort RF3 repair MAY still append missing events after the outcome is assembled, but MUST NOT block returning `Ok(DagOutcome)`. |
 | FO4 | `state == Failed` with `failed_node == None` is permitted only for D8 (all-skipped) and MUST carry `failure = None`. FO2 does **not** apply to D8. |
-| FO4a | `reconcile_terminal_run(..., Failed)` that did **not** arise from a gate decision (RC4/RC5) MUST still put a synthetic `Internal` `failure_ir` on the lowest cancelled-or-failed node so FO6 holds when R9 later surfaces the outcome. |
+| FO4a | `reconcile_terminal_run(..., Failed)` that did **not** arise from a gate decision MUST leave the attributed node in `NodeState::Failed` with a synthetic `Internal` `failure_ir` (RC4/RC5), so FN1 + FO6 hold on R9. |
 | FO5 | `state == Cancelled` MUST carry `failed_node = None` and `failure = None`. |
 | FO6 | When `state == Failed` and `failed_node` is `Some(_)`, `failure` MUST be `Some(_)` (FO1/FO2). |
 
@@ -1980,8 +1981,8 @@ async fn reconcile_terminal_run(&self, dag_id: DagId, terminal: DagState) -> Res
 | RC1 | `terminal` MUST be `Succeeded` \| `Failed` \| `Cancelled`; anything else ⇒ `Err(Config("reconcile_terminal_run requires a terminal state"))`. |
 | RC2 | Missing DAG ⇒ `Err(DagNotFound)`. Already-terminal DAG ⇒ `Ok(())` with no write (idempotent). |
 | RC3 | A DAG owned by a live run in this process ⇒ `Ok(())` with no write: the run owns terminalization. |
-| RC4 | Otherwise: acquire ownership, **re-load** the DAG, then a single CAS marking non-terminal nodes (`WaitingApproval`/`Running`/`Ready` → `Cancelled` for `Cancelled`/`Failed` targets; the rest → `Skipped`), set `DagState = terminal`, append `NodeState` events, release ownership. |
-| RC5 | For `terminal == Failed` arising from a gate decision, the reconciler MUST put an `Approval` `failure_ir` for the gate node so `failed_node` selection (FN2) still works. For other `Failed` reconciles, put a synthetic `Internal` `failure_ir` on the lowest cancelled node (FO4a). |
+| RC4 | Otherwise: acquire ownership, **re-load** the DAG, then a single CAS: for `terminal == Cancelled`, mark non-terminal nodes (`WaitingApproval`/`Running`/`Ready` → `Cancelled`; rest → `Skipped`). For `terminal == Failed`, mark the attributed node (gate if gate-origin, else lowest non-terminal `NodeId`) **`Failed`** with a durable `failure_ir`, and every other non-terminal → `Skipped`. Set `DagState = terminal`, append events, release ownership. |
+| RC5 | Gate-origin `Failed`: `failure_ir` is `ErrorClass::Approval` on the gate (FN2). Non-gate `Failed`: `failure_ir` is `ErrorClass::Internal` on the attributed **`Failed`** node (FN1 / FO4a / FO6). Never attribute solely via a `Cancelled` node. |
 | RC6 | For `terminal == Succeeded` with non-terminal nodes remaining, the reconciler MUST NOT invent success: it MUST write `Failed` with `notes: "control row succeeded with unfinished nodes"` and log at `warn`. |
 | RC7 | `Conflict` ⇒ `Err(Conflict { dag_id })`; callers (resume) log and continue. |
 | RC8 | The method MUST be safe to call concurrently with `cancel` for the same DAG: whichever acquires ownership first wins, the other observes a terminal state and returns `Ok(())`. |
@@ -2059,8 +2060,8 @@ RFC-0008 MVP durability: **in-process edit-transaction map only** + durable chec
 | ER1 | DAG node state is durable (`put_if_generation`). Edit transaction state is **not**. After restart the two MAY disagree: an `Edit` node can be durably `Succeeded` while no in-memory tx exists and workspace creates may be untracked leftovers. |
 | ER2 | The scheduler MUST NOT assume a `Succeeded` `Edit` node implies a clean, known, or exclusive workspace. |
 | ER3 | The scheduler MUST NOT call `EditEngine::rollback`, `EditEngine::apply`, or `GitEditEngine::recover_checkpoint`. Those belong to the write stack / operator (RFC-0008 §2.5 / §6.5; RFC-0015). |
-| ER4 | **Resume-only re-verify.** On `run` entry after restart (not mid-loop), before dispatching any further `Edit` / capability node that consumes the edited tree: if any `Edit` in this generation is durably `Succeeded` and any **reachable** Data∪Sequence successor `VerifyCompile`/`VerifyTest` (not only the immediate out-neighbor) is still non-terminal (`Pending`/`Ready`/`Running` — not `Succeeded`/`CachedHit`/`Failed`/`Cancelled`/`Skipped`), the scheduler MUST prefer that verify frontier next via normal L-steps. Forward-only (§8.5). |
-| ER5 | If a `Succeeded` `Edit` has **no** such non-terminal verify successor in the DAG, the scheduler MUST stop: durable `Failed` with `FailureIr { error_class: Internal, retry: NonRetryable, notes: "edit succeeded without verify successor; workspace unverified after restart" }` and `Ok(DagOutcome { state: Failed, .. })`. |
+| ER4 | **Resume-only re-verify flag.** On `run` entry after restart: let `needs_reverify` be true iff some `Edit` in this generation is `Succeeded` and some Data∪Sequence-reachable `VerifyCompile`/`VerifyTest` is still non-terminal (`Pending`/`Ready`/`Running`). While `needs_reverify`, the loop MUST NOT dispatch `Edit` or other capability nodes that consume the edited tree — only verify / gate / aggregate / already-safe nodes via normal ready-set rules. When a verify becomes Ready, dispatch it. Forward-only (§8.5). Under serial MVP (`enforce_linear_mvp`), at most one Ready exists, so this is a dispatch filter, not a second scheduler. |
+| ER5 | If some `Edit` is `Succeeded` and **every** Data∪Sequence-reachable verify is absent **or** already terminal without any of them being `Succeeded`/`CachedHit` after this generation's edits (i.e. no verify successor exists at all, or all verifies are `Failed`/`Cancelled`/`Skipped` with none ever `Succeeded` post-edit and none still runnable), the scheduler MUST stop with durable `Failed`: `FailureIr { error_class: Internal, retry: NonRetryable, notes: "edit succeeded without successful verify after restart" }` and `Ok(DagOutcome { state: Failed, .. })`. A verify that already `Succeeded` clears `needs_reverify` and MUST NOT trigger ER5. |
 | ER6 | A crash with an `Edit` node durably `Running` follows §5.3.2 adoption (lost attempt). Re-dispatch produces a **new** forward `apply_patch`, not a replay of the lost tx (§5.8.3 RT6 / §8.5 FOW4). |
 | ER7 | Operator cleanup of untracked creates after crash is out of band (RFC-0008 / RFC-0015). The scheduler MUST NOT invent cleanup. |
 
@@ -2445,6 +2446,9 @@ Each AC is a test name or a CI check.
 | 85 | Admitted Edit retry issues a distinct new `apply_patch` call_id / attempt (RT6 / FOW4), not a replay of the prior tx. |
 | 86 | BG3 exhaustion calls `SessionPlane::signal_budget_warning` with RFC-0004 `{snapshot, message}` shape. |
 | 87 | `new` rejects `deps.runs` that is not `session_plane.runs()` (D6). |
+| 88 | After R4 ownership, R4b re-load observes an unowned-cancel terminal blob and short-circuits at R9 (no same-gen overwrite). |
+| 89 | Non-gate `reconcile_terminal_run(..., Failed)` yields R9 `failed_node = Some(_)` via FN1 (attributed node is `Failed`, not merely `Cancelled`). |
+| 90 | ER5 does not fire when a reachable verify already `Succeeded`; ER4 blocks Edit/capability dispatch while `needs_reverify`. |
 
 ---
 
@@ -2490,7 +2494,7 @@ Each AC is a test name or a CI check.
 | P5 | Retry / backoff / escalation + decisions | 0.75 pd |
 | P6 | `ToolCaller` seam, `map_mcp_error`, verify adapters, diagnostics parser + fingerprint | 1.25 pd |
 | P7 | Gate: scheduler orchestration, adapter, `expire_gate`, resume, reconcile | 1.25 pd |
-| P8 | Cancel / drain / amendments A1–A8 | 0.75 pd |
+| P8 | Cancel / drain / amendments A1–A9 | 0.75 pd |
 | P9 | Budgets, meter rebuild, observability | 0.5 pd |
 | P10 | Cross-subsystem e2e + CI greps | 0.75 pd |
 | **Total** | | **~8.5 pd raw → 5–8 pd with overlap** |
