@@ -377,12 +377,12 @@ pub trait DagStore: Send + Sync {
     /// `SELECT` row → decode → enforce checks → `UPDATE` new blob.
     ///
     /// Checks (in order):
-    /// 1. Missing row → `ReplanReplaceError::NotFound`
-    /// 2. Column/blob integrity failures → `ReplanReplaceError::Store(Corrupt|...)`
-    /// 3. Stored generation != `expected_generation` → `GenerationMismatch { actual }`
-    /// 4. Decoded `state == DagState::Running` → `DagBusy { state: Running }`
-    /// 5. `expected_generation > i64::MAX as u64` or
+    /// 1. `expected_generation > i64::MAX as u64` or
     ///    `dag.generation > i64::MAX as u64` → `Store(Internal)`
+    /// 2. Missing row → `ReplanReplaceError::NotFound`
+    /// 3. Column/blob integrity failures → `ReplanReplaceError::Store(Corrupt|...)`
+    /// 4. Stored generation != `expected_generation` → `GenerationMismatch { actual }`
+    /// 5. Decoded `state == DagState::Running` → `DagBusy { state: Running }`
     /// 6. `dag.generation != expected_generation + 1` → `Store(Internal)`
     /// 7. `dag.session_id` differs from stored column → `Store(Internal)`
     /// 8. Else write `dag` and return `Ok(())`
@@ -784,7 +784,7 @@ impl PlanService for DisabledLlmPlanService {
 
 ### 3.18 Crate-root re-exports
 
-MUST re-export: `DagStore`, `SqliteDagStore`, `ReplanReplaceError`, `DagValidator`, `ValidateOpts`, `DagValidationError`, `RetryIncoherence`, `TemplateId`, `TemplateManifest`, `TemplateCatalog`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput`, `CacheKeyMaterials`, `compute_cache_key`, `mvp_*_digest`, `PlanService`, `PlanContext`, `PlanResult`, `PlanProducedPayload`, `PlanError`, `TemplatePlanService`, `DisabledLlmPlanService`.
+MUST re-export: `DagStore`, `SqliteDagStore`, `ReplanReplaceError`, `DagValidator`, `ValidateOpts`, `DagValidationError`, `RetryIncoherence`, `TemplateId`, `TemplateManifest`, `TemplateCatalog`, `TemplateIdMap`, `BuildTopology`, `allocate_ids`, `build_topology`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `NodeInputPayload`, `PredecessorOutput`, `CacheKeyMaterials`, `compute_cache_key`, `mvp_*_digest`, `PlanService`, `PlanContext`, `PlanResult`, `PlanProducedPayload`, `PlanError`, `TemplatePlanService`, `DisabledLlmPlanService`.
 
 Template DTO specs (`TemplateNodeSpec`, …) MAY stay module-public without crate-root re-export.
 
@@ -871,7 +871,7 @@ select(ctx) -> TemplateId:
 1. `template_id ← select(ctx)`.
 2. `manifest ← TemplateCatalog::get(template_id)`.
 3. **Phase A (sync):** `ids ← templates::allocate_ids(manifest)` → `TemplateIdMap` (local name → `NodeId`, plus `GateId` per approval node).
-4. **Phase B (async, planner):** using `ids`, `put` every input / `pending_pred` artifact per §5.3.0; build `input_refs: BTreeMap<NodeId, ArtifactId>` covering **every** node. Missing coverage is a crate bug → `Internal`.
+4. **Phase B (async, planner):** using `ids`, `put` every input / `pending_pred` artifact per §5.3.0 with `NodeInputEnvelope.generation` equal to the plan/replan generation; build `input_refs: BTreeMap<NodeId, ArtifactId>` covering **every** node. Missing coverage is a crate bug → `Internal`.
 5. **Phase C (sync):** `dag ← templates::build_topology(BuildTopology { manifest, dag_id: ctx.dag_id, session_id: ctx.session_id, generation: 1, ids, input_refs })` — every node `Pending`, `TaskDag.state = Pending`, `output_ref = None`, `cache_key = None` when `!enable_cache` (day-1: all false). Every `input_ref` MUST equal the Phase B map entry (no synthetic `ArtifactId::new()`).
 6. `DagValidator::validate(&dag, ValidateOpts::default())?`.
 7. `snapshot ← artifacts.put(TaskDag JSON)` with snapshot labels. Serde failure → `PlanError::Internal`.
@@ -904,14 +904,16 @@ pub struct BuildTopology<'a> {
     pub input_refs: &'a BTreeMap<NodeId, ArtifactId>,
 }
 
-/// Phase A — sync. Duplicate template names or unknown edge endpoints → panic
-/// at catalog init (`catalog_parses` covers shipped manifests) or
-/// `PlanError::Internal` if invoked on a non-catalog manifest in tests.
+/// Phase A — sync. Duplicate template names or unknown edge endpoints are
+/// crate bugs: panic inside `TemplateCatalog::all()` / `catalog_parses`
+/// (shipped manifests) or panic in `allocate_ids` when used from tests on a
+/// hand-built invalid manifest. Signature is infallible.
 pub fn allocate_ids(manifest: &TemplateManifest) -> TemplateIdMap;
 
 /// Phase C — sync, pure. MUST look up every node’s `input_ref` in
-/// `input_refs`; missing key → panic/`Internal` (programmer error).
-/// MUST NOT call `ArtifactId::new()`.
+/// `input_refs`. Missing key is a programmer error → panic.
+/// MUST NOT call `ArtifactId::new()`. Signature is infallible; the planner
+/// maps missing Phase B coverage to `PlanError::Internal` **before** calling.
 pub fn build_topology(args: BuildTopology<'_>) -> TaskDag;
 ```
 
@@ -1054,10 +1056,10 @@ Uses `ctx.dag_id` only (no separate `dag_id` argument).
 
 1. `probe ← dags.get(ctx.dag_id)?.ok_or(DagNotFound)?` (non-atomic preflight for session mismatch / overflow messaging).
 2. If `probe.session_id != ctx.session_id` → `SessionMismatch`.
-3. `template_id ← ctx.template_override.unwrap_or_else(|| select(ctx))`.  
-   **No EventStore scan.** Callers SHOULD pass the prior `PlanResult.template_id` as override. Prefer routing replan through `RunController::request_replan` first so gate waiters are cleared (0003); direct `PlanService::replan` callers MUST ensure superseded `GateId` waiters are cleared.
-4. `next_gen ← probe.generation.checked_add(1).ok_or(GenerationOverflow)?`.
-5. Build fresh topology reusing `ctx.dag_id`, `generation = next_gen`, **`TaskDag.state = Pending`**, all nodes `Pending`, new node/gate ids, new artifacts.
+3. Prefer routing replan through `RunController::request_replan` first so gate waiters are cleared (0003). Production callers MUST do so; direct `PlanService::replan` is test/advanced-only (no public waiter-clear API outside the control plane).
+4. `template_id ← ctx.template_override.unwrap_or_else(|| select(ctx))`.  
+   **No EventStore scan.** Callers SHOULD pass the prior `PlanResult.template_id` as override.
+5. Build fresh topology via Phases A→B→C (§5.3) reusing `ctx.dag_id`, `generation = next_gen`, **`TaskDag.state = Pending`**, all nodes `Pending`, new node/gate ids, new artifacts.
 6. Validate; snapshot (serde fail → `Internal`).
 7. `dags.replace_for_replan(&dag, probe.generation)` mapping:
    - `NotFound` → `DagNotFound`
