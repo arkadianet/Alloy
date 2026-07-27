@@ -69,7 +69,10 @@ where
     };
     for file in &patch.files {
         let result = match file {
-            FilePatch::Delete { path, .. } => apply_delete(path, policy, &writes, &mut out),
+            FilePatch::Delete {
+                path,
+                validation_hunks,
+            } => apply_delete(path, validation_hunks, policy, &writes, &mut out),
             FilePatch::Modify { path, hunks } => {
                 apply_modify(path, hunks, policy, &writes, tx, &mut out, &mut progress)
             }
@@ -187,8 +190,29 @@ pub(crate) fn apply_hunks_to_text(
     Ok(join_lines(&new_lines, final_eof_newline))
 }
 
+/// Prove a unified-diff `Delete`'s hunks consume every line of `old_text`.
+///
+/// `apply_hunks_to_text` returns no bytes whenever the new side is empty, so the
+/// residual `eof_newline` flag on the deletion hunks cannot make a fully removed
+/// file look non-empty.
+pub(crate) fn verify_hunks_delete_whole_file(
+    rel: &str,
+    old_text: &str,
+    hunks: &[Hunk],
+) -> Result<(), EditError> {
+    if apply_hunks_to_text(rel, old_text, hunks)?.is_empty() {
+        Ok(())
+    } else {
+        Err(EditError::ContextMismatch {
+            path: rel.to_string(),
+            detail: "delete leaves content".into(),
+        })
+    }
+}
+
 fn apply_delete(
     rel: &str,
+    validation_hunks: &[Hunk],
     policy: &PathPolicy,
     writes: &GrantMatcher,
     out: &mut FileApplyOutcome,
@@ -203,7 +227,12 @@ fn apply_delete(
         }
     })?;
     ensure_regular(rel, &meta)?;
-    read_utf8_file(&path)?;
+    // Only a unified-diff `Delete` claims the file's contents; a structured one
+    // removes the path as-is, so it must work on non-UTF-8 files too.
+    if !validation_hunks.is_empty() {
+        let old = read_utf8_file(&path)?;
+        verify_hunks_delete_whole_file(rel, &old, validation_hunks)?;
+    }
     fs::remove_file(&path).map_err(|e| EditError::Io(e.to_string()))?;
     out.files_touched.push(rel.to_string());
     Ok(())
@@ -606,6 +635,85 @@ mod tests {
         assert_eq!(out.created_paths, vec!["a/b.txt"]);
         assert_eq!(out.created_dirs, vec!["a"]);
         assert!(!progress.is_empty());
+    }
+
+    /// Structured deletes remove the path as-is, so a file the engine cannot
+    /// decode as text is still deletable; a unified-diff delete instead has to
+    /// prove its hunks match the bytes on disk before unlinking anything.
+    #[test]
+    fn delete_requires_content_proof_only_when_the_diff_claims_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("latin1.bin"), [b'c', b'a', b'f', 0xe9]).unwrap();
+        let structured = PatchSet {
+            files: vec![FilePatch::Delete {
+                path: "latin1.bin".into(),
+                validation_hunks: vec![],
+            }],
+        };
+        apply_file_patches(
+            &structured,
+            &policy(dir.path()),
+            &token(),
+            TransactionId::new(),
+            |_| {},
+        )
+        .unwrap();
+        assert!(!dir.path().join("latin1.bin").exists());
+
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let stale = PatchSet {
+            files: vec![FilePatch::Delete {
+                path: "a.txt".into(),
+                validation_hunks: vec![Hunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 0,
+                    new_lines: 0,
+                    lines: vec!["-one".into()],
+                    eof_newline: true,
+                    old_eof_no_newline: false,
+                }],
+            }],
+        };
+        let err = apply_file_patches(
+            &stale,
+            &policy(dir.path()),
+            &token(),
+            TransactionId::new(),
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err.error,
+            EditError::ContextMismatch { ref detail, .. } if detail == "delete leaves content"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "one\ntwo\n",
+            "a delete that cannot prove the file contents must not unlink it"
+        );
+    }
+
+    /// A delete of a file with no trailing newline still reduces to zero bytes,
+    /// so the hunks' residual `eof_newline` must not make it look non-empty.
+    #[test]
+    fn whole_file_delete_proof_ignores_eof_newline() {
+        let hunk = Hunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 0,
+            new_lines: 0,
+            lines: vec!["-one".into()],
+            eof_newline: true,
+            old_eof_no_newline: true,
+        };
+        verify_hunks_delete_whole_file("a.txt", "one", std::slice::from_ref(&hunk)).unwrap();
+        // The old-side no-newline marker is still an assertion about the file.
+        assert!(matches!(
+            verify_hunks_delete_whole_file("a.txt", "one\n", &[hunk]),
+            Err(EditError::ContextMismatch { ref detail, .. })
+                if detail == "old file has trailing newline"
+        ));
     }
 
     #[test]

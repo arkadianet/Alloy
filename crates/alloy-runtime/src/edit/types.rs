@@ -62,6 +62,12 @@ pub enum FilePatch {
     Delete {
         /// Jail-relative path.
         path: String,
+        /// Full-file deletion hunks kept only to prove the caller saw the
+        /// current contents (RFC-0008 V5). Never serialized, so the wire and
+        /// CAS shape of a `Delete` stays path-only and structured JSON always
+        /// decodes to an empty vector.
+        #[serde(skip)]
+        validation_hunks: Vec<Hunk>,
     },
 }
 
@@ -70,7 +76,9 @@ impl FilePatch {
     #[must_use]
     pub fn path(&self) -> &str {
         match self {
-            Self::Modify { path, .. } | Self::Create { path, .. } | Self::Delete { path } => path,
+            Self::Modify { path, .. } | Self::Create { path, .. } | Self::Delete { path, .. } => {
+                path
+            }
         }
     }
 }
@@ -409,10 +417,45 @@ mod tests {
     fn file_patch_path_accessor() {
         assert_eq!(
             FilePatch::Delete {
-                path: "a.rs".into()
+                path: "a.rs".into(),
+                validation_hunks: vec![],
             }
             .path(),
             "a.rs"
+        );
+    }
+
+    /// `validation_hunks` is proof-of-context only: it must never reach the wire
+    /// or CAS, and structured JSON must always decode to an empty vector.
+    #[test]
+    fn delete_validation_hunks_never_serialize_and_default_empty() {
+        let patch = PatchSet {
+            files: vec![FilePatch::Delete {
+                path: "old.rs".into(),
+                validation_hunks: vec![Hunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 0,
+                    new_lines: 0,
+                    lines: vec!["-line".into()],
+                    eof_newline: true,
+                    old_eof_no_newline: false,
+                }],
+            }],
+        };
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            value["files"][0],
+            serde_json::json!({"action": "delete", "path": "old.rs"})
+        );
+        assert_eq!(
+            serde_json::from_value::<PatchSet>(value).unwrap(),
+            PatchSet {
+                files: vec![FilePatch::Delete {
+                    path: "old.rs".into(),
+                    validation_hunks: vec![],
+                }],
+            }
         );
     }
 
@@ -422,6 +465,7 @@ mod tests {
             files: vec![
                 FilePatch::Delete {
                     path: "old.rs".into(),
+                    validation_hunks: vec![],
                 },
                 FilePatch::Modify {
                     path: "a.rs".into(),

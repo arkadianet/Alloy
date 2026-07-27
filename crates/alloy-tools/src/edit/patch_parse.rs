@@ -220,7 +220,13 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
         if is_create {
             files.push(FilePatch::Create { path, hunks });
         } else if is_delete {
-            files.push(FilePatch::Delete { path });
+            // Hunks are not part of a `Delete` on the wire, but keeping them
+            // locally is the only proof the caller saw the file's current bytes
+            // (V5 / V9).
+            files.push(FilePatch::Delete {
+                path,
+                validation_hunks: hunks,
+            });
         } else {
             files.push(FilePatch::Modify { path, hunks });
         }
@@ -274,9 +280,22 @@ pub(crate) fn validate_patchset_local(
                     return Err(EditError::Conflict("create exists".into()));
                 }
             }
-            FilePatch::Delete { path } => {
+            FilePatch::Delete {
+                path,
+                validation_hunks,
+            } => {
                 validate_existing_file_shape(policy, path, false)?;
-                read_utf8_file(&policy.jail().join(path))?;
+                // A structured `Delete` carries no content claim, so it must not
+                // require the file to be UTF-8; a unified-diff `Delete` claims
+                // every line, and that claim is checked against the file.
+                if !validation_hunks.is_empty() {
+                    let old = read_utf8_file(&policy.jail().join(path))?;
+                    crate::edit::apply::verify_hunks_delete_whole_file(
+                        path,
+                        &old,
+                        validation_hunks,
+                    )?;
+                }
             }
         }
         paths.push(path.to_string());
@@ -521,13 +540,14 @@ fn validate_modify_hunks(path: &str, hunks: &[Hunk]) -> Result<(), EditError> {
     if hunks.is_empty() {
         return Err(EditError::InvalidPatch("empty hunks".into()));
     }
-    validate_common_hunks(path, hunks)?;
+    // V8b: `old_start == 0` is reserved for Create, including on the
+    // zero-length-range insertion shape.
     for hunk in hunks {
-        if hunk.old_start == 0 && hunk.old_lines != 0 {
+        if hunk.old_start == 0 {
             return Err(EditError::InvalidPatch("modify old_start".into()));
         }
     }
-    Ok(())
+    validate_common_hunks(path, hunks)
 }
 
 fn validate_create_hunks(hunks: &[Hunk]) -> Result<(), EditError> {
@@ -535,6 +555,9 @@ fn validate_create_hunks(hunks: &[Hunk]) -> Result<(), EditError> {
         return Err(EditError::InvalidPatch("create hunk shape".into()));
     }
     let hunk = &hunks[0];
+    if hunk.lines.len() > MAX_LINES_PER_HUNK {
+        return Err(EditError::InvalidPatch("hunk too large".into()));
+    }
     if hunk.old_start != 0 || hunk.old_lines != 0 {
         return Err(EditError::InvalidPatch("create hunk shape".into()));
     }
@@ -546,6 +569,16 @@ fn validate_create_hunks(hunks: &[Hunk]) -> Result<(), EditError> {
         return Err(EditError::InvalidPatch("create hunk shape".into()));
     }
     validate_hunk_line_counts(hunk)?;
+    // V8c: the sole hunk writes the whole new file, so its new-side range must
+    // start at line 1 (or be the empty range of an empty file).
+    let starts_at_top = if hunk.new_lines == 0 {
+        hunk.new_start <= 1
+    } else {
+        hunk.new_start == 1
+    };
+    if !starts_at_top {
+        return Err(EditError::InvalidPatch("hunk new_start".into()));
+    }
     Ok(())
 }
 
@@ -640,6 +673,13 @@ fn validate_hunk_shapes_for_action(
 }
 
 fn validate_delete_hunks(hunks: &[Hunk]) -> Result<(), EditError> {
+    // A header-only `--- a/x` / `+++ /dev/null` stanza claims nothing about the
+    // file it removes, so it cannot stand in for a full-file deletion.
+    if hunks.is_empty() {
+        return Err(EditError::InvalidPatch(
+            "delete must remove entire file".into(),
+        ));
+    }
     if hunks.len() > MAX_HUNKS_PER_FILE {
         return Err(EditError::InvalidPatch("too many hunks".into()));
     }
@@ -892,9 +932,11 @@ mod tests {
             files: vec![
                 FilePatch::Delete {
                     path: "a.txt".into(),
+                    validation_hunks: vec![],
                 },
                 FilePatch::Delete {
                     path: "a.txt".into(),
+                    validation_hunks: vec![],
                 },
             ],
         };
@@ -905,6 +947,7 @@ mod tests {
         let patch = PatchSet {
             files: vec![FilePatch::Delete {
                 path: "a.txt".into(),
+                validation_hunks: vec![],
             }],
         };
         assert!(matches!(
@@ -1037,7 +1080,7 @@ index 2222222..0000000
         ));
         assert!(matches!(
             &patch.files[1],
-            FilePatch::Delete { path } if path == "old.txt"
+            FilePatch::Delete { path, .. } if path == "old.txt"
         ));
         assert_eq!(
             serde_json::to_value(&patch).unwrap()["files"][1],
@@ -1213,6 +1256,7 @@ dissimilarity index 100%
             PatchSet {
                 files: vec![FilePatch::Delete {
                     path: "link/file.txt".into(),
+                    validation_hunks: vec![],
                 }],
             },
             PatchSet {
@@ -1240,8 +1284,17 @@ dissimilarity index 100%
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("bad.txt"), [0xff]).unwrap();
         let patch = PatchSet {
-            files: vec![FilePatch::Delete {
+            files: vec![FilePatch::Modify {
                 path: "bad.txt".into(),
+                hunks: vec![Hunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec!["-old".into(), "+new".into()],
+                    eof_newline: true,
+                    old_eof_no_newline: false,
+                }],
             }],
         };
         assert!(matches!(
@@ -1252,6 +1305,165 @@ dissimilarity index 100%
             ),
             Err(EditError::InvalidPatch(ref message)) if message == "file not utf-8"
         ));
+    }
+
+    /// A structured `Delete` makes no claim about the file's bytes, so it must
+    /// not require the target to be UTF-8 — only that it is a regular file.
+    #[test]
+    fn structured_delete_of_non_utf8_file_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Latin-1 "café" plus a NUL: not valid UTF-8 in either byte.
+        std::fs::write(
+            dir.path().join("latin1.txt"),
+            [b'c', b'a', b'f', 0xe9, 0x00],
+        )
+        .unwrap();
+        let patch = PatchSet {
+            files: vec![FilePatch::Delete {
+                path: "latin1.txt".into(),
+                validation_hunks: vec![],
+            }],
+        };
+        assert_eq!(
+            validate_patchset_local(
+                &patch,
+                &policy(dir.path()),
+                &token(vec![Grant::FsWrite(Glob("**".into()))])
+            )
+            .unwrap(),
+            vec!["latin1.txt"]
+        );
+    }
+
+    /// A unified-diff `Delete` claims every line of the file, so its retained
+    /// hunks must be checked against the bytes on disk before removal.
+    #[test]
+    fn unified_diff_delete_proves_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let perms = token(vec![Grant::FsWrite(Glob("**".into()))]);
+
+        let stale =
+            parse_unified_diff("--- a/a.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-one\n").unwrap();
+        assert!(matches!(
+            &stale.files[0],
+            FilePatch::Delete { validation_hunks, .. } if validation_hunks.len() == 1
+        ));
+        assert!(
+            matches!(
+                validate_patchset_local(&stale, &policy(dir.path()), &perms),
+                Err(EditError::ContextMismatch { ref detail, .. })
+                    if detail == "delete leaves content"
+            ),
+            "a delete that only removes line 1 of a two-line file is not a full delete"
+        );
+
+        let wrong_text =
+            parse_unified_diff("--- a/a.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-TWO\n")
+                .unwrap();
+        assert!(matches!(
+            validate_patchset_local(&wrong_text, &policy(dir.path()), &perms),
+            Err(EditError::ContextMismatch { ref detail, .. }) if detail == "delete mismatch"
+        ));
+
+        let exact = parse_unified_diff("--- a/a.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n")
+            .unwrap();
+        assert_eq!(
+            validate_patchset_local(&exact, &policy(dir.path()), &perms).unwrap(),
+            vec!["a.txt"]
+        );
+        assert!(
+            !std::fs::read_to_string(dir.path().join("a.txt"))
+                .unwrap()
+                .is_empty(),
+            "validation must not mutate the workspace"
+        );
+    }
+
+    /// A `--- a/x` / `+++ /dev/null` stanza with no hunks claims nothing about
+    /// the file it removes, so it cannot stand in for a full-file deletion.
+    #[test]
+    fn header_only_delete_is_rejected() {
+        assert!(matches!(
+            parse_unified_diff("--- a/a.txt\n+++ /dev/null\n"),
+            Err(EditError::InvalidPatch(ref message))
+                if message == "delete must remove entire file"
+        ));
+        assert!(matches!(
+            validate_delete_hunks(&[]),
+            Err(EditError::InvalidPatch(ref message))
+                if message == "delete must remove entire file"
+        ));
+    }
+
+    #[test]
+    fn create_hunk_line_cap_and_new_start_enforced() {
+        let create = |lines: Vec<String>, new_start: u32| Hunk {
+            old_start: 0,
+            old_lines: 0,
+            new_start,
+            new_lines: u32::try_from(lines.len()).unwrap(),
+            lines,
+            eof_newline: true,
+            old_eof_no_newline: false,
+        };
+        assert!(matches!(
+            validate_create_hunks(&[create(vec!["+x".into(); MAX_LINES_PER_HUNK + 1], 1)]),
+            Err(EditError::InvalidPatch(ref message)) if message == "hunk too large"
+        ));
+        // V8c: the one create hunk writes the whole file, so it starts at line 1.
+        assert!(matches!(
+            validate_create_hunks(&[create(vec!["+x".into()], 2)]),
+            Err(EditError::InvalidPatch(ref message)) if message == "hunk new_start"
+        ));
+        validate_create_hunks(&[create(vec!["+x".into()], 1)]).unwrap();
+        // An empty create is the one shape whose new-side range may be empty.
+        validate_create_hunks(&[create(vec![], 0)]).unwrap();
+        validate_create_hunks(&[create(vec![], 1)]).unwrap();
+    }
+
+    /// V8b: `old_start == 0` is reserved for Create, including for the
+    /// zero-length-range insertion shape a prepend would otherwise use.
+    #[test]
+    fn modify_rejects_zero_old_start_even_for_insertions() {
+        for old_lines in [0_u32, 1] {
+            let hunk = Hunk {
+                old_start: 0,
+                old_lines,
+                new_start: 1,
+                new_lines: 1,
+                lines: if old_lines == 0 {
+                    vec!["+new".into()]
+                } else {
+                    vec!["-old".into(), "+new".into()]
+                },
+                eof_newline: true,
+                old_eof_no_newline: false,
+            };
+            assert!(matches!(
+                validate_modify_hunks("a.txt", &[hunk]),
+                Err(EditError::InvalidPatch(ref message)) if message == "modify old_start"
+            ));
+        }
+    }
+
+    /// V28: hunks must be sorted by ascending old-side start.
+    #[test]
+    fn descending_hunk_order_rejected() {
+        let hunk = |old_start: u32, new_start: u32| Hunk {
+            old_start,
+            old_lines: 1,
+            new_start,
+            new_lines: 1,
+            lines: vec![format!("-line{old_start}"), format!("+LINE{old_start}")],
+            eof_newline: true,
+            old_eof_no_newline: false,
+        };
+        assert!(matches!(
+            validate_modify_hunks("a.txt", &[hunk(3, 3), hunk(1, 1)]),
+            Err(EditError::InvalidPatch(ref message)) if message == "hunk order"
+        ));
+        validate_modify_hunks("a.txt", &[hunk(1, 1), hunk(3, 3)]).unwrap();
     }
 
     #[test]

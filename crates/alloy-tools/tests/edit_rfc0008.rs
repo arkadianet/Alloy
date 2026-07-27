@@ -398,6 +398,7 @@ async fn create_and_delete_then_rollback_unlinks_create() {
                 },
                 FilePatch::Delete {
                     path: "delete.txt".into(),
+                    validation_hunks: vec![],
                 },
             ],
         },
