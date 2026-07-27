@@ -164,11 +164,11 @@ fn reject_generation_bound(generation: u64) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn updated_at_rfc3339(ts: &Timestamp) -> Result<String, StoreError> {
+fn updated_at_rfc3339(ts: &Timestamp) -> String {
     // Fixed-width fractional seconds so ORDER BY updated_at ASC is chronological.
     // Variable-precision RFC3339 (`…20.1Z` vs `…20.12Z`) is not lexicographic-safe.
     let utc = ts.0.to_offset(time::UtcOffset::UTC);
-    Ok(format!(
+    format!(
         "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z",
         year = utc.year(),
         month = u8::from(utc.month()),
@@ -177,7 +177,7 @@ fn updated_at_rfc3339(ts: &Timestamp) -> Result<String, StoreError> {
         minute = utc.minute(),
         second = utc.second(),
         nanos = utc.nanosecond(),
-    ))
+    )
 }
 
 fn encode_blob(dag: &TaskDag) -> Result<String, StoreError> {
@@ -238,7 +238,7 @@ fn prepare_write(dag: &TaskDag) -> Result<PreparedDagWrite, StoreError> {
         session_id: dag.session_id.to_string(),
         generation: dag.generation,
         blob: encode_blob(dag)?,
-        updated_at: updated_at_rfc3339(&Timestamp::now())?,
+        updated_at: updated_at_rfc3339(&Timestamp::now()),
         session_id_typed: dag.session_id,
     })
 }
@@ -968,8 +968,8 @@ mod tests {
         let b = Timestamp(
             time::OffsetDateTime::from_unix_timestamp_nanos(1_720_000_000_120_000_000).unwrap(),
         );
-        let sa = updated_at_rfc3339(&a).unwrap();
-        let sb = updated_at_rfc3339(&b).unwrap();
+        let sa = updated_at_rfc3339(&a);
+        let sb = updated_at_rfc3339(&b);
         assert!(sa.ends_with(".100000000Z"), "{sa}");
         assert!(sb.ends_with(".120000000Z"), "{sb}");
         assert!(sa < sb, "{sa} should sort before {sb}");

@@ -470,48 +470,87 @@ mod tests {
         assert_eq!(kinds["verify"], NodeKind::VerifyCompile);
         assert_eq!(kinds["gate"], NodeKind::GateHuman);
 
-        assert_eq!(
-            dag.nodes
-                .values()
-                .find(|n| n.kind == NodeKind::Analyze)
-                .unwrap()
-                .capability
-                .as_ref()
-                .unwrap()
-                .as_str(),
-            "repair"
-        );
-        assert_eq!(
-            dag.nodes
-                .values()
-                .find(|n| n.kind == NodeKind::Edit)
-                .unwrap()
-                .capability
-                .as_ref()
-                .unwrap()
-                .as_str(),
-            "edit"
-        );
-
         let analyze = dag
             .nodes
             .values()
             .find(|n| n.kind == NodeKind::Analyze)
             .unwrap();
+        assert_eq!(analyze.capability.as_ref().unwrap().as_str(), "repair");
         assert_eq!(analyze.retry.max_attempts, 2);
-        assert_eq!(analyze.timeout_ms, 300_000);
+        assert!(matches!(
+            analyze.retry.backoff,
+            Backoff::Fixed { delay_ms: 1000 }
+        ));
+        assert_eq!(analyze.retry.retry_on, vec![ErrorClass::Model]);
+        assert!(analyze.retry.escalate_after.is_none());
+        assert!(analyze.retry.escalate_to_tier.is_none());
         assert_eq!(analyze.budget.max_input, 32768);
+        assert_eq!(analyze.budget.max_output, 8192);
+        assert_eq!(analyze.model_tier, ModelTier::Standard);
+        assert!(analyze.approval.is_none());
+        assert_eq!(analyze.timeout_ms, 300_000);
+        assert!(analyze.cache_key.is_none());
+
+        let edit = dag
+            .nodes
+            .values()
+            .find(|n| n.kind == NodeKind::Edit)
+            .unwrap();
+        assert_eq!(edit.capability.as_ref().unwrap().as_str(), "edit");
+        assert_eq!(edit.retry.max_attempts, 2);
+        assert!(matches!(
+            edit.retry.backoff,
+            Backoff::Fixed { delay_ms: 1000 }
+        ));
+        assert_eq!(edit.retry.retry_on, vec![ErrorClass::Model]);
+        assert!(edit.retry.escalate_after.is_none());
+        assert!(edit.retry.escalate_to_tier.is_none());
+        assert_eq!(edit.budget.max_input, 32768);
+        assert_eq!(edit.budget.max_output, 8192);
+        assert_eq!(edit.model_tier, ModelTier::Standard);
+        assert!(edit.approval.is_none());
+        assert_eq!(edit.timeout_ms, 300_000);
+        assert!(edit.cache_key.is_none());
+
+        let verify = dag
+            .nodes
+            .values()
+            .find(|n| n.kind == NodeKind::VerifyCompile)
+            .unwrap();
+        assert!(verify.capability.is_none());
+        assert_eq!(verify.retry.max_attempts, 1);
+        assert!(matches!(
+            verify.retry.backoff,
+            Backoff::Fixed { delay_ms: 0 }
+        ));
+        assert!(verify.retry.retry_on.is_empty());
+        assert!(verify.retry.escalate_after.is_none());
+        assert!(verify.retry.escalate_to_tier.is_none());
+        assert_eq!(verify.budget.max_input, 0);
+        assert_eq!(verify.budget.max_output, 0);
+        assert_eq!(verify.model_tier, ModelTier::Economy);
+        assert!(verify.approval.is_none());
+        assert_eq!(verify.timeout_ms, 600_000);
+        assert!(verify.cache_key.is_none());
 
         let gate = dag
             .nodes
             .values()
             .find(|n| n.kind == NodeKind::GateHuman)
             .unwrap();
+        assert!(gate.capability.is_none());
+        assert_eq!(gate.retry.max_attempts, 1);
+        assert!(matches!(gate.retry.backoff, Backoff::Fixed { delay_ms: 0 }));
+        assert!(gate.retry.retry_on.is_empty());
         assert_eq!(
             gate.approval.as_ref().unwrap().reason,
             "Approve repair diff before completion"
         );
+        assert_eq!(gate.budget.max_input, 0);
+        assert_eq!(gate.budget.max_output, 0);
+        assert_eq!(gate.model_tier, ModelTier::Economy);
         assert_eq!(gate.timeout_ms, 3_600_000);
+        assert!(gate.cache_key.is_none());
 
         // Edge multiset by template name
         let mut edge_names: Vec<(&str, &str, EdgeKind)> = dag

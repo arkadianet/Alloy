@@ -588,12 +588,14 @@ impl PlanService for TemplatePlanService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::NodeKind;
     use crate::dag::{
         mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest,
+        NodeInputEnvelope, NodeInputPayload, NodeKind, PendingPredPlaceholder,
     };
     use crate::events::InMemoryEventSink;
-    use crate::storage::{AlloyStorage, EventStore, StorageOpenOptions};
+    use crate::storage::{
+        AlloyStorage, ArtifactKind, ArtifactStore, DagStore, EventStore, StorageOpenOptions,
+    };
     use std::sync::Mutex;
 
     fn fingerprints() -> (Digest, Digest, Digest) {
@@ -669,6 +671,7 @@ mod tests {
         // Every input_ref resolves with required attribution / labels
         for node in result.dag.nodes.values() {
             let blob = storage.artifacts().get(node.input_ref).await.unwrap();
+            assert_eq!(blob.meta.kind, ArtifactKind::Blob);
             assert_eq!(blob.meta.content_type.as_deref(), Some("application/json"));
             assert_eq!(blob.meta.session_id, Some(session));
             assert_eq!(blob.meta.run_id, Some(run));
@@ -686,12 +689,61 @@ mod tests {
                     .and_then(|v| v.as_str()),
                 Some(dag_id.to_string().as_str())
             );
+
+            // Non-root FromPredecessors pending_pred slots carry the same attribution.
+            let env: NodeInputEnvelope = serde_json::from_slice(&blob.bytes).unwrap();
+            if let NodeInputPayload::FromPredecessors { preds } = env.payload {
+                for pred in preds {
+                    let pending = storage.artifacts().get(pred.output_ref).await.unwrap();
+                    assert_eq!(pending.meta.kind, ArtifactKind::Blob);
+                    assert_eq!(
+                        pending.meta.content_type.as_deref(),
+                        Some("application/json")
+                    );
+                    assert_eq!(pending.meta.session_id, Some(session));
+                    assert_eq!(pending.meta.run_id, Some(run));
+                    assert_eq!(
+                        pending
+                            .meta
+                            .labels
+                            .get("alloy.envelope")
+                            .and_then(|v| v.as_str()),
+                        Some("pending_pred")
+                    );
+                    assert_eq!(
+                        pending
+                            .meta
+                            .labels
+                            .get("alloy.dag_id")
+                            .and_then(|v| v.as_str()),
+                        Some(dag_id.to_string().as_str())
+                    );
+                }
+            }
         }
         let snap = storage
             .artifacts()
             .get(result.snapshot_artifact)
             .await
             .unwrap();
+        assert_eq!(snap.meta.kind, ArtifactKind::Blob);
+        assert_eq!(snap.meta.content_type.as_deref(), Some("application/json"));
+        assert_eq!(snap.meta.session_id, Some(session));
+        assert_eq!(snap.meta.run_id, Some(run));
+        assert_eq!(
+            snap.meta
+                .labels
+                .get("alloy.envelope")
+                .and_then(|v| v.as_str()),
+            Some("dag_snapshot")
+        );
+        assert_eq!(
+            snap.meta
+                .labels
+                .get("alloy.dag_id")
+                .and_then(|v| v.as_str()),
+            Some(dag_id.to_string().as_str())
+        );
         let round: TaskDag = serde_json::from_slice(&snap.bytes).unwrap();
         assert_eq!(round.id, dag_id);
         storage.close().await.unwrap();

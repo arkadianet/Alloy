@@ -78,10 +78,12 @@ pub fn mvp_policy_hash_digest() -> Digest {
 }
 
 /// Content digest for a root [`crate::types::budget::Goal`] (JSON of the Goal only).
-#[must_use = "digest is the cache content input"]
-pub fn goal_content_digest(goal: &crate::types::budget::Goal) -> Result<Digest, serde_json::Error> {
-    let bytes = serde_json::to_vec(goal)?;
-    Ok(Digest::sha256(&bytes))
+///
+/// `Goal` is plain serde data; serialization cannot fail for valid values.
+#[must_use]
+pub fn goal_content_digest(goal: &crate::types::budget::Goal) -> Digest {
+    let bytes = serde_json::to_vec(goal).expect("Goal JSON serialization");
+    Digest::sha256(&bytes)
 }
 
 #[cfg(test)]
@@ -103,7 +105,7 @@ mod tests {
             constraints: vec![],
             attachments: vec![],
         };
-        let content = goal_content_digest(&goal).unwrap();
+        let content = goal_content_digest(&goal);
         assert_eq!(content.as_hex(), GOLDEN_GOAL_CONTENT);
         let policy = mvp_policy_hash_digest();
         let tools = mvp_tool_versions_digest();

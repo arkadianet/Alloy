@@ -647,7 +647,8 @@ pub fn mvp_compiler_fingerprint_digest() -> Digest; // sha256(b"alloy.mvp.compil
 pub fn mvp_policy_hash_digest() -> Digest;        // sha256(b"alloy.mvp.policy_hash.v0")
 
 /// Content-only digest for a `Goal` (§5.8 `Goal` row). MUST NOT include
-/// dag_id / node_id / generation.
+/// dag_id / node_id / generation. `Goal` is plain serde data — returns `Digest`
+/// directly (serialization cannot fail for valid values).
 pub fn goal_content_digest(goal: &Goal) -> Digest;
 ```
 
@@ -1091,14 +1092,15 @@ Evaluate **in order V1…V17**. Return the **first** violation.
 | `session_id` | `TaskDag.session_id` |
 | `generation` | `TaskDag.generation` as SQLite `INTEGER` (i64) |
 | `blob_json` | `serde_json::to_string(TaskDag)` |
-| `updated_at` | RFC3339 UTC |
+| `updated_at` | Fixed-width RFC3339 UTC with **9-digit** fractional seconds (`YYYY-MM-DDTHH:MM:SS.fffffffffZ`) so `ORDER BY updated_at ASC` is lexicographically chronological |
 
 #### 5.6.2 Replan algorithm
 
 Uses `ctx.dag_id` only (no separate `dag_id` argument).
 
-1. `probe ← dags.get(ctx.dag_id)?.ok_or(DagNotFound)?` (non-atomic preflight for session mismatch / overflow messaging).
-2. If `probe.session_id != ctx.session_id` → `SessionMismatch`.
+1. `probe ← dags.get(ctx.dag_id)?.ok_or(DagNotFound)?` (non-atomic preflight for session mismatch / overflow / Running messaging).
+2. If `probe.session_id != ctx.session_id` → `SessionMismatch`.  
+   If `probe.state == Running` → `PlanError::DagBusy { state: Running }` **before** any Phase A–C artifact writes (cheap preflight; `replace_for_replan` remains the atomic race guard).
 3. Prefer routing replan through `RunController::request_replan` first so gate waiters are cleared (0003). Production callers MUST do so; direct `PlanService::replan` is test/advanced-only (no public waiter-clear API outside the control plane).
 4. `template_id ← ctx.template_override.unwrap_or_else(|| select(ctx))`.  
    **No EventStore scan.** Callers SHOULD pass the prior `PlanResult.template_id` as override.
@@ -1115,7 +1117,7 @@ Uses `ctx.dag_id` only (no separate `dag_id` argument).
 9. Append `PlanProduced` (`replan: true`, `reason: Some(reason)`, `run_id: Some(ctx.run_id)`). Same event-failure semantics as §5.2 step 9.
 10. Return `PlanResult`.
 
-**Permitted preflight states:** any except that `replace_for_replan` **atomically** rejects `Running`. Terminal DAG states (`Succeeded`/`Cancelled`/`Failed`) are allowed at the store layer; RFC-0003 may still refuse replan on terminal *run* rows — that is a control-plane concern.
+**Permitted preflight states:** any non-`Running` state at the cheap preflight; `replace_for_replan` **also atomically** rejects `Running` under the race. Terminal DAG states (`Succeeded`/`Cancelled`/`Failed`) are allowed at the store layer; RFC-0003 may still refuse replan on terminal *run* rows — that is a control-plane concern.
 
 #### 5.6.3 Prior-generation recoverability (binding)
 
