@@ -10,7 +10,7 @@ use alloy_runtime::{
 };
 use serde_json::Value;
 
-use crate::authz::{self, GrantGlobError};
+use crate::authz::{GrantGlobError, GrantMatcher};
 use crate::mcp::MAX_ARG_STRING_BYTES;
 use crate::sandbox::{PathAccess, PathPolicy, SandboxError};
 
@@ -229,6 +229,9 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
 }
 
 /// Validate dry-run/apply local rules that do not require git.
+///
+/// The token's `FsWrite` globs are compiled once for the whole patch set instead
+/// of once per file path.
 pub(crate) fn validate_patchset_local(
     patch: &PatchSet,
     policy: &PathPolicy,
@@ -240,6 +243,8 @@ pub(crate) fn validate_patchset_local(
     if patch.files.len() > MAX_FILES {
         return Err(EditError::InvalidPatch("too many files".into()));
     }
+    let writes = GrantMatcher::fs_write(perms)
+        .map_err(|GrantGlobError::Invalid(_)| EditError::InvalidRequest("grant glob".into()))?;
     let mut exact = HashSet::new();
     let mut folded = HashSet::new();
     let mut paths = Vec::with_capacity(patch.files.len());
@@ -255,7 +260,7 @@ pub(crate) fn validate_patchset_local(
         if !folded.insert(case_fold_path(path)) {
             return Err(EditError::InvalidPatch("duplicate path".into()));
         }
-        authorize_patch_path(policy, perms, file)?;
+        authorize_patch_path(policy, &writes, file)?;
         match file {
             FilePatch::Modify { path, hunks } => {
                 validate_modify_hunks(path, hunks)?;
@@ -365,23 +370,17 @@ pub(crate) fn is_digest_excluded_path(path: &str) -> bool {
 
 fn authorize_patch_path(
     policy: &PathPolicy,
-    perms: &PermissionToken,
+    writes: &GrantMatcher,
     file: &FilePatch,
 ) -> Result<(), EditError> {
     let rel = file.path();
-    if !authz::has_fs_write_grant(perms) {
+    if !writes.has_grant() {
         return Err(EditError::MissingGrant("fs_write".into()));
     }
-    match authz::fs_write_covers(perms, rel) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(EditError::PathNotCovered {
-                path: rel.to_string(),
-            })
-        }
-        Err(GrantGlobError::Invalid(_)) => {
-            return Err(EditError::InvalidRequest("grant glob".into()))
-        }
+    if !writes.covers(rel) {
+        return Err(EditError::PathNotCovered {
+            path: rel.to_string(),
+        });
     }
     match file {
         FilePatch::Create { path, .. } => authorize_create_path(policy, path),

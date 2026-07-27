@@ -20,8 +20,9 @@ pub(crate) enum GrantGlobError {
 /// Shared glob expansion used by FsRead and FsWrite (single implementation).
 ///
 /// Expansion mirrors the RFC-0005 deny-glob dialect so a grant and a deny
-/// pattern spelled the same way cover the same jail-relative paths.
-#[allow(dead_code)]
+/// pattern spelled the same way cover the same jail-relative paths. Every
+/// matcher below compiles through this function, so there is exactly one
+/// expansion dialect in the crate (AC 33).
 pub(crate) fn expand_grant_glob(pattern: &str) -> Result<GlobSet, GrantGlobError> {
     let mut builder = GlobSetBuilder::new();
     add_fs_patterns(&mut builder, pattern)?;
@@ -30,27 +31,61 @@ pub(crate) fn expand_grant_glob(pattern: &str) -> Result<GlobSet, GrantGlobError
         .map_err(|e| GrantGlobError::Invalid(e.to_string()))
 }
 
+/// Grant globs of one kind, compiled once and reused for many paths.
+///
+/// The one-shot helpers recompile the token's globs on every call, which is
+/// `O(paths × grants)` glob compilations in the validate/apply hot paths. Hold a
+/// matcher for the duration of one authorization pass instead.
+pub(crate) struct GrantMatcher {
+    /// One compiled set per grant of the matched kind, in token order.
+    sets: Vec<GlobSet>,
+}
+
+impl GrantMatcher {
+    /// Compile every `Grant::FsWrite` glob in `perms`.
+    pub(crate) fn fs_write(perms: &PermissionToken) -> Result<Self, GrantGlobError> {
+        Self::compile(perms.grants.iter().filter_map(|g| match g {
+            Grant::FsWrite(glob) => Some(glob.0.as_str()),
+            _ => None,
+        }))
+    }
+
+    /// Compile every `Grant::FsRead` glob in `perms`.
+    pub(crate) fn fs_read(perms: &PermissionToken) -> Result<Self, GrantGlobError> {
+        Self::compile(perms.grants.iter().filter_map(|g| match g {
+            Grant::FsRead(glob) => Some(glob.0.as_str()),
+            _ => None,
+        }))
+    }
+
+    /// Whether the token carried at least one grant of the matched kind.
+    ///
+    /// Callers distinguish zero-grant (`MissingGrant`) from a miss
+    /// (`PathNotCovered`), so this is not the same question as [`Self::covers`].
+    pub(crate) fn has_grant(&self) -> bool {
+        !self.sets.is_empty()
+    }
+
+    /// True when some compiled grant glob covers `rel` (jail-relative).
+    pub(crate) fn covers(&self, rel: &str) -> bool {
+        self.sets.iter().any(|set| set.is_match(rel))
+    }
+
+    fn compile<'a>(patterns: impl Iterator<Item = &'a str>) -> Result<Self, GrantGlobError> {
+        let sets = patterns
+            .map(expand_grant_glob)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { sets })
+    }
+}
+
 /// True when some `Grant::FsWrite` glob covers `rel` (jail-relative).
 ///
 /// `Ok(false)` when grants exist but none match; caller distinguishes zero-grant
-/// (`MissingGrant("fs_write")`) from a miss (`PathNotCovered`).
+/// (`MissingGrant("fs_write")`) from a miss (`PathNotCovered`). Prefer
+/// [`GrantMatcher::fs_write`] when authorizing more than one path.
 pub(crate) fn fs_write_covers(perms: &PermissionToken, rel: &str) -> Result<bool, GrantGlobError> {
-    let mut builder = GlobSetBuilder::new();
-    let mut saw_grant = false;
-    for grant in &perms.grants {
-        let Grant::FsWrite(glob) = grant else {
-            continue;
-        };
-        saw_grant = true;
-        add_fs_patterns(&mut builder, &glob.0)?;
-    }
-    if !saw_grant {
-        return Ok(false);
-    }
-    let set = builder
-        .build()
-        .map_err(|e| GrantGlobError::Invalid(e.to_string()))?;
-    Ok(set.is_match(rel))
+    Ok(GrantMatcher::fs_write(perms)?.covers(rel))
 }
 
 /// True when some `Grant::FsRead` glob covers `rel` (jail-relative).
@@ -58,22 +93,7 @@ pub(crate) fn fs_write_covers(perms: &PermissionToken, rel: &str) -> Result<bool
 /// Same expansion as [`fs_write_covers`]. `Ok(false)` when grants exist but
 /// none match; zero-grant is also `Ok(false)` — MCP wrappers distinguish.
 pub(crate) fn fs_read_covers(perms: &PermissionToken, rel: &str) -> Result<bool, GrantGlobError> {
-    let mut builder = GlobSetBuilder::new();
-    let mut saw_grant = false;
-    for grant in &perms.grants {
-        let Grant::FsRead(glob) = grant else {
-            continue;
-        };
-        saw_grant = true;
-        add_fs_patterns(&mut builder, &glob.0)?;
-    }
-    if !saw_grant {
-        return Ok(false);
-    }
-    let set = builder
-        .build()
-        .map_err(|e| GrantGlobError::Invalid(e.to_string()))?;
-    Ok(set.is_match(rel))
+    Ok(GrantMatcher::fs_read(perms)?.covers(rel))
 }
 
 /// Whether the token carries at least one `FsRead` grant (regardless of match).
@@ -154,5 +174,28 @@ mod tests {
     #[test]
     fn expand_grant_glob_rejects_bad_pattern() {
         assert!(expand_grant_glob("src/[").is_err());
+        assert!(
+            GrantMatcher::fs_write(&token(vec![Grant::FsWrite(Glob("src/[".into()))])).is_err()
+        );
+    }
+
+    #[test]
+    fn compiled_matcher_agrees_with_one_shot_helper() {
+        let t = token(vec![
+            Grant::FsWrite(Glob("src/**".into())),
+            Grant::FsWrite(Glob("*.toml".into())),
+        ]);
+        let matcher = GrantMatcher::fs_write(&t).unwrap();
+        assert!(matcher.has_grant());
+        for rel in ["src/main.rs", "Cargo.toml", "README.md", "docs/a/b.rs"] {
+            assert_eq!(
+                matcher.covers(rel),
+                fs_write_covers(&t, rel).unwrap(),
+                "rel={rel:?}"
+            );
+        }
+        assert!(!GrantMatcher::fs_write(&token(vec![Grant::GitWrite]))
+            .unwrap()
+            .has_grant());
     }
 }

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use alloy_runtime::{EditError, FilePatch, Hunk, PatchSet, PermissionToken, TransactionId};
 
-use crate::authz::{self, GrantGlobError};
+use crate::authz::{GrantGlobError, GrantMatcher};
 use crate::edit::patch_parse::{
     authorize_create_path, read_utf8_file, reject_symlink_components, rel_from_abs,
     validate_hunk_line_counts, validate_rel_path,
@@ -43,6 +43,10 @@ pub(crate) struct FileApplyError {
 }
 
 /// Apply file patches in vector order.
+///
+/// The token's `FsWrite` globs are compiled once here and reused for every
+/// patched path (plus its temp path and any created parent), rather than
+/// recompiled per authorization.
 pub(crate) fn apply_file_patches<F>(
     patch: &PatchSet,
     policy: &PathPolicy,
@@ -54,14 +58,23 @@ where
     F: FnMut(ApplyProgress),
 {
     let mut out = FileApplyOutcome::default();
+    let writes = match GrantMatcher::fs_write(perms) {
+        Ok(writes) => writes,
+        Err(GrantGlobError::Invalid(_)) => {
+            return Err(Box::new(FileApplyError {
+                error: EditError::InvalidRequest("grant glob".into()),
+                partial: out,
+            }))
+        }
+    };
     for file in &patch.files {
         let result = match file {
-            FilePatch::Delete { path, .. } => apply_delete(path, policy, perms, &mut out),
+            FilePatch::Delete { path, .. } => apply_delete(path, policy, &writes, &mut out),
             FilePatch::Modify { path, hunks } => {
-                apply_modify(path, hunks, policy, perms, tx, &mut out, &mut progress)
+                apply_modify(path, hunks, policy, &writes, tx, &mut out, &mut progress)
             }
             FilePatch::Create { path, hunks } => {
-                apply_create(path, hunks, policy, perms, tx, &mut out, &mut progress)
+                apply_create(path, hunks, policy, &writes, tx, &mut out, &mut progress)
             }
         };
         if let Err(error) = result {
@@ -177,10 +190,10 @@ pub(crate) fn apply_hunks_to_text(
 fn apply_delete(
     rel: &str,
     policy: &PathPolicy,
-    perms: &PermissionToken,
+    writes: &GrantMatcher,
     out: &mut FileApplyOutcome,
 ) -> Result<(), EditError> {
-    authorize_patch_path_write(policy, perms, rel)?;
+    authorize_patch_path_write(policy, writes, rel)?;
     let path = policy.jail().join(rel);
     let meta = fs::symlink_metadata(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -200,7 +213,7 @@ fn apply_modify<F>(
     rel: &str,
     hunks: &[Hunk],
     policy: &PathPolicy,
-    perms: &PermissionToken,
+    writes: &GrantMatcher,
     tx: TransactionId,
     out: &mut FileApplyOutcome,
     progress: &mut F,
@@ -208,7 +221,7 @@ fn apply_modify<F>(
 where
     F: FnMut(ApplyProgress),
 {
-    authorize_patch_path_write(policy, perms, rel)?;
+    authorize_patch_path_write(policy, writes, rel)?;
     let path = policy.jail().join(rel);
     let meta = fs::symlink_metadata(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -237,7 +250,7 @@ fn apply_create<F>(
     rel: &str,
     hunks: &[Hunk],
     policy: &PathPolicy,
-    perms: &PermissionToken,
+    writes: &GrantMatcher,
     tx: TransactionId,
     out: &mut FileApplyOutcome,
     progress: &mut F,
@@ -245,7 +258,7 @@ fn apply_create<F>(
 where
     F: FnMut(ApplyProgress),
 {
-    authorize_patch_create(policy, perms, rel)?;
+    authorize_patch_create(policy, writes, rel)?;
     if policy.jail().join(rel).exists() {
         return Err(EditError::Conflict("create exists".into()));
     }
@@ -326,38 +339,32 @@ where
 
 fn authorize_patch_path_write(
     policy: &PathPolicy,
-    perms: &PermissionToken,
+    writes: &GrantMatcher,
     rel: &str,
 ) -> Result<(), EditError> {
     validate_rel_path(rel)?;
-    authorize_patch_grant(perms, rel)?;
+    authorize_patch_grant(writes, rel)?;
     authorize_policy_write(policy, rel)
 }
 
 fn authorize_patch_create(
     policy: &PathPolicy,
-    perms: &PermissionToken,
+    writes: &GrantMatcher,
     rel: &str,
 ) -> Result<(), EditError> {
     validate_rel_path(rel)?;
-    authorize_patch_grant(perms, rel)?;
+    authorize_patch_grant(writes, rel)?;
     authorize_create_path(policy, rel)
 }
 
-fn authorize_patch_grant(perms: &PermissionToken, rel: &str) -> Result<(), EditError> {
-    if !authz::has_fs_write_grant(perms) {
+fn authorize_patch_grant(writes: &GrantMatcher, rel: &str) -> Result<(), EditError> {
+    if !writes.has_grant() {
         return Err(EditError::MissingGrant("fs_write".into()));
     }
-    match authz::fs_write_covers(perms, rel) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(EditError::PathNotCovered {
-                path: rel.to_string(),
-            })
-        }
-        Err(GrantGlobError::Invalid(_)) => {
-            return Err(EditError::InvalidRequest("grant glob".into()))
-        }
+    if !writes.covers(rel) {
+        return Err(EditError::PathNotCovered {
+            path: rel.to_string(),
+        });
     }
     Ok(())
 }
