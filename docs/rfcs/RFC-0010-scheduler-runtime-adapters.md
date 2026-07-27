@@ -548,8 +548,10 @@ pub fn diagnostic_fingerprint(
 
 ```rust
 /// Host-owned permission minting for verify adapters. Adapters MUST NOT invent grants.
+#[async_trait]
 pub trait VerifyPermissions: Send + Sync {
-    fn token_for(
+    /// Async because `SessionRows::get_session` is async on `main`.
+    async fn token_for(
         &self,
         ctx: &NodeExecRef,
         class: VerifyClass,
@@ -2686,6 +2688,8 @@ Every artifact MUST also carry `alloy.dag_id`, and SHOULD carry `alloy.node_id` 
 | `node_id` | string |
 | `reason` | string (from `ApprovalSpec.reason`) |
 | `timeout_ms` | u64 |
+| `generation` | u64 (DAG generation; required for GR3/GR4/RF6) |
+| `repaired` | bool (optional; RF6 repair only) |
 
 ### H.3 RFC-0009 Appendix C obligations → sections here
 
@@ -2741,7 +2745,7 @@ struct RunCtx {
 | 1 | Host assembly | Build a `ToolHandle` with selectors covering `sel.compiler` (compile) and `sel.test` (test). Missing disclosure ⇒ `McpError::PermissionDenied(NotDisclosed)` ⇒ `PermissionDenied` (never a compile failure). |
 | 2 | Host assembly | Wrap it: `Arc::new(ToolHandleToolCaller::new(handle))`. |
 | 3 | Host assembly | Provide a `VerifyPermissions` implementation reading the profile catalog. |
-| 4 | Adapter | `perms.token_for(&ctx.meta, VerifyClass::Compile)` before each call. |
+| 4 | Adapter | `perms.token_for(&ctx.meta, VerifyClass::Compile).await` before each call. |
 | 5 | RFC-0006 | `match_exec_grant` checks the derived argv against `Grant::Exec(ExecAllow { binary: "cargo", args_glob })`. |
 
 | Required grant shape | Class |
