@@ -7,18 +7,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use alloy_runtime::{
-    ArtifactKind, ArtifactPut, ArtifactStore, CheckpointId, EditAppliedPayload, EditContext,
-    EditEngine, EditError, EditRequest, EditRequestKind, EditTransaction, EditValidation,
-    EventSink, NewSessionEvent, SessionEventType, Timestamp, TransactionId, TxState,
-    EDIT_APPLIED_SCHEMA,
+    ArtifactId, ArtifactKind, ArtifactPut, ArtifactStore, CheckpointId, Digest, EditAppliedPayload,
+    EditContext, EditEngine, EditError, EditRequest, EditRequestKind, EditTransaction,
+    EditValidation, EventSink, NewSessionEvent, PermissionToken, SessionEventType, SessionId,
+    Timestamp, TransactionId, TxState, WorkspaceDigest, EDIT_APPLIED_SCHEMA,
 };
 use async_trait::async_trait;
 use serde_json::json;
+use tracing::field::{display, Empty};
+use tracing::Instrument;
 
 use crate::edit::apply::{apply_file_patches, ApplyProgress, FileApplyOutcome};
 use crate::edit::checkpoint::{
-    create_checkpoint, preflight_git, prepare_repo_for_edit, resolve_checkpoint,
-    restore_checkpoint, tracked_set, CreatedCheckpoint,
+    create_checkpoint, ensure_no_tracked_denied, preflight_git, prepare_repo_for_edit,
+    resolve_checkpoint, restore_checkpoint, tracked_set, CreatedCheckpoint,
 };
 use crate::edit::digest::compute_workspace_digest;
 use crate::edit::map_error::map_store;
@@ -85,6 +87,18 @@ impl GitEditEngineConfig {
     }
 }
 
+/// Identity and pre-image of the mutating transaction currently in flight.
+///
+/// Every post-mutate failure path needs the same five values to restore the
+/// checkpoint and verify the pre-image digest, so they travel together.
+struct ApplyState {
+    tx_id: TransactionId,
+    checkpoint_id: CheckpointId,
+    checkpoint_sha: String,
+    pre_digest: WorkspaceDigest,
+    tracked: BTreeSet<String>,
+}
+
 impl GitEditEngine {
     /// Construct an engine after verifying jail alignment.
     pub fn new(config: GitEditEngineConfig) -> Result<Self, EditError> {
@@ -129,7 +143,7 @@ impl GitEditEngine {
         check_run(ctx.run_id, &ctx.perms)?;
         self.require_git(&ctx.perms)?;
         let tracked = tracked_set(self.broker.as_ref(), &self.path_policy, &ctx.perms).await?;
-        crate::edit::checkpoint::ensure_no_tracked_denied(&self.path_policy, &tracked)?;
+        refuse_tracked_denied(&self.path_policy, &tracked)?;
         let sha = resolve_checkpoint(
             self.broker.as_ref(),
             &self.path_policy,
@@ -137,6 +151,7 @@ impl GitEditEngine {
             checkpoint_id,
         )
         .await?;
+        check_expiry(&ctx.perms)?;
         restore_checkpoint(
             self.broker.as_ref(),
             &self.path_policy,
@@ -167,7 +182,7 @@ impl GitEditEngine {
         Ok(())
     }
 
-    fn require_git(&self, perms: &alloy_runtime::PermissionToken) -> Result<(), EditError> {
+    fn require_git(&self, perms: &PermissionToken) -> Result<(), EditError> {
         require_git_write(perms)?;
         preflight_git(
             perms,
@@ -177,14 +192,100 @@ impl GitEditEngine {
         )
     }
 
-    async fn reconcile_abandoned(
+    /// Compute a workspace digest under an `edit.digest` span (RFC §9.1).
+    fn workspace_digest(
         &self,
-        perms: &alloy_runtime::PermissionToken,
-    ) -> Result<(), EditError> {
+        phase: &'static str,
+        tracked: &BTreeSet<String>,
+        created_paths: &[String],
+    ) -> Result<WorkspaceDigest, EditError> {
+        let span = tracing::debug_span!(
+            "edit.digest",
+            phase = phase,
+            file_count = Empty,
+            total_bytes = Empty
+        );
+        let _entered = span.enter();
+        let digest = compute_workspace_digest(
+            &self.path_policy,
+            tracked,
+            created_paths,
+            self.max_digest_files,
+            self.max_digest_bytes,
+        )?;
+        span.record("file_count", digest.file_count);
+        span.record("total_bytes", digest.total_bytes);
+        Ok(digest)
+    }
+
+    /// Create the checkpoint ref under an `edit.checkpoint` span (RFC §9.1).
+    async fn create_checkpoint_spanned(
+        &self,
+        perms: &PermissionToken,
+        checkpoint_id: CheckpointId,
+        head_sha: &str,
+        tracked: BTreeSet<String>,
+    ) -> Result<CreatedCheckpoint, EditError> {
+        let span = tracing::info_span!(
+            "edit.checkpoint",
+            checkpoint_id = %checkpoint_id,
+            sha = Empty,
+            git.exit = Empty
+        );
+        let created = create_checkpoint(
+            self.broker.as_ref(),
+            &self.path_policy,
+            perms,
+            checkpoint_id,
+            head_sha,
+            tracked,
+        )
+        .instrument(span.clone())
+        .await;
+        if let Ok(created) = &created {
+            span.record("sha", created.checkpoint_sha.as_str());
+            span.record("git.exit", 0);
+        }
+        created
+    }
+
+    async fn reconcile_abandoned(&self, perms: &PermissionToken) -> Result<(), EditError> {
         let abandoned = { lock(&self.abandoned)?.clone() };
         let Some(abandoned) = abandoned else {
             return Ok(());
         };
+        let span = tracing::info_span!(
+            "edit.reconcile_abandoned",
+            checkpoint_id = %abandoned.checkpoint_id,
+            result = Empty
+        );
+        let outcome = self
+            .reconcile_one(&abandoned, perms)
+            .instrument(span.clone())
+            .await;
+        match &outcome {
+            Ok(result) => {
+                span.record("result", *result);
+            }
+            Err(err) => {
+                span.record("result", display(err));
+            }
+        }
+        outcome.map(|_| ())
+    }
+
+    /// Reconcile one abandoned checkpoint; returns the span `result` label.
+    async fn reconcile_one(
+        &self,
+        abandoned: &AbandonedCheckpoint,
+        perms: &PermissionToken,
+    ) -> Result<&'static str, EditError> {
+        tracing::warn!(
+            tx = %abandoned.transaction_id,
+            checkpoint_id = %abandoned.checkpoint_id,
+            "abandon reconcile invoked"
+        );
+        check_expiry(perms)?;
         self.require_git(perms)?;
         let state = {
             lock(&self.tx_store)?
@@ -197,12 +298,17 @@ impl GitEditEngine {
                 "clearing stale abandoned checkpoint for committed edit"
             );
             *lock(&self.abandoned)? = None;
-            return Ok(());
+            return Ok("cleared_committed");
         }
         if state != Some(TxState::Open) {
             *lock(&self.abandoned)? = None;
-            return Ok(());
+            return Ok("cleared_not_open");
         }
+        // V17: a whole-tree restore would rewrite deny-glob paths through the
+        // sandbox binds, so refuse before touching the worktree.
+        let tracked = tracked_set(self.broker.as_ref(), &self.path_policy, perms).await?;
+        refuse_tracked_denied(&self.path_policy, &tracked)?;
+        check_expiry(perms)?;
         if let Err(err) = restore_checkpoint(
             self.broker.as_ref(),
             &self.path_policy,
@@ -214,38 +320,27 @@ impl GitEditEngine {
         )
         .await
         {
-            return Err(EditError::RollbackFailed {
-                tx: abandoned.transaction_id,
-                checkpoint_id: abandoned.checkpoint_id,
-                detail: err.to_string(),
-            });
+            return Err(rollback_failed(
+                abandoned.transaction_id,
+                abandoned.checkpoint_id,
+                err.to_string(),
+            ));
         }
-        let tracked = tracked_set(self.broker.as_ref(), &self.path_policy, perms).await?;
-        let digest = compute_workspace_digest(
-            &self.path_policy,
-            &tracked,
-            &[],
-            self.max_digest_files,
-            self.max_digest_bytes,
-        )?;
-        if digest != abandoned.pre_digest {
-            return Err(EditError::RollbackFailed {
-                tx: abandoned.transaction_id,
-                checkpoint_id: abandoned.checkpoint_id,
-                detail: "digest mismatch after restore".into(),
-            });
-        }
-        if let Some(record) = lock(&self.tx_store)?.get_mut(&abandoned.transaction_id) {
-            record.state = TxState::RolledBack;
-        }
-        *lock(&self.abandoned)? = None;
-        Ok(())
+        self.verify_restored_digest(
+            abandoned.transaction_id,
+            abandoned.checkpoint_id,
+            &abandoned.pre_digest,
+            perms,
+        )
+        .await?;
+        self.mark_rolled_back(abandoned.transaction_id)?;
+        Ok("restored")
     }
 
     async fn rollback_record(
         &self,
         record: TxRecord,
-        perms: &alloy_runtime::PermissionToken,
+        perms: &PermissionToken,
     ) -> Result<(), EditError> {
         let abandoned = AbandonedCheckpoint {
             transaction_id: record.id,
@@ -256,7 +351,19 @@ impl GitEditEngine {
             created_dirs: record.created_dirs.clone(),
             pre_digest: record.pre_digest.clone(),
         };
-        *lock(&self.abandoned)? = Some(abandoned.clone());
+        // RFC §5.11 step 5 arms `abandoned` before the restore so a dropped
+        // rollback future is reconciled like a dropped apply. §6.4 forbids
+        // reconcile from restoring a `Committed` transaction, so the record must
+        // leave `Committed` first: otherwise a cancelled rollback of a committed
+        // edit clears the abandon record and leaves the tree half restored.
+        {
+            let mut slot = lock(&self.abandoned)?;
+            if let Some(stored) = lock(&self.tx_store)?.get_mut(&record.id) {
+                stored.state = TxState::Open;
+            }
+            *slot = Some(abandoned);
+        }
+        check_expiry(perms)?;
         if let Err(err) = restore_checkpoint(
             self.broker.as_ref(),
             &self.path_policy,
@@ -268,31 +375,53 @@ impl GitEditEngine {
         )
         .await
         {
-            return Err(EditError::RollbackFailed {
-                tx: record.id,
-                checkpoint_id: record.checkpoint_id,
-                detail: err.to_string(),
-            });
+            return Err(rollback_failed(
+                record.id,
+                record.checkpoint_id,
+                err.to_string(),
+            ));
         }
-        let tracked = tracked_set(self.broker.as_ref(), &self.path_policy, perms).await?;
-        let digest = compute_workspace_digest(
-            &self.path_policy,
-            &tracked,
-            &[],
-            self.max_digest_files,
-            self.max_digest_bytes,
-        )?;
-        if digest != record.pre_digest {
-            return Err(EditError::RollbackFailed {
-                tx: record.id,
-                checkpoint_id: record.checkpoint_id,
-                detail: "digest mismatch after restore".into(),
-            });
+        self.verify_restored_digest(record.id, record.checkpoint_id, &record.pre_digest, perms)
+            .await?;
+        self.mark_rolled_back(record.id)
+    }
+
+    /// Restore must land exactly on the pre-image (RFC §5.11 step 7).
+    ///
+    /// Leaves the transaction `Open` with its abandon record on any failure so
+    /// the next apply/rollback reconcile can retry.
+    async fn verify_restored_digest(
+        &self,
+        tx: TransactionId,
+        checkpoint_id: CheckpointId,
+        pre_digest: &WorkspaceDigest,
+        perms: &PermissionToken,
+    ) -> Result<(), EditError> {
+        let tracked = tracked_set(self.broker.as_ref(), &self.path_policy, perms)
+            .await
+            .map_err(|err| rollback_failed(tx, checkpoint_id, err.to_string()))?;
+        let digest = self
+            .workspace_digest("post", &tracked, &[])
+            .map_err(|err| rollback_failed(tx, checkpoint_id, err.to_string()))?;
+        if &digest != pre_digest {
+            return Err(rollback_failed(
+                tx,
+                checkpoint_id,
+                "digest mismatch after restore",
+            ));
         }
-        if let Some(stored) = lock(&self.tx_store)?.get_mut(&record.id) {
-            stored.state = TxState::RolledBack;
+        Ok(())
+    }
+
+    /// Mark `tx` rolled back and clear its abandon record (verified restore only).
+    fn mark_rolled_back(&self, tx: TransactionId) -> Result<(), EditError> {
+        let mut slot = lock(&self.abandoned)?;
+        if let Some(record) = lock(&self.tx_store)?.get_mut(&tx) {
+            record.state = TxState::RolledBack;
         }
-        *lock(&self.abandoned)? = None;
+        if slot.as_ref().is_some_and(|a| a.transaction_id == tx) {
+            *slot = None;
+        }
         Ok(())
     }
 
@@ -321,16 +450,58 @@ impl EditEngine for GitEditEngine {
         req: EditRequest,
         ctx: &EditContext,
     ) -> Result<EditValidation, EditError> {
+        let span = tracing::info_span!("edit.validate", file_count = Empty, error = Empty);
+        let result = self.validate_inner(req, ctx).instrument(span.clone()).await;
+        record_error(&span, result)
+    }
+
+    async fn apply(
+        &self,
+        req: EditRequest,
+        ctx: &EditContext,
+    ) -> Result<EditTransaction, EditError> {
+        let span = tracing::info_span!(
+            "edit.apply",
+            tx.id = Empty,
+            file_count = Empty,
+            checkpoint_id = Empty,
+            error = Empty
+        );
+        let result = self.apply_inner(req, ctx).instrument(span.clone()).await;
+        record_error(&span, result)
+    }
+
+    async fn rollback(&self, tx: TransactionId, ctx: &EditContext) -> Result<(), EditError> {
+        let span = tracing::info_span!(
+            "edit.rollback",
+            tx.id = %tx,
+            checkpoint_id = Empty,
+            sha = Empty,
+            files_touched = Empty,
+            error = Empty
+        );
+        let result = self.rollback_inner(tx, ctx).instrument(span.clone()).await;
+        record_error(&span, result)
+    }
+}
+
+impl GitEditEngine {
+    async fn validate_inner(
+        &self,
+        req: EditRequest,
+        ctx: &EditContext,
+    ) -> Result<EditValidation, EditError> {
         let _guard = self.write_lock.lock().await;
         reject_semantic(&req)?;
         let EditRequest::TextPatch { patch } = req else {
             unreachable!("semantic rejected");
         };
         let files_touched = validate_patchset_local(&patch, &self.path_policy, &ctx.perms)?;
+        tracing::Span::current().record("file_count", files_touched.len());
         Ok(EditValidation { files_touched })
     }
 
-    async fn apply(
+    async fn apply_inner(
         &self,
         req: EditRequest,
         ctx: &EditContext,
@@ -345,35 +516,32 @@ impl EditEngine for GitEditEngine {
         };
         let files_touched = validate_patchset_local(&patch, &self.path_policy, &ctx.perms)?;
         self.require_git(&ctx.perms)?;
+        let span = tracing::Span::current();
+        span.record("file_count", files_touched.len());
+
+        // Serialized before the first mutation so that no failure path after the
+        // checkpoint has to unwind work which could have happened up front.
+        let patch_bytes = serde_json::to_vec(&patch)
+            .map_err(|e| EditError::Internal(format!("patch serde: {e}")))?;
+        let patch_hash = Digest::sha256(&patch_bytes);
 
         let (head_sha, tracked) =
             prepare_repo_for_edit(self.broker.as_ref(), &self.path_policy, &ctx.perms, &patch)
                 .await?;
-        let pre_digest = compute_workspace_digest(
-            &self.path_policy,
-            &tracked,
-            &[],
-            self.max_digest_files,
-            self.max_digest_bytes,
-        )?;
+        let pre_digest = self.workspace_digest("pre", &tracked, &[])?;
 
         let tx_id = TransactionId::new();
         let checkpoint_id = CheckpointId::new();
+        span.record("tx.id", display(tx_id));
+        span.record("checkpoint_id", display(checkpoint_id));
         check_expiry(&ctx.perms)?;
         let CreatedCheckpoint {
             checkpoint_sha,
             head_sha,
             tracked,
-        } = create_checkpoint(
-            self.broker.as_ref(),
-            &self.path_policy,
-            &ctx.perms,
-            checkpoint_id,
-            &head_sha,
-            tracked,
-        )
-        .await?;
-        let created_at = Timestamp::now();
+        } = self
+            .create_checkpoint_spanned(&ctx.perms, checkpoint_id, &head_sha, tracked)
+            .await?;
         let record = TxRecord {
             id: tx_id,
             state: TxState::Open,
@@ -390,168 +558,116 @@ impl EditEngine for GitEditEngine {
             patch_content_hash: None,
             session_id: ctx.session_id,
             run_id: Some(ctx.run_id.unwrap_or(ctx.perms.run_id)),
-            created_at: created_at.clone(),
+            created_at: Timestamp::now(),
         };
-        lock(&self.tx_store)?.insert(tx_id, record);
-        *lock(&self.abandoned)? = Some(AbandonedCheckpoint {
-            transaction_id: tx_id,
+        {
+            let mut slot = lock(&self.abandoned)?;
+            lock(&self.tx_store)?.insert(tx_id, record);
+            *slot = Some(AbandonedCheckpoint {
+                transaction_id: tx_id,
+                checkpoint_id,
+                checkpoint_sha: checkpoint_sha.clone(),
+                created_paths: Vec::new(),
+                temp_paths: Vec::new(),
+                created_dirs: Vec::new(),
+                pre_digest: pre_digest.clone(),
+            });
+        }
+        let state = ApplyState {
+            tx_id,
             checkpoint_id,
-            checkpoint_sha: checkpoint_sha.clone(),
-            created_paths: Vec::new(),
-            temp_paths: Vec::new(),
-            created_dirs: Vec::new(),
-            pre_digest: pre_digest.clone(),
-        });
+            checkpoint_sha,
+            pre_digest,
+            tracked,
+        };
 
+        // From here the workspace is mutated: every failure restores first.
+        let mut progress_error: Option<EditError> = None;
         let apply_result =
             apply_file_patches(&patch, &self.path_policy, &ctx.perms, tx_id, |progress| {
-                if let Ok(mut abandoned) = self.abandoned.lock() {
-                    if let Some(a) = abandoned.as_mut() {
-                        match progress {
-                            ApplyProgress::TempPath(path) => a.temp_paths.push(path),
-                            ApplyProgress::CreatedPath(path) => a.created_paths.push(path),
-                            ApplyProgress::CreatedDir(path) => a.created_dirs.push(path),
+                if progress_error.is_some() {
+                    return;
+                }
+                match lock(&self.abandoned) {
+                    Ok(mut abandoned) => {
+                        if let Some(a) = abandoned.as_mut() {
+                            match progress {
+                                ApplyProgress::TempPath(path) => a.temp_paths.push(path),
+                                ApplyProgress::CreatedPath(path) => a.created_paths.push(path),
+                                ApplyProgress::CreatedDir(path) => a.created_dirs.push(path),
+                            }
                         }
                     }
+                    Err(err) => progress_error = Some(err),
                 }
             });
         let file_out = match apply_result {
             Ok(out) => out,
-            Err(err) => {
-                let partial = err.partial;
-                match self
-                    .restore_after_failure(
-                        tx_id,
-                        checkpoint_id,
-                        &checkpoint_sha,
-                        &partial,
-                        &ctx.perms,
-                    )
-                    .await
-                {
-                    Ok(()) => return Err(err.error),
-                    Err(restore_err) => return Err(restore_err),
-                }
+            Err(failure) => {
+                let failure = *failure;
+                return Err(self
+                    .restore_after_failure(failure.error, &state, &failure.partial, &ctx.perms)
+                    .await);
             }
         };
-        update_record_paths(&self.tx_store, tx_id, &file_out)?;
+        if let Some(err) = progress_error {
+            tracing::error!(
+                tx = %tx_id,
+                "apply path bookkeeping failed; restoring checkpoint"
+            );
+            return Err(self
+                .restore_after_failure(err, &state, &file_out, &ctx.perms)
+                .await);
+        }
 
-        let post_digest = match compute_workspace_digest(
-            &self.path_policy,
-            &tracked,
-            &file_out.created_paths,
-            self.max_digest_files,
-            self.max_digest_bytes,
-        ) {
-            Ok(d) => d,
-            Err(err) => {
-                match self
-                    .restore_after_failure(
-                        tx_id,
-                        checkpoint_id,
-                        &checkpoint_sha,
-                        &file_out,
-                        &ctx.perms,
-                    )
-                    .await
-                {
-                    Ok(()) => return Err(err),
-                    Err(restore_err) => return Err(restore_err),
-                }
-            }
-        };
-
-        let patch_bytes = serde_json::to_vec(&patch)
-            .map_err(|e| EditError::Internal(format!("patch serde: {e}")))?;
-        let patch_hash = alloy_runtime::Digest::sha256(&patch_bytes);
-        let mut labels = serde_json::Map::new();
-        labels.insert("transaction_id".into(), json!(tx_id.to_string()));
-        labels.insert("checkpoint_id".into(), json!(checkpoint_id.to_string()));
-        labels.insert("pre_digest".into(), json!(pre_digest.tree.as_hex()));
-        labels.insert("post_digest".into(), json!(post_digest.tree.as_hex()));
-        labels.insert("schema".into(), json!("alloy.patch_set.v1"));
-        let artifact_id = match self
-            .artifacts
-            .put(ArtifactPut {
-                bytes: patch_bytes,
-                kind: ArtifactKind::Patch,
-                content_type: Some("application/json".into()),
-                session_id: ctx.session_id,
-                run_id: Some(ctx.run_id.unwrap_or(ctx.perms.run_id)),
-                labels,
-            })
+        let (post_digest, artifact_id) = match self
+            .stage_commit_inputs(ctx, &state, &file_out, patch_bytes)
             .await
         {
-            Ok(id) => id,
+            Ok(staged) => staged,
             Err(err) => {
-                match self
-                    .restore_after_failure(
-                        tx_id,
-                        checkpoint_id,
-                        &checkpoint_sha,
-                        &file_out,
-                        &ctx.perms,
-                    )
-                    .await
-                {
-                    Ok(()) => return Err(map_store(err)),
-                    Err(restore_err) => return Err(restore_err),
-                }
+                return Err(self
+                    .restore_after_failure(err, &state, &file_out, &ctx.perms)
+                    .await)
             }
         };
 
-        let committed = {
-            let mut abandoned = lock(&self.abandoned)?;
-            let mut txs = lock(&self.tx_store)?;
-            let record = txs
-                .get_mut(&tx_id)
-                .ok_or_else(|| EditError::Internal("missing tx record".into()))?;
-            record.state = TxState::Committed;
-            record.post_digest = Some(post_digest.clone());
-            record.patch_artifact_id = Some(artifact_id);
-            record.patch_content_hash = Some(patch_hash.clone());
-            record.files_touched = files_touched.clone();
-            record.created_paths = file_out.created_paths.clone();
-            record.temp_paths = file_out.temp_paths.clone();
-            record.created_dirs = file_out.created_dirs.clone();
-            *abandoned = None;
-            Self::record_to_tx(record)
+        let facts = EditAppliedFacts {
+            files_touched,
+            post_digest,
+            artifact_id,
+            patch_hash,
+        };
+        // Encoded before the commit point: after CAS + `Committed` + `abandoned
+        // = None`, no serde or event failure may turn a committed edit into
+        // `Err` (RFC §5.1 / AC 2), so nothing below may use `?`.
+        let event = edit_applied_event(ctx, &state, &facts);
+
+        let committed = match self.commit_transaction(&state, &facts, &file_out) {
+            Ok(committed) => committed,
+            Err(err) => {
+                return Err(self
+                    .restore_after_failure(err, &state, &file_out, &ctx.perms)
+                    .await)
+            }
         };
 
-        if let Some(session_id) = ctx.session_id {
-            let payload = EditAppliedPayload {
-                schema: EDIT_APPLIED_SCHEMA.into(),
-                transaction_id: tx_id,
-                checkpoint_id,
-                checkpoint_sha: checkpoint_sha.clone(),
-                pre_digest,
-                post_digest,
-                files_touched,
-                patch_artifact_id: artifact_id,
-                patch_content_hash: patch_hash,
-                request_kind: EditRequestKind::TextPatch,
-            };
-            if let Err(err) = self
-                .events
-                .append_session(NewSessionEvent {
-                    session_id,
-                    run_id: Some(ctx.run_id.unwrap_or(ctx.perms.run_id)),
-                    type_: SessionEventType::EditApplied,
-                    payload: serde_json::to_value(payload).map_err(|e| {
-                        EditError::Internal(format!("EditAppliedPayload serde: {e}"))
-                    })?,
-                })
-                .await
-            {
+        if let Some(event) = event {
+            if let Err(err) = self.events.append_session(event).await {
                 let mapped = crate::edit::map_error::map_event(err);
                 tracing::error!(error = %mapped, tx = %tx_id, "EditApplied append failed after commit");
             }
         }
-        tracing::info!(tx = %tx_id, checkpoint_id = %checkpoint_id, "edit applied");
+        tracing::info!(
+            tx = %tx_id,
+            checkpoint_id = %checkpoint_id,
+            file_count = facts.files_touched.len(),
+            "edit applied"
+        );
         Ok(committed)
     }
 
-    async fn rollback(&self, tx: TransactionId, ctx: &EditContext) -> Result<(), EditError> {
+    async fn rollback_inner(&self, tx: TransactionId, ctx: &EditContext) -> Result<(), EditError> {
         let _guard = self.write_lock.lock().await;
         check_expiry(&ctx.perms)?;
         check_run(ctx.run_id, &ctx.perms)?;
@@ -561,18 +677,16 @@ impl EditEngine for GitEditEngine {
             .cloned()
             .ok_or(EditError::UnknownTransaction(tx))?;
         self.require_git(&ctx.perms)?;
+        let span = tracing::Span::current();
+        span.record("checkpoint_id", display(record.checkpoint_id));
+        span.record("sha", record.checkpoint_sha.as_str());
+        span.record("files_touched", record.files_touched.len());
         let tracked = tracked_set(self.broker.as_ref(), &self.path_policy, &ctx.perms).await?;
-        crate::edit::checkpoint::ensure_no_tracked_denied(&self.path_policy, &tracked)?;
+        refuse_tracked_denied(&self.path_policy, &tracked)?;
 
         match record.state {
             TxState::RolledBack => {
-                let digest = compute_workspace_digest(
-                    &self.path_policy,
-                    &tracked,
-                    &[],
-                    self.max_digest_files,
-                    self.max_digest_bytes,
-                )?;
+                let digest = self.workspace_digest("post", &tracked, &[])?;
                 if digest == record.pre_digest {
                     return Ok(());
                 }
@@ -590,13 +704,7 @@ impl EditEngine for GitEditEngine {
                         reason: "not newest",
                     });
                 }
-                let digest = compute_workspace_digest(
-                    &self.path_policy,
-                    &tracked,
-                    &record.created_paths,
-                    self.max_digest_files,
-                    self.max_digest_bytes,
-                )?;
+                let digest = self.workspace_digest("post", &tracked, &record.created_paths)?;
                 if Some(&digest) != record.post_digest.as_ref() {
                     return Err(EditError::WorkspaceDrifted(tx));
                 }
@@ -628,47 +736,182 @@ impl EditEngine for GitEditEngine {
         }
         self.rollback_record(record, &ctx.perms).await
     }
-}
 
-impl GitEditEngine {
+    /// Post-mutate, pre-commit work: record paths, post digest, CAS put.
+    ///
+    /// Every fallible step lives here so `apply` has exactly one restore-on-error
+    /// seam between the first mutation and the commit point.
+    async fn stage_commit_inputs(
+        &self,
+        ctx: &EditContext,
+        state: &ApplyState,
+        file_out: &FileApplyOutcome,
+        patch_bytes: Vec<u8>,
+    ) -> Result<(WorkspaceDigest, ArtifactId), EditError> {
+        update_record_paths(&self.tx_store, state.tx_id, file_out)?;
+        let post_digest = self.workspace_digest("post", &state.tracked, &file_out.created_paths)?;
+        let mut labels = serde_json::Map::new();
+        labels.insert("transaction_id".into(), json!(state.tx_id.to_string()));
+        labels.insert(
+            "checkpoint_id".into(),
+            json!(state.checkpoint_id.to_string()),
+        );
+        labels.insert("pre_digest".into(), json!(state.pre_digest.tree.as_hex()));
+        labels.insert("post_digest".into(), json!(post_digest.tree.as_hex()));
+        labels.insert("schema".into(), json!("alloy.patch_set.v1"));
+        let artifact_id = self
+            .artifacts
+            .put(ArtifactPut {
+                bytes: patch_bytes,
+                kind: ArtifactKind::Patch,
+                content_type: Some("application/json".into()),
+                session_id: ctx.session_id,
+                run_id: Some(ctx.run_id.unwrap_or(ctx.perms.run_id)),
+                labels,
+            })
+            .await
+            .map_err(map_store)?;
+        Ok((post_digest, artifact_id))
+    }
+
+    /// Commit point: `TxRecord = Committed` and the abandon record cleared.
+    fn commit_transaction(
+        &self,
+        state: &ApplyState,
+        facts: &EditAppliedFacts,
+        file_out: &FileApplyOutcome,
+    ) -> Result<EditTransaction, EditError> {
+        let mut slot = lock(&self.abandoned)?;
+        let mut txs = lock(&self.tx_store)?;
+        let record = txs
+            .get_mut(&state.tx_id)
+            .ok_or_else(|| EditError::Internal("missing tx record".into()))?;
+        record.state = TxState::Committed;
+        record.post_digest = Some(facts.post_digest.clone());
+        record.patch_artifact_id = Some(facts.artifact_id);
+        record.patch_content_hash = Some(facts.patch_hash.clone());
+        record.files_touched = facts.files_touched.clone();
+        record.created_paths = file_out.created_paths.clone();
+        record.temp_paths = file_out.temp_paths.clone();
+        record.created_dirs = file_out.created_dirs.clone();
+        *slot = None;
+        Ok(Self::record_to_tx(record))
+    }
+
+    /// Restore the checkpoint after a mutation failed, then return the error.
+    ///
+    /// Returns the restore failure when the restore itself fails, so the caller
+    /// always surfaces the most serious problem.
     async fn restore_after_failure(
         &self,
-        tx: TransactionId,
-        checkpoint_id: CheckpointId,
-        checkpoint_sha: &str,
+        err: EditError,
+        state: &ApplyState,
         paths: &FileApplyOutcome,
-        perms: &alloy_runtime::PermissionToken,
+        perms: &PermissionToken,
+    ) -> EditError {
+        match self.restore_checkpoint_verified(state, paths, perms).await {
+            Ok(()) => err,
+            Err(restore_err) => restore_err,
+        }
+    }
+
+    /// Restore `state`'s checkpoint and prove the workspace equals `pre_digest`.
+    ///
+    /// FailedDirty on any failure: the transaction stays `Open`, the abandon
+    /// record and checkpoint ref survive, and `TokenExpired` is preserved as the
+    /// public "recover under a fresh token" signal (RFC §5.2 / AC 39).
+    async fn restore_checkpoint_verified(
+        &self,
+        state: &ApplyState,
+        paths: &FileApplyOutcome,
+        perms: &PermissionToken,
     ) -> Result<(), EditError> {
+        // V21: never start a restore with an expired token.
+        check_expiry(perms).inspect_err(|_| {
+            tracing::error!(
+                tx = %state.tx_id,
+                checkpoint_id = %state.checkpoint_id,
+                "FailedDirty: token expired before restore; reconcile under a fresh token"
+            );
+        })?;
         match restore_checkpoint(
             self.broker.as_ref(),
             &self.path_policy,
             perms,
-            checkpoint_sha,
+            &state.checkpoint_sha,
             &paths.created_paths,
             &paths.temp_paths,
             &paths.created_dirs,
         )
         .await
         {
-            Ok(()) => {
-                if let Some(record) = lock(&self.tx_store)?.get_mut(&tx) {
-                    record.state = TxState::RolledBack;
-                }
-                *lock(&self.abandoned)? = None;
-                Ok(())
-            }
+            Ok(()) => {}
             Err(EditError::TokenExpired) => {
-                // FailedDirty: leave Open + abandoned + checkpoint ref.
-                Err(EditError::TokenExpired)
+                tracing::error!(
+                    tx = %state.tx_id,
+                    checkpoint_id = %state.checkpoint_id,
+                    "FailedDirty: token expired during restore; reconcile under a fresh token"
+                );
+                return Err(EditError::TokenExpired);
             }
             Err(err) => {
-                // FailedDirty: leave Open + abandoned + checkpoint ref.
-                Err(EditError::RollbackFailed {
-                    tx,
-                    checkpoint_id,
-                    detail: err.to_string(),
-                })
+                return Err(rollback_failed(
+                    state.tx_id,
+                    state.checkpoint_id,
+                    err.to_string(),
+                ))
             }
+        }
+        self.verify_restored_digest(state.tx_id, state.checkpoint_id, &state.pre_digest, perms)
+            .await?;
+        self.mark_rolled_back(state.tx_id)
+    }
+}
+
+/// Values only known once the mutation and CAS put succeeded.
+struct EditAppliedFacts {
+    files_touched: Vec<String>,
+    post_digest: WorkspaceDigest,
+    artifact_id: ArtifactId,
+    patch_hash: Digest,
+}
+
+/// Encode the `EditApplied` event, or `None` when there is nothing to send.
+///
+/// A serde failure is logged and dropped: the caller is about to commit, and a
+/// committed edit MUST NOT surface as `Err` (RFC §5.1).
+fn edit_applied_event(
+    ctx: &EditContext,
+    state: &ApplyState,
+    facts: &EditAppliedFacts,
+) -> Option<NewSessionEvent> {
+    let session_id: SessionId = ctx.session_id?;
+    let payload = EditAppliedPayload {
+        schema: EDIT_APPLIED_SCHEMA.into(),
+        transaction_id: state.tx_id,
+        checkpoint_id: state.checkpoint_id,
+        checkpoint_sha: state.checkpoint_sha.clone(),
+        pre_digest: state.pre_digest.clone(),
+        post_digest: facts.post_digest.clone(),
+        files_touched: facts.files_touched.clone(),
+        patch_artifact_id: facts.artifact_id,
+        patch_content_hash: facts.patch_hash.clone(),
+        request_kind: EditRequestKind::TextPatch,
+    };
+    match serde_json::to_value(payload) {
+        Ok(payload) => Some(NewSessionEvent {
+            session_id,
+            run_id: Some(ctx.run_id.unwrap_or(ctx.perms.run_id)),
+            type_: SessionEventType::EditApplied,
+            payload,
+        }),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                tx = %state.tx_id,
+                "EditApplied payload encoding failed; skipping event"
+            );
+            None
         }
     }
 }
@@ -698,13 +941,470 @@ fn newest_tx_with_state(
         .map(|r| r.id)
 }
 
+/// Refuse to restore while a deny-glob path is tracked (V17 / RFC §5.11).
+fn refuse_tracked_denied(policy: &PathPolicy, tracked: &BTreeSet<String>) -> Result<(), EditError> {
+    ensure_no_tracked_denied(policy, tracked).inspect_err(|err| {
+        tracing::warn!(error = %err, "refusing restore: deny-glob path is tracked");
+    })
+}
+
+/// Build and log a `RollbackFailed`; the checkpoint ref is always retained.
+fn rollback_failed(
+    tx: TransactionId,
+    checkpoint_id: CheckpointId,
+    detail: impl Into<String>,
+) -> EditError {
+    let err = EditError::RollbackFailed {
+        tx,
+        checkpoint_id,
+        detail: detail.into(),
+    };
+    tracing::error!(error = %err, "rollback failed; checkpoint ref retained");
+    err
+}
+
+fn record_error<T>(span: &tracing::Span, result: Result<T, EditError>) -> Result<T, EditError> {
+    if let Err(err) = &result {
+        span.record("error", display(err));
+    }
+    result
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, EditError> {
     mutex
         .lock()
         .map_err(|_| EditError::Internal("mutex poisoned".into()))
 }
 
-#[allow(dead_code)]
-fn _tracked_from_slice(paths: &[&str]) -> BTreeSet<String> {
-    paths.iter().map(|p| (*p).to_string()).collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::{
+        RecordingSandboxBroker, SandboxBackend, SandboxExecResult, SandboxProfile,
+    };
+    use alloy_runtime::{
+        ArtifactBlob, ArtifactMeta, ExecAllow, Glob, Grant, InMemoryEventSink, ProfileId, RunId,
+        StoreError,
+    };
+    use std::path::Path;
+
+    /// Accepts every put; nothing here exercises CAS storage itself.
+    struct NoopArtifacts;
+
+    #[async_trait]
+    impl ArtifactStore for NoopArtifacts {
+        async fn put(&self, _req: ArtifactPut) -> Result<ArtifactId, StoreError> {
+            Ok(ArtifactId::new())
+        }
+
+        async fn get(&self, _id: ArtifactId) -> Result<ArtifactBlob, StoreError> {
+            Err(StoreError::NotFound("test".into()))
+        }
+
+        async fn meta(&self, _id: ArtifactId) -> Result<ArtifactMeta, StoreError> {
+            Err(StoreError::NotFound("test".into()))
+        }
+
+        async fn get_by_digest(&self, _digest: &Digest) -> Result<Option<ArtifactId>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete(&self, _id: ArtifactId) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        jail: PathBuf,
+        broker: Arc<RecordingSandboxBroker>,
+        engine: GitEditEngine,
+    }
+
+    /// A hermetic engine over a temp jail with a scripted broker.
+    ///
+    /// `git` preflight resolves against a stand-in binary on a temp trusted
+    /// root, so these tests never depend on the host's git.
+    fn fixture() -> Fixture {
+        let root = tempfile::tempdir().unwrap();
+        let jail = root.path().join("repo");
+        std::fs::create_dir_all(&jail).unwrap();
+        let jail = jail.canonicalize().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_stand_in_git(&bin.join("git"));
+
+        let profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
+        let policy = PathPolicy::from_profile(&profile, Vec::new()).unwrap();
+        let broker = Arc::new(RecordingSandboxBroker::new(profile));
+        let engine = GitEditEngine::new(GitEditEngineConfig::new(
+            broker.clone() as Arc<dyn SandboxBroker>,
+            policy,
+            vec![bin],
+            Arc::new(NoopArtifacts),
+            Arc::new(InMemoryEventSink::new()),
+        ))
+        .unwrap();
+        Fixture {
+            _root: root,
+            jail,
+            broker,
+            engine,
+        }
+    }
+
+    fn write_stand_in_git(path: &Path) {
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn edit_token() -> PermissionToken {
+        PermissionToken {
+            profile: ProfileId::new("default").unwrap(),
+            grants: vec![
+                Grant::FsWrite(Glob("**".into())),
+                Grant::GitWrite,
+                Grant::Exec(ExecAllow {
+                    binary: "git".into(),
+                    args_glob: None,
+                }),
+            ],
+            expires: None,
+            run_id: RunId::new(),
+        }
+    }
+
+    fn exit(code: i32) -> Result<SandboxExecResult, crate::sandbox::SandboxError> {
+        Ok(SandboxExecResult::synthetic(
+            Some(code),
+            None,
+            SandboxBackend::Landlock,
+            Digest::sha256(b"policy"),
+        ))
+    }
+
+    fn ls_files(stdout: &[u8]) -> Result<SandboxExecResult, crate::sandbox::SandboxError> {
+        Ok(SandboxExecResult::synthetic(
+            Some(0),
+            None,
+            SandboxBackend::Landlock,
+            Digest::sha256(b"policy"),
+        )
+        .with_stdio(stdout.to_vec(), Vec::new()))
+    }
+
+    fn tx_record(state: TxState, pre_digest: WorkspaceDigest) -> TxRecord {
+        TxRecord {
+            id: TransactionId::new(),
+            state,
+            checkpoint_id: CheckpointId::new(),
+            checkpoint_sha: "0".repeat(40),
+            head_sha_at_checkpoint: "0".repeat(40),
+            pre_digest,
+            post_digest: None,
+            files_touched: vec!["a.txt".into()],
+            created_paths: Vec::new(),
+            temp_paths: Vec::new(),
+            created_dirs: Vec::new(),
+            patch_artifact_id: None,
+            patch_content_hash: None,
+            session_id: None,
+            run_id: None,
+            created_at: Timestamp::now(),
+        }
+    }
+
+    fn abandon_for(record: &TxRecord) -> AbandonedCheckpoint {
+        AbandonedCheckpoint {
+            transaction_id: record.id,
+            checkpoint_id: record.checkpoint_id,
+            checkpoint_sha: record.checkpoint_sha.clone(),
+            created_paths: Vec::new(),
+            temp_paths: Vec::new(),
+            created_dirs: Vec::new(),
+            pre_digest: record.pre_digest.clone(),
+        }
+    }
+
+    fn arm(fx: &Fixture, record: &TxRecord) {
+        fx.engine
+            .tx_store
+            .lock()
+            .unwrap()
+            .insert(record.id, record.clone());
+        *fx.engine.abandoned.lock().unwrap() = Some(abandon_for(record));
+    }
+
+    fn state_of(fx: &Fixture, tx: TransactionId) -> TxState {
+        fx.engine.tx_store.lock().unwrap()[&tx].state
+    }
+
+    fn tracked(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    /// Digest of the current jail contents, as the engine would compute it.
+    fn jail_digest(fx: &Fixture, paths: &[&str]) -> WorkspaceDigest {
+        fx.engine
+            .workspace_digest("pre", &tracked(paths), &[])
+            .unwrap()
+    }
+
+    #[test]
+    fn newest_tx_filters_state_and_breaks_ties_by_uuid() {
+        let digest = WorkspaceDigest {
+            tree: Digest::sha256(b""),
+            file_count: 0,
+            total_bytes: 0,
+        };
+        let mut open_a = tx_record(TxState::Open, digest.clone());
+        let mut open_b = tx_record(TxState::Open, digest.clone());
+        let committed = tx_record(TxState::Committed, digest);
+        // Identical timestamps isolate the UUID tie-break from wall-clock luck.
+        open_b.created_at = open_a.created_at.clone();
+        open_a.created_at = open_b.created_at.clone();
+        let expected = if open_a.id.as_uuid() > open_b.id.as_uuid() {
+            open_a.id
+        } else {
+            open_b.id
+        };
+        let mut txs = HashMap::new();
+        for record in [open_a, open_b, committed.clone()] {
+            txs.insert(record.id, record);
+        }
+        assert_eq!(newest_tx_with_state(&txs, TxState::Open), Some(expected));
+        assert_eq!(
+            newest_tx_with_state(&txs, TxState::Committed),
+            Some(committed.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_restore_when_deny_glob_path_is_tracked() {
+        let fx = fixture();
+        let record = tx_record(TxState::Open, jail_digest(&fx, &[]));
+        arm(&fx, &record);
+        fx.broker.push(ls_files(b".env\0a.txt\0"));
+
+        let err = fx
+            .engine
+            .reconcile_abandoned(&edit_token())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, EditError::TrackedDeniedPath { ref path } if path == ".env"));
+        assert_eq!(
+            fx.broker.recorded().len(),
+            1,
+            "only the tracked-set probe may run; restore must not"
+        );
+        assert_eq!(state_of(&fx, record.id), TxState::Open);
+        assert!(
+            fx.engine.abandoned.lock().unwrap().is_some(),
+            "the abandon record survives so recovery can retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_expired_token_before_any_git() {
+        let fx = fixture();
+        let record = tx_record(TxState::Open, jail_digest(&fx, &[]));
+        arm(&fx, &record);
+        let perms = PermissionToken {
+            expires: Some(Timestamp::now()),
+            ..edit_token()
+        };
+
+        let err = fx.engine.reconcile_abandoned(&perms).await.unwrap_err();
+
+        assert!(matches!(err, EditError::TokenExpired));
+        assert!(
+            fx.broker.recorded().is_empty(),
+            "no git before expiry check"
+        );
+        assert!(fx.engine.abandoned.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn reconcile_clears_without_restore_for_committed_tx() {
+        let fx = fixture();
+        let record = tx_record(TxState::Committed, jail_digest(&fx, &[]));
+        arm(&fx, &record);
+
+        fx.engine.reconcile_abandoned(&edit_token()).await.unwrap();
+
+        assert!(
+            fx.broker.recorded().is_empty(),
+            "committed edits never restore"
+        );
+        assert_eq!(state_of(&fx, record.id), TxState::Committed);
+        assert!(fx.engine.abandoned.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_after_mutate_requires_digest_match_before_clearing_abandon() {
+        let fx = fixture();
+        std::fs::write(fx.jail.join("a.txt"), b"restored\n").unwrap();
+        let mut record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]));
+        // Pre-image the restore cannot reach: the file on disk says otherwise.
+        record.pre_digest.total_bytes += 1;
+        arm(&fx, &record);
+        let state = ApplyState {
+            tx_id: record.id,
+            checkpoint_id: record.checkpoint_id,
+            checkpoint_sha: record.checkpoint_sha.clone(),
+            pre_digest: record.pre_digest.clone(),
+            tracked: tracked(&["a.txt"]),
+        };
+        fx.broker.push(exit(0)); // git restore
+        fx.broker.push(ls_files(b"a.txt\0")); // tracked set for the verify
+
+        let err = fx
+            .engine
+            .restore_checkpoint_verified(&state, &FileApplyOutcome::default(), &edit_token())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EditError::RollbackFailed { ref detail, .. } if detail == "digest mismatch after restore"
+        ));
+        assert_eq!(state_of(&fx, record.id), TxState::Open);
+        assert!(
+            fx.engine.abandoned.lock().unwrap().is_some(),
+            "FailedDirty keeps Open + abandoned"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_after_mutate_marks_rolled_back_on_verified_restore() {
+        let fx = fixture();
+        std::fs::write(fx.jail.join("a.txt"), b"restored\n").unwrap();
+        let record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]));
+        arm(&fx, &record);
+        let state = ApplyState {
+            tx_id: record.id,
+            checkpoint_id: record.checkpoint_id,
+            checkpoint_sha: record.checkpoint_sha.clone(),
+            pre_digest: record.pre_digest.clone(),
+            tracked: tracked(&["a.txt"]),
+        };
+        fx.broker.push(exit(0));
+        fx.broker.push(ls_files(b"a.txt\0"));
+
+        fx.engine
+            .restore_checkpoint_verified(&state, &FileApplyOutcome::default(), &edit_token())
+            .await
+            .unwrap();
+
+        assert_eq!(state_of(&fx, record.id), TxState::RolledBack);
+        assert!(fx.engine.abandoned.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_after_mutate_refuses_expired_token_and_stays_dirty() {
+        let fx = fixture();
+        let record = tx_record(TxState::Open, jail_digest(&fx, &[]));
+        arm(&fx, &record);
+        let state = ApplyState {
+            tx_id: record.id,
+            checkpoint_id: record.checkpoint_id,
+            checkpoint_sha: record.checkpoint_sha.clone(),
+            pre_digest: record.pre_digest.clone(),
+            tracked: BTreeSet::new(),
+        };
+        let perms = PermissionToken {
+            expires: Some(Timestamp::now()),
+            ..edit_token()
+        };
+
+        let err = fx
+            .engine
+            .restore_checkpoint_verified(&state, &FileApplyOutcome::default(), &perms)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, EditError::TokenExpired));
+        assert!(fx.broker.recorded().is_empty());
+        assert_eq!(state_of(&fx, record.id), TxState::Open);
+        assert!(fx.engine.abandoned.lock().unwrap().is_some());
+    }
+
+    /// A cancelled or failed rollback of a *committed* edit must stay
+    /// reconcilable: the record leaves `Committed` before the restore starts, so
+    /// the next reconcile restores instead of clearing the abandon record.
+    #[tokio::test]
+    async fn failed_rollback_of_committed_tx_is_reconcilable() {
+        let fx = fixture();
+        std::fs::write(fx.jail.join("a.txt"), b"restored\n").unwrap();
+        let mut record = tx_record(TxState::Committed, jail_digest(&fx, &["a.txt"]));
+        record.state = TxState::Committed;
+        fx.engine
+            .tx_store
+            .lock()
+            .unwrap()
+            .insert(record.id, record.clone());
+        fx.broker.push(exit(1)); // git restore fails
+
+        let err = fx
+            .engine
+            .rollback_record(record.clone(), &edit_token())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, EditError::RollbackFailed { .. }));
+        assert_eq!(
+            state_of(&fx, record.id),
+            TxState::Open,
+            "mid-rollback state must not stay Committed, or reconcile would skip the restore"
+        );
+        let armed = fx.engine.abandoned.lock().unwrap().clone().unwrap();
+        assert_eq!(armed.transaction_id, record.id);
+
+        // The next apply/rollback reconcile now finishes the rollback.
+        fx.broker.push(ls_files(b"a.txt\0")); // tracked-deny scan
+        fx.broker.push(exit(0)); // git restore
+        fx.broker.push(ls_files(b"a.txt\0")); // digest verify
+        fx.engine.reconcile_abandoned(&edit_token()).await.unwrap();
+
+        assert_eq!(state_of(&fx, record.id), TxState::RolledBack);
+        assert!(fx.engine.abandoned.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rollback_clears_abandon_only_after_digest_verify() {
+        let fx = fixture();
+        std::fs::write(fx.jail.join("a.txt"), b"restored\n").unwrap();
+        let mut record = tx_record(TxState::Open, jail_digest(&fx, &["a.txt"]));
+        record.pre_digest.file_count += 1;
+        fx.engine
+            .tx_store
+            .lock()
+            .unwrap()
+            .insert(record.id, record.clone());
+        fx.broker.push(exit(0)); // git restore
+        fx.broker.push(ls_files(b"a.txt\0")); // digest verify
+
+        let err = fx
+            .engine
+            .rollback_record(record.clone(), &edit_token())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EditError::RollbackFailed { ref detail, .. } if detail == "digest mismatch after restore"
+        ));
+        assert_eq!(state_of(&fx, record.id), TxState::Open);
+        assert!(
+            fx.engine.abandoned.lock().unwrap().is_some(),
+            "abandon record must survive a failed digest verification"
+        );
+    }
 }

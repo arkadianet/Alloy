@@ -120,7 +120,12 @@ impl Stack {
             Arc::clone(&storage),
             RetentionPolicy::defaults(),
         ));
-        let path_policy = PathPolicy::from_profile(&profile, vec![]).unwrap();
+        // RFC-0008 §3.10: engine and host MUST share one `read_only_roots`
+        // value. The jail is never an RO root — RO roots are the allowlisted
+        // cargo/rustup subtrees outside it — or the engine's own writes would be
+        // refused as writes into a read-only root.
+        let read_only_roots: Vec<PathBuf> = Vec::new();
+        let path_policy = PathPolicy::from_profile(&profile, read_only_roots.clone()).unwrap();
         let engine = Arc::new(
             GitEditEngine::new(GitEditEngineConfig::new(
                 broker.clone() as Arc<dyn SandboxBroker>,
@@ -137,7 +142,7 @@ impl Stack {
         let host = InProcessMcpHost::new(
             broker.clone(),
             homes,
-            vec![jail.clone()],
+            read_only_roots,
             patch_backend,
             McpHostConfig::new(),
         )

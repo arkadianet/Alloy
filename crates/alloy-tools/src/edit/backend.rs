@@ -35,9 +35,11 @@ impl PatchApplyBackend for EditEnginePatchBackend {
         run: Option<RunId>,
     ) -> Result<ApplyPatchOutcome, PatchApplyError> {
         let req = decode_patch_value(&args.patch).map_err(map_edit_error)?;
+        // RFC-0008 §3.8.5: the call's run wins, otherwise attribute to the run
+        // the token was minted for — never leave the edit unattributed.
         let ctx = EditContext {
             session_id: session,
-            run_id: run,
+            run_id: Some(run.unwrap_or(perms.run_id)),
             perms: perms.clone(),
         };
         if args.dry_run {

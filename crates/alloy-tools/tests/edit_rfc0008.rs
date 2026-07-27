@@ -8,8 +8,9 @@ use std::sync::Arc;
 use alloy_runtime::storage::{EventStore, StorageOpenOptions};
 use alloy_runtime::{
     AlloyStorage, ArtifactKind, ArtifactStore, EditContext, EditEngine, EditError, EditRequest,
-    ExecAllow, FilePatch, Glob, Grant, Hunk, PatchSet, PermissionToken, ProfileId, RunId,
-    SessionEventType, SessionId, TxState,
+    EventSeq, EventSink, EventSinkError, ExecAllow, FilePatch, Glob, Grant, Hunk, NewSessionEvent,
+    PatchSet, PermissionToken, ProfileId, RunId, RuntimeEvent, SessionEventType, SessionId,
+    TxState,
 };
 use alloy_tools::mcp::{ApplyPatchArgs, PatchApplyBackend, PatchApplyError, PermissionDenial};
 use alloy_tools::{
@@ -17,6 +18,7 @@ use alloy_tools::{
     GitEditEngineConfig, NativeSandboxBroker, OperatorHomes, PathPolicy, SandboxBackend,
     SandboxBroker, SandboxError, SandboxExecRequest, SandboxProfile,
 };
+use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -27,6 +29,8 @@ struct Fixture {
     storage: AlloyStorage,
     engine: Arc<GitEditEngine>,
     session: SessionId,
+    profile: SandboxProfile,
+    homes: OperatorHomes,
 }
 
 impl Fixture {
@@ -95,7 +99,24 @@ impl Fixture {
             storage,
             engine,
             session: SessionId::new(),
+            profile,
+            homes,
         })
+    }
+
+    /// A second engine over the same repo with a different event sink.
+    fn engine_with_events(&self, events: Arc<dyn EventSink>) -> Arc<GitEditEngine> {
+        let policy = PathPolicy::from_profile(&self.profile, Vec::new()).unwrap();
+        Arc::new(
+            GitEditEngine::new(GitEditEngineConfig::new(
+                self.broker.clone() as Arc<dyn SandboxBroker>,
+                policy,
+                trusted_exec_path(&self.homes),
+                self.storage.artifacts() as Arc<dyn ArtifactStore>,
+                events,
+            ))
+            .unwrap(),
+        )
     }
 
     fn ctx(&self, perms: PermissionToken) -> EditContext {
@@ -177,6 +198,20 @@ async fn run_git(broker: &Arc<NativeSandboxBroker>, jail: &Path, args: &[&str]) 
     String::from_utf8(result.stdout).unwrap()
 }
 
+/// Rejects every append, so a post-commit event failure is observable.
+struct FailingEventSink;
+
+#[async_trait]
+impl EventSink for FailingEventSink {
+    async fn append_runtime(&self, _ev: RuntimeEvent) -> Result<(), EventSinkError> {
+        Err(EventSinkError::Io("sink down".into()))
+    }
+
+    async fn append_session(&self, _ev: NewSessionEvent) -> Result<EventSeq, EventSinkError> {
+        Err(EventSinkError::Io("sink down".into()))
+    }
+}
+
 fn modify_patch() -> EditRequest {
     EditRequest::TextPatch {
         patch: PatchSet {
@@ -246,6 +281,43 @@ async fn textpatch_apply_checkpoint_event_and_rollback() {
         .rollback(tx.id, &fx.ctx(edit_token()))
         .await
         .unwrap();
+    fx.close().await;
+}
+
+/// After the commit point an `EditApplied` failure MUST NOT roll back and MUST
+/// still return `Ok(EditTransaction)` (RFC-0008 §5.1 / Day-1 item 2).
+#[tokio::test]
+async fn event_failure_after_commit_still_commits() {
+    let Some(fx) = Fixture::build().await else {
+        return;
+    };
+    let engine = fx.engine_with_events(Arc::new(FailingEventSink));
+
+    let tx = engine
+        .apply(modify_patch(), &fx.ctx(edit_token()))
+        .await
+        .expect("a committed edit must not fail because the event sink is down");
+
+    assert_eq!(tx.state, TxState::Committed);
+    assert!(tx.post_digest.is_some());
+    assert!(tx.patch_artifact_id.is_some());
+    assert_eq!(
+        std::fs::read_to_string(fx.jail.join("a.txt")).unwrap(),
+        "two\n",
+        "the mutation must survive: no restore after commit"
+    );
+    let checkpoint_ref = format!("refs/alloy/checkpoints/{}", tx.checkpoint_id.unwrap());
+    let sha = run_git(&fx.broker, &fx.jail, &["rev-parse", &checkpoint_ref]).await;
+    assert_eq!(sha.trim().len(), 40);
+    assert!(
+        fx.storage
+            .events()
+            .list_session_events(fx.session, None, 16)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the failing sink recorded nothing, which is what makes this a real failpoint"
+    );
     fx.close().await;
 }
 
