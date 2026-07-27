@@ -96,13 +96,23 @@ impl SchedulerCounters {
 
     /// An RF3/RF6/RF7 crash-repair event was appended (§5.3.3).
     ///
-    /// Called by `checkpoint::Checkpoint::repair_*`, which are themselves
-    /// not yet called from `loop_.rs` (see their doc comments) — hence
-    /// unreachable from a production root until crash-repair-on-resume is
-    /// wired in.
-    #[allow(dead_code)]
+    /// `repair_node_state`/`repair_gate_terminal` are not yet called from
+    /// `loop_.rs` (see their doc comments) — `repair_approval_requested` is,
+    /// as of P7's `gate.rs`, so this is reachable in production.
     pub(super) fn inc_event_repairs(&self) {
         self.event_repairs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// §5.12.2 step 1: a `cancel(dag_id)` call was observed (owned or not).
+    pub(super) fn inc_cancels(&self) {
+        self.cancels.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A `cancel`-side C6 (or an owned run's C6, observed by `cancel` after
+    /// `cancel_drain_grace` had already elapsed) landed past the soft
+    /// `cancel_drain_grace` target, inside the `cancel_write_grace` buffer.
+    pub(super) fn inc_forced_cancel_writes(&self) {
+        self.forced_cancel_writes.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn snapshot(&self) -> SchedulerMetrics {

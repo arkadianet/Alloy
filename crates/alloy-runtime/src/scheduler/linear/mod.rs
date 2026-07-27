@@ -128,16 +128,14 @@ pub struct LinearScheduler {
     /// Held for the process lifetime; released on `Drop`.
     _lock: OwnershipLock,
     metrics: Arc<SchedulerCounters>,
-    /// DAG-level ownership: one in-process `run` per [`crate::DagId`]
-    /// (§4.5). Minimal insert-if-absent set for R4 / `AlreadyOwned`. The
-    /// full `OwnedDag`/`OwnedGuard` race-free `Notify`-based cancel wait
-    /// (§4.3-4.4) lands in P8; this set only tracks membership.
-    pub(super) owned: std::sync::Mutex<std::collections::HashSet<crate::types::ids::DagId>>,
+    /// DAG-level ownership: one in-process `run` (or transient cancel-side
+    /// entry, §5.12.4) per [`crate::DagId`] (§4.5, §4.3). Visible only within
+    /// `scheduler::linear` (matches [`own::OwnedDag`]'s own `pub(super)`).
+    pub(in crate::scheduler::linear) owned:
+        std::sync::Mutex<std::collections::HashMap<crate::types::ids::DagId, Arc<own::OwnedDag>>>,
     /// Cancels observed for DAGs this process does not (yet) own, or whose
-    /// live loop has not reached its next L2 check yet (§5.12.1). Full
-    /// `pending_cancels` + forced-C6-after-grace semantics (§5.12.3) land in
-    /// P8; for now this only drives the loop's own L1/L2 cancel path.
-    pub(super) pending_cancels:
+    /// live loop has not reached its next L2 check yet (§5.12.1).
+    pub(in crate::scheduler::linear) pending_cancels:
         std::sync::Mutex<std::collections::HashSet<crate::types::ids::DagId>>,
 }
 
@@ -216,7 +214,7 @@ impl LinearScheduler {
             deps,
             _lock: lock,
             metrics: Arc::new(SchedulerCounters::new()),
-            owned: std::sync::Mutex::new(std::collections::HashSet::new()),
+            owned: std::sync::Mutex::new(std::collections::HashMap::new()),
             pending_cancels: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }

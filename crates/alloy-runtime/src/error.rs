@@ -50,7 +50,11 @@ pub enum RuntimeError {
 /// `Err(SchedError)` is reserved for "no durable [`crate::DagOutcome`] was
 /// written" — planned failures (compile/test exhaustion, gate deny/expiry,
 /// budget/run timeout, cancellation) return `Ok(DagOutcome)` instead.
-#[derive(Debug, Error)]
+///
+/// `Clone`: `OwnedDag::cancel_result` (§4.3 O3) needs to store a copy of the
+/// terminal `Err` alongside the one `run` actually returns. Every variant is
+/// plain data (`String`/`DagId`), so this is free.
+#[derive(Debug, Clone, Error)]
 #[non_exhaustive]
 pub enum SchedError {
     /// No real scheduler registered (`NullScheduler` only).

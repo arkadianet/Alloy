@@ -162,21 +162,6 @@ impl RunCtx<'_> {
     }
 }
 
-/// RAII membership guard for [`LinearScheduler::owned`] (minimal P4
-/// ownership; see module docs for what P8 adds).
-struct OwnedMembership<'a> {
-    sched: &'a LinearScheduler,
-    dag_id: DagId,
-}
-
-impl Drop for OwnedMembership<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut owned) = self.sched.owned.lock() {
-            owned.remove(&self.dag_id);
-        }
-    }
-}
-
 #[async_trait]
 impl Scheduler for LinearScheduler {
     async fn run(&self, dag_id: DagId) -> Result<DagOutcome, SchedError> {
@@ -206,7 +191,7 @@ impl LinearScheduler {
         let checkpoint = self.checkpoint();
 
         // R1
-        let mut dag = self
+        let dag = self
             .deps
             .dags
             .get(dag_id)
@@ -224,24 +209,39 @@ impl LinearScheduler {
         // R3
         let run_row = self.resolve_run_binding(&dag).await?;
         let run_id = run_row.id;
+        let session_id = dag.session_id;
 
-        // R4: minimal insert-if-absent ownership (see module docs).
-        {
-            let mut owned = self
-                .owned
-                .lock()
-                .map_err(|_| SchedError::Ownership("ownership map poisoned".into()))?;
-            if !owned.insert(dag_id) {
-                return Err(SchedError::AlreadyOwned(dag_id));
-            }
-        }
-        let _guard = OwnedMembership {
-            sched: self,
-            dag_id,
-        };
+        // R4: real DAG ownership (§4.3-4.4) — `AlreadyOwned` if contended.
+        let guard = self.try_acquire_dag(dag_id, Some(run_id), session_id)?;
 
+        // O3: `cancel_result` MUST be written before `guard` drops (notifying
+        // any waiting `cancel`), on every exit — success, planned terminal,
+        // or `Err`. Run the owned body to completion first, capture its
+        // `Result` without an early `?`, write the result, THEN return it —
+        // `guard` drops at the end of this function's scope either way.
+        let result = self
+            .run_owned(&checkpoint, dag_id, run_id, &guard.owned)
+            .await;
+        guard.owned.set_cancel_result(match &result {
+            Ok(outcome) => Ok(outcome.state),
+            Err(e) => Err(e.clone()),
+        });
+        result
+    }
+
+    /// R4b-R18: the owned body of `run`. Reloads the DAG under ownership and
+    /// runs it to a terminal `DagOutcome` or a propagated `SchedError`.
+    /// Every return here is captured by [`Self::run_impl`]'s O3 chokepoint —
+    /// this function itself MUST NOT touch `cancel_result`.
+    async fn run_owned(
+        &self,
+        checkpoint: &Checkpoint,
+        dag_id: DagId,
+        run_id: RunId,
+        owned: &super::own::OwnedDag,
+    ) -> Result<DagOutcome, SchedError> {
         // R4b: re-load under ownership.
-        dag = self
+        let mut dag = self
             .deps
             .dags
             .get(dag_id)
@@ -280,13 +280,22 @@ impl LinearScheduler {
             });
         }
 
-        // R5
+        // R5 / PC2: a `cancel(dag_id)` that arrived before this `run()` won
+        // ownership left its intent in `pending_cancels`, not on
+        // `owned.run_cancel` (that token did not exist yet) — fire it now so
+        // L1 stops the loop before dispatching a node, not just eventually
+        // via that `cancel_impl` call's own "AlreadyOwned, retry" fallback.
         {
-            let mut pending = self
-                .pending_cancels
-                .lock()
-                .map_err(|_| SchedError::Ownership("pending_cancels poisoned".into()))?;
-            pending.remove(&dag_id);
+            let was_pending = {
+                let mut pending = self
+                    .pending_cancels
+                    .lock()
+                    .map_err(|_| SchedError::Ownership("pending_cancels poisoned".into()))?;
+                pending.remove(&dag_id)
+            };
+            if was_pending {
+                owned.run_cancel.cancel();
+            }
         }
 
         // R6
@@ -307,16 +316,15 @@ impl LinearScheduler {
         let meter = self.deps.cost_meters.meter_for(run_id);
         meter.with_mut(|m| *m = rebuilt);
 
-        let run_cancel = self.deps.runtime_cancel.child_token();
         let ctx = CheckpointCtx {
             session_id: session.id,
             run_id: Some(run_id),
         };
         let rc = RunCtx {
-            checkpoint: &checkpoint,
+            checkpoint,
             ctx,
             session: &session,
-            run_cancel: &run_cancel,
+            run_cancel: &owned.run_cancel, // O1: fired by `cancel(dag_id)`.
             run_id,
             run_started: Instant::now(), // R12
             run_timeout: self.deps.run_timeout,
@@ -1228,40 +1236,89 @@ impl LinearScheduler {
     }
 
     // -----------------------------------------------------------------
-    // `cancel` (minimal — see module docs)
+    // `cancel` (§5.12 — full return table + race-free O4 wait)
     // -----------------------------------------------------------------
 
     async fn cancel_impl(&self, dag_id: DagId) -> Result<(), SchedError> {
-        let is_owned = {
-            let owned = self
-                .owned
-                .lock()
-                .map_err(|_| SchedError::Ownership("ownership map poisoned".into()))?;
-            owned.contains(&dag_id)
-        };
-        if is_owned {
-            // PC1/PC2: mark pending; the live loop's L1/L2 observes it on
-            // its next iteration. P4 does not yet block until that run's
-            // own C6 commits (§4.3 O4 / §5.12.2 step 7 — P8).
-            let mut pending = self
-                .pending_cancels
-                .lock()
-                .map_err(|_| SchedError::Ownership("pending_cancels poisoned".into()))?;
-            pending.insert(dag_id);
-            return Ok(());
-        }
+        self.metrics.inc_cancels(); // §5.12.2 step 1
 
-        // Unowned: PC1 — insert into pending_cancels so a `run` starting
-        // moments later cancels immediately at R5, then best-effort C6 now
-        // if the DAG is durably non-terminal (§5.12.4, simplified: no
-        // transient-ownership re-load race handling — P8).
-        {
-            let mut pending = self
-                .pending_cancels
-                .lock()
-                .map_err(|_| SchedError::Ownership("pending_cancels poisoned".into()))?;
-            pending.insert(dag_id);
+        // Bounded retry for the razor-thin TOCTOU window where a lookup
+        // between two ownership-map operations can observe a transient gap
+        // (contended insert, then the owner drops before our follow-up
+        // lookup). Two attempts, not unbounded recursion (async self-recursion
+        // needs boxing to compile at all; this path is rare enough that a
+        // small bound is simpler and just as correct).
+        for _ in 0..2 {
+            if let Some(owned) = self.lookup_owned(dag_id)? {
+                // §5.12.2: fire the run's own token; L1/L2 or the in-flight
+                // `select!` (dispatch_node) observes it and writes C6.
+                owned.run_cancel.cancel();
+                return self.wait_for_cancel_result(&owned).await;
+            }
+
+            // Unowned (§5.12.4).
+            {
+                let mut pending = self
+                    .pending_cancels
+                    .lock()
+                    .map_err(|_| SchedError::Ownership("pending_cancels poisoned".into()))?;
+                pending.insert(dag_id); // PC1
+            }
+
+            // Step 1: run binding is for event attribution only — a missing
+            // binding is tolerated (step 4), any other error propagates.
+            let Some(probe) = self
+                .deps
+                .dags
+                .get(dag_id)
+                .await
+                .map_err(|e| map_store_error_on_load(e, dag_id))?
+            else {
+                return Err(SchedError::DagNotFound(dag_id));
+            };
+            let run_id = match self.resolve_run_binding(&probe).await {
+                Ok(row) => Some(row.id),
+                Err(SchedError::RunBindingMissing(_)) => None,
+                Err(e) => return Err(e),
+            };
+
+            // Step 2: transient ownership insert — occupied means a `run()`
+            // won the race between our lookup above and this insert; retry
+            // the loop, which will find it via `lookup_owned` this time.
+            let guard = match self.try_acquire_dag(dag_id, run_id, probe.session_id) {
+                Ok(g) => g,
+                Err(SchedError::AlreadyOwned(_)) => continue,
+                Err(e) => return Err(e),
+            };
+
+            let result = self.cancel_unowned_body(dag_id, run_id).await;
+            guard.owned.set_cancel_result(match &result {
+                Ok(()) => Ok(DagState::Cancelled),
+                Err(e) => Err(e.clone()),
+            });
+            // Step 8: consumed either way — a later `run` should not inherit
+            // a stale cancel intent from this call.
+            if let Ok(mut pending) = self.pending_cancels.lock() {
+                pending.remove(&dag_id);
+            }
+            return result;
         }
+        Err(SchedError::Internal(
+            "cancel: ownership map contention exceeded retry bound".into(),
+        ))
+    }
+
+    /// §5.12.4 steps 3-6: re-load under (transient) ownership, terminal
+    /// check, C6 write. Does not touch `pending_cancels` or ownership —
+    /// the caller ([`Self::cancel_impl`]) owns both.
+    async fn cancel_unowned_body(
+        &self,
+        dag_id: DagId,
+        run_id: Option<RunId>,
+    ) -> Result<(), SchedError> {
+        // Step 3: re-load closes the window a same-generation CAS alone
+        // cannot detect (a concurrent same-gen writer that already
+        // terminalized between our first probe and now).
         let Some(mut dag) = self
             .deps
             .dags
@@ -1275,22 +1332,24 @@ impl LinearScheduler {
             dag.state,
             DagState::Succeeded | DagState::Failed | DagState::Cancelled | DagState::ReplanRequired
         ) {
-            return Ok(());
+            return Ok(()); // no write
+        }
+        // Step 4: missing run binding ⇒ still write C6, warn.
+        if run_id.is_none() {
+            tracing::warn!(
+                dag_id = %dag_id,
+                "cancel: no run binding for this dag; writing C6 without run attribution"
+            );
         }
         let checkpoint = self.checkpoint();
         let ctx = CheckpointCtx {
             session_id: dag.session_id,
-            run_id: None,
+            run_id,
         };
         let (cancelled, skipped) = cancel_targets(&dag);
         checkpoint
             .c6_cancel(&mut dag, ctx, &cancelled, &skipped)
             .await?;
-        let mut pending = self
-            .pending_cancels
-            .lock()
-            .map_err(|_| SchedError::Ownership("pending_cancels poisoned".into()))?;
-        pending.remove(&dag_id);
         Ok(())
     }
 }
@@ -2693,6 +2752,113 @@ mod tests {
         let persisted = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
         assert_eq!(persisted.state, DagState::Cancelled);
         assert_eq!(persisted.nodes[&a].state, NodeState::Skipped);
+        fx.close().await;
+    }
+
+    // ---- cancel (owned path, §4.3-4.4/§5.12.2 O4 race-free wait) ----
+
+    #[tokio::test]
+    async fn cancel_owned_run_blocks_until_c6_commits_and_interrupts_dispatch() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        // Hangs forever unless interrupted — proves `cancel(dag_id)` reaches
+        // the in-flight dispatch's own `select!` (`rc.run_cancel`, now the
+        // real per-run token via `OwnedDag`), not just the loop-boundary
+        // L1/L2 checks a cancel arriving between dispatches would hit.
+        struct Never;
+        #[async_trait]
+        impl CapabilityExecutor for Never {
+            async fn execute(
+                &self,
+                _ctx: &CapabilityExecContext,
+            ) -> Result<CapabilityOutcome, CapabilityExecError> {
+                std::future::pending().await
+            }
+        }
+
+        let sched = Arc::new(fx.build_scheduler(
+            fx._dir.path().join("s1"),
+            Arc::new(Never),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        ));
+
+        let sched2 = Arc::clone(&sched);
+        let run_handle = tokio::spawn(async move { sched2.run(dag_id).await });
+        tokio::time::sleep(Duration::from_millis(50)).await; // let it reach dispatch
+
+        // O4/CN2: `cancel` MUST NOT return before the run's own C6 is
+        // durable — no sleep/poll after this call, so a premature `Ok(())`
+        // (the pre-P8 behavior) would make the very next assertion flaky.
+        sched.cancel(dag_id).await.unwrap();
+
+        let final_dag = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(final_dag.state, DagState::Cancelled);
+        assert_eq!(final_dag.nodes[&a].state, NodeState::Cancelled);
+
+        let outcome = run_handle.await.unwrap().unwrap();
+        assert_eq!(outcome.state, DagState::Cancelled);
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_owned_run_already_terminal_is_ok_with_no_rewrite() {
+        // §5.12.3: "Owned run; run already terminal ⇒ Ok(())." A cancel that
+        // lands after the terminal checkpoint must observe it, not error.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = StaticCapability::new(vec![Ok(CapabilityOutcome::Succeeded {
+            payload: serde_json::json!({"ok": true}),
+        })]);
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s1"),
+            capabilities,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        // The run already returned — ownership is released — so this is the
+        // §5.12.4 unowned-but-terminal path (step 3: terminal ⇒ `Ok(())`,
+        // no write).
+        sched.cancel(dag_id).await.unwrap();
+        let persisted = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, DagState::Succeeded);
         fx.close().await;
     }
 
