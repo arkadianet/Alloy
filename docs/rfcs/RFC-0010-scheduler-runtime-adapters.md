@@ -134,7 +134,7 @@ Seven RFCs have built substrate — storage, sessions, observability, sandbox, t
 | **0006** | `ToolCall` / `ToolResult` / `ToolError` / `McpError` / `ToolHandle` / `cargo_check` / `cargo_test` / disclosure tags |
 | **0007** | `RetryDisposition` / `FailureIr.retry` admission rule (consumed; not a Cargo dependency of the hard path) |
 | **0008** | Single write stack (`EditWorker → apply_patch → EditEngine`); in-process-only edit txs; no MCP rollback; `recover_checkpoint` is operator/engine — **not** scheduler (§6.5 / §8.5) |
-| **0009** | Validated DAG shapes, readiness rules, `put_if_generation`, §6.5 / §6.6, envelopes, retry field ownership, Appendix C obligations |
+| **0009** | Validated DAG shapes, readiness rules, `put_if_generation`, §6.5 / §6.6, envelopes, retry field ownership, Appendix C obligations. **Amended** in §2.7 (A9 adoption; A10 `Pending`/`Ready` → `Failed`) |
 
 ### 2.3 Already implemented | Added by RFC-0010 | Deferred
 
@@ -1491,7 +1491,7 @@ Without step 4 the DAG blob stays `WaitingApproval` forever and `PlanService::re
 | W2 | The CAS is the commit point. Events are **derived** and MAY lag. |
 | W3 | Events MUST NOT be appended before their CAS. An event describing an uncommitted transition would make the log a liar and break RF2. |
 | W4 | Event append failure after a successful CAS MUST NOT roll back the CAS. It MUST be logged at `warn` and MUST be repaired by RF3 on the next pass. |
-| W4a | **Load-bearing attempt events (C3 / C8).** After C3's CAS, the scheduler MUST append (or immediately RF3-repair) `NodeState{to:running, attempt:k}` **before** dispatching the node future. After C8's CAS, it MUST append (or immediately RF3-repair) the (c)/(d) pair **before** backoff or the next C3. If append and immediate repair both fail ⇒ `Err(Store(..))` without dispatching / without starting backoff (blob stays as committed; resume uses §5.3.1 / adoption). This narrows W4 for attempt accounting only — other events remain best-effort. |
+| W4a | **Load-bearing attempt events (C3 / C8).** After C3's CAS, the scheduler MUST append (or immediately RF3-repair) `NodeState{to:running, attempt:k}` **before** dispatching the node future. After C8's CAS: append (c) best-effort (logical waypoint; **not** RF3-repairable while the blob is `Ready` — RF2 keys on durable `to`); then MUST append (or RF3-repair) (d) `NodeState{to:ready, attempt:k, next_attempt:k+1}` **before** backoff or the next C3. Missing (c) alone MUST NOT block when (d) is durable. If C3's running event or C8's (d) cannot be made durable ⇒ `Err(Store(..))` without dispatching / without starting backoff (blob stays as committed; resume uses §5.3.1 / adoption). A C3 CAS whose event append/repair fails still consumes attempt `k` on resume (adoption soft-fails it) — that is intentional vs an unbounded crash loop. This narrows W4 for attempt accounting only. |
 | W5 | Orphaned artifacts from a failed CAS are acceptable (no GC in RFC-0002) and MUST NOT be deleted (deletion races a concurrent reader). |
 | W6 | Every CAS MUST pass `expected = Some(current.generation)` and MUST leave `dag.generation` unchanged. |
 
@@ -1533,8 +1533,8 @@ Both events MUST be appended **after** the CAS, in order (c) then (d).
 | RT4 | On restart with the node `Ready` and `attempts_started = k` (a failed attempt recorded), the scheduler MUST continue the remaining backoff (§5.11.3 rule B4) and then perform C3 for attempt `k + 1`. |
 | RT5 | The `Failed → Ready` transition MUST NOT be used for non-admitted failures. Non-admitted failures go straight to durable `Failed` via C7. |
 | RT6 | Retry of an `Edit` node (when admitted) MUST produce a **new forward** patch via a fresh worker/`apply_patch` call. The scheduler MUST NOT reapply, replay, or revert the previous transaction (§8.5). |
-| RT7 | C8 recovery MUST NOT invent an attempt counter on the `Ready` blob. Attempt identity comes from §5.3.1 events (C3 `attempt` and C8 `next_attempt`). W4a forbids dispatching after a C3 CAS whose running-event append/repair failed, so a later C8 cannot orphan attempt `k`. A C8 CAS whose (c)/(d) events were lost still has the prior C3 event for `k` (RF8). |
-| RT8 | AC 94: simulated C3 CAS + forced event-append failure MUST NOT dispatch; resume adopts the `Running` node. Simulated C8 CAS + lost (c)/(d) with durable C3 event for `k` MUST rebuild `attempts_started = k` and not redispatch `k`. |
+| RT7 | C8 recovery MUST NOT invent an attempt counter on the `Ready` blob. Attempt identity comes from §5.3.1 (C3 `attempt` and C8 `next_attempt` on (d)). W4a forbids dispatching after a C3 CAS whose running-event append/repair failed, so a later C8 cannot orphan attempt `k`. A C8 CAS whose (c)/(d) events were lost still has the prior C3 event for `k`; if (d) is also missing on resume, RF3 repairs (d) using §5.3.1 (`next_attempt = k+1`) before backoff (RF8). |
+| RT8 | AC 94: simulated C3 CAS + forced event-append failure MUST NOT dispatch; resume adopts the `Running` node and charges attempt `k`. Simulated C8 CAS + lost (c)/(d) with durable C3 event for `k` MUST rebuild `attempts_started = k` (and repair (d) if needed) and not redispatch `k`. |
 
 #### 5.8.4 Conflict handling
 
@@ -2148,7 +2148,7 @@ Documented as comments only. Alloy MUST NEVER write `.env` (§1.5 rule 10).
 
 The mapping is **total** over the exhaustive `StoreError` enum on `main` (not `#[non_exhaustive]`). A new variant on `main` MUST update this table in the same change.
 
-`EventSinkError` from an append MUST NOT abort a committed transition (W4); it is logged and repaired.
+`EventSinkError` from an append MUST NOT roll back a committed CAS (W4). For C3/C8 attempt events, W4a requires immediate repair or `Err(Store)` before dispatch/backoff; other events are logged and RF3-repaired later.
 
 ### 8.3 Fail-closed catalogue
 
@@ -2176,6 +2176,7 @@ The mapping is **total** over the exhaustive `StoreError` enum on `main` (not `#
 | Gate deny / expiry | `Ok(DagOutcome { state: Failed, .. })` |
 | Budget exhaustion | `Ok(DagOutcome { state: Failed, .. })` |
 | Run timeout | `Ok(DagOutcome { state: Failed, .. })` |
+| ER5 resume stop / L14 `needs_reverify` block | `Ok(DagOutcome { state: Failed, .. })` |
 | Cancellation with a durable C6 | `Ok(DagOutcome { state: Cancelled, .. })` |
 | Replan observed | `Ok(DagOutcome { state: ReplanRequired, .. })` |
 
@@ -2450,16 +2451,19 @@ Each AC is a test name or a CI check.
 | 81 | Negative finite `MaxUsd` clamps to `0.0` and trips BG3 with a direct `BudgetWarning`. |
 | 82 | DecisionLog/`ObsError` after a committed CAS does not abort the durable outcome (BE4); before the CAS it maps to `Store`. |
 | 83 | Scheduler code paths never call `EditEngine::{apply,rollback}` or `recover_checkpoint` (CI grep / unit). |
-| 84 | After a simulated restart with `Edit=Succeeded` and `VerifyCompile=Pending`, resume dispatches verify next (ER4); with reachable verifies all terminal without success and a non-terminal remaining, returns `Ok(Failed)` per ER5; verify-less `Edit→GateHuman` resume does **not** ER5. |
+| 84 | After a simulated restart with `Edit=Succeeded` and `VerifyCompile=Pending`, resume dispatches verify next (ER4); with reachable verifies all terminal without success and a `Pending`/`Ready` target remaining, returns `Ok(Failed)` per ER5; verify-less `Edit→GateHuman` resume does **not** ER5; `WaitingApproval`-only with no Pending/Ready skips ER5. |
 | 85 | Admitted Edit retry issues a fresh `CapabilityExecutor::execute` with `CapabilityExecContext.attempt == k + 1` (RT6 / FOW4), not a replay of the prior tx. |
 | 86 | BG3 exhaustion calls `SessionPlane::signal_budget_warning` with RFC-0004 `{snapshot, message}` shape. |
 | 87 | `new` rejects `deps.runs` that is not `session_plane.runs()` (D6). |
 | 88 | After R4 ownership, R4b re-load observes an unowned-cancel terminal blob and short-circuits at R9 (no same-gen overwrite); non-terminal re-load re-validates when `validate_on_load`. |
 | 89 | Non-gate `reconcile_terminal_run(..., Failed)` yields R9 `failed_node = Some(_)` via FN1 (attributed node is `Failed`, not merely `Cancelled`). |
+| 89b | RC4/RC6 with no non-terminal remaining: `state: Failed`, `failed_node: None`, `failure: None`, no terminal-node rewrite (FO4(ii)). |
 | 90 | ER5 does not fire when a reachable verify already `Succeeded`, when every node is already terminal, or when `performed_c1`; ER4 blocks `{Plan,Analyze,Edit,Review}` while `needs_reverify`. |
 | 91 | Resume with all nodes `Succeeded` and `dag.state == Running` on a verify-less DAG returns `Ok(Succeeded)` via derive+C7 (no `Succeeded → Failed`). |
 | 92 | Gate-origin `reconcile_terminal_run(..., Failed)` yields gate `Cancelled` + `Approval` and R9 `failed_node` via FN2; R9+RF7 still attributes when the Approval event was lost after CAS. |
-| 93 | Pre-dispatch C7 may legally take `Pending → Failed` / `Ready → Failed` (A10 / Appendix B); L14 needs_reverify block durable-fails rather than `Err(Invariant)`. |
+| 93 | Pre-dispatch C7 may legally take `Pending → Failed` / `Ready → Failed` (A10 / Appendix B). |
+| 94 | W4a: C3 CAS + forced event-append failure does not dispatch (resume adopts `Running`); C8 CAS + lost (c)/(d) with durable C3 event for `k` rebuilds `attempts_started = k` and does not redispatch `k` (RF8/RT7/RT8). |
+| 95 | L14 `needs_reverify` block durable-fails the blocked Ready node (`Ok(Failed)`), never `Err(Invariant)`. |
 
 ---
 
