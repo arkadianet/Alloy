@@ -274,10 +274,18 @@ pub enum FilePatch {
         path: String,
         hunks: Vec<Hunk>,
     },
-    /// Delete an existing file. Structured JSON carries no hunks. Unified-diff deletes
-    /// may parse hunks for shape-check then discard them (V5 / §5.3.1).
+    /// Delete an existing file. **Path-only on the wire and in CAS** (§5.3.2): the
+    /// `serde(skip)` field below never serializes and always deserializes empty, so a
+    /// structured JSON `Delete` is exactly `{"action":"delete","path":...}` (V5).
     Delete {
         path: String,
+        /// Full-file deletion hunks retained from a unified-diff parse, kept only as
+        /// local proof that the caller saw the file's current bytes. Empty for
+        /// structured JSON. When non-empty, `apply`/`validate` require the hunks to
+        /// reduce the file to zero bytes (V9); when empty, only the shape checks
+        /// (exists, regular file, tracked) run and the file need not be UTF-8.
+        #[serde(skip)]
+        validation_hunks: Vec<Hunk>,
     },
 }
 
@@ -285,7 +293,9 @@ impl FilePatch {
     /// Jail-relative path for this operation.
     pub fn path(&self) -> &str {
         match self {
-            Self::Modify { path, .. } | Self::Create { path, .. } | Self::Delete { path } => path,
+            Self::Modify { path, .. } | Self::Create { path, .. } | Self::Delete { path, .. } => {
+                path
+            }
         }
     }
 }
@@ -309,10 +319,18 @@ pub struct Hunk {
     /// Default `true` for structured JSON patches that omit the field.
     #[serde(default = "default_true")]
     pub eof_newline: bool,
+    /// Whether the **old** file must lack a trailing `\n` at EOF: set by a
+    /// `\ No newline at end of file` marker following a `-` or context line (§5.3.1 /
+    /// Appendix D). Purely an assertion about the current file — a mismatch is V9
+    /// `ContextMismatch`. Default `false`, and omitted from the canonical CAS JSON when
+    /// `false` so structured patches that never set it keep their existing bytes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub old_eof_no_newline: bool,
 }
 
 // In types.rs (private):
 fn default_true() -> bool { true }
+fn is_false(value: &bool) -> bool { !*value }
 
 /// Semantic edit ops (V2 §13). Serde-stable; MVP returns UnsupportedOp for all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1133,7 +1151,7 @@ Effective size ceiling via MCP: **64 KiB arguments object** (RFC-0006). Backend 
 | File headers | `--- <old>` then `+++ <new>` (`a/`/`b/` optional) |
 | Path normalize | Strip one `a/` or `b/` prefix; reject absolute, empty, `\\`, NUL, `.`/`..` segments → `PathDenied` |
 | Create | Old `/dev/null` → `FilePatch::Create` |
-| Delete | New `/dev/null` → `FilePatch::Delete` (hunks discarded after confirming full-file deletion shape) |
+| Delete | New `/dev/null` → `FilePatch::Delete`. Hunks must describe the **whole** file (contiguous `-`-only ranges from line 1) and are retained in the serde-skipped `validation_hunks` (§3.2) so `validate`/`apply` can prove they reduce the file to zero bytes. A header-only stanza with no hunks → `InvalidPatch("delete must remove entire file")` |
 | Rename/copy | Unsupported → `InvalidPatch("rename/copy unsupported")` |
 | Binary | Unsupported → `InvalidPatch("binary patch unsupported")` |
 | Hunk header | `@@ -old_start,old_lines +new_start,new_lines @@` |
@@ -1164,11 +1182,11 @@ CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention a
 | V3 | `PathPolicy::authorize(Write)` fails | `PathDenied` (from SandboxError map) |
 | V4a | Zero `FsWrite` grants on the token | `MissingGrant("fs_write")` |
 | V4b | ≥1 `FsWrite` grant but no glob matches path | `PathNotCovered` |
-| V5 | `FilePatch::Delete` used with non-empty hunks at struct build | `InvalidPatch` (parser prevents) |
+| V5 | `Delete` hunks (from unified diff) do not remove the entire file, or are absent altogether | `InvalidPatch("delete must remove entire file")`; hunks that parse but do not consume every line → `ContextMismatch`. A structured `Delete` carries no hunks, makes no content claim, and therefore does **not** require a UTF-8 target |
 | V6 | Duplicate paths in one PatchSet (byte-exact **and** case-fold on case-insensitive FS) | `InvalidPatch("duplicate path")` |
 | V7 | Overlapping old-line ranges (two hunks whose old-side consumed ranges intersect; zero-length insertions at the same `old_start` also overlap) | `OverlappingHunks` |
 | V8 | Hunk header counts ≠ line kinds; or any `Hunk.lines` entry contains NUL or raw `\n` | `InvalidPatch("hunk line count")` / `InvalidPatch("hunk line content")` |
-| V8b | `Modify` hunk with `old_start == 0` (reserved for Create) | `InvalidPatch("modify old_start")` |
+| V8b | **Any** `Modify` hunk with `old_start == 0`, including the zero-length-range insertion shape (`old_start` is reserved for Create; prepend with a `@@ -1,0 +… @@` insertion boundary instead) | `InvalidPatch("modify old_start")` |
 | V8c | After applying all hunks in order, reconstructed new-side line positions disagree with each hunk’s `new_start`/`new_lines` (treat `new_*` as assertions) | `InvalidPatch("hunk new_start")` |
 | V9 | Context/delete lines mismatch file (incl. old-side no-newline assertion) | `ContextMismatch` |
 | V10 | Delete target missing | `Conflict("delete missing file")` |
@@ -1188,7 +1206,7 @@ CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention a
 | V24 | Conflicted index / merge/rebase/bisect in progress | `Conflict("repo state not clean for checkpoint")` (permanent) |
 | V25 | `index.lock` present (host `symlink_metadata` probe; §5.6) | `Git("index.lock present")` (retryable) |
 | V26 | Any path component is `.git` or `.alloy-sbx` (validated in `validate` too) | `PathDenied { reason: "git metadata path" }` / `"sandbox scratch path"` |
-| V27 | `Create` hunk shape invalid (≠1 hunk, or `old_start`/`old_lines` ≠ 0, or non-`+` lines) | `InvalidPatch("create hunk shape")` |
+| V27 | `Create` hunk shape invalid (≠1 hunk, or `old_start`/`old_lines` ≠ 0, or non-`+` lines) | `InvalidPatch("create hunk shape")`; over `MAX_LINES_PER_HUNK` lines → `InvalidPatch("hunk too large")`; new-side range not starting at line 1 (empty file may use the empty range) → `InvalidPatch("hunk new_start")` |
 | V28 | Hunks not sorted by ascending `old_start` | `InvalidPatch("hunk order")` |
 | V29 | Object format is not SHA-1 (e.g. SHA-256 repo) or SHA length ≠ 40 hex | `Environment("unsupported object format")` |
 | V30 | Patch path under `target/**` or matching `.**.alloy-tmp-**` | `InvalidPatch("path excluded from digest")` |
@@ -1289,10 +1307,10 @@ All shapes include the `-c` identity/EOL prefix above as leading argv elements a
 Before checkpoint on the mutating path:
 
 1. `git rev-parse --show-toplevel` canonicalize → MUST equal `path_policy.jail()`; else `Environment("repo toplevel != jail")`.
-2. Confirm `.git` is a **directory** (not a gitfile). Host `symlink_metadata(jail.join(".git"))` — if not a directory → `Environment("linked worktree not supported")` (covers linked worktrees where toplevel can still equal jail).
+2. Confirm `.git` is a **directory** (not a gitfile). Host `symlink_metadata(jail.join(".git"))` — if the probe fails or the entry is not a directory → `Environment("linked worktree not supported")` (covers linked worktrees where toplevel can still equal jail).
 3. `git ls-files -z` → build the **tracked-path set** (NUL-delimited). **Non-UTF-8 tracked paths:** if any NUL-separated entry is not valid UTF-8 → `Environment("non-utf8 tracked path")` (fail closed; `deny_matches_rel` is `&str`). Otherwise any tracked path with `path_policy.deny_matches_rel` → `TrackedDeniedPath` (V17).
 4. **Tracked-set invariant (V16):** every `Modify` and `Delete` path MUST be in the tracked-path set; every `Create` path MUST NOT be. Violation → `UntrackedPath` (covers untracked **and** git-ignored paths). Paths outside the patch are left untouched.
-5. Nested `.git` directories below jail (submodules) are not walked by digest; patch paths inside submodules → `Environment("submodule path not supported")`.
+5. Nested `.git` markers below jail are not walked by digest; patch paths under one → `Environment("submodule path not supported")`. A marker is a `.git` **gitfile** (how git records a submodule's worktree) *or* a `.git` **directory** (a nested clone), probed with `symlink_metadata` so a symlinked `.git` is never followed out of the jail.
 6. V30 digest-excluded patch paths (§5.4) — also enforced here as a final pre-checkpoint guard.
 
 **Restore MUST NOT** run broad `git clean -fd` over the jail (would delete untracked `.env` and user files). Restore uses:
@@ -1312,7 +1330,7 @@ MVP: in-process `TxRecord` map only (§4.4). Durable audit = checkpoint refs + `
 | Rule | Value |
 | --- | --- |
 | Root | `path_policy.jail()` |
-| Include | Regular files in the **tracked set** (`git ls-files -z`), minus excludes below, **plus** (for `post_digest` only) still-existing `created_paths` from the open/committed tx. Untracked and git-ignored files are never hashed. Tracked paths that are missing on disk, non-regular, or become non-regular mid-tx are **omitted** from the encoding (e.g. after `Delete` while still listed by `ls-files` until the next index refresh — MVP hashes worktree bytes only). |
+| Include | Regular files in the **tracked set** (`git ls-files -z`), minus excludes below, **plus** (for `post_digest` only) still-existing `created_paths` from the open/committed tx. Untracked and git-ignored files are never hashed. Tracked paths that are missing on disk, non-regular, or become non-regular mid-tx are **omitted** from the encoding (e.g. after `Delete` while still listed by `ls-files` until the next index refresh — MVP hashes worktree bytes only). Only `NotFound` is treated as "missing": any other metadata error is `Io(...)`, since silently skipping an unreadable file would let a pre/post digest comparison match on a workspace nobody verified. |
 | Exclude | `.git/**`, `.alloy-sbx/**`, `target/**`, paths matching deny-globs, temp files matching `.**.alloy-tmp-**`, symlinks (do not follow). Skip non-UTF-8 path names without hashing them. Rationale: `target/` and ignore rules routinely exceed digest caps and would make post-verify rollback impossible after `cargo check` (RFC-0010). |
 | Encoding | Sorted jail-relative paths; for each: `path\0` + `Digest::sha256(contents).as_hex()` + `\n`; `tree = Digest::sha256(concat)` |
 | Caps | Exceed → `DigestLimitExceeded` **before** mutate (pre) or trigger rollback (post). A file whose recorded length already exceeds the remaining byte budget is refused **before** it is opened; the budget is re-checked while reading, since the recorded length is only a hint. |
@@ -1331,9 +1349,15 @@ abandon record (`Arc<Mutex<…>>`, updated as paths are created) and the
 mutation start while the orphaned task is still writing. The guard returns to the
 caller for the commit steps.
 
+If the task itself dies (panic), it takes the guard with it, so `apply` retakes
+the write lock before touching the workspace. Whoever held the lock in between may
+already have reconciled the transaction, so `apply` re-reads the `TxRecord` and
+restores only while it is still `Open`; otherwise it returns the task error alone
+rather than replaying a restore over work that is no longer its own.
+
 For each `FilePatch` in vector order:
 
-1. If `Delete`: authorize final path (V2–V4); require exists (V10); `remove_file`; record in `files_touched`; continue.
+1. If `Delete`: authorize final path (V2–V4); require exists (V10) and be a regular non-symlink file (V18/V19). If `validation_hunks` is non-empty (unified-diff delete), load UTF-8 and require the hunks to reduce the file to zero bytes (V5/V9); if it is empty (structured delete), make **no** content claim — the target need not be UTF-8. Then `remove_file`; record in `files_touched`; continue.
 2. If `Modify`: authorize final path (V2–V4); require exists (V22); reject symlink (V18); load UTF-8.
 3. If `Create`: require target missing (V11). Walk relative segments from jail:
    - For each existing prefix component: `symlink_metadata`; symlink → `PathDenied { reason: "symlink parent" }`.
@@ -1760,7 +1784,11 @@ Git argv MUST be spawned only through `SandboxBroker` → `sandbox::process`. Ed
 | `eof_old_side_marker_context` | old-side `\ No newline` mismatch → ContextMismatch; new-side sets eof |
 | `path_escape_rejected` | `..`, absolute → `PathDenied` |
 | `git_metadata_path_rejected` | `.git/hooks/…` / `.alloy-sbx/…` → V26 in validate and apply |
-| `create_hunk_shape_rejected` | V27 |
+| `create_hunk_shape_rejected` | V27, including the per-hunk line cap and the new-side `new_start` assertion |
+| `modify_zero_old_start_rejected` | V8b for every `Modify` hunk, insertions included |
+| `hunk_order_rejected` | V28 descending `old_start` |
+| `header_only_delete_rejected` | delete stanza with no hunks → `InvalidPatch("delete must remove entire file")` |
+| `delete_content_proof` | unified-diff delete hunks must reduce the file to zero bytes (else `ContextMismatch`); structured delete removes a non-UTF-8 file |
 | `dotenv_denied` | `.env` → PathDenied; rollback does not delete untracked `.env` |
 | `fs_write_grant_examples_table` | Glob table; V4a zero grants vs V4b miss |
 | `missing_git_write_denied` | PermissionDenied elevation |
@@ -1768,7 +1796,10 @@ Git argv MUST be spawned only through `SandboxBroker` → `sandbox::process`. Ed
 | `untracked_modify_rejected` | `UntrackedPath` |
 | `ignored_modify_rejected` | gitignored path Modify → `UntrackedPath` (V16) |
 | `tracked_denied_path_rejected` | `TrackedDeniedPath` |
-| `repo_not_jail_rejected` | nested git root ≠ jail → `Environment` |
+| `repo_not_jail_rejected` | nested git root ≠ jail → `Environment("repo toplevel != jail")` |
+| `empty_repository_rejected` | unborn HEAD → `Environment("empty repository: make initial commit")` |
+| `submodule_marker_rejected` | nested `.git` gitfile **or** directory under a patch path → `Environment("submodule path not supported")` |
+| `unsupported_object_format_rejected` | V29 declared `sha256` format and non-40-hex HEAD → `Environment` |
 | `index_lock_rejected` | V25 |
 | `merge_in_progress_rejected` | V24 |
 | `dry_run_no_mutate_no_checkpoint` | Tree unchanged; no new refs; `transaction_id=None` |
@@ -1787,6 +1818,8 @@ Git argv MUST be spawned only through `SandboxBroker` → `sandbox::process`. Ed
 | `token_expired_mid_restore` | leaves Open+abandoned; maps to TokenExpired |
 | `run_id_mismatch_rejected` | `InvalidRequest("run_id mismatch")` |
 | `event_fail_after_commit_still_ok` | failing EventSink after commit → `Ok(EditTransaction)`; no rollback |
+| `session_id_none_skips_event` | AC 15: `session_id: None` commits and emits no `EditApplied`, while the same engine still emits one with a session |
+| `tracked_deny_path_blocks_rollback` | AC 36: a deny-glob path added to the index after commit → `TrackedDeniedPath`, no restore |
 | `update_ref_argv_no_stdin` | checkpoint create uses argv old-oid form (no `--stdin`) |
 | `stdout_truncated_fail_closed` | injected truncated ls-files → Environment |
 | `linked_worktree_rejected` | `.git` file → Environment |
