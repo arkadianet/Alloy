@@ -9,7 +9,7 @@
 
 #![allow(clippy::disallowed_methods)] // positive baselines may use host Command
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use std::net::TcpListener;
@@ -153,6 +153,28 @@ async fn broker_for_jail_with_homes(
     profile.network = NetworkPolicy::Deny;
     profile.exec_timeout = Duration::from_secs(30);
     NativeSandboxBroker::with_operator_homes(profile, homes).await
+}
+
+/// A `CARGO_HOME` containing only a copy of the real `cargo`.
+///
+/// The jail grants read on `$CARGO_HOME/{registry,git,bin}` but deliberately
+/// *not* on `$CARGO_HOME/config.toml`, and cargo treats an EACCES on that
+/// file as a hard error rather than "absent". So on any machine whose
+/// operator has a `~/.cargo/config.toml` — common; a shared
+/// `build.target-dir` is the usual reason — every sandboxed `cargo check`
+/// here died with `could not load Cargo configuration` before compiling
+/// anything, and this test was permanently red locally while staying green
+/// on CI (which has no such file). Pointing `CARGO_HOME` at a clean
+/// directory makes the test depend only on the code under test.
+/// `RUSTUP_HOME` stays real so the shim still resolves a toolchain, and the
+/// fixture crates resolve by path, so an empty registry costs nothing.
+#[cfg(target_os = "linux")]
+fn hermetic_homes(root: &Path) -> Option<OperatorHomes> {
+    let real = OperatorHomes::resolve().ok()?;
+    let cargo_home = root.join("cargo-home");
+    std::fs::create_dir_all(cargo_home.join("bin")).ok()?;
+    std::fs::copy(which_cargo()?, cargo_home.join("bin/cargo")).ok()?;
+    Some(OperatorHomes::new(cargo_home, real.rustup_home))
 }
 
 /// Shared default image tag for container tests (matches profile fallback).
@@ -937,7 +959,15 @@ async fn landlock_cargo_check_fixture() {
     let jail = fixtures.clone();
     let cwd = fixture_root.canonicalize().expect("fixture canonicalize");
 
-    let broker = broker_for_jail(jail).await.unwrap();
+    let homes_root = tempfile::tempdir().unwrap();
+    let Some(homes) = hermetic_homes(homes_root.path()) else {
+        if require_landlock() {
+            panic!("could not stage a hermetic CARGO_HOME");
+        }
+        eprintln!("skip: could not stage a hermetic CARGO_HOME");
+        return;
+    };
+    let broker = broker_for_jail_with_homes(jail, homes).await.unwrap();
     let req = SandboxExecRequest::new(
         vec![
             cargo.clone(),
