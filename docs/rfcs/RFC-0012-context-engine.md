@@ -283,6 +283,10 @@ impl DomainId {
 }
 
 /// A caller-pinned item that MUST appear in the assembled pack (rule B11).
+///
+/// V2 §8.1 names `ContextHandle` in `AssembleRequest` but does not define
+/// it; this shape is the normative fill-in (not an amendment — V2 left it
+/// open).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -298,7 +302,8 @@ pub enum ContextHandle {
     Artifact(ArtifactId),
     /// A recorded diagnostic.
     Diagnostic(DiagnosticId),
-    /// A graph node, resolved via `GraphQuery::Symbol` on its path (D14).
+    /// A graph node, resolved via `GraphQuery::Symbol` on its path (D14);
+    /// graph-unavailable resolution degrades per rule E11.
     Symbol {
         /// Rust path or workspace-relative file path (RFC-0011 Q2).
         path: String,
@@ -479,7 +484,8 @@ pub struct Degradation {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum DegradationReason {
-    /// `NullProjectGraph` or `GraphError::Disabled`.
+    /// `GraphError::Disabled`. (A `NullProjectGraph` read succeeds empty —
+    /// RFC-0011 Q10 — and therefore maps to `GraphEmpty`, not here.)
     GraphDisabled,
     /// `GraphError::Busy` after one retry (E4).
     GraphBusy,
@@ -615,7 +621,7 @@ impl TokenEstimator for BytesPerTokenEstimator {
 #[non_exhaustive]
 pub enum ContextError {
     /// `token_budget == 0`, or the effective budget cannot hold the system
-    /// frame (rule E5).
+    /// frame plus the pinned goal and `must_include` items (rule E5).
     #[error("budget too small: need >= {needed} estimated tokens, have {have}")]
     BudgetTooSmall {
         /// Minimum viable estimate.
@@ -702,16 +708,26 @@ impl DefaultContextEngine {
 #[async_trait]
 impl ContextEngine for DefaultContextEngine { /* §5–§8 */ }
 
-/// Engine that assembles only the system frame and the goal. Mirrors
-/// `NullProjectGraph`'s role: available before wiring, in tests, and under
-/// `--no-context`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NullContextEngine;
+/// Engine that assembles only the system frame and an optional
+/// caller-supplied goal. `AssembleRequest` carries no goal (V2 froze it) and
+/// this engine holds no stores, so the goal must be injected at construction.
+/// Mirrors `NullProjectGraph`'s role: available before wiring, in tests, and
+/// under `--no-context`.
+#[derive(Debug, Default, Clone)]
+pub struct NullContextEngine { /* goal: Option<String> */ }
+
+impl NullContextEngine {
+    /// Engine whose packs carry `goal` as their only user content.
+    #[must_use]
+    pub fn with_goal(goal: impl Into<String>) -> Self;
+}
 
 #[async_trait]
 impl ContextEngine for NullContextEngine {
-    /// System frame + the goal text only, with citations for both; never
-    /// fails unless `token_budget == 0` (E5) or there is no goal (A15).
+    /// With a goal: system frame + the goal text, with citations for both.
+    /// Without one (`Default`): `Err(ContextError::EmptyPrompt)` (A15) —
+    /// there is no store to fetch a goal from. `token_budget == 0` is E5
+    /// either way.
     async fn assemble(&self, req: AssembleRequest) -> Result<PromptPack, ContextError>;
     async fn compact(&self, _d: DomainId, _s: CompactStrategy) -> Result<(), ContextError> { Ok(()) }
     async fn evict(&self, _p: EvictPolicy) -> Result<EvictReport, ContextError> { Ok(EvictReport::default()) }
@@ -772,10 +788,10 @@ pub struct ContextMetricsSnapshot {
 | **D6** | Domain builders MUST NOT execute processes, open sockets, or call MCP tools. They read the event store, the artifact store, the graph handle, and the workspace filesystem only (SEC6). |
 | **D7** | Any input that is not valid UTF-8, or whose first 8 KiB contains a NUL byte, MUST be excluded with `DegradationReason::NotTextual`. Bytes are never lossily transcoded into a prompt. |
 | **D8** | WorkingSet file order: `(is_focus DESC, has_diagnostic DESC, path ASC)`. |
-| **D9** | Graph seeds are derived only from `must_include` `Symbol` / `File` handles and from diagnostic primary span paths, deduplicated, sorted by path. |
+| **D9** | Graph seeds are derived only from `must_include` `Symbol` / `File` handles and from diagnostic primary span paths, deduplicated, sorted by path. A diagnostic's **primary span** is `spans[0]` (`DiagnosticEvent.spans` carries no primary flag); a diagnostic with no spans contributes no seed. |
 | **D10** | The neighbourhood is a single `GraphQuery::Subgraph { seeds, radius }` with `radius = profile.graph_radius` (clamped `0..=3` by RFC-0011 Q7). One query, not one per seed. |
-| **D11** | Diagnostic order: `(level DESC [Error > Warning > Note > Help], code ASC, primary path ASC, DiagnosticId ASC)`. |
-| **D12** | Artifact order: `(created_at DESC, ArtifactId ASC)`, filtered to `ArtifactKind` in {`Patch`, `Log`, `Decision`, `Blob`}; `ArtifactKind::PromptPack` artifacts are **excluded** (no prompt-in-prompt recursion). |
+| **D11** | Diagnostic order: `(level DESC [Error > Warning > Note > Help], code ASC, primary path ASC, DiagnosticId ASC)`. The primary path is the D9 primary span's path; diagnostics without spans sort after those with one. |
+| **D12** | Artifact order: `(created_at DESC, ArtifactId ASC)`, filtered to `ArtifactKind` in {`Patch`, `Log`, `Decision`, `Blob`}; `ArtifactKind::PromptPack` **and** `ArtifactKind::Other(_)` artifacts are **excluded** (no prompt-in-prompt recursion; no unclassified bodies). This exclusion outranks B11: a pinned `PromptPack`- or `Other`-kind artifact is `MustIncludeNotFound`, never embedded. |
 | **D13** | Conversation order: ascending `EventSeq`, after selecting the most recent `max_conversation_events` window. Rendering is oldest-first; selection is newest-first. |
 | **D14** | Only `GraphQuery::Symbol`, `GraphQuery::Diagnostics` and `GraphQuery::Subgraph` may be constructed in `context/**` (RFC-0011 E.1; CI grep T-CI6). |
 | **D15** | A domain that produces no content MUST still appear in the manifest with `"items": 0` and its degradations. Absence is reported, never implied. |
@@ -788,7 +804,7 @@ pub struct ContextMetricsSnapshot {
 
 **Inputs.** `EventStore::list_session_events(session, ..)` for `AssembleRequest.session`, plus `AssembleInputs.input`.
 
-**Selection.** Scan the most recent `max_conversation_events` events (default 200). Admit only these `SessionEventType`s, each rendered from a documented payload field:
+**Selection.** The window is the last `max_conversation_events` **raw** events (default 200, additionally clamped by the store's `MAX_EVENTS_PAGE`), fetched via `EventStore::last_seq` followed by one `list_session_events` page with `after = Some(EventSeq(last.saturating_sub(max_conversation_events as u64)))` — the store's cursor is forward-only, so the window is computed from the tail, never by paging from zero. Inside the window, admit only these `SessionEventType`s, each rendered from the payload fields pinned in Appendix F:
 
 | Event type | Rendered as | Notes |
 | --- | --- | --- |
@@ -826,13 +842,13 @@ Deduplicate, clamp to `max_files`, read from `workspace_root.join(path)` with th
 
 An empty `GraphView` is **normal**, not exceptional: it is precisely what RFC-0011's thin M7 slice returns before an ingest has run, and what `NullProjectGraph` always returns. It yields `graph: None` plus `Degradation { reason: GraphEmpty }`, and the domain proceeds on files and diagnostics alone (E2).
 
-**(c) Diagnostics.** `AssembleInputs.diagnostics` first (the current attempt's `FailureIr.diagnostics`, RFC-0010), then the graph's recorded `Diagnostics` view when the former is empty. Clamp to `max_diagnostics`, order by D11. Each renders as `level[code] path:line:col — message`, with `children` flattened to at most three lines each and `raw_json` **never** rendered (D17).
+**(c) Diagnostics.** `AssembleInputs.diagnostics` first (the current attempt's `FailureIr.diagnostics`, RFC-0010), then the graph's recorded `Diagnostics` view when the former is empty. A pinned `ContextHandle::Diagnostic(id)` is resolved by scanning `inputs.diagnostics` first; if absent, one `GraphQuery::Diagnostics` query is issued and scanned for the id — an explicit exception to the only-when-empty rule, still within the A13 query bound — and if still absent the pin is `MustIncludeNotFound` (B11). Clamp to `max_diagnostics`, order by D11. Each renders as `level[code] path:line:col — message`, with `children` flattened to at most three lines each and `raw_json` **never** rendered (D17).
 
 **Assembly.** One `ChatRole::User` message per sub-part that has content, in the fixed order files → graph → diagnostics, each inside its own untrusted-content fence (SEC3).
 
 ### 4.4 Domain 3 — Artifacts (weight 0.25)
 
-**Inputs.** `must_include` `Artifact` handles, plus artifacts referenced by the admitted conversation events (`EditApplied`, `Decision`), plus `PredecessorOutput.output_ref` values from `NodeInputPayload::FromPredecessors`.
+**Inputs.** `must_include` `Artifact` handles, plus artifacts referenced by the admitted conversation events — `EditApplied` via `/patch_artifact_id`, `Decision` via `ArtifactStore::get_by_digest` on `/content_hash` (Appendix F) — plus `PredecessorOutput.output_ref` values from `NodeInputPayload::FromPredecessors`.
 
 **Selection.** `ArtifactStore::meta` for every candidate; clamp to `max_artifacts`; order by D12. A pinned handle is fetched by body via `ArtifactStore::get` (digest-verified by RFC-0002); an unpinned artifact contributes **metadata only** — `kind`, `byte_len`, `digest`, `created_at`, and non-secret `labels`. Bodies are admitted for unpinned artifacts only when `kind` is `Patch` and the body fits in the remaining allowance.
 
@@ -915,7 +931,7 @@ The first two settings are V2 Appendix B verbatim. RFC-0015 owns the file, the l
 ```
 
 - `{domain}` is `DomainId::label()`; `{kind}` is one of `goal`, `history`, `file`, `graph`, `diagnostics`, `artifact`, `must_include`.
-- `digest` is the first 12 hex characters of the section's `Citation.digest`, so a reader can join a rendered section to its citation by eye.
+- `digest` is the first 12 hex characters of the SHA-256 of the **whole section body** (the bytes between the fence lines). For a single-citation section this equals the citation's digest; in a multi-citation section (`working_set:graph`) the per-node citations digest their own rendered line(s) instead (CIT2).
 - `fidelity` appears **only** on `working_set:graph` sections and carries `GraphView.fidelity` (CIT6).
 - The fence tokens `<<<alloy:` and `>>>` are stripped from untrusted content before insertion, so content cannot forge a section boundary (rule **SEC8**).
 
@@ -940,14 +956,14 @@ Rule **B7**: a marker is mandatory and machine-parseable; a silent drop is a def
 | --- | --- |
 | **B1** | `effective = min(req.token_budget, profile.total_token_budget, inputs.budget.max_input as usize)`. Absent inputs are skipped, never defaulted upward. `effective == 0` → `BudgetTooSmall`. |
 | **B2** | Token counts are **estimates**, produced by `TokenEstimator` over UTF-8 **bytes**. The default is `len().div_ceil(4)`. Every doc comment, log field and manifest field carrying a count MUST be named `*_est` and MUST NOT be described as a token count. |
-| **B3** | `SYSTEM_FRAME_RESERVE_EST = 512` estimated tokens is reserved before any allowance. If `effective <= SYSTEM_FRAME_RESERVE_EST` → `BudgetTooSmall`. |
+| **B3** | `SYSTEM_FRAME_RESERVE_EST = 512` estimated tokens is reserved before any allowance. If `effective <= SYSTEM_FRAME_RESERVE_EST + goal_min_est + must_include_est` — where `goal_min_est` is the estimate of the pinned goal's first 2 000 bytes (D3) — → `BudgetTooSmall` (E5). The undroppable items are part of the floor; B12's `Internal` must never be the messenger for an impossible request. |
 | **B4** | `allowance(d) = floor((effective - reserve - must_include_est) * weight(d) / sum_of_live_weights)`. Integer floor, computed in a fixed domain order, so no float ordering nondeterminism reaches the result. |
 | **B5** | Unused allowance is redistributed in **exactly one pass**, in `DomainId::LIVE` order, each domain taking what it can use. No second pass and no iteration to a fixed point — a second pass would make the output depend on float accumulation order. |
-| **B6** | A domain MUST NOT exceed its allowance. Clamping happens **inside** the domain builder, ranked by D5, so the drop choice is a property of the domain rather than of the render loop. |
+| **B6** | A domain MUST NOT exceed its allowance. Clamping happens **inside** the domain builder, ranked by D5, so the drop choice is a property of the domain rather than of the render loop. Exception: the pinned goal (D3) may exceed the Conversation allowance — E5 already guarantees it fits the overall budget. |
 | **B7** | Every truncation and every drop leaves a marker (§5.4). |
 | **B8** | Every marker is mirrored by a manifest counter (`truncated`, `omitted`). |
 | **B9** | Drop granularity: file excerpts truncate at a **line boundary**; conversation lines, diagnostics, graph nodes, graph edges and artifacts are dropped **whole**. An item that cannot fit at its minimum size (one line + marker) is dropped whole. |
-| **B10** | Backstop drop order, applied only if step 8 is reached: ascending domain weight (`Conversation` 0.20 → `Artifacts` 0.25 → `WorkingSet` 0.55), and within a domain the exact reverse of the D5 inclusion order. The pinned goal (D3) and `must_include` (B11) are never droppable. |
+| **B10** | Backstop drop order, applied only if step 8 is reached: ascending domain weight (`Conversation` 0.20 → `Artifacts` 0.25 → `WorkingSet` 0.55), ties broken by **reverse `DomainId::LIVE` order**, and within a domain the exact reverse of the D5 inclusion order. The pinned goal (D3) and `must_include` (B11) are never droppable. |
 | **B11** | `must_include` is allocated before weights and is never dropped or truncated. If it does not fit → `MustIncludeTooLarge`. If it does not exist → `MustIncludeNotFound`. These are the request's promise; breaking them silently would be worse than failing. |
 | **B12** | The final assembled estimate MUST be `<= effective`. A violation is `ContextError::Internal`, asserted in every build (not `debug_assert!`). |
 | **B13** | The estimator MUST be monotonic: `a.len() <= b.len()` implies `estimate(a) <= estimate(b)`. |
@@ -995,7 +1011,7 @@ alloy://must_include/{handle-kind}/{key}
 | Rule | Statement |
 | --- | --- |
 | **CIT1** | Every rendered section MUST contribute at least one `Citation`, and every `Citation.digest` MUST be `Some` (§7.11 item 9). A `None` digest is a defect. |
-| **CIT2** | The digest is `Digest::sha256` over the **rendered bytes as they appear in the pack** — post-redaction, post-truncation, post-normalisation. It records what the model saw, not what was on disk. |
+| **CIT2** | The digest is `Digest::sha256` over the **rendered bytes as they appear in the pack** — post-redaction, post-truncation, post-normalisation. It records what the model saw, not what was on disk. A citation covering a whole section digests the full section body; a per-item citation (e.g. one graph node) digests exactly its own rendered line(s). The fence-header digest is always the whole-body digest (§5.3). |
 | **CIT3** | Citations are ordered to match section render order (A2), then by `source` ascending within a section. Two identical assemblies produce identical citation vectors (A1). |
 | **CIT4** | A `source` MUST NOT contain an absolute host path, a secret, a home directory, or a URL with credentials (SEC4). |
 | **CIT5** | No duplicate `(source, digest)` pair. Two renderings of the same source (e.g. two line windows of one file) carry different `#L` fragments and therefore different sources. |
@@ -1071,14 +1087,15 @@ V2 §5.3's single-binary, no-daemon topology admits no context-compaction daemon
 | --- | --- |
 | **E1** | **A graph or store failure MUST NEVER fail assembly, and therefore never fails a DAG node** (RFC-0011 Appendix C rule E1, adopted verbatim). There is no `From<GraphError> for ContextError` and no `From<StoreError> for ContextError` (T-CI8). |
 | **E2** | Every `GraphError` maps to a `Degradation`: `Disabled` → `GraphDisabled`; `Busy` → `GraphBusy`; every other variant (`Corrupt`, `Migration`, `Io`, `Internal`, `NotFound`, `InvalidQuery`, `Closed`, `Workspace`, `Manifest`, `LimitExceeded`) → `GraphUnavailable`. An `Ok` but empty view → `GraphEmpty`. |
-| **E3** | Every degradation is **visible three times**: a `Degradation` in `WorkingSet.degradations`, a `[alloy: … degraded — …]` marker in the rendered text, and a manifest entry. The model is told the graph was unavailable rather than being left to infer that the project has no modules. |
+| **E3** | Every degradation is visible in `WorkingSet.degradations` and in the manifest, and — whenever the affected domain rendered at least one section — as a `[alloy: … degraded — …]` marker in that domain's first rendered section. A domain that rendered nothing carries no marker (A2/A7 forbid empty sections); its degradations remain visible in the two structured places. The model is told the graph was unavailable rather than being left to infer that the project has no modules. |
 | **E4** | `GraphError::Busy` is retried **exactly once** with no sleep, then degrades. No backoff loop inside assembly (RFC-0011 Appendix C prescribes "retry once, then omit the graph projection"). |
-| **E5** | Hard error 1: `BudgetTooSmall` — `token_budget == 0`, or `effective <= SYSTEM_FRAME_RESERVE_EST`. |
+| **E5** | Hard error 1: `BudgetTooSmall` — `token_budget == 0`, or `effective <= SYSTEM_FRAME_RESERVE_EST + goal_min_est + must_include_est` (B3): the reserve plus the pinned goal (D3) and `must_include` (B11) must fit. |
 | **E6** | Hard error 2: `MustIncludeTooLarge` — a pinned item cannot fit even alone. |
 | **E7** | Hard error 3: `MustIncludeNotFound` — a pinned item does not exist. |
 | **E8** | Hard error 4: `EmptyPrompt` — no `User` content at all. Returning a system-frame-only pack would burn a model call to no purpose. |
 | **E9** | `InvalidRequest`, `InvalidProfile`, `SummaryNotFound`, `DomainNotLive` and `Internal` are programming or configuration errors, not runtime degradations. |
 | **E10** | Cancellation is the caller's: `assemble` takes no `CancellationToken`. It is bounded by A13 and returns promptly; RFC-0010's dispatch wraps it. |
+| **E11** | **Deliberate exception to E1.** A `must_include` `Symbol` pin whose resolution fails for graph-availability reasons (any `GraphError`, or an empty view) degrades to a `File` pin on the same path when `path` names a readable workspace-relative file; otherwise it is `MustIncludeNotFound` (E7). A pin is the caller's explicit promise (B11), so this is the only place a graph outage may surface as an error. |
 
 ### 9.2 Caller decision table
 
@@ -1195,7 +1212,7 @@ Rule **C6**: **no new `[workspace.dependencies]` entry.** Everything needed is a
 
 | # | Test name | Asserts |
 | --- | --- | --- |
-| T4a | `null_graph_yields_graph_disabled_degradation_not_an_error` | E1, E2 |
+| T4a | `null_graph_yields_graph_empty_degradation_not_an_error` | E1, E2, RFC-0011 Q10 |
 | T4b | `empty_graph_view_yields_graph_empty_and_files_still_render` | E2 — the roadmap's "may have an empty graph projection" |
 | T4c | `graph_busy_retries_once_then_degrades` | E4 |
 | T4d | `graph_corrupt_maps_to_graph_unavailable` | E2 |
@@ -1235,6 +1252,7 @@ Rule **C6**: **no new `[workspace.dependencies]` entry.** Everything needed is a
 | T6e | `must_include_too_large_is_an_error` | E6 |
 | T6f | `must_include_not_found_is_an_error` | E7 |
 | T6g | `item_that_cannot_fit_minimally_is_dropped_whole` | B9 |
+| T6h | `symbol_pin_degrades_to_file_pin_when_graph_unavailable` | E11 — a file-path pin survives a null graph; a Rust-path pin is `MustIncludeNotFound` |
 
 ### 13.7 Unit — cache, stale, evict
 
@@ -1248,13 +1266,13 @@ Rule **C6**: **no new `[workspace.dependencies]` entry.** Everything needed is a
 | T7f | `mark_stale_unknown_id_is_summary_not_found` | K6 |
 | T7g | `compact_live_domain_drops_cache_and_summarises_nothing` | A12 |
 | T7h | `compact_reserved_domain_is_domain_not_live` | A12 |
-| T7i | `null_engine_assembles_goal_only_and_mark_stale_errors` | §3.8 |
+| T7i | `null_engine_with_goal_assembles_goal_only_default_is_empty_prompt` | §3.8 — `with_goal` pack; `Default` → `EmptyPrompt`; `mark_stale` errors |
 
 ### 13.8 Integration (`crates/alloy-runtime/tests/context_rfc0012.rs`)
 
 | # | Test name | Asserts |
 | --- | --- | --- |
-| T8a | `repair_loop_pack_matches_appendix_a_golden` | Appendix A byte-for-byte, citations included |
+| T8a | `repair_loop_pack_matches_committed_golden` | A golden fixture generated by the implementation and committed to the tree; Appendix A mirrors its shape (its digests are illustrative) |
 | T8b | `assemble_over_a_recorded_toy_workspace_graph_view` | End-to-end against a recorded `GraphView` fixture matching RFC-0011 Appendix B (keeps C2 intact — no `alloy-index` dependency) |
 | T8c | `assemble_after_diagnostic_ingest_includes_a_diagnostics_citation` | The draft's original integration criterion |
 | T8d | `pack_round_trips_through_serde_and_into_a_completion_request` | RFC-0007 binding: `PromptPack.messages` → `CompletionRequest.messages` unchanged |
@@ -1342,7 +1360,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 23. The neighbourhood is one `Subgraph` query for all seeds (**D10**, T4f).
 - [ ] 24. Graph seeds are deduplicated and sorted (**D9**, T4i).
 - [ ] 25. The engine holds a `GraphViewHandle`; `dyn ProjectGraph` and the write methods appear nowhere in `context/**` (**SEC1**, T-CI3).
-- [ ] 26. A `NullProjectGraph`-backed handle yields `GraphDisabled` and a successful assemble (**E1/E2**, T4a, T8g).
+- [ ] 26. A `NullProjectGraph`-backed handle yields `GraphEmpty` and a successful assemble; `GraphDisabled` is reserved for a literal `GraphError::Disabled` (**E1/E2**, T4a, T8g).
 - [ ] 27. An empty `GraphView` yields `GraphEmpty` and the WorkingSet still renders files and diagnostics (**E2**, T4b).
 - [ ] 28. `GraphError::Busy` is retried exactly once, then degrades (**E4**, T4c).
 - [ ] 29. Every other `GraphError` maps to `GraphUnavailable` with no error propagation (**E2**, T4d).
@@ -1370,7 +1388,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 51. The backstop drop order is ascending domain weight, then reverse inclusion rank (**B10**, T6c).
 - [ ] 52. `must_include` is never dropped or truncated (**B11**, T6d).
 - [ ] 53. `MustIncludeTooLarge` and `MustIncludeNotFound` are raised as specified (**E6/E7**, T6e, T6f).
-- [ ] 54. `BudgetTooSmall` is raised for `token_budget == 0` and for a budget below the system reserve (**E5**, T2e, T2f).
+- [ ] 54. `BudgetTooSmall` is raised for `token_budget == 0` and for a budget below the system reserve plus the pinned goal and `must_include` minimums (**E5**, T2e, T2f).
 - [ ] 55. `EmptyPrompt` is raised rather than returning a system-frame-only pack (**A15/E8**, T5l).
 - [ ] 56. A memo entry is never served across a `GraphVersion` change (**K1**, T7a, T7b).
 - [ ] 57. A failed `version()` lookup is treated as a miss (**K3**, T7c).
@@ -1387,9 +1405,10 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 68. The context module writes nothing, anywhere, and appends no session event or `DecisionRecord` (**A14/OB1/SEC9**, T-CI9, grep for `EventSink` / `DecisionLog`).
 - [ ] 69. Span names match the OB3 list exactly, and no span records prompt content (**OB3/OB4**).
 - [ ] 70. Degradations warn once per reason per call, not per item (**OB5**).
-- [ ] 71. `NullContextEngine` assembles a goal-only pack and fails `mark_stale` (§3.8, T7i).
-- [ ] 72. The Appendix A worked example reproduces byte-for-byte, citations included (**T8a**).
+- [ ] 71. `NullContextEngine::with_goal` assembles a goal-only pack; the `Default` form returns `EmptyPrompt`; `mark_stale` fails (§3.8, T7i).
+- [ ] 72. The repair-loop pack matches a committed golden fixture generated from the implementation; Appendix A mirrors its shape with illustrative digests (**T8a**).
 - [ ] 73. `cargo doc --workspace --no-deps` is warning-free with `-D warnings`; every public item in §3 is documented.
+- [ ] 74. A `Symbol` pin with an unavailable or empty graph degrades to a `File` pin when its path names a file, else `MustIncludeNotFound` (**E11**, T6h).
 
 ---
 
@@ -1455,6 +1474,11 @@ Critical path: A → C → F. D and E parallelise behind A.
 
 ## Appendix A — Worked example (repair loop over the RFC-0011 toy workspace)
 
+> **Note:** every `digest=` / `"digest"` value in this appendix is an
+> **illustrative placeholder**, not a real SHA-256 prefix. The normative
+> golden bytes are generated by the implementation and committed as a fixture
+> (T8a); this appendix mirrors its shape only.
+
 ### A.1 Setting
 
 The workspace is RFC-0011 Appendix B's toy tree at `GraphVersion(1)`, `GraphFidelity::Manifest`. `cargo check` produced one `E0502` in `crates/toy-core/src/io.rs`. The scheduler dispatches a `Repair` node.
@@ -1472,7 +1496,7 @@ let req = AssembleRequest {
 };
 let inputs = AssembleInputs {
     run: Some(run),
-    input: Some(node_envelope),   // NodeInputPayload::Goal { text: "fix the borrow error in toy-core" }
+    input: Some(node_envelope),   // NodeInputPayload::Goal(goal) — goal.text: "fix the borrow error in toy-core"
     diagnostics: vec![e0502],     // from FailureIr.diagnostics (RFC-0010)
     budget: Some(TokenBudget { max_input: 32_000, max_output: 4_096 }),
     focus_paths: vec!["crates/toy-core/src/io.rs".into()],
@@ -1508,7 +1532,7 @@ fix the borrow error in toy-core
 [alloy: truncated — 31 of 118 lines shown]
 <<<alloy:end working_set:file>>>
 
-[User]  <<<alloy:working_set:graph toy_core::io digest=e4da3b7fbbce fidelity=manifest (module layout only; not a call graph)>>>
+[User]  <<<alloy:working_set:graph toy_core::io digest=45c48cce2e2d fidelity=manifest (module layout only; not a call graph)>>>
 module  toy_core                crates/toy-core/src/lib.rs
 module  toy_core::io            crates/toy-core/src/io.rs
 module  toy_core::io::reader    crates/toy-core/src/io/reader.rs
@@ -1521,7 +1545,7 @@ error[E0502] crates/toy-core/src/io.rs:23:9 — cannot borrow `*buf` as mutable
   note: crates/toy-core/src/io.rs:21:17 — immutable borrow occurs here
 <<<alloy:end working_set:diagnostics>>>
 
-[User]  <<<alloy:must_include:file crates/toy-core/src/io.rs#L10-L40 digest=c81e728d9d4c>>>
+[User]  <<<alloy:must_include:file crates/toy-core/src/io.rs#L10-L40 digest=9d5ed678fe57>>>
 (pinned above)
 <<<alloy:end must_include:file>>>
 ```
@@ -1538,18 +1562,18 @@ The Artifacts domain rendered nothing (this is attempt 1; there is no prior patc
   { "source": "alloy://working_set/graph/1/toy_core::io",                    "digest": "1c383cd30b7c…" },
   { "source": "alloy://working_set/graph/1/toy_core::io::reader",            "digest": "c9f0f895fb98…" },
   { "source": "alloy://working_set/diagnostics/E0502/9f2c…",                 "digest": "1679091c5a88…" },
-  { "source": "alloy://must_include/file/crates/toy-core/src/io.rs#L10-L40", "digest": "c81e728d9d4c…" }
+  { "source": "alloy://must_include/file/crates/toy-core/src/io.rs#L10-L40", "digest": "9d5ed678fe57…" }
 ]
 ```
 
-Seven citations, seven digests, zero `None` — AC 36. The same file appears twice under **different sources** (`working_set` and `must_include`), satisfying CIT5's uniqueness rule on the `(source, digest)` pair while honestly recording that the bytes were rendered under two labels.
+Seven citations, seven digests, zero `None` — AC 36. The same file appears twice under **different sources** (`working_set` and `must_include`) *and* different digests: the addendum's citation digests its own rendered bytes — `(pinned above)` — not the file's (CIT2), which also satisfies CIT5's `(source, digest)` uniqueness.
 
 ### A.5 The same assembly with an empty graph (the M7 default)
 
 `SqliteProjectGraph` has never been rebuilt, or the handle is `GraphViewHandle::null()`. Both `Symbol` and `Subgraph` return an empty `GraphView` (RFC-0011 Q10). The result:
 
 - the `working_set:graph` section is **omitted** (A7 — no content, no citation);
-- `WorkingSet.degradations` gains `{ working_set, graph_empty }` (or `graph_disabled` for the null handle);
+- `WorkingSet.degradations` gains `{ working_set, graph_empty }` — the null handle too, since its reads succeed empty (RFC-0011 Q10) and the opaque handle cannot be distinguished from an unbuilt graph;
 - the WorkingSet file section carries `[alloy: working_set degraded — graph_empty]`;
 - the manifest's `graph` object reads `{"version": 0, "fidelity": "manifest", "queried": 2, "degraded": true}`;
 - **`assemble` returns `Ok`.** Five citations instead of seven. The repair loop proceeds on files + diagnostics.
@@ -1616,7 +1640,7 @@ Rule **E1** restated for emphasis, adopted verbatim from RFC-0011 Appendix C: **
 
 1. Owns parsing `[context]` into `ContextProfile` via `ContextProfile::from_toml_table`, including the V2 Appendix B defaults and the D19 unknown-key rejection.
 2. Owns constructing `DefaultContextEngine` in the composition root with the `GraphViewHandle` it already built for `CapabilityContext` (one handle, one graph).
-3. Owns any `--no-context` flag, which MUST select `NullContextEngine` rather than a zero budget.
+3. Owns any `--no-context` flag, which MUST select `NullContextEngine` (constructed via `with_goal` with the session's goal text) rather than a zero budget.
 4. MUST document any `ALLOY_CONTEXT_*` knob in `example.env` and MUST NEVER write `.env` (SEC11).
 5. MAY surface `ContextMetricsSnapshot` in a status command; MUST NOT print prompt content (OB4).
 
@@ -1647,3 +1671,29 @@ Four further RFC-0011 constraints are adopted although E.1 states them elsewhere
 | Appendix C rule E1 — a graph failure MUST NEVER fail a DAG node | **E1** | 26, 30 |
 | G12 / SEC6 — no absolute host path crosses the boundary | **SEC4** | 66 |
 | Appendix C — on `Busy`, retry once then omit the projection | **E4** | 28 |
+
+---
+
+## Appendix F — Admitted event payload fields (normative)
+
+`SessionEvent.payload` is untyped JSON (`serde_json::Value`). The Conversation
+and Artifacts domains read **only** the JSON-pointer paths below, verified
+against the emitters on `main` (RFC-0002/0003/0004 for live emitters;
+RFC-0008 §9.3's `EditAppliedPayload` for `EditApplied`, whose emitter is still
+Draft). An admitted event whose pinned pointer is missing or of the wrong type
+is **skipped** and counted in the manifest's `omitted` — never a guess, never
+an error (D4).
+
+| Event type | Pointer(s) read | Used as |
+| --- | --- | --- |
+| `GoalSubmitted` | `/goal/text` | The pinned goal text (D3) |
+| `Decision` | `/kind`; `/metadata`; `/content_hash` | `decision <kind>: <summary>` where `<summary>` is `/metadata` rendered as one line of compact JSON, redacted, bounded to 200 bytes; `/content_hash`, when present, feeds the Artifacts candidate set via `ArtifactStore::get_by_digest` (§4.4) |
+| `ApprovalRequested` | `/gate_id` | one line: gate id |
+| `ApprovalResolved` | `/gate_id`; `/decision` | one line: gate id + outcome |
+| `EditApplied` | `/transaction_id`; `/files_touched`; `/patch_artifact_id` | `edit <transaction>: <n> files` with `n = files_touched.len()`; `/patch_artifact_id` feeds the Artifacts candidate set (§4.4) |
+| `BudgetWarning` | `/message` | one line, redacted |
+| `Error` | `/class`; `/message` (optional) | one line, redacted, bounded to 400 bytes |
+
+`prompt_body` on `Decision` payloads, and every pointer not listed here, MUST
+NOT be read (SEC2 posture: the smallest possible surface of the log enters a
+prompt).
