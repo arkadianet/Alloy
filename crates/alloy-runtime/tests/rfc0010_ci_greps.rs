@@ -11,12 +11,16 @@
 //!
 //! A manual pass over all 95 ACs (cross-referencing test names, then
 //! reading source where names were ambiguous) found the following with no
-//! dedicated test today. None of these are known *implementation* bugs
-//! (the one that was — AC 66/89's FO6 violation in
-//! `assemble_already_terminal_outcome` — was fixed and given its own
-//! `fo1_r9_*`/`fo2_r9_*`/`fo3_r9_*` tests in `scheduler/linear/loop_.rs`
-//! immediately, not left on this list). Also tracked as RFC-0010 §15 Q8.
-//! Numbers are RFC-0010 §13 AC numbers.
+//! dedicated test today. Also tracked as RFC-0010 §15 Q8. Numbers are
+//! RFC-0010 §13 AC numbers.
+//!
+//! The sweep, and the three-reviewer round that followed it, turned up
+//! real implementation bugs as well as test debt. Those were fixed and
+//! tested rather than listed here: FO6/FN2 attribution (ACs 66/89/92),
+//! RF3+RF7 resume wiring (ACs 23/24), B4's resume backoff (AC 26), the
+//! `CapabilityExecContext` budget/deadline contract, BE4's pre-CAS
+//! ordering (AC 82), the `pending_cancels` leak, §5.3.2 row 4 gate
+//! adoption, and the run half of the §5.3.1/§5.7.2 scan keys.
 //!
 //! - **AC 12**: `run` on a DAG with no bound run row returns
 //!   `RunBindingMissing` — the code path exists, no test calls it directly.
@@ -26,15 +30,13 @@
 //!   correct by code inspection for every `cN_*` method but untested via a
 //!   call-order-tracking store double, unlike the RFC's own suggested
 //!   "Recorded store" mechanism.
-//! - **AC 23/24**: `repair_node_state` (RF3, general non-gate crash repair)
-//!   is unit-tested in isolation but never called from `loop_.rs` — only
-//!   `repair_approval_requested` (gate-specific) is wired in, as of P7.
-//!   `adopt_running` (R13, crash-mid-`Running` adoption) has no dedicated
-//!   end-to-end test exercising `run()` on a pre-seeded `Running` node.
-//! - **AC 26**: restart with a `Ready` node + one recorded failed attempt
-//!   waiting the full remaining backoff (paused clock) before C3 — backoff
-//!   computation and live-run interruption are both tested; this specific
-//!   fresh-process restart scenario isn't.
+//! - **AC 23/24** (*closed*): RF3/RF7 are wired into R9 via
+//!   `repair_gate_terminal`, and `adopt_running` now has end-to-end tests
+//!   for both §5.3.2 gate rows. General non-gate RF3-on-adoption is still
+//!   only unit-tested.
+//! - **AC 26** (*closed*): `b4_resumed_ready_node_with_prior_attempts_*`
+//!   covers the fresh-process restart on a paused clock, and
+//!   `b4_in_loop_retry_does_not_double_wait_*` pins the converse.
 //! - **AC 33**: gate-allow resume is tested from one intermediate crash
 //!   point, not "each" per the AC's plural wording.
 //! - **AC 35/36**: resume-with-`WaitingApproval`-and-no-resolution
@@ -69,9 +71,9 @@
 //! - **AC 80**: `expire_gate`'s `Err(other)` retry-up-to-`EXPIRE_RETRY_MAX`
 //!   loop is only exercised via its happy path (`gate_expiry_terminalizes_*`
 //!   in `loop_.rs`); the retry-then-exhaust behavior isn't.
-//! - **AC 82**: BE4 (`ObsError`/`DecisionLog` failure logged-not-aborted
-//!   after a committed CAS, mapped to `Store` before one) has no dedicated
-//!   scheduler-level test.
+//! - **AC 82** (*partly closed*): the pre-CAS half is now pinned by
+//!   `be4_pre_cas_decision_failure_aborts_the_retry_checkpoint`. The
+//!   post-CAS half (logged, not aborted) still has no dedicated test.
 //! - **AC 88**: R4b's re-load observing a concurrent unowned-cancel's
 //!   terminal write (short-circuiting at R9 instead of overwriting) has no
 //!   dedicated race test.
