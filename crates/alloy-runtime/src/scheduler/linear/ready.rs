@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use crate::dag::{preds_satisfied, Backoff, NodeState, TaskDag};
+use crate::dag::{preds_satisfied, Backoff, EdgeKind, NodeKind, NodeState, TaskDag};
 use crate::error::SchedError;
 use crate::scheduler::DagState;
 use crate::types::ids::NodeId;
@@ -44,6 +44,89 @@ pub fn promotable_nodes(dag: &TaskDag) -> Vec<NodeId> {
         .filter(|(id, _)| preds_satisfied(dag, **id))
         .map(|(id, _)| *id)
         .collect()
+}
+
+/// Node kinds ER4 blocks from dispatch while `needs_reverify` holds.
+///
+/// The complement — `VerifyCompile`, `VerifyTest`, `GateHuman`, `Aggregate` —
+/// stays dispatchable, which is what lets the pending verify actually run and
+/// clear the flag.
+#[must_use]
+pub fn er4_blocked_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Plan | NodeKind::Analyze | NodeKind::Edit | NodeKind::Review
+    )
+}
+
+/// Every node reachable from `from` along Data ∪ Sequence edges, following
+/// RFC-0009 §5.3.1's edge semantics (`Hint` is not a dependency and is
+/// ignored). `from` itself is not included.
+#[must_use]
+fn data_or_sequence_reachable(dag: &TaskDag, from: NodeId) -> std::collections::BTreeSet<NodeId> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![from];
+    while let Some(current) = stack.pop() {
+        for edge in &dag.edges {
+            if edge.from != current || edge.kind == EdgeKind::Hint {
+                continue;
+            }
+            if seen.insert(edge.to) {
+                stack.push(edge.to);
+            }
+        }
+    }
+    seen
+}
+
+/// Verify nodes reachable from any `Succeeded` `Edit` in this generation
+/// (ER4/ER5's "Data∪Sequence-reachable `VerifyCompile`/`VerifyTest`").
+///
+/// Empty when no `Edit` succeeded, or when the succeeded edits reach no
+/// verify at all — ER5's "verify-less DAG" carve-out (e.g. `Edit → GateHuman`,
+/// where the human is the check) depends on telling those two apart from
+/// "reachable verifies exist but none succeeded".
+#[must_use]
+pub fn verifies_reachable_from_succeeded_edits(dag: &TaskDag) -> Vec<NodeId> {
+    let mut out = std::collections::BTreeSet::new();
+    for (id, node) in &dag.nodes {
+        if node.kind != NodeKind::Edit || node.state != NodeState::Succeeded {
+            continue;
+        }
+        for reached in data_or_sequence_reachable(dag, *id) {
+            if matches!(
+                dag.nodes.get(&reached).map(|n| n.kind),
+                Some(NodeKind::VerifyCompile | NodeKind::VerifyTest)
+            ) {
+                out.insert(reached);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// ER4's `needs_reverify`, derived from the blob rather than stored.
+///
+/// True iff some `Edit` in this generation is `Succeeded` **and** some
+/// Data∪Sequence-reachable verify is still non-terminal
+/// (`Pending`/`Ready`/`Running`). A verify that reached
+/// `Succeeded`/`CachedHit` clears it.
+///
+/// Deliberately a pure predicate over `TaskDag`: nothing is persisted, so
+/// there is no flag to keep in sync across a crash, and R15 recomputes the
+/// same answer on every resume. (An earlier reading of ER4 assumed it
+/// required a `TaskNode.needs_reverify` field and deferred the whole rule on
+/// that basis — it does not.)
+#[must_use]
+pub fn needs_reverify(dag: &TaskDag) -> bool {
+    verifies_reachable_from_succeeded_edits(dag)
+        .into_iter()
+        .any(|id| {
+            matches!(
+                dag.nodes[&id].state,
+                NodeState::Pending | NodeState::Ready | NodeState::Running
+            )
+        })
 }
 
 /// Backoff sleep before the attempt following failed attempt `attempt`
@@ -354,6 +437,133 @@ mod tests {
         nodes.insert(a, node(a, NodeState::Running));
         let dag = dag_from(nodes, vec![]);
         assert!(promotable_nodes(&dag).is_empty());
+    }
+
+    // ---- ER4 needs_reverify (§6.5) ----
+
+    fn kinded(id: NodeId, kind: NodeKind, state: NodeState) -> TaskNode {
+        let mut n = node(id, state);
+        n.kind = kind;
+        n
+    }
+
+    fn edge(from: NodeId, to: NodeId, kind: EdgeKind) -> DependencyEdge {
+        DependencyEdge { from, to, kind }
+    }
+
+    /// `Edit(Succeeded) → VerifyCompile(state)`, plus the edge kind to use.
+    fn edit_then_verify(verify_state: NodeState, edge_kind: EdgeKind) -> (TaskDag, NodeId, NodeId) {
+        let e = NodeId::new();
+        let v = NodeId::new();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(e, kinded(e, NodeKind::Edit, NodeState::Succeeded));
+        nodes.insert(v, kinded(v, NodeKind::VerifyCompile, verify_state));
+        (dag_from(nodes, vec![edge(e, v, edge_kind)]), e, v)
+    }
+
+    #[test]
+    fn needs_reverify_true_when_a_succeeded_edit_has_a_nonterminal_verify() {
+        for state in [NodeState::Pending, NodeState::Ready, NodeState::Running] {
+            let (dag, _, _) = edit_then_verify(state, EdgeKind::Data);
+            assert!(needs_reverify(&dag), "{state:?} must still need re-verify");
+        }
+    }
+
+    #[test]
+    fn needs_reverify_false_once_the_verify_succeeds_or_is_cached() {
+        for state in [NodeState::Succeeded, NodeState::CachedHit] {
+            let (dag, _, _) = edit_then_verify(state, EdgeKind::Data);
+            assert!(!needs_reverify(&dag), "{state:?} must clear the flag");
+        }
+    }
+
+    #[test]
+    fn needs_reverify_follows_sequence_edges_too() {
+        // ER4 says "Data ∪ Sequence", not Data alone.
+        let (dag, _, _) = edit_then_verify(NodeState::Pending, EdgeKind::Sequence);
+        assert!(needs_reverify(&dag));
+    }
+
+    #[test]
+    fn needs_reverify_ignores_hint_edges() {
+        // `Hint` is not a dependency (RFC-0009 §5.3.1), so a verify only
+        // reachable through one is not "reachable" for ER4's purposes.
+        let (dag, _, _) = edit_then_verify(NodeState::Pending, EdgeKind::Hint);
+        assert!(!needs_reverify(&dag));
+    }
+
+    #[test]
+    fn needs_reverify_false_when_no_edit_succeeded() {
+        let e = NodeId::new();
+        let v = NodeId::new();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(e, kinded(e, NodeKind::Edit, NodeState::Ready));
+        nodes.insert(v, kinded(v, NodeKind::VerifyCompile, NodeState::Pending));
+        let dag = dag_from(nodes, vec![edge(e, v, EdgeKind::Data)]);
+        assert!(!needs_reverify(&dag));
+    }
+
+    #[test]
+    fn needs_reverify_false_for_a_verify_less_dag() {
+        // `Edit → GateHuman`: the human is the check, so ER4/ER5 stay out.
+        let e = NodeId::new();
+        let g = NodeId::new();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(e, kinded(e, NodeKind::Edit, NodeState::Succeeded));
+        nodes.insert(g, kinded(g, NodeKind::GateHuman, NodeState::Pending));
+        let dag = dag_from(nodes, vec![edge(e, g, EdgeKind::Data)]);
+        assert!(!needs_reverify(&dag));
+        assert!(verifies_reachable_from_succeeded_edits(&dag).is_empty());
+    }
+
+    #[test]
+    fn needs_reverify_reaches_a_verify_transitively() {
+        // Edit → Review → VerifyCompile: reachability, not just adjacency.
+        let e = NodeId::new();
+        let r = NodeId::new();
+        let v = NodeId::new();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(e, kinded(e, NodeKind::Edit, NodeState::Succeeded));
+        nodes.insert(r, kinded(r, NodeKind::Review, NodeState::Pending));
+        nodes.insert(v, kinded(v, NodeKind::VerifyCompile, NodeState::Pending));
+        let dag = dag_from(
+            nodes,
+            vec![edge(e, r, EdgeKind::Data), edge(r, v, EdgeKind::Data)],
+        );
+        assert!(needs_reverify(&dag));
+    }
+
+    #[test]
+    fn needs_reverify_ignores_a_verify_not_downstream_of_the_edit() {
+        // A verify that the succeeded edit cannot reach says nothing about
+        // whether the edit's changes were verified.
+        let e = NodeId::new();
+        let v = NodeId::new();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(e, kinded(e, NodeKind::Edit, NodeState::Succeeded));
+        nodes.insert(v, kinded(v, NodeKind::VerifyCompile, NodeState::Pending));
+        let dag = dag_from(nodes, vec![]); // no edges at all
+        assert!(!needs_reverify(&dag));
+    }
+
+    #[test]
+    fn er4_blocked_kind_matches_the_rfc_partition() {
+        for kind in [
+            NodeKind::Plan,
+            NodeKind::Analyze,
+            NodeKind::Edit,
+            NodeKind::Review,
+        ] {
+            assert!(er4_blocked_kind(kind), "{kind:?} must be blocked");
+        }
+        for kind in [
+            NodeKind::VerifyCompile,
+            NodeKind::VerifyTest,
+            NodeKind::GateHuman,
+            NodeKind::Aggregate,
+        ] {
+            assert!(!er4_blocked_kind(kind), "{kind:?} must stay dispatchable");
+        }
     }
 
     // ---- backoff_delay ----

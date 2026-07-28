@@ -9,10 +9,10 @@
 //! ownership and the race-free cancel wait), `budget.rs` (§5.16.1 effective
 //! ceilings), and `checkpoint.rs` (every CAS plus the §5.3.3 crash repairs).
 //!
-//! One gap is flagged rather than silently skipped: R15 (edit-tx resume,
-//! `needs_reverify`/ER4/ER5) is a no-op, because `TaskNode` on `main` has no
-//! `needs_reverify` field — RFC-0008's resume-repair bit does not exist yet
-//! to read.
+//! R15 implements ER4/ER5 (§6.5): `needs_reverify` is a *derived* predicate
+//! over node states and Data∪Sequence reachability (`ready.rs`), not a stored
+//! `TaskNode` field, so it needs nothing from RFC-0008 and stays inside ER3's
+//! boundary — the scheduler never touches the edit stack.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +26,10 @@ use super::budget;
 use super::checkpoint::{map_store_error, map_store_error_on_load, Checkpoint, CheckpointCtx};
 use super::envelopes::{self, InputShape};
 use super::gate::GateResolution;
-use super::ready::{backoff_delay, derive_dag_state, promotable_nodes, ready_nodes, DeriveFlags};
+use super::ready::{
+    backoff_delay, derive_dag_state, er4_blocked_kind, needs_reverify, promotable_nodes,
+    ready_nodes, verifies_reachable_from_succeeded_edits, DeriveFlags,
+};
 use super::retry::{self, Admission, Escalation};
 use super::LinearScheduler;
 use crate::adapters::{
@@ -397,12 +400,18 @@ impl LinearScheduler {
         }
 
         // R14
-        if dag.state == DagState::Pending {
+        let performed_c1 = dag.state == DagState::Pending;
+        if performed_c1 {
             checkpoint.c1_start(&mut dag).await?;
         }
 
-        // R15: edit-tx resume is a no-op (see module docs — `needs_reverify`
-        // does not exist on `TaskNode` yet).
+        // R15 (ER5): resume-only. Skipped when this call performed C1 — a DAG
+        // that was still `Pending` never got as far as an edit.
+        if !performed_c1 {
+            if let Some(outcome) = self.er5_edit_without_verify(&mut dag, &rc).await? {
+                return Ok(outcome);
+            }
+        }
 
         // R16: resume with a durable WaitingApproval DAG (§5.7.2/§5.7.3).
         if dag.state == DagState::WaitingApproval {
@@ -412,6 +421,29 @@ impl LinearScheduler {
                 .find(|n| n.state == NodeState::WaitingApproval)
                 .map(|n| n.id)
             {
+                match self.gate_route(&mut dag, &rc, gate_node, true).await? {
+                    StepOutcome::Terminal(outcome) => return Ok(outcome),
+                    StepOutcome::Continue | StepOutcome::NaturalExit => {}
+                }
+            }
+        }
+
+        // R16b: a gate left durably `Ready` with the DAG already `Running` is
+        // the C9b→C3 crash window: C9b committed `WaitingApproval → Ready` and
+        // `DagState → Running`, then the process died before GA4's C3. R16
+        // above cannot see it (the DAG is no longer `WaitingApproval`) and
+        // `adopt_running` cannot either (no node is `Running`), so without
+        // this the loop reaches L13 and takes the *first-schedule* path:
+        // a second `ApprovalRequested`, a fresh waiter, and the approval the
+        // human already granted is discarded and left to expire. Route it
+        // through the resume path so the durable resolution is re-scanned.
+        if !performed_c1 {
+            let ready_gate = dag
+                .nodes
+                .values()
+                .find(|n| n.kind == NodeKind::GateHuman && n.state == NodeState::Ready)
+                .map(|n| n.id);
+            if let Some(gate_node) = ready_gate {
                 match self.gate_route(&mut dag, &rc, gate_node, true).await? {
                     StepOutcome::Terminal(outcome) => return Ok(outcome),
                     StepOutcome::Continue | StepOutcome::NaturalExit => {}
@@ -607,6 +639,84 @@ impl LinearScheduler {
         Ok(None)
     }
 
+    /// R15 / ER5 (§6.5): on resume, an `Edit` that durably succeeded while
+    /// every reachable verify ended terminal *without* success means the
+    /// workspace was mutated and never re-verified. Nothing will re-run those
+    /// verifies (they are terminal), so the run cannot honestly continue.
+    ///
+    /// Returns `Some(outcome)` when ER5 fired and terminalized; `None` to
+    /// continue into R16+.
+    ///
+    /// Guards, all normative and all load-bearing:
+    /// - **Every node terminal ⇒ MUST NOT fire.** §6.3's all-terminal derive
+    ///   owns that case (it may well be D7 `Succeeded`), and firing here
+    ///   would rewrite a terminal — forbidden outright.
+    /// - **Verify-less DAGs MUST NOT fire.** No reachable verify from the
+    ///   succeeded edit (e.g. `Edit → GateHuman`) means the human *is* the
+    ///   check; there is nothing missing.
+    /// - **Any succeeded/cached verify clears it.** That is exactly ER4's
+    ///   `needs_reverify` being false for a reason other than "no verify".
+    /// - **Any still-runnable verify clears it.** The re-verify can still
+    ///   happen; ER4's dispatch filter will make sure it happens first.
+    /// - Target is the lowest `Pending`/`Ready` node (A10 edges only). No
+    ///   `WaitingApproval → Failed`, no terminal rewrites. With no such
+    ///   target, skip and continue rather than inventing one.
+    ///
+    /// On well-formed blobs a terminal-without-success verify normally
+    /// co-terminalizes the DAG through C6/C7, so R9 short-circuits long
+    /// before R15 — ER5 is a defensive guard for synthetic or repaired blobs.
+    async fn er5_edit_without_verify(
+        &self,
+        dag: &mut TaskDag,
+        rc: &RunCtx<'_>,
+    ) -> Result<Option<DagOutcome>, SchedError> {
+        let terminal = |s: NodeState| {
+            matches!(
+                s,
+                NodeState::Succeeded
+                    | NodeState::Failed
+                    | NodeState::Skipped
+                    | NodeState::Cancelled
+                    | NodeState::CachedHit
+            )
+        };
+        if dag.nodes.values().all(|n| terminal(n.state)) {
+            return Ok(None);
+        }
+
+        let verifies = verifies_reachable_from_succeeded_edits(dag);
+        if verifies.is_empty() {
+            return Ok(None); // no succeeded edit, or a verify-less DAG
+        }
+        let all_terminal_without_success = verifies.iter().all(|id| {
+            let state = dag.nodes[id].state;
+            terminal(state) && !matches!(state, NodeState::Succeeded | NodeState::CachedHit)
+        });
+        if !all_terminal_without_success {
+            return Ok(None);
+        }
+
+        let Some(target) = dag
+            .nodes
+            .iter()
+            .find(|(_, n)| matches!(n.state, NodeState::Pending | NodeState::Ready))
+            .map(|(id, _)| *id)
+        else {
+            return Ok(None); // no A10-legal target; continue to R16/derive
+        };
+
+        let failure = FailureIr {
+            node: target,
+            error_class: ErrorClass::Internal,
+            retry: RetryDisposition::NonRetryable,
+            diagnostics: vec![],
+            notes: "edit succeeded without successful verify after restart".into(),
+        };
+        Ok(Some(
+            self.terminal_failed(dag, rc, target, None, failure).await?,
+        ))
+    }
+
     /// R13 (§5.3.2): adopt a node durably `Running` on entry (crash
     /// resume). Returns `Some(outcome)` when adoption itself terminalized
     /// the run (retries exhausted); `None` to continue into R14+.
@@ -797,6 +907,31 @@ impl LinearScheduler {
         let Some(selected) = ready.into_iter().next() else {
             return Ok(StepOutcome::NaturalExit);
         };
+
+        // L14 / ER4: while a succeeded `Edit` still has a non-terminal
+        // reachable verify, the workspace is mutated but unverified. Model
+        // kinds MUST NOT be dispatched into that state — they would build on
+        // an unverified tree. Verify/gate/aggregate kinds stay dispatchable,
+        // which is what lets the pending verify run and clear the condition.
+        //
+        // Under the serial MVP this is a dispatch filter, not a second
+        // scheduler: there is exactly one Ready node, so "filtered" means
+        // "nothing else can run". ER4 is explicit that the node is then
+        // durably failed via C7, not reported as `Err(Invariant)` — a wedged
+        // blob has to reach a terminal state an operator can act on.
+        if er4_blocked_kind(dag.nodes[&selected].kind) && needs_reverify(dag) {
+            let failure = FailureIr {
+                node: selected,
+                error_class: ErrorClass::Internal,
+                retry: RetryDisposition::NonRetryable,
+                diagnostics: vec![],
+                notes: "blocked by pending re-verify after edit (ER4)".into(),
+            };
+            return Ok(StepOutcome::Terminal(
+                self.terminal_failed(dag, rc, selected, None, failure)
+                    .await?,
+            ));
+        }
 
         // L10 done (selected). L13: gate route before any C3.
         if dag.nodes[&selected].kind == NodeKind::GateHuman {
@@ -1285,8 +1420,11 @@ impl LinearScheduler {
     }
 
     /// §5.11.2: one `DecisionKind::Retry` record per admission decision.
-    /// Best-effort (BE4-style posture): a logging failure here MUST NOT
-    /// undo the C7/C8 checkpoint it describes.
+    ///
+    /// BE4: this runs *before* the C7/C8 it describes, so a `DecisionLog`
+    /// failure maps to `Err(Store)` and the caller MUST NOT proceed with that
+    /// CAS. (It is not best-effort — that posture only applies to records
+    /// appended after a committed CAS.)
     #[allow(clippy::too_many_arguments)]
     async fn record_retry_admitted(
         &self,
@@ -1470,8 +1608,9 @@ impl LinearScheduler {
             .meter_for(rc.run_id)
             .check_budget(&rc.effective_budget);
         // BE1: one Budget decision + a BudgetWarning, before terminalizing.
+        // BE4: pre-CAS, so a failure here aborts before the C7 below.
         self.signal_budget_exhaustion(rc, Some(node_id), check)
-            .await;
+            .await?;
         self.metrics.inc_budget_stops();
         let failure = FailureIr {
             node: node_id,
@@ -1489,18 +1628,24 @@ impl LinearScheduler {
     /// BE1: append one `DecisionKind::Budget` record and a `BudgetWarning`.
     /// `check` is `meter.check_budget(&rc.effective_budget)` at the moment
     /// of exhaustion, so the caller doesn't compute it twice.
+    ///
+    /// BE4: the Budget record precedes the C7 that terminalizes the run, so a
+    /// `DecisionLog` failure maps to `Err(Store)` and the caller MUST NOT
+    /// proceed with that CAS — the same rule the retry path already follows.
+    /// The `BudgetWarning` signal afterwards is a separate obs channel and
+    /// stays best-effort.
     async fn signal_budget_exhaustion(
         &self,
         rc: &RunCtx<'_>,
         node_id: Option<NodeId>,
         check: crate::obs::BudgetCheck,
-    ) {
+    ) -> Result<(), SchedError> {
         let metadata = serde_json::json!({
             "check": format!("{check:?}"),
             "effective_usd": rc.effective_budget.max_usd_per_run,
             "effective_tokens": rc.effective_budget.max_tokens_per_run,
         });
-        self.record_budget_decision(rc, node_id, metadata).await;
+        self.record_budget_decision(rc, node_id, metadata).await?;
 
         let meter = self.deps.cost_meters.meter_for(rc.run_id);
         if budget::is_pre_dispatch_exhausted(&rc.effective_budget) && !check.is_exhausted() {
@@ -1532,6 +1677,7 @@ impl LinearScheduler {
         {
             tracing::warn!(error = %e, "budget warning failed");
         }
+        Ok(())
     }
 
     /// §5.16.3 "after each node completes": best-effort spend-accrual
@@ -1572,18 +1718,27 @@ impl LinearScheduler {
                 .collect();
             metadata["ignored_parallelism"] = serde_json::Value::Object(ignored);
         }
-        self.record_budget_decision(rc, None, metadata).await;
+        // BG1/BG5 is a run-level note, not a pre-CAS record — no CAS depends
+        // on it, so BE4 does not apply and a sink outage must not fail the run.
+        if let Err(e) = self.record_budget_decision(rc, None, metadata).await {
+            tracing::warn!(error = %e, "budget-ignored decision record failed");
+        }
     }
 
     /// Shared `DecisionKind::Budget` recorder (BE1/BG1/BG5). `node_id` is
     /// `None` for run-level notes (BG1/BG5), `Some` for an exhaustion
     /// attribution (BE1).
+    ///
+    /// Returns the `ObsError` rather than swallowing it: BE1's caller records
+    /// *before* the C7 it describes and must honour BE4 (pre-CAS failure ⇒
+    /// `Err(Store)`, no CAS). BG1/BG5 are not tied to a CAS at all and stay
+    /// best-effort at their own call site.
     async fn record_budget_decision(
         &self,
         rc: &RunCtx<'_>,
         node_id: Option<NodeId>,
         metadata: serde_json::Value,
-    ) {
+    ) -> Result<(), SchedError> {
         let rec = DecisionRecord {
             session: rc.ctx.session_id,
             run: rc.ctx.run_id,
@@ -1593,9 +1748,12 @@ impl LinearScheduler {
             content_hash: None,
             prompt_body: None,
         };
-        if let Err(e) = self.deps.decisions.record(rec).await {
-            tracing::warn!(error = %e, ?node_id, "budget decision record failed");
-        }
+        self.deps
+            .decisions
+            .record(rec)
+            .await
+            .map(|_seq| ())
+            .map_err(|e| SchedError::Store(format!("pre-CAS decision record failed: {e}")))
     }
 
     /// §5.19 T8: run timeout with no `Running` node in the general case
@@ -1638,23 +1796,71 @@ impl LinearScheduler {
         rc: &RunCtx<'_>,
     ) -> Result<DagOutcome, SchedError> {
         let state = derive_dag_state(dag, DeriveFlags::default())?;
-        match state {
-            DagState::Succeeded => {
-                rc.checkpoint.c7_terminal_succeeded(dag).await?;
-                Ok(DagOutcome {
+        if state == DagState::Succeeded {
+            rc.checkpoint.c7_terminal_succeeded(dag).await?;
+            return Ok(DagOutcome {
+                dag_id: dag.id,
+                generation: dag.generation,
+                state: DagState::Succeeded,
+                failed_node: None,
+                failure: None,
+            });
+        }
+
+        // DS4 stall recovery (§5.17). The loop exited naturally, so no
+        // `Ready`, `Running`, or `WaitingApproval` node remains — yet the
+        // derive says non-terminal. That means one or more `Pending` nodes can
+        // never be promoted (a `Skipped`/`Failed`/`Cancelled` Data
+        // predecessor). §5.15's SK3 bulk-terminalize normally forecloses this,
+        // so it is unreachable on blobs this scheduler wrote — but a replan or
+        // a repaired/hand-built blob can present it, and returning `Err` here
+        // left the DAG durably `Running` with nothing that would ever revisit
+        // it: a permanent wedge whose only operator signal is an `Invariant`
+        // string. Skip the stalled nodes, re-derive (D8 takes an all-`Skipped`
+        // graph to `Failed`), and commit that terminal instead.
+        let stalled: Vec<NodeId> = dag
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.state == NodeState::Pending)
+            .map(|(id, _)| *id)
+            .collect();
+
+        if !stalled.is_empty() {
+            // Derive against a copy first: DS4 only sanctions the CAS if the
+            // skip actually resolves the stall.
+            let mut probe = dag.clone();
+            for id in &stalled {
+                probe
+                    .nodes
+                    .get_mut(id)
+                    .expect("id came from this map")
+                    .state = NodeState::Skipped;
+            }
+            let after = derive_dag_state(&probe, DeriveFlags::default())?;
+            if after != DagState::Running {
+                tracing::warn!(
+                    dag_id = %dag.id,
+                    stalled = ?stalled,
+                    resolved_to = ?after,
+                    "dag stalled: unsatisfiable Data predecessors; skipping and terminalizing (DS4)"
+                );
+                rc.checkpoint
+                    .c7_terminal_stalled(dag, rc.ctx, &stalled, after)
+                    .await?;
+                // FO4(i): an all-`Skipped` terminal attributes no node.
+                return Ok(DagOutcome {
                     dag_id: dag.id,
                     generation: dag.generation,
-                    state: DagState::Succeeded,
+                    state: after,
                     failed_node: None,
                     failure: None,
-                })
+                });
             }
-            other => Err(SchedError::Invariant(format!(
-                "natural loop exit produced unexpected state {other:?} (DS4 stall path not \
-                 reachable given §5.15 SK3's bulk-terminalize design; flagged for follow-up \
-                 if this ever fires)"
-            ))),
         }
+
+        // DS4's own fallback: the skip did not resolve it, so the blob is
+        // genuinely inconsistent rather than merely stalled.
+        Err(SchedError::Invariant(format!("dag stalled: {stalled:?}")))
     }
 
     // -----------------------------------------------------------------
@@ -1870,12 +2076,22 @@ fn verify_outcome_to_result(
             "raw_artifact": outcome.raw_artifact.map(|id| id.to_string()),
         })) // OU4
     } else {
+        // RL1-RL5 put the raw log for `ok: false` too, but its id only
+        // survived on the success path (in the output envelope). On this path
+        // nothing durable referenced it, so the artifact existed with no way
+        // back to it from the run's records — exactly when an operator most
+        // wants the compiler output. `FailureIr` has no artifact-id field, so
+        // name it in `notes`, which is what a failed verify surfaces.
+        let notes = match outcome.raw_artifact {
+            Some(id) => format!("{notes} (raw log: {id})"),
+            None => notes.to_string(),
+        };
         DispatchResult::Failed(FailureIr {
             node: NodeId::new(), // overwritten by the caller (DP4)
             error_class: class,
             retry: RetryDisposition::NonRetryable,
             diagnostics: outcome.diagnostics, // F2
-            notes: notes.to_string(),
+            notes,
         })
     }
 }
@@ -2352,6 +2568,32 @@ mod tests {
                 .unwrap()
         }
 
+        /// A plain success-output artifact for a node that already
+        /// `Succeeded`, usable as a real `output_ref` (no `pending_pred`
+        /// label, so E3 accepts it as a predecessor slot).
+        async fn put_node_output(&self, dag_id: DagId, node_id: NodeId) -> ArtifactId {
+            let env = crate::dag::NodeOutputEnvelope::new(
+                dag_id,
+                node_id,
+                NodeKind::Edit,
+                1,
+                1,
+                serde_json::json!({"ok": true}),
+            );
+            self.storage
+                .artifacts()
+                .put(ArtifactPut {
+                    bytes: serde_json::to_vec(&env).unwrap(),
+                    kind: ArtifactKind::Blob,
+                    content_type: Some("application/json".into()),
+                    session_id: None,
+                    run_id: None,
+                    labels: serde_json::Map::new(),
+                })
+                .await
+                .unwrap()
+        }
+
         async fn put_pending_placeholder_artifact(&self) -> ArtifactId {
             let bytes =
                 serde_json::to_vec(&serde_json::json!({"schema_version": 1, "pending": true}))
@@ -2484,6 +2726,21 @@ mod tests {
             sched_dir: std::path::PathBuf,
             capabilities: Arc<dyn CapabilityExecutor>,
         ) -> LinearScheduler {
+            self.build_scheduler_with_failing_decisions_and_budget(
+                sched_dir,
+                capabilities,
+                BudgetPolicy::default(),
+            )
+        }
+
+        /// [`Self::build_scheduler_with_failing_decisions`] with an explicit
+        /// ceiling, so the budget stop path can be driven too.
+        fn build_scheduler_with_failing_decisions_and_budget(
+            &self,
+            sched_dir: std::path::PathBuf,
+            capabilities: Arc<dyn CapabilityExecutor>,
+            budget_policy: BudgetPolicy,
+        ) -> LinearScheduler {
             let deps = LinearSchedulerDeps {
                 dags: self.storage.dags(),
                 artifacts: self.storage.artifacts(),
@@ -2498,7 +2755,7 @@ mod tests {
                 decisions: Arc::new(AlwaysFailingDecisionLog),
                 cost_meters: Arc::new(ProcessCostMeterFactory::new()),
                 runtime_cancel: CancellationToken::new(),
-                budget_policy: BudgetPolicy::default(),
+                budget_policy,
                 run_timeout: Duration::from_secs(30),
                 config: {
                     let mut c = SchedConfig::new(sched_dir);
@@ -4459,6 +4716,529 @@ mod tests {
                 .unwrap();
         }
         (gate_id, node_id)
+    }
+
+    // ---- ER4 / ER5 / L14 re-verify (§6.5, ACs 84/90/95) ----
+
+    /// `Edit → verify` plus an optional extra node, all in one generation.
+    /// The DAG is seeded `Running` (a resume, not a fresh start), so R15 is
+    /// not skipped by `performed_c1`.
+    async fn seed_edit_verify_dag(
+        fx: &Fixture,
+        session: SessionId,
+        dag_id: DagId,
+        verify_state: NodeState,
+        extra: Option<(NodeKind, NodeState)>,
+    ) -> (NodeId, NodeId, Option<NodeId>) {
+        let edit = NodeId::new();
+        let verify = NodeId::new();
+        let e_input = fx.put_goal_envelope(dag_id, edit, NodeKind::Edit).await;
+        let v_input = fx
+            .put_goal_envelope(dag_id, verify, NodeKind::VerifyCompile)
+            .await;
+
+        let mut e_node = llm_node(edit, NodeKind::Edit, e_input, adapter_retry());
+        e_node.state = NodeState::Succeeded;
+        // A real output envelope, not `put_pending_placeholder_artifact` —
+        // that one carries `alloy.envelope = pending_pred`, which E3 rejects.
+        e_node.output_ref = Some(fx.put_node_output(dag_id, edit).await);
+        let mut v_node = adapter_node(verify, NodeKind::VerifyCompile, v_input);
+        v_node.state = verify_state;
+
+        let mut nodes = BTreeMap::from([(edit, e_node), (verify, v_node)]);
+        let mut edges = vec![crate::dag::DependencyEdge {
+            from: edit,
+            to: verify,
+            kind: crate::dag::EdgeKind::Data,
+        }];
+        let extra_id = match extra {
+            Some((kind, state)) => {
+                let id = NodeId::new();
+                let input = fx.put_goal_envelope(dag_id, id, kind).await;
+                let mut n = if is_capability_kind(kind) {
+                    llm_node(id, kind, input, adapter_retry())
+                } else {
+                    adapter_node(id, kind, input)
+                };
+                n.state = state;
+                if kind == NodeKind::GateHuman {
+                    n.approval = Some(crate::dag::ApprovalSpec {
+                        gate: GateId::new(),
+                        reason: "review".into(),
+                    });
+                }
+                nodes.insert(id, n);
+                edges.push(crate::dag::DependencyEdge {
+                    from: edit,
+                    to: id,
+                    kind: crate::dag::EdgeKind::Data,
+                });
+                Some(id)
+            }
+            None => None,
+        };
+
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes,
+            edges,
+            state: DagState::Running,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+        (edit, verify, extra_id)
+    }
+
+    /// AC 84: resume with `Edit=Succeeded`, `VerifyCompile=Pending` must
+    /// dispatch the verify next — not ER5-fail, and not stall.
+    #[tokio::test]
+    async fn er4_resume_dispatches_the_pending_verify_next() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let (_edit, verify, _) =
+            seed_edit_verify_dag(&fx, session, dag_id, NodeState::Pending, None).await;
+
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-er4"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            StaticVerify::ok_once(),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded, "{outcome:?}");
+        let after = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(after.nodes[&verify].state, NodeState::Succeeded);
+        fx.close().await;
+    }
+
+    /// AC 95: the blocked node is durably `Failed` via C7 — `Ok(Failed)`,
+    /// never `Err(Invariant)`.
+    #[tokio::test]
+    async fn er4_l14_blocked_ready_node_is_durably_failed_not_an_error() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        // Topology: Edit(Succeeded) → Review(Ready) → VerifyCompile(Pending).
+        // `needs_reverify` holds (the verify is reachable and non-terminal),
+        // and the verify is *not* promotable yet, so `Review` is the only
+        // Ready node — exactly ER4's "the only Ready node is blocked" case.
+        let edit = NodeId::new();
+        let review = NodeId::new();
+        let verify = NodeId::new();
+        let e_input = fx.put_goal_envelope(dag_id, edit, NodeKind::Edit).await;
+        let r_input = fx.put_goal_envelope(dag_id, review, NodeKind::Review).await;
+        let v_input = fx
+            .put_goal_envelope(dag_id, verify, NodeKind::VerifyCompile)
+            .await;
+        let mut e_node = llm_node(edit, NodeKind::Edit, e_input, adapter_retry());
+        e_node.state = NodeState::Succeeded;
+        e_node.output_ref = Some(fx.put_node_output(dag_id, edit).await);
+        let mut r_node = llm_node(review, NodeKind::Review, r_input, adapter_retry());
+        r_node.state = NodeState::Ready;
+        let mut v_node = adapter_node(verify, NodeKind::VerifyCompile, v_input);
+        v_node.state = NodeState::Pending;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(edit, e_node), (review, r_node), (verify, v_node)]),
+            edges: vec![
+                crate::dag::DependencyEdge {
+                    from: edit,
+                    to: review,
+                    kind: crate::dag::EdgeKind::Data,
+                },
+                crate::dag::DependencyEdge {
+                    from: review,
+                    to: verify,
+                    kind: crate::dag::EdgeKind::Data,
+                },
+            ],
+            state: DagState::Running,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched
+            .run(dag_id)
+            .await
+            .expect("ER4 must durable-fail, not return Err");
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(review));
+        assert_eq!(
+            outcome.failure.expect("FO6").notes,
+            "blocked by pending re-verify after edit (ER4)"
+        );
+
+        let after = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.nodes[&review].state,
+            NodeState::Failed,
+            "the block must be durable, not just an in-memory outcome"
+        );
+        fx.close().await;
+    }
+
+    /// AC 84/90: reachable verify terminal-without-success and a `Pending`
+    /// target remaining ⇒ ER5 fires.
+    #[tokio::test]
+    async fn er5_fires_when_a_succeeded_edit_has_only_failed_verifies() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let (_edit, _verify, target) = seed_edit_verify_dag(
+            &fx,
+            session,
+            dag_id,
+            NodeState::Failed,
+            Some((NodeKind::Review, NodeState::Pending)),
+        )
+        .await;
+        let target = target.unwrap();
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(target));
+        let failure = outcome.failure.expect("FO6");
+        assert_eq!(failure.error_class, ErrorClass::Internal);
+        assert_eq!(failure.retry, RetryDisposition::NonRetryable);
+        assert_eq!(
+            failure.notes,
+            "edit succeeded without successful verify after restart"
+        );
+        fx.close().await;
+    }
+
+    /// AC 90: a verify that already succeeded clears `needs_reverify`, so
+    /// ER5 must not fire even though an `Edit` succeeded.
+    #[tokio::test]
+    async fn er5_does_not_fire_when_a_reachable_verify_succeeded() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let (_edit, _verify, review) = seed_edit_verify_dag(
+            &fx,
+            session,
+            dag_id,
+            NodeState::Succeeded,
+            Some((NodeKind::Review, NodeState::Pending)),
+        )
+        .await;
+        let review = review.unwrap();
+
+        let caps = StaticCapability::new(vec![Ok(CapabilityOutcome::Succeeded {
+            payload: serde_json::json!({"ok": true}),
+        })]);
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-er5-ok"),
+            caps as Arc<dyn CapabilityExecutor>,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+
+        // The Review runs normally (not blocked, not ER5-failed).
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded, "{outcome:?}");
+        let after = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(after.nodes[&review].state, NodeState::Succeeded);
+        fx.close().await;
+    }
+
+    /// AC 84: `Edit → GateHuman` with no reachable verify is a verify-less
+    /// DAG — the human is the check, so ER5 must stay out of it.
+    #[tokio::test]
+    async fn er5_does_not_fire_for_a_verify_less_dag() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+
+        let edit = NodeId::new();
+        let gate = NodeId::new();
+        let e_input = fx.put_goal_envelope(dag_id, edit, NodeKind::Edit).await;
+        let g_input = fx
+            .put_goal_envelope(dag_id, gate, NodeKind::GateHuman)
+            .await;
+        let mut e_node = llm_node(edit, NodeKind::Edit, e_input, adapter_retry());
+        e_node.state = NodeState::Succeeded;
+        e_node.output_ref = Some(fx.put_node_output(dag_id, edit).await);
+        let mut g_node = adapter_node(gate, NodeKind::GateHuman, g_input);
+        g_node.state = NodeState::Pending;
+        let gate_id = GateId::new();
+        g_node.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "review".into(),
+        });
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(edit, e_node), (gate, g_node)]),
+            edges: vec![crate::dag::DependencyEdge {
+                from: edit,
+                to: gate,
+                kind: crate::dag::EdgeKind::Data,
+            }],
+            state: DagState::Running,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let run_id = fx.seed_run(session, dag_id, "running").await;
+
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-er5-gate"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            StaticGate::new(fx.plane.clone(), vec![Ok(Approval::Allow)]),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let _ = (run_id, gate_id);
+        let outcome = sched.run(dag_id).await.unwrap();
+
+        assert_ne!(
+            outcome.state,
+            DagState::Failed,
+            "verify-less DAG must not ER5-fail: {outcome:?}"
+        );
+        fx.close().await;
+    }
+
+    /// AC 90: ER5 is resume-only. A DAG still `Pending` at entry gets C1 in
+    /// this same call (`performed_c1`), so ER5 must be skipped entirely.
+    #[tokio::test]
+    async fn er5_is_skipped_when_this_call_performed_c1() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let (_edit, _verify, review) = seed_edit_verify_dag(
+            &fx,
+            session,
+            dag_id,
+            NodeState::Failed,
+            Some((NodeKind::Review, NodeState::Pending)),
+        )
+        .await;
+        let review = review.unwrap();
+        // Rewind the DAG to Pending so this run performs C1.
+        let mut dag = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        dag.state = DagState::Pending;
+        fx.storage.dags().put(&dag).await.unwrap();
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched.run(dag_id).await.unwrap();
+        // Still Failed, but attributed by the ER4 L14 block (the Review is
+        // promotable and blocked), not by ER5's restart note.
+        assert_eq!(outcome.failed_node, Some(review));
+        assert_ne!(
+            outcome.failure.expect("FO6").notes,
+            "edit succeeded without successful verify after restart",
+            "ER5 must not fire on a run that performed C1"
+        );
+        fx.close().await;
+    }
+
+    // ---- R16b: gate left Ready by a C9b→C3 crash ----
+
+    #[tokio::test]
+    async fn resume_with_a_ready_gate_rescans_the_durable_approval() {
+        // C9b committed `WaitingApproval → Ready` + `DagState::Running`, then
+        // the process died before GA4's C3. R16 cannot see it (DAG is no
+        // longer WaitingApproval) and `adopt_running` cannot either (nothing
+        // is Running). Without R16b the loop takes the *first-schedule* gate
+        // path, re-requests approval, and lets the granted one expire.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+
+        let node_id = NodeId::new();
+        let gate_id = GateId::new();
+        let input = fx
+            .put_goal_envelope(dag_id, node_id, NodeKind::GateHuman)
+            .await;
+        let mut node = adapter_node(node_id, NodeKind::GateHuman, input);
+        node.state = NodeState::Ready;
+        node.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "review".into(),
+        });
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(node_id, node)]),
+            edges: vec![],
+            state: DagState::Running,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let run_id = fx.seed_run(session, dag_id, "running").await;
+
+        // The human already approved before the crash.
+        fx.storage
+            .events()
+            .append_session(crate::events::NewSessionEvent {
+                session_id: session,
+                run_id: Some(run_id),
+                type_: crate::events::SessionEventType::ApprovalResolved,
+                payload: serde_json::json!({
+                    "gate_id": gate_id.to_string(),
+                    "decision": "allow",
+                    "generation": 1u64,
+                }),
+            })
+            .await
+            .unwrap();
+
+        // `NeverGate` guarantees the durable scan is what resolves this: if
+        // the code re-registered a waiter instead, the run would hang.
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-r16b"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(NeverGate {
+                plane: fx.plane.clone(),
+            }),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), sched.run(dag_id))
+            .await
+            .expect("must resolve from the durable approval, not wait on a new waiter")
+            .unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded, "{outcome:?}");
+
+        let after = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(after.nodes[&node_id].state, NodeState::Succeeded);
+        assert!(after.nodes[&node_id].output_ref.is_some(), "GA1");
+
+        // And it must not have re-requested approval.
+        let requested = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.type_ == crate::events::SessionEventType::ApprovalRequested)
+            .count();
+        assert_eq!(
+            requested, 0,
+            "a resumed, already-approved gate must not re-request approval"
+        );
+        fx.close().await;
+    }
+
+    // ---- DS4 stall recovery (§5.17) ----
+
+    #[tokio::test]
+    async fn ds4_stalled_dag_is_terminalized_instead_of_wedged() {
+        // A `Pending` node whose only Data predecessor is `Skipped` can never
+        // be promoted. The loop exits naturally with nothing Ready, and the
+        // derive says `Running` — previously an `Err(Invariant)` that left the
+        // blob durably `Running` forever.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+
+        let a = NodeId::new();
+        let b = NodeId::new();
+        let a_input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let b_input = fx.put_goal_envelope(dag_id, b, NodeKind::Review).await;
+        let mut a_node = llm_node(a, NodeKind::Analyze, a_input, adapter_retry());
+        a_node.state = NodeState::Skipped;
+        let mut b_node = llm_node(b, NodeKind::Review, b_input, adapter_retry());
+        b_node.state = NodeState::Pending;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, a_node), (b, b_node)]),
+            edges: vec![crate::dag::DependencyEdge {
+                from: a,
+                to: b,
+                kind: crate::dag::EdgeKind::Data,
+            }],
+            state: DagState::Running,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched
+            .run(dag_id)
+            .await
+            .expect("DS4 must terminalize, not Err");
+        assert_eq!(outcome.state, DagState::Failed, "D8: all-skipped ⇒ Failed");
+        assert_eq!(outcome.failed_node, None, "FO4(i): a stall attributes none");
+        assert!(outcome.failure.is_none());
+
+        let after = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.state,
+            DagState::Failed,
+            "the terminal must be durable"
+        );
+        assert_eq!(after.nodes[&b].state, NodeState::Skipped);
+        fx.close().await;
+    }
+
+    // ---- BE4 on the budget stop path (AC 82) ----
+
+    #[tokio::test]
+    async fn be4_pre_cas_budget_decision_failure_aborts_the_stop_checkpoint() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        // BG3: `max_usd_per_run = 0` exhausts the budget before dispatch, so
+        // L6 takes the stop path and records a pre-C7 Budget decision.
+        let policy = BudgetPolicy {
+            max_usd_per_run: 0.0,
+            ..BudgetPolicy::default()
+        };
+        let sched = fx.build_scheduler_with_failing_decisions_and_budget(
+            fx._dir.path().join("s-be4b"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            policy,
+        );
+
+        let err = sched.run(dag_id).await.unwrap_err();
+        assert!(
+            matches!(err, SchedError::Store(ref m) if m.contains("decision record failed")),
+            "BE4: a pre-CAS ObsError must surface as Store, got {err:?}"
+        );
+        let after = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_ne!(
+            after.nodes[&a].state,
+            NodeState::Failed,
+            "C7 must not proceed when its Budget record could not be written"
+        );
+        fx.close().await;
     }
 
     // ---- Aggregate fold ----
