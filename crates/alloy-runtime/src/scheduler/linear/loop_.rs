@@ -467,17 +467,35 @@ impl LinearScheduler {
     }
 
     /// R9: the DAG is already durably terminal; assemble the outcome from
-    /// the persisted blob without any CAS (§5.18 FO1-FO6, simplified: P4
-    /// handles the `Succeeded`/plain-`Cancelled` cases in full; a durable
-    /// `Failed` blob's `failed_node` is resolved via FN1 over the node map;
-    /// `failure` is recovered per FO1/FO2/FO3 when `failed_node` is `Some(_)`
-    /// (FO6) — `None` stays `None` (FO4: D8 all-`Skipped` / RC4-RC6 bare-CAS
-    /// reconcile never had a `Failed` node to begin with).
+    /// the persisted blob without any state CAS (§5.18 FO1-FO6).
+    ///
+    /// `failed_node` follows the §5.18 ladder in order:
+    /// - **FN1** — the lowest `NodeId` in `NodeState::Failed`.
+    /// - **FN2** — otherwise the lowest `Cancelled` node carrying a durable
+    ///   `ErrorClass::Approval` failure. This is the gate deny/expiry shape
+    ///   (C9c) and the gate-origin `reconcile_terminal_run` shape (RC4/RC5):
+    ///   both leave the *gate* `Cancelled`, never `Failed`, so FN1 alone
+    ///   reports `failed_node: None` on every resumed gate-denied DAG and
+    ///   breaks the FO4a contract RC4 depends on.
+    /// - **FN3** — otherwise `None` (FO4(i) D8 all-`Skipped`, FO4(ii)
+    ///   RC4/RC6 bare-CAS reconcile).
+    ///
+    /// Before FN2 selection this applies **RF7** to every `GateHuman` node
+    /// sitting in `Cancelled` (R9's normative "apply RF7 before FO
+    /// assembly", AC 92): a gate CAS that committed but lost its `NodeState`
+    /// event, or whose `failure_ir` artifact is gone, would otherwise be
+    /// invisible to FN2 and degrade to FO3's synthetic `Internal` — which
+    /// FN2 rejects, losing the attribution entirely. RF7 is idempotent and
+    /// writes nothing when the event and artifact are both intact.
+    ///
+    /// `failure` is then recovered per FO1/FO2/FO3 from that node's own
+    /// terminal transition, so FO6 (`Failed` + `Some(node)` ⇒ `Some(failure)`)
+    /// holds on both ladders.
     async fn assemble_already_terminal_outcome(
         &self,
         checkpoint: &Checkpoint,
         dag: &TaskDag,
-        _run_id: RunId,
+        run_id: RunId,
     ) -> Result<DagOutcome, SchedError> {
         match dag.state {
             DagState::Succeeded => Ok(DagOutcome {
@@ -487,6 +505,7 @@ impl LinearScheduler {
                 failed_node: None,
                 failure: None,
             }),
+            // FO5: a plain cancel never attributes a node.
             DagState::Cancelled => Ok(DagOutcome {
                 dag_id: dag.id,
                 generation: dag.generation,
@@ -495,20 +514,37 @@ impl LinearScheduler {
                 failure: None,
             }),
             DagState::Failed => {
-                // FN1: lowest NodeId in Failed.
-                let failed_node = dag
+                let ctx = CheckpointCtx {
+                    session_id: dag.session_id,
+                    run_id: Some(run_id),
+                };
+                // `dag.nodes` is a BTreeMap, so iteration is already
+                // ascending `NodeId` — "lowest" is the first match.
+                let fn1 = dag
                     .nodes
                     .iter()
                     .find(|(_, n)| n.state == NodeState::Failed)
                     .map(|(id, _)| *id);
-                let failure = match failed_node {
-                    Some(node_id) => Some(
-                        checkpoint
-                            .recover_failure_ir(dag.id, dag.session_id, node_id, dag.generation)
-                            .await?,
-                    ),
-                    None => None, // FO4(i)/(ii): nothing to recover.
+
+                let (failed_node, failure) = match fn1 {
+                    Some(node_id) => {
+                        let failure = checkpoint
+                            .recover_failure_ir(
+                                dag.id,
+                                ctx,
+                                node_id,
+                                dag.generation,
+                                NodeState::Failed,
+                            )
+                            .await?;
+                        (Some(node_id), Some(failure))
+                    }
+                    None => self
+                        .fn2_approval_attribution(checkpoint, dag, ctx)
+                        .await?
+                        .map_or((None, None), |(id, f)| (Some(id), Some(f))),
                 };
+
                 Ok(DagOutcome {
                     dag_id: dag.id,
                     generation: dag.generation,
@@ -521,6 +557,45 @@ impl LinearScheduler {
                 "assemble_already_terminal_outcome called for non-terminal state {other:?}"
             ))),
         }
+    }
+
+    /// FN2 (§5.18): the lowest `Cancelled` node whose durable failure is an
+    /// `ErrorClass::Approval` one, with RF7 applied first to any `GateHuman`
+    /// candidate so a lost post-CAS event still attributes.
+    ///
+    /// Recovering the failure *is* the test: FO1/FO2 report `Approval` only
+    /// when a durable record says so, and FO3's eventless floor is
+    /// `Internal`, which correctly excludes a node cancelled for any other
+    /// reason from FN2.
+    async fn fn2_approval_attribution(
+        &self,
+        checkpoint: &Checkpoint,
+        dag: &TaskDag,
+        ctx: CheckpointCtx,
+    ) -> Result<Option<(NodeId, FailureIr)>, SchedError> {
+        for (id, node) in &dag.nodes {
+            if node.state != NodeState::Cancelled {
+                continue;
+            }
+            if node.kind == NodeKind::GateHuman {
+                // RF7 before selection. Best-effort: a repair that cannot
+                // write must not stop R9 from returning the outcome it can
+                // still assemble from the blob (FO3's "MUST NOT block").
+                if let Err(e) = checkpoint
+                    .repair_gate_terminal(dag.id, ctx, *id, dag.generation)
+                    .await
+                {
+                    tracing::warn!(node_id = %id, error = %e, "RF7 gate repair failed at R9");
+                }
+            }
+            let failure = checkpoint
+                .recover_failure_ir(dag.id, ctx, *id, dag.generation, NodeState::Cancelled)
+                .await?;
+            if failure.error_class == ErrorClass::Approval {
+                return Ok(Some((*id, failure)));
+            }
+        }
+        Ok(None)
     }
 
     /// R13 (§5.3.2): adopt a node durably `Running` on entry (crash
@@ -552,7 +627,7 @@ impl LinearScheduler {
         }
         let attempts_started = rc
             .checkpoint
-            .rebuild_attempts_started(dag.id, rc.session.id, node_id, dag.generation, true)
+            .rebuild_attempts_started(dag.id, rc.ctx, node_id, dag.generation, true)
             .await?;
         let failure = FailureIr {
             node: node_id,
@@ -715,7 +790,7 @@ impl LinearScheduler {
 
         let attempts_started = rc
             .checkpoint
-            .rebuild_attempts_started(dag.id, rc.session.id, node_id, dag.generation, false)
+            .rebuild_attempts_started(dag.id, rc.ctx, node_id, dag.generation, false)
             .await?;
         let attempt = attempts_started + 1;
 
@@ -2601,6 +2676,198 @@ mod tests {
         assert_eq!(failure.error_class, ErrorClass::Internal);
         assert_eq!(failure.retry, RetryDisposition::NonRetryable);
         assert_eq!(failure.notes, "failure detail unavailable; event missing");
+        fx.close().await;
+    }
+
+    // ---- FN2: gate deny/expiry attribution on R9 (§5.18, AC 66/92) ----
+
+    /// Gate deny/expiry (C9c) and gate-origin RC4 both leave the gate node
+    /// `Cancelled`, never `Failed`. `seeded` controls whether the C9c
+    /// `NodeState` event survived the crash.
+    async fn seed_gate_denied_dag(
+        fx: &Fixture,
+        session: SessionId,
+        dag_id: DagId,
+        seed_event: bool,
+    ) -> (NodeId, NodeId) {
+        let analyze = NodeId::new();
+        let gate = NodeId::new();
+        let a_input = fx
+            .put_goal_envelope(dag_id, analyze, NodeKind::Analyze)
+            .await;
+        let g_input = fx
+            .put_goal_envelope(dag_id, gate, NodeKind::GateHuman)
+            .await;
+        let mut a_node = llm_node(analyze, NodeKind::Analyze, a_input, adapter_retry());
+        // Every other non-terminal node is Skipped by C9c, never Failed.
+        a_node.state = NodeState::Skipped;
+        let mut g_node = adapter_node(gate, NodeKind::GateHuman, g_input);
+        g_node.state = NodeState::Cancelled;
+        g_node.approval = Some(crate::dag::ApprovalSpec {
+            gate: GateId::new(),
+            reason: "review the diff".into(),
+        });
+
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(analyze, a_node), (gate, g_node)]),
+            edges: vec![],
+            state: DagState::Failed,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "failed").await;
+
+        if seed_event {
+            let failure = FailureIr {
+                node: gate,
+                error_class: ErrorClass::Approval,
+                retry: RetryDisposition::NonRetryable,
+                diagnostics: vec![],
+                notes: "approval denied".into(),
+            };
+            let artifact = fx
+                .storage
+                .artifacts()
+                .put(crate::storage::ArtifactPut {
+                    bytes: serde_json::to_vec(&failure).unwrap(),
+                    kind: crate::storage::ArtifactKind::Blob,
+                    content_type: Some("application/json".into()),
+                    session_id: Some(session),
+                    run_id: None,
+                    labels: serde_json::Map::new(),
+                })
+                .await
+                .unwrap();
+            fx.storage
+                .events()
+                .append_session(crate::events::NewSessionEvent {
+                    session_id: session,
+                    run_id: None,
+                    type_: crate::events::SessionEventType::NodeState,
+                    payload: serde_json::json!({
+                        "node_id": gate.to_string(),
+                        "from": "waiting_approval",
+                        "to": "cancelled",
+                        "generation": 1u64,
+                        "decision": "deny",
+                        "failure_ref": artifact.to_string(),
+                        "error_class": "approval",
+                        "retry": "non_retryable",
+                    }),
+                })
+                .await
+                .unwrap();
+        }
+        (analyze, gate)
+    }
+
+    #[tokio::test]
+    async fn fn2_r9_attributes_a_resumed_gate_denied_dag_to_the_cancelled_gate() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let (_analyze, gate) = seed_gate_denied_dag(&fx, session, dag_id, true).await;
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched.run(dag_id).await.unwrap();
+
+        assert_eq!(outcome.state, DagState::Failed);
+        // FN1 finds nothing (no node is `Failed`); FN2 must attribute the gate.
+        assert_eq!(outcome.failed_node, Some(gate));
+        let failure = outcome.failure.expect("FO6: Failed + Some(node) ⇒ Some");
+        assert_eq!(failure.error_class, ErrorClass::Approval);
+        assert_eq!(failure.notes, "approval denied");
+        fx.close().await;
+    }
+
+    /// AC 92: the gate CAS committed but its `NodeState` event was lost, so
+    /// nothing durable says "approval". RF7 must synthesize it *before* FN2
+    /// selection, or the attribution is lost entirely.
+    #[tokio::test]
+    async fn fn2_r9_rf7_repairs_a_lost_gate_event_before_attributing() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let (_analyze, gate) = seed_gate_denied_dag(&fx, session, dag_id, false).await;
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched.run(dag_id).await.unwrap();
+
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(gate));
+        let failure = outcome.failure.expect("FO6");
+        assert_eq!(failure.error_class, ErrorClass::Approval);
+        assert_eq!(failure.notes, "repaired after crash");
+
+        // RF7 is a durable repair: the event it synthesized must be there.
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 50)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.type_ == crate::events::SessionEventType::NodeState
+                    && e.payload["node_id"] == gate.to_string()
+                    && e.payload["to"] == "cancelled"
+                    && e.payload["repaired"] == true
+            }),
+            "RF7 must append the lost cancelled event"
+        );
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn fn1_r9_wins_over_fn2_when_both_shapes_are_present() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let (analyze, gate) = seed_gate_denied_dag(&fx, session, dag_id, true).await;
+
+        // Promote the non-gate node to `Failed`: FN1 must now win outright,
+        // whichever NodeId sorts lower.
+        let mut dag = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        dag.nodes.get_mut(&analyze).unwrap().state = NodeState::Failed;
+        fx.storage.dags().put(&dag).await.unwrap();
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.failed_node, Some(analyze));
+        assert_ne!(outcome.failed_node, Some(gate));
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn fn3_r9_does_not_attribute_a_cancelled_node_without_an_approval_failure() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+
+        // A `Cancelled` non-gate node on a `Failed` DAG with no durable
+        // Approval failure: FN2 must not claim it (FO3's floor is `Internal`).
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.state = NodeState::Cancelled;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Failed,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "failed").await;
+
+        let sched = reconcile_scheduler(&fx);
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, None, "FN3");
+        assert!(outcome.failure.is_none());
         fx.close().await;
     }
 

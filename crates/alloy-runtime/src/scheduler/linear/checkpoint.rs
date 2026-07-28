@@ -941,16 +941,20 @@ impl Checkpoint {
     /// §5.3.1: rebuild `attempts_started` for `node_id` at `generation` from
     /// the session event log (`TaskNode` carries no attempt field).
     /// `durably_running` selects the `Running`-only floor rule.
+    ///
+    /// `ctx` supplies the full §5.3.1 scan key `(session, run, node)` — the
+    /// `run` half matters because Appendix F permits several run rows per
+    /// DAG, so a prior run's attempts must not inflate this run's counter.
     pub(crate) async fn rebuild_attempts_started(
         &self,
         dag_id: DagId,
-        session_id: SessionId,
+        ctx: CheckpointCtx,
         node_id: NodeId,
         generation: u64,
         durably_running: bool,
     ) -> Result<u32, SchedError> {
         let events = self
-            .list_node_state_events(dag_id, session_id, node_id, generation)
+            .list_node_state_events(dag_id, ctx, node_id, generation)
             .await?;
         let mut max_attempt: u32 = 0;
         let mut max_next: u32 = 0;
@@ -970,15 +974,23 @@ impl Checkpoint {
         }
     }
 
-    /// Page every `NodeState` event for `(session, node)` filtered to
-    /// `payload.generation == generation` (§5.3.1's normative scan rule).
+    /// Page every `NodeState` event for the §5.3.1 scan key
+    /// `(session, run, node)` filtered to `payload.generation == generation`.
+    ///
+    /// **Run matching (§5.3.1).** An event belongs to this scan when its
+    /// `run_id` is either this run's or `None`. `None` means the writer was
+    /// not run-attributed at all — `reconcile_terminal_run` (A2: not a
+    /// scheduler-aware caller) writes its RC4 node states that way, and R9
+    /// still has to see them for FN1/FN2/AC 89/AC 92. An unattributed event
+    /// cannot belong to a *different* run, so admitting it does not reopen
+    /// the cross-run bleed this key exists to close.
     ///
     /// `pub(super)`: also used by [`Self::recover_failure_ir`]'s FO1/FO2 scan
     /// from `loop_.rs`'s R9 fast path.
     pub(super) async fn list_node_state_events(
         &self,
         dag_id: DagId,
-        session_id: SessionId,
+        ctx: CheckpointCtx,
         node_id: NodeId,
         generation: u64,
     ) -> Result<Vec<crate::events::SessionEvent>, SchedError> {
@@ -988,7 +1000,7 @@ impl Checkpoint {
         loop {
             let page = self
                 .events
-                .list_session_events(session_id, after, MAX_EVENTS_PAGE)
+                .list_session_events(ctx.session_id, after, MAX_EVENTS_PAGE)
                 .await
                 .map_err(|e| map_store_error(e, dag_id))?;
             if page.is_empty() {
@@ -998,6 +1010,9 @@ impl Checkpoint {
             for ev in page {
                 after = Some(ev.seq);
                 if ev.type_ != SessionEventType::NodeState {
+                    continue;
+                }
+                if !run_matches(ev.run_id, ctx.run_id) {
                     continue;
                 }
                 let matches_node =
@@ -1016,14 +1031,22 @@ impl Checkpoint {
     }
 
     /// FO1/FO2/FO3 (§5.18): recover the `FailureIr` for a node the caller
-    /// has already confirmed is durably `NodeState::Failed`, for the R9
-    /// already-terminal fast path (`assemble_already_terminal_outcome`) —
-    /// the in-memory `FailureIr` a live `terminal_failed`/`c9c_gate_deny`
-    /// call would have doesn't exist across a process restart, so this
-    /// reconstructs it from what's durable. Read-only: no checkpoint/CAS.
+    /// has already confirmed reached the durable terminal state `terminal`,
+    /// for the R9 already-terminal fast path
+    /// (`assemble_already_terminal_outcome`) — the in-memory `FailureIr` a
+    /// live `terminal_failed`/`c9c_gate_deny` call would have doesn't exist
+    /// across a process restart, so this reconstructs it from what's
+    /// durable. Read-only: no checkpoint/CAS.
+    ///
+    /// `terminal` selects which transition to look for, because the two
+    /// attributable shapes differ: FN1 nodes land in `NodeState::Failed`
+    /// (C7), while FN2 gate deny/expiry lands in `NodeState::Cancelled`
+    /// (C9c / RC4 gate-origin) carrying the same `failure_ref` /
+    /// `error_class` / `retry` fields. Matching only `to: "failed"` would
+    /// silently drop every FN2 attribution to FO3's synthetic `Internal`.
     ///
     /// Ladder, each rung only reached if the one above fails:
-    /// 1. FO1 — the `failure_ref` artifact named on the failing `NodeState`
+    /// 1. FO1 — the `failure_ref` artifact named on the terminal `NodeState`
     ///    event, parsed back into a `FailureIr`.
     /// 2. FO2 — no artifact (missing/corrupt/unparseable): degrade to a
     ///    `FailureIr` built from that same event's `error_class`/`retry`
@@ -1033,20 +1056,23 @@ impl Checkpoint {
     pub(super) async fn recover_failure_ir(
         &self,
         dag_id: DagId,
-        session_id: SessionId,
+        ctx: CheckpointCtx,
         node_id: NodeId,
         generation: u64,
+        terminal: NodeState,
     ) -> Result<FailureIr, SchedError> {
         let events = self
-            .list_node_state_events(dag_id, session_id, node_id, generation)
+            .list_node_state_events(dag_id, ctx, node_id, generation)
             .await?;
         // Most-recent match wins: a node that failed, retried (C8's own
         // best-effort `to:failed` waypoint), and failed again durably has
         // more than one `to:failed` event for the same generation, and only
         // the last one is the terminal one.
-        let Some(ev) = events.iter().rev().find(|ev| {
-            ev.payload.get("to").and_then(Value::as_str) == Some(state_str(NodeState::Failed))
-        }) else {
+        let Some(ev) = events
+            .iter()
+            .rev()
+            .find(|ev| ev.payload.get("to").and_then(Value::as_str) == Some(state_str(terminal)))
+        else {
             // FO3 floor: no matching event survived at all.
             return Ok(FailureIr {
                 node: node_id,
@@ -1100,11 +1126,10 @@ impl Checkpoint {
     /// `Ok(false)` is returned; otherwise a `repaired: true` event is
     /// appended and `Ok(true)` is returned (and `event_repairs` bumped).
     ///
-    /// Exercised directly by its own unit tests (crash-window simulation);
-    /// not yet called from `loop_.rs` — wiring crash-repair-on-resume into
-    /// R4b/R11's adoption path is not part of P4's charter.
+    /// Wired into R9's already-terminal path (`loop_.rs`) via
+    /// [`Self::repair_gate_terminal`], and exercised directly by its own
+    /// unit tests (crash-window simulation).
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
     pub(crate) async fn repair_node_state(
         &self,
         dag_id: DagId,
@@ -1115,9 +1140,10 @@ impl Checkpoint {
         generation: u64,
         attempt: Option<u32>,
         next_attempt: Option<u32>,
+        failure: Option<RepairedFailure>,
     ) -> Result<bool, SchedError> {
         let existing = self
-            .list_node_state_events(dag_id, ctx.session_id, node_id, generation)
+            .list_node_state_events(dag_id, ctx, node_id, generation)
             .await?;
         // RF5 dedup key: (node, generation, to, attempt) when attempt is
         // present, (node, generation, to, next_attempt) when next_attempt is
@@ -1146,6 +1172,23 @@ impl Checkpoint {
         }
         if let Some(n) = next_attempt {
             extra.insert("next_attempt".into(), Value::from(n));
+        }
+        // RF7: a repaired terminal event MUST carry the same failure fields
+        // the lost original did, or FO1/FO2 recover nothing from it and FN2
+        // silently degrades to FO3's synthetic `Internal`.
+        if let Some(f) = failure {
+            extra.insert(
+                "failure_ref".into(),
+                Value::String(f.failure_ref.to_string()),
+            );
+            extra.insert(
+                "error_class".into(),
+                Value::String(error_class_str(f.error_class).to_string()),
+            );
+            extra.insert(
+                "retry".into(),
+                Value::String(retry_disposition_str(f.retry).to_string()),
+            );
         }
         extra.insert("repaired".into(), Value::Bool(true));
         let ev = Self::node_state_event(ctx, node_id, from, to, generation, extra);
@@ -1226,42 +1269,67 @@ impl Checkpoint {
     /// `failure_ir` (`notes: "repaired after crash"`) so FN2/FO2/FO6 hold.
     /// Returns the `failure_ir` artifact id in use (existing or synthesized).
     ///
-    /// Not yet wired into `loop_.rs` — see [`Self::repair_node_state`]'s doc.
-    #[allow(dead_code)]
+    /// Idempotent, and cheap when nothing is broken: it resolves the durable
+    /// `failure_ref` itself (rather than trusting a caller-supplied one) and
+    /// returns without writing when the `Cancelled` event and its artifact
+    /// are both already intact. Called from R9 before FN2 selection
+    /// (`loop_.rs::assemble_already_terminal_outcome`, AC 92) and from the
+    /// gate-origin reconcile path.
     pub(crate) async fn repair_gate_terminal(
         &self,
         dag_id: DagId,
         ctx: CheckpointCtx,
         node_id: NodeId,
         generation: u64,
-        decision: GateDecision,
-        existing_failure_ref: Option<ArtifactId>,
     ) -> Result<ArtifactId, SchedError> {
-        let failure_ref = match existing_failure_ref {
-            Some(id) => id,
-            None => {
-                let synthetic = FailureIr {
-                    node: node_id,
-                    error_class: ErrorClass::Approval,
-                    retry: RetryDisposition::NonRetryable,
-                    diagnostics: vec![],
-                    notes: "repaired after crash".into(),
-                };
-                let bytes = serde_json::to_vec(&synthetic)
-                    .map_err(|e| SchedError::Internal(format!("encode failure_ir: {e}")))?;
-                self.put_artifact(
-                    dag_id,
-                    Some(node_id),
-                    ctx,
-                    generation,
-                    "failure_ir",
-                    ArtifactKind::Blob,
-                    Some("application/json"),
-                    bytes,
-                )
-                .await?
-            }
+        // What survived the crash? The `Cancelled` event may be missing
+        // entirely, or present but with an unresolvable `failure_ref`.
+        let events = self
+            .list_node_state_events(dag_id, ctx, node_id, generation)
+            .await?;
+        let cancelled_ev = events.iter().rev().find(|ev| {
+            ev.payload.get("to").and_then(Value::as_str) == Some(state_str(NodeState::Cancelled))
+        });
+        let durable_ref = match cancelled_ev {
+            Some(ev) => ev
+                .payload
+                .get("failure_ref")
+                .and_then(Value::as_str)
+                .and_then(|s| ArtifactId::parse(s).ok()),
+            None => None,
         };
+        if let Some(id) = durable_ref {
+            // Only intact if the artifact itself still resolves (FO1).
+            if self.artifacts.get(id).await.is_ok() {
+                return Ok(id);
+            }
+        }
+
+        let synthetic = FailureIr {
+            node: node_id,
+            error_class: ErrorClass::Approval,
+            retry: RetryDisposition::NonRetryable,
+            diagnostics: vec![],
+            notes: "repaired after crash".into(),
+        };
+        let bytes = serde_json::to_vec(&synthetic)
+            .map_err(|e| SchedError::Internal(format!("encode failure_ir: {e}")))?;
+        let failure_ref = self
+            .put_artifact(
+                dag_id,
+                Some(node_id),
+                ctx,
+                generation,
+                "failure_ir",
+                ArtifactKind::Blob,
+                Some("application/json"),
+                bytes,
+            )
+            .await?;
+        // When the event is missing this appends it carrying the synthetic
+        // failure fields (so FO1 resolves); when it already exists the RF5
+        // dedup key short-circuits and FO2 reads the surviving event's own
+        // `error_class`, which is what FN2 needs either way.
         self.repair_node_state(
             dag_id,
             ctx,
@@ -1271,10 +1339,37 @@ impl Checkpoint {
             generation,
             None,
             None,
+            Some(RepairedFailure {
+                failure_ref,
+                error_class: ErrorClass::Approval,
+                retry: RetryDisposition::NonRetryable,
+            }),
         )
         .await?;
-        let _ = decision; // decision is carried by the (possibly pre-existing) NodeState event; RF7 only fills gaps.
         Ok(failure_ref)
+    }
+}
+
+/// Durable failure fields an RF7-repaired `NodeState` event must carry so
+/// FO1/FO2 can recover a structured failure from it (§5.18).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RepairedFailure {
+    /// Artifact holding the serialized [`FailureIr`].
+    pub failure_ref: ArtifactId,
+    /// Class the repaired event reports.
+    pub error_class: ErrorClass,
+    /// Retry disposition the repaired event reports.
+    pub retry: RetryDisposition,
+}
+
+/// §5.3.1 / §5.7.2 run half of the scan key: an event belongs to `want` when
+/// it is attributed to that run, or to no run at all (see
+/// [`Checkpoint::list_node_state_events`] for why unattributed events count).
+pub(super) fn run_matches(event_run: Option<RunId>, want: Option<RunId>) -> bool {
+    match (event_run, want) {
+        (None, _) => true,
+        (Some(_), None) => true,
+        (Some(a), Some(b)) => a == b,
     }
 }
 
@@ -1911,7 +2006,7 @@ mod tests {
         // still floor at 1 (first C3 lost its event).
         let attempts = fx
             .checkpoint
-            .rebuild_attempts_started(dag.id, session, a, dag.generation, true)
+            .rebuild_attempts_started(dag.id, fx.ctx(session), a, dag.generation, true)
             .await
             .unwrap();
         assert_eq!(attempts, 1);
@@ -1942,7 +2037,7 @@ mod tests {
 
         let attempts = fx
             .checkpoint
-            .rebuild_attempts_started(dag.id, session, a, dag.generation, true)
+            .rebuild_attempts_started(dag.id, ctx, a, dag.generation, true)
             .await
             .unwrap();
         assert_eq!(attempts, 2);
@@ -1971,7 +2066,7 @@ mod tests {
 
         let attempts = fx
             .checkpoint
-            .rebuild_attempts_started(dag.id, session, a, dag.generation, false)
+            .rebuild_attempts_started(dag.id, ctx, a, dag.generation, false)
             .await
             .unwrap();
         assert_eq!(attempts, 0);
@@ -2001,6 +2096,7 @@ mod tests {
                 dag.generation,
                 Some(1),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2017,6 +2113,7 @@ mod tests {
                 NodeState::Running,
                 dag.generation,
                 Some(1),
+                None,
                 None,
             )
             .await
@@ -2057,6 +2154,7 @@ mod tests {
                 dag.generation,
                 Some(1),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2074,6 +2172,7 @@ mod tests {
                 NodeState::Running,
                 dag.generation,
                 Some(2),
+                None,
                 None,
             )
             .await
@@ -2149,14 +2248,7 @@ mod tests {
 
         let failure_ref = fx
             .checkpoint
-            .repair_gate_terminal(
-                dag.id,
-                ctx,
-                node_id,
-                dag.generation,
-                GateDecision::Expired,
-                None,
-            )
+            .repair_gate_terminal(dag.id, ctx, node_id, dag.generation)
             .await
             .unwrap();
 
@@ -2171,9 +2263,42 @@ mod tests {
             .list_session_events(session, None, 10)
             .await
             .unwrap();
-        assert!(events
+        let repaired = events
             .iter()
-            .any(|e| e.type_ == SessionEventType::NodeState && e.payload["to"] == "cancelled"));
+            .find(|e| e.type_ == SessionEventType::NodeState && e.payload["to"] == "cancelled")
+            .expect("RF7 must append the lost cancelled event");
+        // The repaired event has to carry the failure fields too, or FO1/FO2
+        // recover nothing from it and FN2 degrades to FO3's `Internal`.
+        assert_eq!(repaired.payload["failure_ref"], failure_ref.to_string());
+        assert_eq!(repaired.payload["error_class"], "approval");
+        assert_eq!(repaired.payload["retry"], "non_retryable");
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn repair_gate_terminal_is_idempotent_across_repeated_resumes() {
+        let fx = Fixture::new().await;
+        let session = SessionId::new();
+        let gate = GateId::new();
+        let node_id = NodeId::new();
+        let dag = seeded_dag(&fx, session, vec![gate_node(node_id, gate)]).await;
+        let ctx = fx.ctx(session);
+
+        let first = fx
+            .checkpoint
+            .repair_gate_terminal(dag.id, ctx, node_id, dag.generation)
+            .await
+            .unwrap();
+        let second = fx
+            .checkpoint
+            .repair_gate_terminal(dag.id, ctx, node_id, dag.generation)
+            .await
+            .unwrap();
+        // Second resume must resolve the first repair's artifact, not mint a
+        // fresh one and re-append: R9 calls this on every already-terminal
+        // `run()`, which for a polled CLI is unbounded.
+        assert_eq!(first, second);
+        assert_eq!(fx.metrics.snapshot().event_repairs, 1);
         fx.close().await;
     }
 
@@ -2207,20 +2332,93 @@ mod tests {
             )
             .await
             .unwrap();
+        // Nothing was lost: the C9c event survived and names the artifact.
+        fx.storage
+            .events()
+            .append_session(NewSessionEvent {
+                session_id: session,
+                run_id: None,
+                type_: SessionEventType::NodeState,
+                payload: serde_json::json!({
+                    "node_id": node_id.to_string(),
+                    "from": "waiting_approval",
+                    "to": "cancelled",
+                    "generation": dag.generation,
+                    "failure_ref": existing_ref.to_string(),
+                    "error_class": "approval",
+                    "retry": "non_retryable",
+                }),
+            })
+            .await
+            .unwrap();
 
         let returned = fx
             .checkpoint
-            .repair_gate_terminal(
-                dag.id,
-                ctx,
-                node_id,
-                dag.generation,
-                GateDecision::Deny,
-                Some(existing_ref),
-            )
+            .repair_gate_terminal(dag.id, ctx, node_id, dag.generation)
             .await
             .unwrap();
         assert_eq!(returned, existing_ref);
+        assert_eq!(
+            fx.metrics.snapshot().event_repairs,
+            0,
+            "an intact gate terminal must not be repaired"
+        );
+        fx.close().await;
+    }
+
+    // ---- §5.3.1 run half of the scan key ----
+
+    #[test]
+    fn run_matches_admits_same_run_and_unattributed_only() {
+        let a = RunId::new();
+        let b = RunId::new();
+        assert!(run_matches(Some(a), Some(a)));
+        assert!(!run_matches(Some(b), Some(a)), "cross-run must not match");
+        // Unattributed writers (reconcile, A2) stay visible to every run.
+        assert!(run_matches(None, Some(a)));
+        assert!(run_matches(Some(a), None));
+    }
+
+    #[tokio::test]
+    async fn attempt_rebuild_ignores_another_runs_events() {
+        let fx = Fixture::new().await;
+        let session = SessionId::new();
+        let a = NodeId::new();
+        let dag = seeded_dag(&fx, session, vec![plain_node(a, NodeState::Ready)]).await;
+        let mine = RunId::new();
+        let theirs = RunId::new();
+
+        // A different run of the same DAG+generation reached attempt 3.
+        fx.storage
+            .events()
+            .append_session(NewSessionEvent {
+                session_id: session,
+                run_id: Some(theirs),
+                type_: SessionEventType::NodeState,
+                payload: serde_json::json!({
+                    "node_id": a.to_string(),
+                    "from": "ready",
+                    "to": "running",
+                    "generation": dag.generation,
+                    "attempt": 3u64,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let ctx = CheckpointCtx {
+            session_id: session,
+            run_id: Some(mine),
+        };
+        let attempts = fx
+            .checkpoint
+            .rebuild_attempts_started(dag.id, ctx, a, dag.generation, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts, 0,
+            "another run's attempts must not burn this run's retry budget"
+        );
         fx.close().await;
     }
 }

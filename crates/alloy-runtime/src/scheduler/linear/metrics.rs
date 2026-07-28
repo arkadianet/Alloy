@@ -96,9 +96,10 @@ impl SchedulerCounters {
 
     /// An RF3/RF6/RF7 crash-repair event was appended (§5.3.3).
     ///
-    /// `repair_node_state`/`repair_gate_terminal` are not yet called from
-    /// `loop_.rs` (see their doc comments) — `repair_approval_requested` is,
-    /// as of P7's `gate.rs`, so this is reachable in production.
+    /// All three repair paths are reachable in production:
+    /// `repair_approval_requested` from `gate.rs`'s GR3, and
+    /// `repair_gate_terminal` (which calls `repair_node_state`) from R9's
+    /// FN2 selection in `loop_.rs`.
     pub(super) fn inc_event_repairs(&self) {
         self.event_repairs.fetch_add(1, Ordering::Relaxed);
     }

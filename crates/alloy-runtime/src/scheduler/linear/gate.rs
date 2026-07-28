@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::checkpoint::{map_store_error, GateDecision};
+use super::checkpoint::{map_store_error, run_matches, CheckpointCtx, GateDecision};
 use super::loop_::{non_terminal_except, RunCtx, StepOutcome};
 use super::LinearScheduler;
 use crate::adapters::{NodeExecContext, NodeExecRef};
@@ -24,7 +24,7 @@ use crate::scheduler::DagState;
 use crate::session::{RunControlState, MAX_EVENTS_PAGE};
 use crate::storage::EventStore;
 use crate::types::diagnostic::{ErrorClass, FailureIr, RetryDisposition};
-use crate::types::ids::{DagId, GateId, NodeId, SessionId};
+use crate::types::ids::{DagId, GateId, NodeId};
 
 /// `EXPIRE_RETRY_MAX` (§5.7.8): total `expire_gate` attempts, including the
 /// first, when it keeps returning an unrecognized `Err(other)`.
@@ -132,7 +132,7 @@ impl LinearScheduler {
 
         // §5.7.2: resume always scans for a durable resolution first.
         if let Some(resolution) = self
-            .scan_gate_resolution(dag.id, rc.ctx.session_id, gate_id, dag.generation)
+            .scan_gate_resolution(dag.id, rc.ctx, gate_id, dag.generation)
             .await?
         {
             return self
@@ -199,7 +199,7 @@ impl LinearScheduler {
                 // in-memory `Approval` value, regardless of which way it went.
                 Ok(Ok(_approval)) => {
                     match self
-                        .scan_gate_resolution(dag.id, rc.ctx.session_id, gate_id, dag.generation)
+                        .scan_gate_resolution(dag.id, rc.ctx, gate_id, dag.generation)
                         .await?
                     {
                         Some(resolution) => self.gate_apply_resolution(dag, rc, node_id, resolution).await,
@@ -285,7 +285,7 @@ impl LinearScheduler {
                 // GA4 already committed in a prior attempt; only the fold + C4 remain.
                 let attempt = rc
                     .checkpoint
-                    .rebuild_attempts_started(dag.id, rc.session.id, node_id, dag.generation, true)
+                    .rebuild_attempts_started(dag.id, rc.ctx, node_id, dag.generation, true)
                     .await?;
                 self.gate_fold_and_succeed(dag, rc, node_id, attempt, decision)
                     .await
@@ -307,7 +307,7 @@ impl LinearScheduler {
     ) -> Result<StepOutcome, SchedError> {
         let attempts_started = rc
             .checkpoint
-            .rebuild_attempts_started(dag.id, rc.session.id, node_id, dag.generation, false)
+            .rebuild_attempts_started(dag.id, rc.ctx, node_id, dag.generation, false)
             .await?;
         let attempt = (attempts_started + 1).max(1);
         rc.checkpoint
@@ -419,7 +419,7 @@ impl LinearScheduler {
             // GT3: a later loop iteration for the same key skips further calls.
             if rc.gate_already_expired(gate_id) {
                 if let Some(GateResolution::Expired) = self
-                    .scan_gate_resolution(dag.id, rc.ctx.session_id, gate_id, dag.generation)
+                    .scan_gate_resolution(dag.id, rc.ctx, gate_id, dag.generation)
                     .await?
                 {
                     return self
@@ -510,7 +510,7 @@ impl LinearScheduler {
     ) -> Result<StepOutcome, SchedError> {
         rc.mark_gate_expired(gate_id); // this key's expiry question is now settled either way.
         if let Some(resolution) = self
-            .scan_gate_resolution(dag.id, rc.ctx.session_id, gate_id, dag.generation)
+            .scan_gate_resolution(dag.id, rc.ctx, gate_id, dag.generation)
             .await?
         {
             return self
@@ -562,7 +562,7 @@ impl LinearScheduler {
             }
             RunControlState::Failed => {
                 match self
-                    .scan_gate_resolution(dag.id, rc.ctx.session_id, gate_id, dag.generation)
+                    .scan_gate_resolution(dag.id, rc.ctx, gate_id, dag.generation)
                     .await?
                 {
                     Some(resolution @ (GateResolution::Deny | GateResolution::Expired)) => {
@@ -620,10 +620,15 @@ impl LinearScheduler {
     // §5.7.2 durable resolution scan / GR4 remaining deadline
     // -----------------------------------------------------------------
 
+    /// §5.7.2. The normative scan key is `(run_id, gate_id, generation)`
+    /// (§5.3.1's "Event scans" paragraph): Appendix F permits several run
+    /// rows per DAG, so an approval recorded against a *different* run must
+    /// not resolve this run's gate. Unattributed (`run_id: None`) events stay
+    /// in scope — they cannot belong to another run.
     async fn scan_gate_resolution(
         &self,
         dag_id: DagId,
-        session_id: SessionId,
+        ctx: CheckpointCtx,
         gate_id: GateId,
         generation: u64,
     ) -> Result<Option<GateResolution>, SchedError> {
@@ -634,7 +639,7 @@ impl LinearScheduler {
             let page = self
                 .deps
                 .events
-                .list_session_events(session_id, after, MAX_EVENTS_PAGE)
+                .list_session_events(ctx.session_id, after, MAX_EVENTS_PAGE)
                 .await
                 .map_err(|e| map_store_error(e, dag_id))?;
             if page.is_empty() {
@@ -644,6 +649,9 @@ impl LinearScheduler {
             for ev in &page {
                 after = Some(ev.seq);
                 if ev.type_ != SessionEventType::ApprovalResolved {
+                    continue;
+                }
+                if !run_matches(ev.run_id, ctx.run_id) {
                     continue;
                 }
                 let matches_gate =
