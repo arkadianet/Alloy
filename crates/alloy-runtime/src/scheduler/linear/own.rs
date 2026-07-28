@@ -151,7 +151,25 @@ impl Drop for OwnedGuard<'_> {
         if let Ok(mut map) = self.sched.owned.lock() {
             map.remove(&self.dag_id);
         }
-        self.owned.completed.notify_waiters(); // G2: even if `cancel_result` is still `None`
+        // O3 normally fills `cancel_result` before this runs. The one path
+        // that cannot is a panic unwinding out of the run body: ownership is
+        // released here, but a concurrent `cancel` would then see `None`,
+        // ignore the notify as spurious, and burn its entire drain grace
+        // before reporting a misleading "grace exceeded". Record the panic as
+        // the outcome so the waiter resolves immediately with something true.
+        {
+            let mut slot = self
+                .owned
+                .cancel_result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = Some(Err(SchedError::Internal(
+                    "run body panicked; ownership released without an outcome".into(),
+                )));
+            }
+        }
+        self.owned.completed.notify_waiters(); // G2
     }
 }
 

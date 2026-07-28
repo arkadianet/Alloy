@@ -10,6 +10,7 @@
 //! without this, the DAG would simply wedge non-terminal forever.
 
 use super::checkpoint::{CheckpointCtx, GateDecision};
+use super::gate::GateResolution;
 use super::loop_::{cancel_targets, non_terminal_except};
 use super::LinearScheduler;
 use crate::dag::{NodeKind, NodeState, TaskDag};
@@ -50,6 +51,31 @@ fn lowest_non_terminal(dag: &TaskDag) -> Option<NodeId> {
 /// `WaitingApproval` as a precondition, so implementing the second disjunct
 /// would need its own, different write path for a state this design cannot
 /// produce.
+impl LinearScheduler {
+    /// The durable `ApprovalResolved` for `node_id`'s gate at this
+    /// generation, if one exists. Best-effort: a scan failure here must not
+    /// abort a reconcile whose whole job is to unstick a wedged run, so it
+    /// degrades to `None` (the `Expired` default) rather than propagating.
+    async fn durable_gate_decision(
+        &self,
+        dag: &TaskDag,
+        ctx: CheckpointCtx,
+        node_id: NodeId,
+    ) -> Option<GateResolution> {
+        let gate_id = dag.nodes.get(&node_id)?.approval.as_ref()?.gate;
+        match self
+            .scan_gate_resolution(dag.id, ctx, gate_id, dag.generation)
+            .await
+        {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::warn!(error = %e, %gate_id, "reconcile: gate resolution scan failed");
+                None
+            }
+        }
+    }
+}
+
 fn waiting_gate_node(dag: &TaskDag) -> Option<NodeId> {
     dag.nodes
         .values()
@@ -193,22 +219,32 @@ impl LinearScheduler {
     ) -> Result<(), SchedError> {
         if let Some(gate_node_id) = waiting_gate_node(dag) {
             let skipped = non_terminal_except(dag, gate_node_id);
+            // RC4's gate-origin predicate has two arms: the gate is still
+            // `WaitingApproval`, *or* a generation-matched durable
+            // `ApprovalResolved` says deny/expired. When that resolution does
+            // exist, record what actually happened — writing `expired` over a
+            // durable `deny` mislabels the event an operator reads back, and
+            // §5.7's own note is explicit that the `Approval` failure record
+            // is what carries "denied" vs "timeout" apart.
+            let (decision, notes) = match self.durable_gate_decision(dag, ctx, gate_node_id).await {
+                Some(GateResolution::Deny) => (
+                    GateDecision::Deny,
+                    "reconciled: approval denied, never observed by a live run",
+                ),
+                _ => (
+                    GateDecision::Expired,
+                    "reconciled: gate resolution never observed by a live run",
+                ),
+            };
             let failure = FailureIr {
                 node: gate_node_id,
                 error_class: ErrorClass::Approval,
                 retry: RetryDisposition::NonRetryable,
                 diagnostics: vec![],
-                notes: "reconciled: gate resolution never observed by a live run".into(),
+                notes: notes.into(),
             };
             checkpoint
-                .c9c_gate_deny(
-                    dag,
-                    ctx,
-                    gate_node_id,
-                    GateDecision::Expired,
-                    &failure,
-                    &skipped,
-                )
+                .c9c_gate_deny(dag, ctx, gate_node_id, decision, &failure, &skipped)
                 .await?;
             return Ok(());
         }

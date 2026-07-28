@@ -13,8 +13,9 @@
 //! - [`events`] — session event envelopes and [`EventSink`]
 //! - [`storage`] — SQLite event log, artifact CAS, DAG blobs, handoff (RFC-0002/0009)
 //! - [`runtime`] — [`AlloyRuntime`] host lifecycle
-//! - [`scheduler`] — [`Scheduler`] trait + [`NullScheduler`]
-//! - [`adapters`] — Verify*/GateHuman stub traits
+//! - [`scheduler`] — [`Scheduler`] trait, [`LinearScheduler`] (RFC-0010), [`NullScheduler`]
+//! - [`adapters`] — Verify/GateHuman/Capability seams plus the MCP-backed
+//!   verify adapters (RFC-0010)
 //! - [`session`] — [`SessionPlane`] control plane: Session/RunController (RFC-0003)
 //! - [`obs`] — DecisionLog, CostMeter, redaction/query helpers (RFC-0004)
 //! - [`router`] — sealed model routing, provider traits, and HTTP provider (RFC-0007)

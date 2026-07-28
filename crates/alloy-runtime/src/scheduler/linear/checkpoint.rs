@@ -582,6 +582,48 @@ impl Checkpoint {
         Ok(failure_ref)
     }
 
+    /// C7 (DS4 stall path): mark `skipped` (the remaining `Pending` nodes
+    /// whose Data predecessors can never be satisfied) as `Skipped` and
+    /// commit `DagState → terminal` in one CAS.
+    ///
+    /// No `failure_ir`: a stall attributes no node — the DAG is unrunnable as
+    /// a graph, not failed at a step (FO4(i)'s all-`Skipped` shape). The
+    /// caller re-derives after the skip and passes whatever §5.17 yields.
+    #[tracing::instrument(
+        name = "sched.checkpoint",
+        skip_all,
+        fields(checkpoint = "c7", generation = dag.generation, nodes_changed = skipped.len())
+    )]
+    pub(crate) async fn c7_terminal_stalled(
+        &self,
+        dag: &mut TaskDag,
+        ctx: CheckpointCtx,
+        skipped: &[NodeId],
+        terminal: crate::scheduler::DagState,
+    ) -> Result<(), SchedError> {
+        let generation = dag.generation;
+        let mut froms = Vec::with_capacity(skipped.len());
+        for &id in skipped {
+            let node = dag.nodes.get_mut(&id).ok_or_else(|| {
+                SchedError::Invariant(format!("unknown node {id} in c7_terminal_stalled"))
+            })?;
+            non_terminal_or_err(node.state, id, "c7_terminal_stalled")?;
+            froms.push((id, node.state, NodeState::Skipped));
+            node.state = NodeState::Skipped;
+        }
+        dag.state = terminal;
+        self.cas(dag).await?;
+        self.metrics.inc_nodes_skipped_by(skipped.len());
+
+        for (id, from, to) in froms {
+            let mut extra = serde_json::Map::new();
+            extra.insert("reason".into(), Value::String("dag stalled".into()));
+            self.append_best_effort(Self::node_state_event(ctx, id, from, to, generation, extra))
+                .await;
+        }
+        Ok(())
+    }
+
     /// C7 (success path): every node already reached `Succeeded`/`CachedHit`
     /// via its own C4; this checkpoint only commits `DagState → Succeeded`
     /// (Appendix A). No node transitions, no events.
@@ -1226,6 +1268,14 @@ impl Checkpoint {
                 if ev.type_ != SessionEventType::ApprovalRequested {
                     continue;
                 }
+                // Same run half of the scan key as §5.3.1/§5.7.2 (see
+                // `list_node_state_events`): another run's `ApprovalRequested`
+                // must not suppress this run's RF6 repair, or GR4 falls back to
+                // a repair that never happens and the gate keeps re-deriving a
+                // full deadline.
+                if !run_matches(ev.run_id, ctx.run_id) {
+                    continue;
+                }
                 let matches_gate =
                     ev.payload.get("gate_id").and_then(Value::as_str) == Some(gate_id_str.as_str());
                 let matches_gen =
@@ -1325,22 +1375,36 @@ impl Checkpoint {
         // failure fields (so FO1 resolves); when it already exists the RF5
         // dedup key short-circuits and FO2 reads the surviving event's own
         // `error_class`, which is what FN2 needs either way.
-        self.repair_node_state(
-            dag_id,
-            ctx,
-            node_id,
-            NodeState::WaitingApproval,
-            NodeState::Cancelled,
-            generation,
-            None,
-            None,
-            Some(RepairedFailure {
-                failure_ref,
-                error_class: ErrorClass::Approval,
-                retry: RetryDisposition::NonRetryable,
-            }),
-        )
-        .await?;
+        let appended = self
+            .repair_node_state(
+                dag_id,
+                ctx,
+                node_id,
+                NodeState::WaitingApproval,
+                NodeState::Cancelled,
+                generation,
+                None,
+                None,
+                Some(RepairedFailure {
+                    failure_ref,
+                    error_class: ErrorClass::Approval,
+                    retry: RetryDisposition::NonRetryable,
+                }),
+            )
+            .await?;
+        if !appended {
+            // The `Cancelled` event survived but its artifact did not, so RF5
+            // deduped and nothing now references the blob just written. Say so
+            // rather than returning an id the durable record does not name:
+            // FO1 will miss, FO2 still recovers `Approval` from the surviving
+            // event's own fields, and FN2 holds either way. Returning the
+            // orphan silently would imply a link that does not exist.
+            tracing::debug!(
+                %node_id,
+                %failure_ref,
+                "RF7: cancelled event already present; synthetic failure_ir is unreferenced"
+            );
+        }
         Ok(failure_ref)
     }
 }

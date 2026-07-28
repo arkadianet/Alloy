@@ -717,6 +717,14 @@ impl LinearScheduler {
                 if ev.type_ != SessionEventType::ApprovalRequested {
                     continue;
                 }
+                // Same `(run_id, gate_id, generation)` key §5.7.2's resolution
+                // scan uses: under Appendix F multi-run binding, another run's
+                // `ApprovalRequested` would otherwise donate its (older)
+                // timestamp and hand this run a shorter — or already expired —
+                // deadline than the gate was granted.
+                if !run_matches(ev.run_id, rc.ctx.run_id) {
+                    continue;
+                }
                 let matches_gate =
                     ev.payload.get("gate_id").and_then(Value::as_str) == Some(gate_id_str.as_str());
                 let matches_gen =

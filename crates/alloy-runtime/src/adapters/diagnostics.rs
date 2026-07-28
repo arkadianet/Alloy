@@ -68,6 +68,12 @@ pub fn parse_rustc_diagnostics(stdout_utf8: &str) -> Vec<DiagnosticEvent> {
         tracing::debug!(unparseable, "rustc diagnostics: skipped unparseable lines");
     }
     if truncated {
+        // DG6 caps the *diagnostics* at MAX_DIAGNOSTICS and then appends the
+        // marker, so a truncated result is 200 real entries + 1 marker by
+        // design. Making room for the marker inside the cap would silently
+        // drop a real diagnostic, which is the opposite of what the marker is
+        // there to signal. `dg6_caps_at_max_diagnostics_with_note_marker`
+        // pins the count.
         out.push(truncation_marker());
     }
     out

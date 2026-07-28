@@ -14,13 +14,24 @@
 //! dedicated test today. Also tracked as RFC-0010 §15 Q8. Numbers are
 //! RFC-0010 §13 AC numbers.
 //!
-//! The sweep, and the three-reviewer round that followed it, turned up
-//! real implementation bugs as well as test debt. Those were fixed and
-//! tested rather than listed here: FO6/FN2 attribution (ACs 66/89/92),
-//! RF3+RF7 resume wiring (ACs 23/24), B4's resume backoff (AC 26), the
+//! The sweep, and the reviewer rounds that followed it, turned up real
+//! implementation bugs as well as test debt. Those were fixed and tested
+//! rather than listed here: FO6/FN2 attribution (ACs 66/89/92), RF3+RF7
+//! resume wiring (ACs 23/24), B4's resume backoff (AC 26), the
 //! `CapabilityExecContext` budget/deadline contract, BE4's pre-CAS
-//! ordering (AC 82), the `pending_cancels` leak, §5.3.2 row 4 gate
-//! adoption, and the run half of the §5.3.1/§5.7.2 scan keys.
+//! ordering on both the retry and budget paths (AC 82), the
+//! `pending_cancels` leak, §5.3.2 row 4 gate adoption, the run half of
+//! the §5.3.1/§5.7.2/GR4/RF6 scan keys, R15's ER4/ER5 re-verify rules
+//! (ACs 84/90/95), the C9b→C3 crash window that silently expired an
+//! approved gate, and DS4 stall recovery.
+//!
+//! ACs 84/90/95 were previously carried as an out-of-scope deferral on the
+//! grounds that ER4 needed a `TaskNode.needs_reverify` field the codebase
+//! does not have. That reading was wrong: ER4 defines `needs_reverify` as a
+//! *derived* predicate over node states and edge reachability, so nothing
+//! needed to be added to `TaskNode`. They are genuinely covered now
+//! (`ready.rs`'s `needs_reverify_*` unit tests plus `loop_.rs`'s `er4_*` /
+//! `er5_*` end-to-end tests).
 //!
 //! - **AC 12**: `run` on a DAG with no bound run row returns
 //!   `RunBindingMissing` — the code path exists, no test calls it directly.
@@ -166,11 +177,12 @@ fn ac73_no_artifact_kind_json_in_scheduler_or_adapters() {
 #[test]
 fn ac83_scheduler_never_calls_edit_engine() {
     // AC 83: "Scheduler code paths never call EditEngine::{apply,rollback}
-    // or recover_checkpoint." RFC-0008's EditEngine lives outside this
-    // RFC's ownership boundary entirely (R15's edit-tx resume is a no-op —
-    // see loop_.rs's module doc); this only needs to stay true, not become
-    // true, but it's cheap enough to make that an enforced fact rather than
-    // an assumption.
+    // or recover_checkpoint." ER3 puts RFC-0008's EditEngine outside this
+    // RFC's ownership boundary entirely — R15 now implements ER4/ER5, and it
+    // does so purely from the DAG blob (node states + edge reachability),
+    // never by touching the edit stack. This only needs to stay true, not
+    // become true, but it's cheap enough to make it an enforced fact rather
+    // than an assumption.
     let mut files = Vec::new();
     walk_rs_files(&crate_root().join("src/scheduler"), &mut files);
     for file in &files {
