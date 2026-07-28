@@ -137,6 +137,11 @@ uuid_id!(
     /// Identifier of a recorded graph snapshot (RFC-0011 §4.7, amendment A2).
     GraphSnapshotId
 );
+uuid_id!(
+    /// Identifier of a compacted or memoized context projection (RFC-0012 §8,
+    /// amendment A1).
+    SummaryId
+);
 
 name_id!(
     /// Profile catalog id (`default`, `autonomous`, `readonly`).
