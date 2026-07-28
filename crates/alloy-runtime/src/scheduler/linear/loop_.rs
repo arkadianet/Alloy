@@ -1,36 +1,18 @@
 //! The serial scheduling loop (RFC-0010 §5.1 R1-R18, §5.2 L1-L16, §5.6
 //! dispatch table, §5.9 success path, §5.14 `Aggregate` fold).
 //!
-//! [`LinearScheduler::run`]/[`LinearScheduler::cancel`] land on the
-//! [`crate::Scheduler`] trait here for the first time. `admit_retry` (§5.11
-//! A1-A6 admission, tier escalation, interruptible backoff) is complete as
-//! of P5 — see `retry.rs` for the pure decision logic it calls into. Two
-//! seams remain, deferred to later phases; each is a private method with a
-//! doc comment pointing at the RFC section that completes it:
+//! [`LinearScheduler::run`]/[`LinearScheduler::cancel`] implement the
+//! [`crate::Scheduler`] trait here. The surrounding machinery lives in
+//! sibling modules: `retry.rs` (pure §5.11 admission), `gate.rs` (§5.7's
+//! full state machine, including the deadline/expiry and durable-resolution
+//! resume scans this module routes into from R13/R16), `own.rs` (§4.3-4.4
+//! ownership and the race-free cancel wait), `budget.rs` (§5.16.1 effective
+//! ceilings), and `checkpoint.rs` (every CAS plus the §5.3.3 crash repairs).
 //!
-//! - [`LinearScheduler::dispatch_gate`] — §5.7's full state machine:
-//!   deadline/expiry (§5.7.8), durable-resolution resume scans
-//!   (§5.7.2/§5.7.3), and closed-receiver reclassification (§5.7.9)
-//!   (**P7**). This phase implements the mechanical
-//!   `C9a -> wait_approval -> C9b/C9c` happy path with no deadline wrapping.
-//! - DAG ownership release — the race-free `Notify`-based cancel wait and
-//!   forced-C6-after-grace machinery (§4.3-4.4, §5.12.3) (**P8**). This
-//!   phase uses [`LinearScheduler::owned`], a minimal insert-if-absent set,
-//!   so R4/`AlreadyOwned` and the `pending_cancels`-driven L1/L2 cancel path
-//!   are real, but `cancel` does not yet block until the run's own C6
-//!   commits, and a `cancel(dag_id)` call cannot interrupt an
-//!   already-in-flight dispatch (only `deps.runtime_cancel` can, since it is
-//!   the only cancellation token reachable from outside `run`).
-//!
-//! Two further gaps are flagged (not phase-assigned in RFC-0010's own
-//! P1-P10 breakdown) rather than silently skipped:
-//!
-//! - R15 (edit-tx resume, `needs_reverify`/ER4/ER5) is a no-op: `TaskNode`
-//!   on `main` has no `needs_reverify` field, so RFC-0008's resume-repair
-//!   bit does not exist yet to read.
-//! - R7/L6 use `deps.budget_policy` directly as the "effective" ceiling (no
-//!   goal-constraint folding, BG1-BG6); full effective-ceiling computation
-//!   is P9's charter (§5.16.1).
+//! One gap is flagged rather than silently skipped: R15 (edit-tx resume,
+//! `needs_reverify`/ER4/ER5) is a no-op, because `TaskNode` on `main` has no
+//! `needs_reverify` field — RFC-0008's resume-repair bit does not exist yet
+//! to read.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::budget;
 use super::checkpoint::{map_store_error, map_store_error_on_load, Checkpoint, CheckpointCtx};
 use super::envelopes::{self, InputShape};
+use super::gate::GateResolution;
 use super::ready::{backoff_delay, derive_dag_state, promotable_nodes, ready_nodes, DeriveFlags};
 use super::retry::{self, Admission, Escalation};
 use super::LinearScheduler;
@@ -648,8 +631,39 @@ impl LinearScheduler {
         }
         let node_id = running[0];
         if dag.nodes[&node_id].kind == NodeKind::GateHuman {
-            // Table row 3/4: gate resume needs a durable-allow scan (P7).
-            return Err(SchedError::Invariant("gate node running".into()));
+            // §5.3.2 rows 3/4. A gate only reaches `Running` through GA4's
+            // post-allow C3, so the question is whether that allow is still
+            // durable:
+            //   row 4 — durable allow: resume mid-fold. `gate_allow_fold`'s
+            //     `Running` arm already implements exactly this (fold + C4,
+            //     skipping the CASes the blob shows as done), so route into
+            //     it rather than duplicating the sequence here.
+            //   row 3 — no durable allow: genuinely illegal, and the
+            //     unconditional error this replaced was correct for it.
+            // Without row 4 a crash in the window between the post-allow C3
+            // and the fold's C4 strands the run permanently: every retry
+            // reloads the same `Running` gate and re-raises `Invariant`.
+            let gate_id = dag.nodes[&node_id]
+                .approval
+                .as_ref()
+                .map(|a| a.gate)
+                .ok_or_else(|| {
+                    SchedError::Invariant(format!("gate node {node_id} has no approval"))
+                })?;
+            let resolution = self
+                .scan_gate_resolution(dag.id, rc.ctx, gate_id, dag.generation)
+                .await?;
+            return match resolution {
+                Some(r @ (GateResolution::Allow | GateResolution::AllowOnce)) => {
+                    match self.gate_apply_resolution(dag, rc, node_id, r).await? {
+                        StepOutcome::Terminal(outcome) => Ok(Some(outcome)),
+                        StepOutcome::Continue | StepOutcome::NaturalExit => Ok(None),
+                    }
+                }
+                Some(GateResolution::Deny) | Some(GateResolution::Expired) | None => {
+                    Err(SchedError::Invariant("gate node running".into()))
+                }
+            };
         }
         let attempts_started = rc
             .checkpoint
@@ -1672,14 +1686,6 @@ impl LinearScheduler {
             tracing::Span::current().record("owned", false);
 
             // Unowned (§5.12.4).
-            {
-                let mut pending = self
-                    .pending_cancels
-                    .lock()
-                    .map_err(|_| SchedError::Ownership("pending_cancels poisoned".into()))?;
-                pending.insert(dag_id); // PC1
-            }
-
             // Step 1: run binding is for event attribution only — a missing
             // binding is tolerated (step 4), any other error propagates.
             let Some(probe) = self
@@ -1690,6 +1696,20 @@ impl LinearScheduler {
                 .map_err(|e| map_store_error_on_load(e, dag_id))?
             else {
                 return Err(SchedError::DagNotFound(dag_id));
+            };
+
+            // PC1 gates the insert on the durable DAG being non-terminal, so
+            // the probe has to come first. PC4 then requires removal on
+            // *every* exit — a leaked entry cancels a later, unrelated run of
+            // the same `DagId` (a replan keeps the id and only bumps the
+            // generation), which is precisely the hazard PC4 names. The guard
+            // covers the `?` returns, the `continue`, and the loop's own
+            // contention exit alike; hand-rolled removals covered only the
+            // success path.
+            let _pending = if terminal_state(probe.state) {
+                None
+            } else {
+                Some(PendingCancelGuard::insert(&self.pending_cancels, dag_id)?)
             };
             let run_id = match self.resolve_run_binding(&probe).await {
                 Ok(row) => Some(row.id),
@@ -1711,11 +1731,8 @@ impl LinearScheduler {
                 Ok(()) => Ok(DagState::Cancelled),
                 Err(e) => Err(e.clone()),
             });
-            // Step 8: consumed either way — a later `run` should not inherit
-            // a stale cancel intent from this call.
-            if let Ok(mut pending) = self.pending_cancels.lock() {
-                pending.remove(&dag_id);
-            }
+            // Step 8's removal is `_pending`'s `Drop`, here and on every
+            // other exit from this scope.
             return result;
         }
         Err(SchedError::Internal(
@@ -1766,6 +1783,51 @@ impl LinearScheduler {
             .c6_cancel(&mut dag, ctx, &cancelled, &skipped)
             .await?;
         Ok(())
+    }
+}
+
+/// Is `state` one of the durable terminals `cancel` must treat as a no-op?
+fn terminal_state(state: DagState) -> bool {
+    matches!(
+        state,
+        DagState::Succeeded | DagState::Failed | DagState::Cancelled | DagState::ReplanRequired
+    )
+}
+
+/// RAII membership in `pending_cancels` (§5.12.1 PC1/PC4).
+///
+/// PC4 requires the entry to disappear once the cancel intent is consumed or
+/// resolved. Removing by hand only covered the one success path, so a store
+/// error, a missing run binding, an `AlreadyOwned` retry, or the contention
+/// bound each left a live entry behind — and a live entry fires
+/// `run_cancel` on the *next* `run()` for that `DagId` (R5), which after a
+/// replan is a different, unrelated generation. `Drop` removes on every path
+/// including `?` and `continue`.
+struct PendingCancelGuard<'a> {
+    set: &'a std::sync::Mutex<std::collections::HashSet<DagId>>,
+    dag_id: DagId,
+}
+
+impl<'a> PendingCancelGuard<'a> {
+    fn insert(
+        set: &'a std::sync::Mutex<std::collections::HashSet<DagId>>,
+        dag_id: DagId,
+    ) -> Result<Self, SchedError> {
+        set.lock()
+            .map_err(|_| SchedError::Ownership("pending_cancels poisoned".into()))?
+            .insert(dag_id);
+        Ok(Self { set, dag_id })
+    }
+}
+
+impl Drop for PendingCancelGuard<'_> {
+    fn drop(&mut self) {
+        // A poisoned lock still yields the set; dropping the intent is more
+        // important than the poison, and leaving it behind is the bug.
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.dag_id);
     }
 }
 
@@ -4227,6 +4289,176 @@ mod tests {
         // PC4: consumed at R5, not left behind to wrongly cancel a later run.
         assert!(!sched.pending_cancels.lock().unwrap().contains(&dag_id));
         fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn pc4_cancel_of_a_missing_dag_leaves_no_pending_entry() {
+        // The insert used to happen before the durable checks, and only the
+        // success path removed it. A `DagNotFound` therefore leaked an entry
+        // that would fire `run_cancel` on the next `run()` for that id.
+        let fx = Fixture::new().await;
+        let sched = reconcile_scheduler(&fx);
+        let dag_id = DagId::new();
+
+        let err = sched.cancel(dag_id).await.unwrap_err();
+        assert!(matches!(err, SchedError::DagNotFound(_)), "got {err:?}");
+        assert!(
+            !sched.pending_cancels.lock().unwrap().contains(&dag_id),
+            "PC4: a failed cancel must not leave a cancel intent behind"
+        );
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn pc4_cancel_of_a_terminal_dag_leaves_no_pending_entry() {
+        // PC1 only admits an insert for a *non-terminal* durable DAG; a
+        // terminal cancel is a no-op and must not arm anything.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        seed_failed_single_node(&fx, session, dag_id).await;
+        let sched = reconcile_scheduler(&fx);
+
+        sched.cancel(dag_id).await.unwrap();
+        assert!(
+            !sched.pending_cancels.lock().unwrap().contains(&dag_id),
+            "PC1/PC4: terminal cancel must not arm a pending entry"
+        );
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn pc4_a_leaked_intent_would_cancel_the_next_unrelated_run() {
+        // Guards the *consequence* PC4 exists to prevent, independent of how
+        // the entry got there: a stale intent cancels a later, unrelated run
+        // of the same DagId (a replan reuses the id and only bumps the
+        // generation). If a future refactor reintroduces a leak, this states
+        // plainly what it costs.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        seed_pending_single_node(&fx, session, dag_id).await;
+        fx.seed_run(session, dag_id, "running").await;
+        let sched = reconcile_scheduler(&fx);
+
+        sched.pending_cancels.lock().unwrap().insert(dag_id);
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(
+            outcome.state,
+            DagState::Cancelled,
+            "a live entry cancels the next run — which is why it must never outlive its cancel"
+        );
+        fx.close().await;
+    }
+
+    // ---- §5.3.2 row 4: gate adoption with a durable allow ----
+
+    #[tokio::test]
+    async fn adopt_running_gate_without_durable_allow_is_an_invariant() {
+        // Row 3 — unchanged behaviour, pinned so the row-4 fix below cannot
+        // accidentally widen it.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let (_gate_id, _node) = seed_running_gate(&fx, session, dag_id, None).await;
+        let sched = reconcile_scheduler(&fx);
+
+        let err = sched.run(dag_id).await.unwrap_err();
+        assert!(
+            matches!(err, SchedError::Invariant(ref m) if m == "gate node running"),
+            "got {err:?}"
+        );
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn adopt_running_gate_with_durable_allow_resumes_the_fold() {
+        // Row 4: a crash between GA4's post-allow C3 and the fold's C4 used
+        // to strand the run forever — every retry reloaded the same
+        // `Running` gate and re-raised `Invariant`.
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let (_gate_id, node_id) = seed_running_gate(&fx, session, dag_id, Some("allow")).await;
+        let sched = reconcile_scheduler(&fx);
+
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        let after = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(after.nodes[&node_id].state, NodeState::Succeeded);
+        assert!(
+            after.nodes[&node_id].output_ref.is_some(),
+            "GA1: the resumed fold must still put a node_output envelope"
+        );
+        fx.close().await;
+    }
+
+    /// A single `GateHuman` node durably `Running` (post-allow C3 committed,
+    /// fold's C4 lost). `decision` seeds a durable `ApprovalResolved`.
+    async fn seed_running_gate(
+        fx: &Fixture,
+        session: SessionId,
+        dag_id: DagId,
+        decision: Option<&str>,
+    ) -> (GateId, NodeId) {
+        let node_id = NodeId::new();
+        let gate_id = GateId::new();
+        let input = fx
+            .put_goal_envelope(dag_id, node_id, NodeKind::GateHuman)
+            .await;
+        let mut node = adapter_node(node_id, NodeKind::GateHuman, input);
+        node.state = NodeState::Running;
+        node.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "review".into(),
+        });
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(node_id, node)]),
+            edges: vec![],
+            state: DagState::Running,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let run_id = fx.seed_run(session, dag_id, "running").await;
+
+        // The C3 that moved it to Running is durable (W4a/DP1).
+        fx.storage
+            .events()
+            .append_session(crate::events::NewSessionEvent {
+                session_id: session,
+                run_id: Some(run_id),
+                type_: crate::events::SessionEventType::NodeState,
+                payload: serde_json::json!({
+                    "node_id": node_id.to_string(),
+                    "from": "ready",
+                    "to": "running",
+                    "generation": 1u64,
+                    "attempt": 1u64,
+                }),
+            })
+            .await
+            .unwrap();
+
+        if let Some(decision) = decision {
+            fx.storage
+                .events()
+                .append_session(crate::events::NewSessionEvent {
+                    session_id: session,
+                    run_id: Some(run_id),
+                    type_: crate::events::SessionEventType::ApprovalResolved,
+                    payload: serde_json::json!({
+                        "gate_id": gate_id.to_string(),
+                        "decision": decision,
+                        "generation": 1u64,
+                    }),
+                })
+                .await
+                .unwrap();
+        }
+        (gate_id, node_id)
     }
 
     // ---- Aggregate fold ----

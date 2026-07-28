@@ -35,7 +35,7 @@ const EXPIRE_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 /// Durable resolution for a gate, per the `ApprovalResolved.decision` wire
 /// vocabulary (§5.7.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateResolution {
+pub(super) enum GateResolution {
     Allow,
     AllowOnce,
     Deny,
@@ -217,7 +217,7 @@ impl LinearScheduler {
         })
     }
 
-    fn gate_apply_resolution<'a>(
+    pub(super) fn gate_apply_resolution<'a>(
         &'a self,
         dag: &'a mut TaskDag,
         rc: &'a RunCtx<'_>,
@@ -625,7 +625,7 @@ impl LinearScheduler {
     /// rows per DAG, so an approval recorded against a *different* run must
     /// not resolve this run's gate. Unattributed (`run_id: None`) events stay
     /// in scope — they cannot belong to another run.
-    async fn scan_gate_resolution(
+    pub(super) async fn scan_gate_resolution(
         &self,
         dag_id: DagId,
         ctx: CheckpointCtx,

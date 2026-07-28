@@ -94,12 +94,7 @@ pub(crate) enum GateDecision {
     AllowOnce,
     /// Explicit denial.
     Deny,
-    /// `timeout_ms` elapsed unresolved.
-    ///
-    /// Not yet produced: the real deadline/`expire_gate` path (RFC-0010
-    /// §5.7.8) lands in P7. `c9c_gate_deny` and `gate_decision_str` already
-    /// handle it correctly; only the caller that would select it is missing.
-    #[allow(dead_code)]
+    /// `timeout_ms` elapsed unresolved (§5.7.8's `expire_gate` path).
     Expired,
 }
 
