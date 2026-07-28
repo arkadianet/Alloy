@@ -133,6 +133,10 @@ uuid_id!(
     /// Out-of-process MCP server identifier (RFC-0006).
     ServerId
 );
+uuid_id!(
+    /// Identifier of a recorded graph snapshot (RFC-0011 §4.7, amendment A2).
+    GraphSnapshotId
+);
 
 name_id!(
     /// Profile catalog id (`default`, `autonomous`, `readonly`).
@@ -154,6 +158,11 @@ name_id!(
     /// Catalog id for a model endpoint row in `router.toml` (RFC-0007).
     EndpointId
 );
+name_id!(
+    /// Cargo package name as it appears in `[package] name` (RFC-0011,
+    /// amendment A2 — V2 §7.2's `GraphQuery::Diagnostics` names it).
+    CrateId
+);
 
 /// Invalid catalog name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -164,7 +173,10 @@ pub enum IdError {
 }
 
 /// Monotonic graph schema/version token.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Copy`/`PartialOrd`/`Ord` per RFC-0011 amendment A1: monotonicity
+/// assertions (G8) and `max()` over stored versions need ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GraphVersion(pub u64);
 
 /// Lowercase hex SHA-256 digest (64 chars).

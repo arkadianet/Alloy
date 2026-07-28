@@ -60,6 +60,21 @@ dependencies = [
 [[package]]
 name = "alloy-index"
 version = "0.1.0"
+dependencies = [
+ "alloy-runtime",
+ "async-trait",
+ "globset",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "alloy-runtime"
