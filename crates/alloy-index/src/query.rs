@@ -16,6 +16,19 @@ use crate::store::{now_rfc3339, read_version};
 /// Q7's radius clamp.
 const MAX_SUBGRAPH_RADIUS: u8 = 3;
 
+/// Encode a serde value that serializes to a JSON string (timestamps,
+/// unit-enum levels) into its bare string form, failing loudly on any other
+/// shape instead of trimming quotes off arbitrary JSON.
+fn json_string<T: serde::Serialize>(value: &T, what: &str) -> Result<String, GraphError> {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(s)) => Ok(s),
+        Ok(other) => Err(GraphError::Internal(format!(
+            "encode {what}: expected a JSON string, got {other}"
+        ))),
+        Err(e) => Err(GraphError::Internal(format!("encode {what}: {e}"))),
+    }
+}
+
 /// Run one read query (Q1–Q11). Never writes (Q10).
 pub(crate) fn run(
     conn: &Connection,
@@ -120,13 +133,7 @@ fn diagnostics(
     version: alloy_runtime::GraphVersion,
     limits: &IngestLimits,
 ) -> Result<GraphView, GraphError> {
-    let since_str = since
-        .map(|t| {
-            serde_json::to_string(t)
-                .map(|s| s.trim_matches('"').to_string())
-                .map_err(|e| GraphError::Internal(format!("encode since: {e}")))
-        })
-        .transpose()?;
+    let since_str = since.map(|t| json_string(t, "since")).transpose()?;
     let mut sql = String::from("SELECT event_json FROM graph_diagnostics WHERE 1 = 1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(c) = crate_id {
@@ -194,10 +201,18 @@ fn subgraph(
         }
     }
 
-    // Unknown seeds are ignored (Q7).
+    // Unknown seeds are ignored (Q7). The visited set is capped at
+    // `max_query_nodes + 1`: one over the cap is enough to detect Q9
+    // truncation, and it bounds both memory and the SQL `IN` placeholder
+    // count well under SQLite's variable limit. BFS order over sorted
+    // adjacency is deterministic, so the capped set is too (Q8).
+    let visit_cap = limits.max_query_nodes as usize + 1;
     let mut visited: BTreeSet<String> = BTreeSet::new();
     let mut frontier: VecDeque<(String, u8)> = VecDeque::new();
     for seed in seeds {
+        if visited.len() >= visit_cap {
+            break;
+        }
         let id = seed.to_string();
         let known: i64 = conn
             .query_row(
@@ -210,12 +225,15 @@ fn subgraph(
             frontier.push_back((id, 0));
         }
     }
-    while let Some((id, depth)) = frontier.pop_front() {
+    'bfs: while let Some((id, depth)) = frontier.pop_front() {
         if depth >= radius {
             continue;
         }
         if let Some(neighbours) = adjacency.get(&id) {
             for n in neighbours {
+                if visited.len() >= visit_cap {
+                    break 'bfs;
+                }
                 if visited.insert(n.clone()) {
                     frontier.push_back((n.clone(), depth + 1));
                 }
@@ -279,10 +297,7 @@ pub(crate) fn record_diagnostic(
     d: &DiagnosticEvent,
     workspace_root: Option<&Path>,
 ) -> Result<(), GraphError> {
-    let level = serde_json::to_string(&d.level)
-        .map_err(|e| GraphError::Internal(format!("encode level: {e}")))?
-        .trim_matches('"')
-        .to_string();
+    let level = json_string(&d.level, "level")?;
     let primary_path = d
         .spans
         .first()
@@ -337,10 +352,7 @@ fn relativise(path: &str, workspace_root: Option<&Path>) -> Option<String> {
 
 /// §6.7 / IN14: append-only fix record.
 pub(crate) fn record_fix(conn: &mut Connection, f: &FixEvent) -> Result<(), GraphError> {
-    let recorded_at = serde_json::to_string(&f.recorded_at)
-        .map_err(|e| GraphError::Internal(format!("encode recorded_at: {e}")))?
-        .trim_matches('"')
-        .to_string();
+    let recorded_at = json_string(&f.recorded_at, "recorded_at")?;
     let tx = conn.unchecked_transaction().map_err(from_rusqlite)?;
     tx.execute(
         "INSERT INTO graph_fixes

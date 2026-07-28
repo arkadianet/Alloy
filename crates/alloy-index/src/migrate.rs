@@ -5,7 +5,6 @@
 //! transaction, and `current_version = SELECT MAX(version)`.
 
 use alloy_runtime::graph::GraphError;
-use alloy_runtime::Timestamp;
 use rusqlite::Connection;
 
 use crate::db::from_rusqlite;
@@ -135,21 +134,14 @@ pub(crate) fn migrate(conn: &Connection, refuse_newer: bool) -> Result<u32, Grap
         tx.execute_batch(V1_SQL).map_err(from_rusqlite)?;
         tx.execute(
             "INSERT INTO graph_schema_migrations (version, applied_at) VALUES (1, ?1)",
-            [serde_json::to_string(&Timestamp::now())
-                .map_err(|e| GraphError::Internal(format!("encode timestamp: {e}")))?
-                .trim_matches('"')],
+            [crate::store::now_rfc3339()?],
         )
         .map_err(from_rusqlite)?;
         tx.execute(
             "INSERT INTO graph_meta
                (id, model_version, graph_version, content_digest, workspace_root_rule, updated_at)
              VALUES (1, ?1, 0, '', 'unset', ?2)",
-            rusqlite::params![
-                GRAPH_MODEL_VERSION,
-                serde_json::to_string(&Timestamp::now())
-                    .map_err(|e| GraphError::Internal(format!("encode timestamp: {e}")))?
-                    .trim_matches('"'),
-            ],
+            rusqlite::params![GRAPH_MODEL_VERSION, crate::store::now_rfc3339()?],
         )
         .map_err(from_rusqlite)?;
         tx.commit().map_err(from_rusqlite)?;
@@ -195,12 +187,7 @@ pub(crate) fn check_model_version(conn: &Connection) -> Result<(), GraphError> {
         "UPDATE graph_meta
            SET model_version = ?1, graph_version = 0, content_digest = '', updated_at = ?2
          WHERE id = 1",
-        rusqlite::params![
-            GRAPH_MODEL_VERSION,
-            serde_json::to_string(&Timestamp::now())
-                .map_err(|e| GraphError::Internal(format!("encode timestamp: {e}")))?
-                .trim_matches('"'),
-        ],
+        rusqlite::params![GRAPH_MODEL_VERSION, crate::store::now_rfc3339()?],
     )
     .map_err(from_rusqlite)?;
     tx.commit().map_err(from_rusqlite)?;

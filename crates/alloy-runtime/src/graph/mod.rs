@@ -152,14 +152,13 @@ pub fn derive_node_id(kind: GraphNodeKind, stable_key: &str) -> GraphNodeId {
     bytes[6] = (bytes[6] & 0x0f) | 0x80; // version nibble = 8
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant = 0b10
 
-    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
     let s = format!(
         "{}-{}-{}-{}-{}",
-        hex(&bytes[0..4]),
-        hex(&bytes[4..6]),
-        hex(&bytes[6..8]),
-        hex(&bytes[8..10]),
-        hex(&bytes[10..16]),
+        hex::encode(&bytes[0..4]),
+        hex::encode(&bytes[4..6]),
+        hex::encode(&bytes[6..8]),
+        hex::encode(&bytes[8..10]),
+        hex::encode(&bytes[10..16]),
     );
     GraphNodeId::parse(&s).expect("derived uuid string is always canonical")
 }

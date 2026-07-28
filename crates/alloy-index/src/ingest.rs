@@ -146,7 +146,9 @@ struct Member {
     package: String,
     dir_rel: PathBuf,
     lib_path: Option<String>,
-    bin_paths: Vec<(String, String)>, // (bin name, path)
+    /// `[[bin]]` entries: name plus explicit `path` when present. Name-only
+    /// bins resolve to the conventional `src/bin/<name>.rs` at seed time.
+    bin_paths: Vec<(String, Option<String>)>,
 }
 
 /// Parse the root manifest and discover members (§6.3).
@@ -318,8 +320,8 @@ fn parse_member_manifest(
         for bin in bins {
             let name = bin.get("name").and_then(|n| n.as_str());
             let path = bin.get("path").and_then(|p| p.as_str());
-            if let (Some(name), Some(path)) = (name, path) {
-                bin_paths.push((name.to_string(), path.to_string()));
+            if let Some(name) = name {
+                bin_paths.push((name.to_string(), path.map(str::to_string)));
             }
         }
     }
@@ -448,35 +450,47 @@ fn ingest_crate_modules(
     // IN7b: binary roots. Bin roots never descend — layout inference cannot
     // attribute `src/` children between a lib root and a bin root without
     // parsing, and G7 forbids inventing the answer.
-    let mut bin_seeds: Vec<(String, PathBuf)> = Vec::new();
-    for (name, path) in &member.bin_paths {
-        let rel = dir.join(path);
-        if root.join(&rel).is_file() {
-            bin_seeds.push((name.clone(), rel));
-        }
+    //
+    // Deduped by resolved file path (BTreeMap: sorted, deterministic — IN5):
+    // conventional roots first, explicit `[[bin]]` entries last so an
+    // explicit name wins for the same file. Name-only `[[bin]]` entries
+    // resolve to the conventional `src/bin/<name>.rs`.
+    let mut bin_files: std::collections::BTreeMap<PathBuf, String> =
+        std::collections::BTreeMap::new();
+    let main_rel = dir.join("src/main.rs");
+    if root.join(&main_rel).is_file() {
+        bin_files.insert(main_rel, "main".into());
     }
-    if bin_seeds.is_empty() {
-        let main_rel = dir.join("src/main.rs");
-        if root.join(&main_rel).is_file() {
-            bin_seeds.push(("main".into(), main_rel));
-        }
-        let bin_dir = root.join(dir).join("src/bin");
-        if bin_dir.is_dir() {
-            for (name, path) in sorted_entries(&bin_dir, &mut out.skipped)? {
-                if path.is_file() && name.ends_with(".rs") {
-                    let stem = name.trim_end_matches(".rs").to_string();
-                    bin_seeds.push((stem, dir.join("src/bin").join(&name)));
-                }
+    let bin_dir = root.join(dir).join("src/bin");
+    if bin_dir.is_dir() {
+        for (name, path) in sorted_entries(&bin_dir, &mut out.skipped)? {
+            if path.is_file() && name.ends_with(".rs") {
+                let stem = name.trim_end_matches(".rs").to_string();
+                bin_files.insert(dir.join("src/bin").join(&name), stem);
             }
         }
     }
-    for (bin_name, rel) in bin_seeds {
+    for (name, path) in &member.bin_paths {
+        let rel = match path {
+            Some(path) => dir.join(path),
+            None => dir.join("src/bin").join(format!("{name}.rs")),
+        };
+        if root.join(&rel).is_file() {
+            bin_files.insert(rel, name.clone());
+        }
+    }
+    for (rel, bin_name) in bin_files {
         seeds.push(ModuleSeed {
             module_path: format!("{ident}::{bin_name}"),
             file_rel: rel,
             children_dir: None,
         });
     }
+
+    // Every crate-root file (lib and bins alike) is claimed: none may
+    // reappear as a lib child module, wherever its path puts it.
+    let claimed: std::collections::BTreeSet<PathBuf> =
+        seeds.iter().map(|s| s.file_rel.clone()).collect();
 
     // Descend (IN7c–IN7e), breadth-first over a work queue, entries sorted.
     // (seed, parent (id, module path), depth)
@@ -552,14 +566,6 @@ fn ingest_crate_modules(
             continue;
         }
 
-        // Which sibling files are already claimed as roots of this crate?
-        // (`src/lib.rs` descends `src/`; `main.rs` / bin roots must not
-        // reappear as child modules of the lib.)
-        let claimed: Vec<String> = ["lib.rs", "main.rs"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-
         let mut child_names: Vec<(String, PathBuf, PathBuf)> = Vec::new(); // (module name, file rel, child children dir)
         let entries = sorted_entries(&children_abs, &mut out.skipped)?;
         let dir_names: std::collections::BTreeSet<String> = entries
@@ -569,7 +575,10 @@ fn ingest_crate_modules(
             .collect();
         for (name, path) in &entries {
             if path.is_file() {
-                if !name.ends_with(".rs") || *name == "mod.rs" || claimed.contains(name) {
+                if !name.ends_with(".rs")
+                    || *name == "mod.rs"
+                    || claimed.contains(&children_dir.join(name))
+                {
                     continue;
                 }
                 let stem = name.trim_end_matches(".rs").to_string();

@@ -42,12 +42,19 @@ fn read(path: &Path) -> String {
 }
 
 // T7 / SEC2: no worker-facing `graph_query` MCP tool. In `alloy-tools` the
-// string may appear only in negative assertions (forbidden-registration
-// lists / tests) and rule doc comments — never as a registration.
+// string may appear only in comments, `fn no_*` negative-assertion tests,
+// explicit deny-list lines, or `#[cfg(test)]` code — never as a production
+// registration. A bare string literal is deliberately NOT exempt: a real
+// `register("graph_query")` must trip this test.
 #[test]
 fn sec2_no_graph_query_tool_outside_negative_assertions() {
     for file in rs_files("crates/alloy-tools/src") {
         let text = read(&file);
+        // Everything after the first `#[cfg(test)]` marker is test code.
+        let test_start_line = text
+            .lines()
+            .position(|l| l.trim_start().starts_with("#[cfg(test)]"))
+            .unwrap_or(usize::MAX);
         for (i, line) in text.lines().enumerate() {
             if !line.contains("graph_query") {
                 continue;
@@ -58,7 +65,7 @@ fn sec2_no_graph_query_tool_outside_negative_assertions() {
                 || trimmed.starts_with("fn no_") // negative-assertion test fns
                 || line.contains("No `graph_query`")
                 || line.contains("forbidden")
-                || line.contains('"'); // string literal inside a deny-list/test
+                || i >= test_start_line;
             assert!(
                 negative,
                 "{}:{}: graph_query outside a negative assertion: {line}",

@@ -487,6 +487,56 @@ async fn directory_without_mod_rs_is_not_a_module() {
     assert_eq!(loose, 0);
 }
 
+// IN7b: a bin root with an explicit path inside src/ is claimed — it must
+// not reappear as a lib child module (same module path would violate G9).
+#[tokio::test]
+async fn explicit_bin_path_inside_src_is_not_double_ingested() {
+    let fx = Fx::new();
+    write(
+        &fx.ws.join("crates/toy-core/Cargo.toml"),
+        "[package]\nname = \"toy-core\"\n[[bin]]\nname = \"runner\"\npath = \"src/runner.rs\"\n",
+    );
+    write(
+        &fx.ws.join("crates/toy-core/src/runner.rs"),
+        "fn main() {}\n",
+    );
+    let g = fx.open().await;
+    g.rebuild(&fx.ws).await.unwrap();
+    let view = g
+        .query(GraphQuery::Symbol {
+            path: "toy_core::runner".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(view.nodes.len(), 1, "exactly one node for the bin root");
+    g.close().await.unwrap();
+}
+
+// IN7b: name-only [[bin]] entries resolve to conventional src/bin/<name>.rs
+// even alongside an explicit-path sibling.
+#[tokio::test]
+async fn name_only_bin_resolves_conventionally_beside_explicit_bins() {
+    let fx = Fx::new();
+    write(
+        &fx.ws.join("crates/toy-cli/Cargo.toml"),
+        "[package]\nname = \"toy-cli\"\n[[bin]]\nname = \"cli\"\npath = \"src/main.rs\"\n[[bin]]\nname = \"helper\"\n",
+    );
+    write(
+        &fx.ws.join("crates/toy-cli/src/bin/helper.rs"),
+        "fn main() {}\n",
+    );
+    let g = fx.open().await;
+    g.rebuild(&fx.ws).await.unwrap();
+    for path in ["toy_cli::cli", "toy_cli::helper"] {
+        let view = g
+            .query(GraphQuery::Symbol { path: path.into() })
+            .await
+            .unwrap();
+        assert_eq!(view.nodes.len(), 1, "{path} must exist");
+    }
+    g.close().await.unwrap();
+}
+
 // T3i: IN12 — malformed member manifest warns and continues.
 #[tokio::test]
 async fn malformed_member_manifest_warns_and_continues() {
@@ -1233,7 +1283,8 @@ async fn worker_style_handle_answers_after_host_ingest() {
     let fx = Fx::new();
     let g = std::sync::Arc::new(fx.open().await);
     g.rebuild(&fx.ws).await.unwrap();
-    let handle = GraphViewHandle::new(g.clone() as std::sync::Arc<dyn ProjectGraph>);
+    let graph: std::sync::Arc<dyn ProjectGraph> = g.clone();
+    let handle = GraphViewHandle::new(graph);
     let view = handle
         .query(GraphQuery::Symbol {
             path: "crates/toy-core/src/io/reader.rs".into(),

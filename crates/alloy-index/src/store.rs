@@ -111,18 +111,29 @@ impl SqliteProjectGraph {
         self.metrics.snapshot()
     }
 
-    /// Full ingest returning the detailed report (`rebuild` returns only the
-    /// version).
+    /// Full ingest returning the detailed report (`rebuild` returns only
+    /// the version). Memoizes `root` on success so `apply_incremental`
+    /// works after either entry point.
     pub async fn rebuild_reported(&self, root: &Path) -> Result<IngestReport, GraphError> {
-        let root = root.to_path_buf();
+        let owned_root = root.to_path_buf();
         let limits = self.limits;
-        let scan = tokio::task::spawn_blocking(move || scan_workspace(&root, &limits))
-            .await
-            .map_err(|e| GraphError::Internal(format!("spawn_blocking join: {e}")))??;
+        let scan = {
+            let scan_root = owned_root.clone();
+            tokio::task::spawn_blocking(move || scan_workspace(&scan_root, &limits))
+                .await
+                .map_err(|e| GraphError::Internal(format!("spawn_blocking join: {e}")))??
+        };
 
         let db = Arc::clone(&self.db);
         let report =
             spawn_graph_db(db, move |db| db.with_mut(|conn| commit_scan(conn, &scan))).await?;
+
+        // Memoize on success so `apply_incremental` works after either
+        // `rebuild` or `rebuild_reported`.
+        *self
+            .workspace_root
+            .lock()
+            .map_err(|_| GraphError::Internal("root mutex poisoned".into()))? = Some(owned_root);
 
         GraphMetrics::bump(&self.metrics.rebuilds);
         if report.unchanged {
@@ -181,12 +192,18 @@ fn quarantine(layout: &GraphLayout, reason: &str) -> Result<(), GraphError> {
         .map_err(|e| GraphError::Internal(format!("clock: {e}")))?
         .as_nanos();
     tracing::warn!(%reason, "quarantining corrupt graph database (S8)");
+    let base = layout
+        .db_path
+        .file_name()
+        .ok_or_else(|| GraphError::Internal("graph db path has no file name".into()))?;
     for suffix in ["", "-wal", "-shm"] {
-        let src = PathBuf::from(format!("{}{suffix}", layout.db_path.display()));
+        // OsStr-based so non-UTF-8 path components survive untouched.
+        let mut name = base.to_os_string();
+        name.push(suffix);
+        let src = layout.db_path.with_file_name(&name);
         if src.exists() {
-            let dest = layout
-                .quarantine_dir
-                .join(format!("graph.sqlite{suffix}.{nanos}"));
+            name.push(format!(".{nanos}"));
+            let dest = layout.quarantine_dir.join(&name);
             std::fs::rename(&src, &dest)
                 .map_err(|e| GraphError::Io(format!("quarantine {}: {e}", src.display())))?;
         }
@@ -400,13 +417,7 @@ fn digest_from_rows(conn: &Connection) -> Result<Digest, GraphError> {
 #[async_trait]
 impl ProjectGraph for SqliteProjectGraph {
     async fn rebuild(&self, root: &Path) -> Result<GraphVersion, GraphError> {
-        let report = self.rebuild_reported(root).await?;
-        *self
-            .workspace_root
-            .lock()
-            .map_err(|_| GraphError::Internal("root mutex poisoned".into()))? =
-            Some(root.to_path_buf());
-        Ok(report.version)
+        Ok(self.rebuild_reported(root).await?.version)
     }
 
     #[tracing::instrument(skip_all, name = "index.incremental")]
@@ -446,53 +457,80 @@ impl ProjectGraph for SqliteProjectGraph {
         }
 
         // Modified-only path: re-hash tracked module files; untracked or
-        // non-.rs paths are ignored and counted (§6.6).
+        // non-.rs paths are ignored and counted (§6.6). Filesystem work runs
+        // on the blocking pool (X3's posture), and the same symlink/escape
+        // rules as the scan walk apply (IN4/SEC7): a symlinked file, or a
+        // path whose resolution leaves the workspace root, is skipped.
         let limits = self.limits;
-        let mut updates: Vec<(String, Digest, u64)> = Vec::new();
-        let mut skipped = 0u64;
-        for change in changes {
-            if !change.path.ends_with(".rs") {
-                skipped += 1;
-                continue;
-            }
-            let abs = root.join(&change.path);
-            if !abs.is_file() {
-                skipped += 1;
-                continue;
-            }
-            let (digest, byte_len, oversized) = hash_file(&abs, &limits)?;
-            if oversized {
-                skipped += 1;
-            }
-            updates.push((change.path.clone(), digest, byte_len));
-        }
+        let change_paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+        let hash_root = root.clone();
+        let (updates, skipped) = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<(String, Digest, u64)>, u64), GraphError> {
+                let canonical_root = hash_root
+                    .canonicalize()
+                    .map_err(|e| GraphError::Workspace(format!("canonicalize root: {e}")))?;
+                let mut updates: Vec<(String, Digest, u64)> = Vec::new();
+                let mut skipped = 0u64;
+                for path in change_paths {
+                    if !path.ends_with(".rs") {
+                        skipped += 1;
+                        continue;
+                    }
+                    let abs = hash_root.join(&path);
+                    // IN4/SEC7: never hash through a symlink...
+                    let is_symlink = std::fs::symlink_metadata(&abs)
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false);
+                    if is_symlink || !abs.is_file() {
+                        skipped += 1;
+                        continue;
+                    }
+                    // ...and never a path that resolves outside the root
+                    // (a symlinked intermediate directory).
+                    match abs.canonicalize() {
+                        Ok(resolved) if resolved.starts_with(&canonical_root) => {}
+                        _ => {
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                    let (digest, byte_len, oversized) = hash_file(&abs, &limits)?;
+                    if oversized {
+                        skipped += 1;
+                    }
+                    updates.push((path, digest, byte_len));
+                }
+                Ok((updates, skipped))
+            },
+        )
+        .await
+        .map_err(|e| GraphError::Internal(format!("spawn_blocking join: {e}")))??;
         GraphMetrics::add(&self.metrics.files_skipped, skipped);
 
         let db = Arc::clone(&self.db);
         spawn_graph_db(db, move |db| {
             db.with_mut(|conn| {
                 let tx = conn.unchecked_transaction().map_err(from_rusqlite)?;
-                for (path, digest, byte_len) in &updates {
-                    let tracked: i64 = tx
-                        .query_row(
-                            "SELECT COUNT(*) FROM graph_files WHERE path = ?1",
-                            [path],
-                            |r| r.get(0),
+                {
+                    let mut files_stmt = tx
+                        .prepare_cached(
+                            "UPDATE graph_files SET digest = ?1, byte_len = ?2 WHERE path = ?3",
                         )
                         .map_err(from_rusqlite)?;
-                    if tracked == 0 {
-                        continue; // not a module file — ignored (§6.6).
+                    let mut nodes_stmt = tx
+                        .prepare_cached("UPDATE graph_nodes SET digest = ?1 WHERE file = ?2")
+                        .map_err(from_rusqlite)?;
+                    for (path, digest, byte_len) in &updates {
+                        let changed = files_stmt
+                            .execute(rusqlite::params![digest.as_hex(), *byte_len as i64, path])
+                            .map_err(from_rusqlite)?;
+                        if changed == 0 {
+                            continue; // not a tracked module file — ignored (§6.6).
+                        }
+                        nodes_stmt
+                            .execute(rusqlite::params![digest.as_hex(), path])
+                            .map_err(from_rusqlite)?;
                     }
-                    tx.execute(
-                        "UPDATE graph_files SET digest = ?1, byte_len = ?2 WHERE path = ?3",
-                        rusqlite::params![digest.as_hex(), *byte_len as i64, path],
-                    )
-                    .map_err(from_rusqlite)?;
-                    tx.execute(
-                        "UPDATE graph_nodes SET digest = ?1 WHERE file = ?2",
-                        rusqlite::params![digest.as_hex(), path],
-                    )
-                    .map_err(from_rusqlite)?;
                 }
                 let (version, _bumped) = recompute_and_bump(&tx)?;
                 tx.commit().map_err(from_rusqlite)?;

@@ -23,5 +23,8 @@ mod query;
 mod store;
 
 pub use layout::{GraphLayout, GraphOpenOptions, IngestLimits};
+// `GraphOpenOptions.synchronous` is this type; re-exported so configuring an
+// open does not require a direct `alloy-runtime` import.
+pub use alloy_runtime::SqliteSynchronous;
 pub use metrics::GraphMetricsSnapshot;
 pub use store::SqliteProjectGraph;
