@@ -440,9 +440,10 @@ pub struct FixEvent {
     pub recorded_at: Timestamp,
 }
 
-/// Outcome summary of an ingest pass (returned via `IngestReport`, logged by the caller).
+/// Outcome summary of an ingest pass (returned via `rebuild_reported`,
+/// logged by the caller). Constructed by `alloy-index`, so not
+/// `#[non_exhaustive]` — adding a field is an API change by design.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
 pub struct IngestReport {
     /// Version after the pass.
     pub version: GraphVersion,
@@ -660,7 +661,7 @@ impl ProjectGraph for SqliteProjectGraph { /* §6, §7 */ }
 
 ### 3.11 Crate-root re-exports
 
-`alloy-runtime` re-exports from `graph`: `FileChange`, `FileChangeKind`, `FixEvent`, `GraphEdge`, `GraphEdgeKind`, `GraphError`, `GraphFidelity`, `GraphNode`, `GraphNodeKind`, `GraphQuery`, `GraphSnapshotId`, `GraphView`, `GraphViewHandle`, `IngestReport`, `NullProjectGraph`, `ProjectGraph` (plus `CrateId` from `types::ids`).
+`alloy-runtime` re-exports from `graph`: `derive_node_id`, `FileChange`, `FileChangeKind`, `FixEvent`, `GraphEdge`, `GraphEdgeKind`, `GraphError`, `GraphFidelity`, `GraphNode`, `GraphNodeKind`, `GraphQuery`, `GraphSnapshotId`, `GraphView`, `GraphViewHandle`, `IngestReport`, `NullProjectGraph`, `ProjectGraph` (plus `CrateId` from `types::ids`).
 
 `alloy-index` re-exports: `GraphLayout`, `GraphMetricsSnapshot`, `GraphOpenOptions`, `IngestLimits`, `SqliteProjectGraph`, and `pub use alloy_runtime::graph::*` is **forbidden** — consumers import the seam from `alloy-runtime` directly (rule **C4b**), so there is exactly one path to each type.
 
@@ -1074,7 +1075,6 @@ globset       = { workspace = true }
 rusqlite      = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
-sha2          = { workspace = true }
 thiserror     = { workspace = true }
 time          = { workspace = true }
 tokio         = { workspace = true }
@@ -1092,7 +1092,7 @@ tokio    = { workspace = true }
 - `walkdir` / `ignore` are **not** added — the walk is ~80 lines of `std::fs` with an explicit skip list, and writing it by hand is what makes IN4 (no symlink following) and IN5 (sorted traversal) auditable rather than configuration-dependent.
 - `cargo_metadata` is **not** added — see §6.2.
 - `syn` is **not** added — it is the Beta deepening's dependency, and adding it now would be dead weight under DoD gate 9.
-- Hashing uses `Digest::sha256` from `alloy-runtime` (`sha2` is listed because the incremental file hashing path uses `DigestHasher` streaming for large files).
+- `sha2` is **not** listed — all hashing goes through `alloy-runtime`'s `Digest::sha256` / `DigestHasher`, so the graph and the seam can never disagree on digest encoding.
 
 Lint attributes added to `crates/alloy-index/src/lib.rs`:
 
