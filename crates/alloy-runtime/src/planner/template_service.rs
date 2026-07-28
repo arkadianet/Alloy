@@ -595,8 +595,8 @@ impl PlanService for TemplatePlanService {
 mod tests {
     use super::*;
     use crate::dag::{
-        mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest,
-        NodeInputEnvelope, NodeInputPayload, NodeKind, PendingPredPlaceholder,
+        compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, NodeInputEnvelope,
+        NodeInputPayload, NodeKind, PendingPredPlaceholder,
     };
     use crate::events::InMemoryEventSink;
     use crate::storage::{
@@ -605,10 +605,18 @@ mod tests {
     use std::sync::Mutex;
 
     fn fingerprints() -> (Digest, Digest, Digest) {
+        let toolchain = crate::types::toolchain::ToolchainRecord {
+            channel: "1.97.1".into(),
+            rustc_version: "rustc 1.97.1 (test)".into(),
+            cargo_version: "cargo 1.97.1 (test)".into(),
+        };
         (
-            mvp_policy_hash_digest(),
-            mvp_tool_versions_digest(),
-            mvp_compiler_fingerprint_digest(),
+            policy_hash_digest(
+                &crate::types::ids::ProfileId::new("default").unwrap(),
+                &crate::types::budget::BudgetPolicy::default(),
+            ),
+            tool_versions_digest(&toolchain),
+            compiler_fingerprint_digest(&toolchain, "x86_64-unknown-linux-gnu"),
         )
     }
 

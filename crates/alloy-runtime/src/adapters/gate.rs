@@ -103,6 +103,7 @@ mod tests {
                 retain_tool_bodies: false,
                 run_timeout: Duration::from_secs(30),
                 budget_policy: BudgetPolicy::default(),
+                capture: Default::default(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();

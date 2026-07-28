@@ -134,17 +134,7 @@ pub struct FixtureManifest {
     pub driver: FixtureDriverKind,
 }
 
-/// Captured Rust and Cargo toolchain identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ToolchainRecord {
-    /// Toolchain channel, e.g. `1.97.1`.
-    pub channel: String,
-    /// `rustc -V` output captured with the recording.
-    pub rustc_version: String,
-    /// `cargo -V` output captured with the recording.
-    pub cargo_version: String,
-}
+pub use alloy_runtime::ToolchainRecord;
 
 /// Workspace snapshot reference inside a fixture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

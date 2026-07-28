@@ -137,6 +137,12 @@ uuid_id!(
     /// Identifier of a recorded graph snapshot (RFC-0011 §4.7, amendment A2).
     GraphSnapshotId
 );
+uuid_id!(
+    /// Identity of one run's trajectory record (research §7.11 item 7).
+    /// Minted at `submit_goal` beside `dag_id`, before any exporter exists,
+    /// so every run ever executed can be joined to a corpus row later.
+    TrajectoryId
+);
 
 name_id!(
     /// Profile catalog id (`default`, `autonomous`, `readonly`).

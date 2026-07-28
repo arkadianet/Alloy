@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use super::error::StoreError;
 
 /// Schema version shipped by this crate (RFC-0002 / RFC-0003 existence probes).
-pub const CODE_SCHEMA_VERSION: u32 = 3;
+pub const CODE_SCHEMA_VERSION: u32 = 4;
 
 // `schema_migrations` is bootstrapped in `ensure_migrations_table` before v1 runs.
 // PK (session_id, seq) covers ordered replay, not (session_id, run_id, type) probes —
@@ -97,6 +97,14 @@ CREATE INDEX IF NOT EXISTS idx_runtime_events_run_finished_run_id
   WHERE json_extract(event_json, '$.run_finished.run_id') IS NOT NULL;
 "#;
 
+// Session provenance and consent (research §7.11 item 4). One nullable JSON
+// column: the shape is owned by `types::provenance::SessionProvenance`, and
+// consent recorded here is the only consent that exists — it cannot be
+// obtained retroactively for data already captured.
+const V4_SQL: &str = r#"
+ALTER TABLE sessions ADD COLUMN provenance_json TEXT NULL;
+"#;
+
 /// Apply pending migrations. Returns the schema version after migrate.
 ///
 /// When `refuse_newer` is true and the DB reports a version above
@@ -165,6 +173,23 @@ pub fn migrate(conn: &Connection, refuse_newer: bool) -> Result<u32, StoreError>
         tx.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![3i64, now_rfc3339()],
+        )
+        .map_err(|e| StoreError::Migration(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+    }
+
+    let current = current_version(conn)?;
+    if current < 4 {
+        tracing::info!(version = 4, "applying migration");
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        tx.execute_batch(V4_SQL)
+            .map_err(|e| StoreError::Migration(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![4i64, now_rfc3339()],
         )
         .map_err(|e| StoreError::Migration(e.to_string()))?;
         tx.commit()
@@ -274,9 +299,26 @@ mod tests {
     fn migrate_fresh_and_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         let v = migrate(&conn, true).unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         let v2 = migrate(&conn, true).unwrap();
-        assert_eq!(v2, 3);
+        assert_eq!(v2, 4);
+    }
+
+    /// Research §7.11 item 4: v4 adds the nullable provenance column, and a
+    /// v3 database upgrades in place without touching existing rows.
+    #[test]
+    fn migrate_v4_adds_sessions_provenance_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn, true).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions')
+                 WHERE name = 'provenance_json'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "sessions.provenance_json must exist at v4");
     }
 
     #[test]

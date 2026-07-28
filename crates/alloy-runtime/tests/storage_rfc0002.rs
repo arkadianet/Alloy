@@ -86,7 +86,7 @@ async fn open_creates_layout() {
     assert!(dir.path().join("alloy.sqlite").is_file());
     assert!(dir.path().join("artifacts").is_dir());
     assert!(dir.path().join("graph").is_dir());
-    assert_eq!(storage.schema_version(), 3);
+    assert_eq!(storage.schema_version(), 4);
     storage.close().await.unwrap();
 }
 
@@ -102,7 +102,7 @@ async fn migrate_idempotent_and_refuse_newer() {
     let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
         .await
         .unwrap();
-    assert_eq!(storage.schema_version(), 3);
+    assert_eq!(storage.schema_version(), 4);
     storage.close().await.unwrap();
     drop(storage);
 
@@ -909,5 +909,52 @@ async fn crash_after_commit_reopen_sees_event() {
         .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].seq, EventSeq(0));
+    storage.close().await.unwrap();
+}
+
+/// Research §7.11 item 4: provenance and consent round-trip through the v4
+/// column; an unrecorded session reads `None` (fail closed); recording
+/// against a missing session errors instead of silently dropping consent.
+#[tokio::test]
+async fn session_provenance_round_trips_and_fails_closed() {
+    use alloy_runtime::{ConsentRecord, SessionProvenance, PROVENANCE_SCHEMA_VERSION};
+    let (_dir, storage) = open_temp().await;
+    let rows = storage.sessions();
+    let session = Session {
+        id: SessionId::new(),
+        workspace_root: "/tmp/ws".into(),
+        profile: ProfileId::new("default").unwrap(),
+        budget: BudgetPolicy::default(),
+        language_backends: vec![],
+        created_at: Timestamp::now(),
+    };
+    rows.upsert_session(&session).await.unwrap();
+
+    // Never recorded → None, the fail-closed reading.
+    assert_eq!(rows.get_provenance(session.id).await.unwrap(), None);
+
+    let provenance = SessionProvenance {
+        schema_version: PROVENANCE_SCHEMA_VERSION,
+        repo: Some("https://github.com/arkadianet/Alloy".into()),
+        head_sha: Some("4b8dfd7".into()),
+        spdx: vec!["MIT OR Apache-2.0".into()],
+        consent: ConsentRecord {
+            corpus_ok: true,
+            share_ok: false,
+        },
+    };
+    rows.set_provenance(session.id, &provenance).await.unwrap();
+    let got = rows.get_provenance(session.id).await.unwrap().unwrap();
+    assert_eq!(got, provenance);
+
+    // Recording against a session that does not exist is an error.
+    let err = rows
+        .set_provenance(SessionId::new(), &provenance)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, alloy_runtime::StoreError::NotFound(_)),
+        "got {err:?}"
+    );
     storage.close().await.unwrap();
 }

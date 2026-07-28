@@ -331,7 +331,12 @@ impl SessionService for SessionServiceView {
         let run = RunId::new();
         let dag_id = DagId::new();
         let now = Timestamp::now();
-        let record = RunGoalRecord { goal, dag_id };
+        let record = RunGoalRecord {
+            goal,
+            dag_id,
+            trajectory_id: Some(crate::types::ids::TrajectoryId::new()),
+            trajectory_schema: crate::session::TRAJECTORY_SCHEMA_VERSION,
+        };
         let goal_json = serde_json::to_value(&record)
             .map_err(|e| SessionError::Internal(format!("serialize goal record: {e}")))?;
 

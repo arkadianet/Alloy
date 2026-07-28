@@ -39,6 +39,20 @@ pub trait SessionRows: Send + Sync {
     /// Load a session row.
     async fn get_session(&self, id: SessionId) -> Result<Option<Session>, StoreError>;
 
+    /// Write session provenance + consent (research §7.11 item 4).
+    /// Overwrites any prior record; the session row must exist.
+    async fn set_provenance(
+        &self,
+        id: SessionId,
+        provenance: &crate::types::provenance::SessionProvenance,
+    ) -> Result<(), StoreError>;
+    /// Load session provenance. `Ok(None)` = never recorded — read it as
+    /// "no consent, provenance unknown" (fail closed).
+    async fn get_provenance(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<crate::types::provenance::SessionProvenance>, StoreError>;
+
     /// Upsert a run row.
     async fn upsert_run(&self, row: &RunRow) -> Result<(), StoreError>;
     /// Load a run row.
@@ -105,6 +119,60 @@ impl SessionRows for SqliteSessionRows {
                     ],
                 )?;
                 Ok(())
+            })
+        })
+        .await
+        .map_err(|e| self.map_busy(e))
+    }
+
+    async fn set_provenance(
+        &self,
+        id: SessionId,
+        provenance: &crate::types::provenance::SessionProvenance,
+    ) -> Result<(), StoreError> {
+        let _permit = self.gate.enter()?;
+        let db = Arc::clone(&self.db);
+        let id_str = id.to_string();
+        let json =
+            serde_json::to_string(provenance).map_err(|e| StoreError::Internal(e.to_string()))?;
+        spawn_db(db, move |handle| {
+            handle.with(|conn| {
+                let changed = conn.execute(
+                    "UPDATE sessions SET provenance_json = ?1 WHERE id = ?2",
+                    params![json, id_str],
+                )?;
+                if changed == 0 {
+                    return Err(StoreError::NotFound(format!("session {id_str}")));
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| self.map_busy(e))
+    }
+
+    async fn get_provenance(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<crate::types::provenance::SessionProvenance>, StoreError> {
+        let _permit = self.gate.enter()?;
+        let db = Arc::clone(&self.db);
+        let id_str = id.to_string();
+        spawn_db(db, move |handle| {
+            handle.with(|conn| {
+                let row: Option<Option<String>> = conn
+                    .query_row(
+                        "SELECT provenance_json FROM sessions WHERE id = ?1",
+                        [&id_str],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(Some(json)) = row else {
+                    return Ok(None);
+                };
+                serde_json::from_str(&json)
+                    .map(Some)
+                    .map_err(|e| StoreError::Corrupt(format!("provenance_json: {e}")))
             })
         })
         .await

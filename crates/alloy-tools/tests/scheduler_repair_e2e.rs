@@ -61,7 +61,7 @@ mod linux {
         RecordingDecisionLog, RetentionPolicy, RunControlState, RunGoalRecord, RunRow,
         RuntimeConfig, SchedConfig, Scheduler, Session, SessionVerifyPermissions, TaskDag,
         TemplateCatalog, TemplateId, Timestamp, ToolCaller, ToolName, ToolSelector,
-        UnavailableVerifyTest, VerifyCompileAdapter, VerifyPermissions,
+        UnavailableVerifyTest, Verifier, VerifyPermissions,
     };
     use alloy_tools::mcp::{
         InProcessMcpHost, McpHostConfig, McpPlatform, StubPatchApplyBackend, ToolHandle,
@@ -287,6 +287,7 @@ mod linux {
                 retain_tool_bodies: false,
                 run_timeout: Duration::from_secs(300),
                 budget_policy: BudgetPolicy::default(),
+                capture: Default::default(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();
@@ -336,6 +337,8 @@ mod linux {
                     attachments: vec![],
                 },
                 dag_id,
+                trajectory_id: Some(alloy_runtime::TrajectoryId::new()),
+                trajectory_schema: alloy_runtime::TRAJECTORY_SCHEMA_VERSION,
             };
             let row = RunRow {
                 id: run_id,
@@ -447,7 +450,7 @@ mod linux {
         fx: &Fixture,
         sched_dir: PathBuf,
         capabilities: &Arc<dyn CapabilityExecutor>,
-        verify_compile: &Arc<dyn VerifyCompileAdapter>,
+        verify_compile: &Arc<dyn Verifier>,
     ) -> LinearScheduler {
         let mut config = SchedConfig::new(sched_dir);
         config.max_backoff = Duration::from_secs(1);
@@ -542,7 +545,7 @@ mod linux {
             Some("check*".into()),
             None,
         ));
-        let verify_compile: Arc<dyn VerifyCompileAdapter> = Arc::new(McpVerifyCompileAdapter::new(
+        let verify_compile: Arc<dyn Verifier> = Arc::new(McpVerifyCompileAdapter::new(
             tools,
             perms,
             fx.storage.artifacts(),

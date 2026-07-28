@@ -25,9 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use self::metrics::SchedulerCounters;
 use self::own::OwnershipLock;
-use crate::adapters::{
-    CapabilityExecutor, GateHumanAdapter, VerifyCompileAdapter, VerifyTestAdapter,
-};
+use crate::adapters::{CapabilityExecutor, GateHumanAdapter, Verifier};
 use crate::dag::ValidateOpts;
 use crate::error::SchedError;
 use crate::obs::{CostMeterFactory, DecisionLog};
@@ -99,9 +97,9 @@ pub struct LinearSchedulerDeps {
     /// Gate resolution / expiry. MUST equal `session_plane.runs()` (D6).
     pub runs: Arc<dyn RunController>,
     /// Compile verification adapter.
-    pub verify_compile: Arc<dyn VerifyCompileAdapter>,
+    pub verify_compile: Arc<dyn Verifier>,
     /// Test verification adapter.
-    pub verify_test: Arc<dyn VerifyTestAdapter>,
+    pub verify_test: Arc<dyn Verifier>,
     /// Human gate adapter.
     pub gate_human: Arc<dyn GateHumanAdapter>,
     /// `UnavailableCapabilityExecutor` until RFC-0013.
@@ -281,6 +279,7 @@ mod tests {
                 retain_tool_bodies: false,
                 run_timeout: Duration::from_secs(30),
                 budget_policy: BudgetPolicy::default(),
+                capture: Default::default(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();
