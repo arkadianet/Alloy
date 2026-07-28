@@ -9,7 +9,12 @@
 
 #![allow(clippy::disallowed_methods)] // positive baselines may use host Command
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+// Only `hermetic_homes` names `Path`, and that is Linux-gated; importing it
+// unconditionally fails the macOS/Seatbelt job under `-D warnings`.
+#[cfg(target_os = "linux")]
+use std::path::Path;
 
 #[cfg(target_os = "linux")]
 use std::net::TcpListener;
