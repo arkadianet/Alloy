@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use super::budget;
 use super::checkpoint::{map_store_error, map_store_error_on_load, Checkpoint, CheckpointCtx};
 use super::envelopes::{self, InputShape};
-use super::ready::{derive_dag_state, promotable_nodes, ready_nodes, DeriveFlags};
+use super::ready::{backoff_delay, derive_dag_state, promotable_nodes, ready_nodes, DeriveFlags};
 use super::retry::{self, Admission, Escalation};
 use super::LinearScheduler;
 use crate::adapters::{
@@ -105,6 +105,14 @@ pub(super) struct RunCtx<'a> {
     /// §5.7.9 `GATE_REREGISTER_MAX`: per-gate re-registration attempts
     /// consumed so far this `run` invocation.
     gate_reregister_counts: std::sync::Mutex<std::collections::HashMap<GateId, u32>>,
+    /// B4: nodes whose retry backoff this `run` invocation has already slept
+    /// (§5.11.3). Backoff elapsed time is not durable, so on resume a `Ready`
+    /// node with `attempts_started >= 1` must re-wait the full delay before
+    /// C3. Membership here is what distinguishes "this process already served
+    /// the wait, in `apply_soft_failure`" from "this attempt counter came off
+    /// the event log and we owe the wait" — without it the in-loop retry path
+    /// would sleep twice per retry.
+    backoff_served: std::sync::Mutex<std::collections::HashSet<NodeId>>,
 }
 
 impl RunCtx<'_> {
@@ -147,6 +155,23 @@ impl RunCtx<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(gate);
+    }
+
+    /// B4: record that this `run` has slept `node`'s retry backoff, so the
+    /// dispatch that follows does not re-serve it.
+    fn mark_backoff_served(&self, node: NodeId) {
+        self.backoff_served
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(node);
+    }
+
+    /// B4: has this `run` already slept `node`'s retry backoff?
+    fn backoff_already_served(&self, node: NodeId) -> bool {
+        self.backoff_served
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&node)
     }
 
     /// §5.7.9 `GATE_REREGISTER_MAX`: consume one re-registration attempt for
@@ -378,6 +403,7 @@ impl LinearScheduler {
             gate_wait_total: std::sync::Mutex::new(Duration::ZERO),
             expired_gates: std::sync::Mutex::new(std::collections::HashSet::new()),
             gate_reregister_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            backoff_served: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
         // BG1/BG5: record once, now that `rc` exists to record through.
         self.record_budget_ignored(&rc, &effective).await;
@@ -794,6 +820,31 @@ impl LinearScheduler {
             .await?;
         let attempt = attempts_started + 1;
 
+        // B4: backoff elapsed time is not durable (§12), so a `Ready` node
+        // whose attempt counter came off the event log rather than from this
+        // process's own C8 owes the full wait again before C3. Deliberately
+        // over-waits after a crash — never under-waits.
+        if attempts_started >= 1 && !rc.backoff_already_served(node_id) {
+            let delay = backoff_delay(
+                &dag.nodes[&node_id].retry.backoff,
+                attempts_started,
+                self.deps.config.max_backoff,
+            );
+            rc.mark_backoff_served(node_id);
+            if !delay.is_zero() {
+                // B3: cancel during backoff is immediate.
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = rc.run_cancel.cancelled() => {
+                        return self.cancel_path(dag, rc).await;
+                    }
+                    () = self.deps.runtime_cancel.cancelled() => {
+                        return self.cancel_path(dag, rc).await;
+                    }
+                }
+            }
+        }
+
         // L12 (§5.11.4 ES1-ES6): decided before C3 (ES4).
         let kind_for_escalation = dag.nodes[&node_id].kind;
         let effective_tier = if is_capability_kind(kind_for_escalation) {
@@ -803,7 +854,7 @@ impl LinearScheduler {
                     tier
                 }
                 Escalation::SkippedNoTarget => {
-                    self.record_escalation_skipped(rc, node_id, attempt).await;
+                    self.record_escalation_skipped(rc, node_id, attempt).await?;
                     dag.nodes[&node_id].model_tier
                 }
                 Escalation::None => dag.nodes[&node_id].model_tier,
@@ -820,6 +871,11 @@ impl LinearScheduler {
         let node_budget_timeout = Duration::from_millis(node_timeout_ms);
         let remaining_run = rc.remaining_run();
         // T7: attribution when node_deadline = min(node.timeout_ms, remaining_run).
+        // `<=` (not `<`) is deliberate: on an exact tie the run budget is the
+        // binding constraint, so a timeout at that instant is a run timeout
+        // (T8, non-retryable) rather than a node timeout (retryable). Ties are
+        // reachable whenever a node's `timeout_ms` equals the run budget, which
+        // single-node templates make routine.
         let run_attributed = remaining_run <= node_budget_timeout;
         let node_deadline = node_budget_timeout.min(remaining_run);
 
@@ -842,8 +898,14 @@ impl LinearScheduler {
             .c3_dispatch(dag, rc.ctx, node_id, attempt)
             .await?;
 
-        let kind = dag.nodes[&node_id].kind;
-        let capability = dag.nodes[&node_id].capability.clone();
+        let plan = DispatchPlan {
+            kind: dag.nodes[&node_id].kind,
+            capability: dag.nodes[&node_id].capability.clone(),
+            effective_tier,
+            budget: dag.nodes[&node_id].budget.clone(),
+            deadline: node_deadline,
+            input,
+        };
         let meta = NodeExecRef {
             session_id: rc.session.id,
             run_id: rc.run_id,
@@ -854,7 +916,7 @@ impl LinearScheduler {
         };
 
         let outcome = tokio::select! {
-            res = tokio::time::timeout(node_deadline, self.dispatch_kind(kind, capability, &meta, effective_tier, input, rc)) => {
+            res = tokio::time::timeout(node_deadline, self.dispatch_kind(plan, &meta, rc)) => {
                 match res {
                     Ok(inner) => inner?,
                     Err(_elapsed) => {
@@ -899,13 +961,18 @@ impl LinearScheduler {
     /// routed by the caller before C3).
     async fn dispatch_kind(
         &self,
-        kind: NodeKind,
-        capability: Option<crate::types::ids::CapabilityId>,
+        plan: DispatchPlan,
         meta: &NodeExecRef,
-        effective_tier: crate::types::budget::ModelTier,
-        input: crate::dag::NodeInputEnvelope,
         rc: &RunCtx<'_>,
     ) -> Result<DispatchResult, SchedError> {
+        let DispatchPlan {
+            kind,
+            capability,
+            effective_tier,
+            budget,
+            deadline,
+            input,
+        } = plan;
         match kind {
             NodeKind::Plan | NodeKind::Analyze | NodeKind::Edit | NodeKind::Review => {
                 let capability = capability.ok_or_else(|| {
@@ -917,11 +984,8 @@ impl LinearScheduler {
                     capability,
                     kind,
                     effective_tier,
-                    budget: crate::types::budget::TokenBudget {
-                        max_input: 0,
-                        max_output: 0,
-                    },
-                    timeout: Duration::from_millis(0),
+                    budget,
+                    timeout: deadline,
                     input,
                     attempt: meta.attempt,
                     cost_meter: self.deps.cost_meters.meter_for(meta.run_id),
@@ -1139,8 +1203,13 @@ impl LinearScheduler {
 
         match decision {
             Admission::Reject(reason) => {
+                // BE4: this record describes a decision whose CAS (C7, inside
+                // `terminal_failed`) has not happened yet, so a `DecisionLog`
+                // failure here MUST surface as `Err(Store)` and MUST NOT let
+                // the CAS proceed. Only *after* a committed CAS is logging
+                // best-effort.
                 self.record_retry_rejected(rc, node_id, attempt, &failure, reason)
-                    .await;
+                    .await?;
                 self.metrics.inc_retries_rejected();
                 Ok(StepOutcome::Terminal(
                     self.terminal_failed(dag, rc, node_id, Some(attempt), failure)
@@ -1160,6 +1229,7 @@ impl LinearScheduler {
                     None // ES5
                 };
                 let backoff_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                // BE4, as above: pre-CAS, so failure aborts before C8.
                 self.record_retry_admitted(
                     rc,
                     node_id,
@@ -1169,7 +1239,7 @@ impl LinearScheduler {
                     backoff_ms,
                     escalated_to,
                 )
-                .await;
+                .await?;
 
                 rc.checkpoint
                     .c8_retry(
@@ -1183,6 +1253,9 @@ impl LinearScheduler {
                     )
                     .await?;
 
+                // B4: this process is serving the wait for `next_attempt`, so
+                // the re-dispatch that follows must not serve it a second time.
+                rc.mark_backoff_served(node_id);
                 if !delay.is_zero() {
                     // B3: cancel during backoff is immediate.
                     tokio::select! {
@@ -1210,7 +1283,7 @@ impl LinearScheduler {
         failure: &FailureIr,
         backoff_ms: u64,
         escalated_to: Option<ModelTier>,
-    ) {
+    ) -> Result<(), SchedError> {
         let metadata = serde_json::json!({
             "node_id": node_id.to_string(),
             "attempt": attempt,
@@ -1220,7 +1293,7 @@ impl LinearScheduler {
             "backoff_ms": backoff_ms,
             "escalated_to": escalated_to,
         });
-        self.record_decision(rc, node_id, metadata).await;
+        self.record_decision(rc, node_id, metadata).await
     }
 
     async fn record_retry_rejected(
@@ -1230,7 +1303,7 @@ impl LinearScheduler {
         attempt: u32,
         failure: &FailureIr,
         reason: retry::RejectReason,
-    ) {
+    ) -> Result<(), SchedError> {
         let metadata = serde_json::json!({
             "node_id": node_id.to_string(),
             "attempt": attempt,
@@ -1238,20 +1311,38 @@ impl LinearScheduler {
             "retry_admitted": false,
             "reason": reason.as_str(),
         });
-        self.record_decision(rc, node_id, metadata).await;
+        self.record_decision(rc, node_id, metadata).await
     }
 
     /// ES2: `escalate_after` is due but no `escalate_to_tier` is configured.
-    async fn record_escalation_skipped(&self, rc: &RunCtx<'_>, node_id: NodeId, attempt: u32) {
+    /// BE4: recorded before the C3 this escalation decision applies to, so a
+    /// `DecisionLog` failure aborts the dispatch rather than silently
+    /// dispatching at a tier no audit trail explains.
+    async fn record_escalation_skipped(
+        &self,
+        rc: &RunCtx<'_>,
+        node_id: NodeId,
+        attempt: u32,
+    ) -> Result<(), SchedError> {
         let metadata = serde_json::json!({
             "node_id": node_id.to_string(),
             "attempt": attempt,
             "escalation_skipped": "no target tier",
         });
-        self.record_decision(rc, node_id, metadata).await;
+        self.record_decision(rc, node_id, metadata).await
     }
 
-    async fn record_decision(&self, rc: &RunCtx<'_>, node_id: NodeId, metadata: serde_json::Value) {
+    /// BE4: every caller of this records a decision whose CAS has **not**
+    /// committed yet, so an `ObsError` maps to `Err(Store(..))` and the
+    /// caller MUST NOT proceed with that CAS. Post-CAS records (§5.16's
+    /// budget signals, the gate records) stay best-effort and do not route
+    /// through here.
+    async fn record_decision(
+        &self,
+        rc: &RunCtx<'_>,
+        node_id: NodeId,
+        metadata: serde_json::Value,
+    ) -> Result<(), SchedError> {
         let rec = DecisionRecord {
             session: rc.ctx.session_id,
             run: rc.ctx.run_id,
@@ -1261,9 +1352,12 @@ impl LinearScheduler {
             content_hash: None,
             prompt_body: None,
         };
-        if let Err(e) = self.deps.decisions.record(rec).await {
-            tracing::warn!(error = %e, %node_id, "retry/escalation decision record failed");
-        }
+        self.deps
+            .decisions
+            .record(rec)
+            .await
+            .map(|_seq| ())
+            .map_err(|e| SchedError::Store(format!("pre-CAS decision record failed: {e}")))
     }
 
     /// Wraps [`Checkpoint::c7_terminal_failed`] with the SK3 "every other
@@ -1673,6 +1767,26 @@ impl LinearScheduler {
             .await?;
         Ok(())
     }
+}
+
+/// Everything §5.6's dispatch table needs for one attempt, resolved before
+/// C3 commits so the values handed to a worker match what was checkpointed.
+struct DispatchPlan {
+    kind: NodeKind,
+    capability: Option<crate::types::ids::CapabilityId>,
+    /// Post-escalation tier (ES3: never written back to `TaskNode`).
+    effective_tier: crate::types::budget::ModelTier,
+    /// The node's own token budget from the topology. `CapabilityExecContext`
+    /// documents this as the per-node budget and RFC-0013's workers will
+    /// enforce against it — shipping a zeroed one is a broken contract even
+    /// while `UnavailableCapabilityExecutor` ignores it.
+    budget: crate::types::budget::TokenBudget,
+    /// §5.19 node deadline, already clamped by the remaining run budget.
+    /// The same value `dispatch_node`'s `tokio::time::timeout` wrapper uses
+    /// (DP2), so a worker's own deadline arithmetic agrees with the
+    /// scheduler's.
+    deadline: Duration,
+    input: crate::dag::NodeInputEnvelope,
 }
 
 /// Success payload or structured failure from one dispatch (capability or
@@ -2299,6 +2413,61 @@ mod tests {
                 },
             };
             (LinearScheduler::new_for_test(deps).unwrap(), decisions)
+        }
+
+        /// BE4 probe: identical wiring, but every `DecisionLog::record`
+        /// fails, so a pre-CAS record cannot be persisted.
+        fn build_scheduler_with_failing_decisions(
+            &self,
+            sched_dir: std::path::PathBuf,
+            capabilities: Arc<dyn CapabilityExecutor>,
+        ) -> LinearScheduler {
+            let deps = LinearSchedulerDeps {
+                dags: self.storage.dags(),
+                artifacts: self.storage.artifacts(),
+                events: self.storage.events(),
+                sessions: self.storage.sessions(),
+                session_plane: self.plane.clone(),
+                runs: self.plane.runs(),
+                verify_compile: Arc::new(crate::adapters::UnavailableVerifyCompile),
+                verify_test: Arc::new(crate::adapters::UnavailableVerifyTest),
+                gate_human: Arc::new(crate::adapters::UnavailableGateHuman),
+                capabilities,
+                decisions: Arc::new(AlwaysFailingDecisionLog),
+                cost_meters: Arc::new(ProcessCostMeterFactory::new()),
+                runtime_cancel: CancellationToken::new(),
+                budget_policy: BudgetPolicy::default(),
+                run_timeout: Duration::from_secs(30),
+                config: {
+                    let mut c = SchedConfig::new(sched_dir);
+                    c.validate_on_load = false;
+                    c
+                },
+            };
+            LinearScheduler::new_for_test(deps).unwrap()
+        }
+    }
+
+    struct AlwaysFailingDecisionLog;
+    #[async_trait]
+    impl crate::obs::DecisionLog for AlwaysFailingDecisionLog {
+        async fn record(
+            &self,
+            _rec: DecisionRecord,
+        ) -> Result<crate::types::ids::EventSeq, crate::obs::ObsError> {
+            Err(crate::obs::ObsError::Invalid("decision sink down".into()))
+        }
+        async fn record_model_call(
+            &self,
+            _rec: crate::obs::ModelCallRecord,
+        ) -> Result<crate::types::ids::EventSeq, crate::obs::ObsError> {
+            Err(crate::obs::ObsError::Invalid("decision sink down".into()))
+        }
+        async fn record_tool_call(
+            &self,
+            _rec: crate::obs::ToolCallRecord,
+        ) -> Result<crate::types::ids::EventSeq, crate::obs::ObsError> {
+            Err(crate::obs::ObsError::Invalid("decision sink down".into()))
         }
     }
 
@@ -4268,6 +4437,315 @@ mod tests {
             diagnostics: vec![],
             notes: notes.into(),
         }
+    }
+
+    // ---- BE4: pre-CAS decision-record failure aborts the CAS ----
+
+    #[tokio::test]
+    async fn be4_pre_cas_decision_failure_aborts_the_retry_checkpoint() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.retry = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::Fixed { delay_ms: 0 },
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: None,
+            escalate_to_tier: None,
+        };
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        // Attempt 1 soft-fails ⇒ an admitted retry ⇒ a pre-C8 Retry record.
+        let caps = StaticCapability::new(vec![Ok(CapabilityOutcome::Failed {
+            failure: retryable_model_failure(a, "flaky"),
+        })]);
+        let sched = fx.build_scheduler_with_failing_decisions(
+            fx._dir.path().join("s-be4"),
+            caps as Arc<dyn CapabilityExecutor>,
+        );
+
+        let err = sched.run(dag_id).await.unwrap_err();
+        assert!(
+            matches!(err, SchedError::Store(ref m) if m.contains("decision record failed")),
+            "BE4: a pre-CAS ObsError must surface as Store, got {err:?}"
+        );
+
+        // And the C8 it described must NOT have committed.
+        let after = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(
+            after.nodes[&a].state,
+            NodeState::Running,
+            "C8 must not proceed when its decision record could not be written"
+        );
+        fx.close().await;
+    }
+
+    // ---- §5.6 / CE: the capability context carries the real contract ----
+
+    /// Captures the whole `CapabilityExecContext` so the test can assert on
+    /// fields `UnavailableCapabilityExecutor` would silently ignore.
+    struct ContextCapturingCapability {
+        seen: StdMutex<Vec<(TokenBudget, Duration)>>,
+    }
+    impl ContextCapturingCapability {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: StdMutex::new(Vec::new()),
+            })
+        }
+    }
+    #[async_trait]
+    impl CapabilityExecutor for ContextCapturingCapability {
+        async fn execute(
+            &self,
+            ctx: &CapabilityExecContext,
+        ) -> Result<CapabilityOutcome, CapabilityExecError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((ctx.budget.clone(), ctx.timeout));
+            Ok(CapabilityOutcome::Succeeded {
+                payload: serde_json::json!({"ok": true}),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_the_nodes_real_budget_and_clamped_deadline() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.budget = TokenBudget {
+            max_input: 4242,
+            max_output: 777,
+        };
+        node.timeout_ms = 5_000;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let caps = ContextCapturingCapability::new();
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-ctx"),
+            Arc::clone(&caps) as Arc<dyn CapabilityExecutor>,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            // Run budget far exceeds the node timeout, so the §5.19 clamp
+            // resolves to the node's own deadline.
+            Duration::from_secs(600),
+        );
+        sched.run(dag_id).await.unwrap();
+
+        let seen = caps.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let (budget, timeout) = &seen[0];
+        assert_eq!(
+            budget.max_input, 4242,
+            "worker MUST see the node's own token budget, not a zeroed one"
+        );
+        assert_eq!(budget.max_output, 777);
+        assert_eq!(
+            *timeout,
+            Duration::from_millis(5_000),
+            "worker MUST see the §5.19-clamped node deadline, not zero"
+        );
+        fx.close().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_deadline_is_clamped_by_the_remaining_run_budget() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.timeout_ms = 600_000; // far longer than the run budget below
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let caps = ContextCapturingCapability::new();
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-clamp"),
+            Arc::clone(&caps) as Arc<dyn CapabilityExecutor>,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        sched.run(dag_id).await.unwrap();
+
+        let (_, timeout) = caps.seen.lock().unwrap()[0].clone();
+        assert!(
+            timeout <= Duration::from_secs(30) && timeout > Duration::ZERO,
+            "deadline must be min(node.timeout_ms, remaining_run), got {timeout:?}"
+        );
+        fx.close().await;
+    }
+
+    // ---- B4: resume re-waits the full backoff before C3 (§5.11.3) ----
+
+    #[tokio::test(start_paused = true)]
+    async fn b4_resumed_ready_node_with_prior_attempts_rewaits_full_backoff() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.retry = RetryPolicy {
+            max_attempts: 3,
+            backoff: Backoff::Fixed { delay_ms: 10_000 },
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: None,
+            escalate_to_tier: None,
+        };
+        // Durably `Ready` — the crash landed after C8 committed.
+        node.state = NodeState::Ready;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Running,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let run_id = fx.seed_run(session, dag_id, "running").await;
+
+        // C8 recorded next_attempt = 2 before the crash, so `attempts_started`
+        // rebuilds to 1 and attempt 2 owes a fresh 10s wait.
+        fx.storage
+            .events()
+            .append_session(crate::events::NewSessionEvent {
+                session_id: session,
+                run_id: Some(run_id),
+                type_: crate::events::SessionEventType::NodeState,
+                payload: serde_json::json!({
+                    "node_id": a.to_string(),
+                    "from": "failed",
+                    "to": "ready",
+                    "generation": 1u64,
+                    "attempt": 1u64,
+                    "next_attempt": 2u64,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let caps = ContextCapturingCapability::new();
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-b4"),
+            Arc::clone(&caps) as Arc<dyn CapabilityExecutor>,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(600),
+        );
+
+        let started = tokio::time::Instant::now();
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+        // TD1/TD2: paused clock, so this is the virtual time the scheduler
+        // actually slept, not a wall-clock measurement.
+        assert!(
+            started.elapsed() >= Duration::from_millis(10_000),
+            "B4 requires the full backoff re-wait before C3, slept {:?}",
+            started.elapsed()
+        );
+        fx.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn b4_in_loop_retry_does_not_double_wait_its_backoff() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.retry = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::Fixed { delay_ms: 10_000 },
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: None,
+            escalate_to_tier: None,
+        };
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        // Attempt 1 soft-fails (one C8 backoff), attempt 2 succeeds.
+        let caps = StaticCapability::new(vec![
+            Ok(CapabilityOutcome::Failed {
+                failure: retryable_model_failure(a, "flaky"),
+            }),
+            Ok(CapabilityOutcome::Succeeded {
+                payload: serde_json::json!({"ok": true}),
+            }),
+        ]);
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-b4b"),
+            caps as Arc<dyn CapabilityExecutor>,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(600),
+        );
+
+        let started = tokio::time::Instant::now();
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+        // Exactly one 10s backoff, not two: `apply_soft_failure` already
+        // served it, so the re-dispatch must not serve it again.
+        assert!(
+            started.elapsed() < Duration::from_millis(20_000),
+            "in-loop retry double-waited its backoff: {:?}",
+            started.elapsed()
+        );
+        fx.close().await;
     }
 
     fn escalating_retry(max_attempts: u32, escalate_after: u32, tier: ModelTier) -> RetryPolicy {
