@@ -153,7 +153,7 @@ Three **additive** amendments are authorised by this RFC. Each is a derive or a 
 | # | Amendment | Crate | Justification |
 | --- | --- | --- | --- |
 | **A1** | Add `Copy, PartialOrd, Ord` to `GraphVersion` | `alloy-runtime::types::ids` | It is `pub struct GraphVersion(pub u64)`; monotonicity assertions (G8) and `max()` over stored versions need ordering. Sound for a `u64` newtype. |
-| **A2** | Add `name_id!(CrateId)` to `types::ids` | `alloy-runtime::types::ids` | V2 §7.2's `GraphQuery::Diagnostics { crate_id: Option<CrateId>, .. }` names a type that does not exist. Minted with the **existing** `name_id!` macro so validation (1..=128 bytes), serde, `Display` and `as_str` match every other catalog id. |
+| **A2** | Add `name_id!(CrateId)` and `uuid_id!(GraphSnapshotId)` to `types::ids` | `alloy-runtime::types::ids` | V2 §7.2's `GraphQuery::Diagnostics { crate_id: Option<CrateId>, .. }` names a type that does not exist. Minted with the **existing** `name_id!` / `uuid_id!` macros so validation, serde, `Display` and parsing match every other catalog id. Both macros are private `macro_rules!` in `types::ids`, so both new ids MUST be minted there, not in `graph` (the macro is not visible to sibling modules). |
 | **A3** | New module `alloy-runtime::graph` + crate-root re-exports | `alloy-runtime` | The seam (§2.4). Purely additive; no existing module changes. |
 
 RFC-0002 conventions this RFC mirrors rather than re-uses (because `storage::open::{DbHandle, spawn_db}` are crate-private): single `Mutex<Option<Connection>>`, `PRAGMA foreign_keys=ON` → `busy_timeout` → `journal_mode=WAL` → `synchronous`, `OpenFlags::READ_WRITE|CREATE|NO_MUTEX`, integer migration ledger with refuse-newer, `spawn_blocking` wrapper, `close()` with WAL truncate-checkpoint, `Drop` warning when closed implicitly, and error mapping by `rusqlite::ErrorCode` (never by message substring).
@@ -173,7 +173,7 @@ RFC-0002's `sessions.graph_version INTEGER NULL` column is the **only** cross-da
 | **C5** | `alloy-index` MUST NOT depend on `alloy-tools`, `alloy-cli`, or `alloy-eval`. It performs no tool calls and no process execution. |
 | **C6** | The workspace stays at **five** crates. No `alloy-graph`, no `alloy-lang-*`. |
 
-This is exactly the precedent RFC-0010 set with `ToolCaller` (trait in `alloy-runtime`) and `ToolHandleToolCaller` (impl in `alloy-tools`). V2 §5.4's `alloy-index/ # ProjectGraph MVP` refers to the index implementation, which is what lands there.
+This is exactly the precedent RFC-0010 set with its runtime adapters: `VerifyCompileAdapter`, `VerifyTestAdapter`, `GateHumanAdapter` and `CapabilityExecutor` are traits in `alloy-runtime::adapters`, with real implementations wired by the composition root against `alloy-tools`' MCP host. V2 §5.4's `alloy-index/ # ProjectGraph MVP` refers to the index implementation, which is what lands there.
 
 ```text
 alloy-cli ──► alloy-index ──► alloy-runtime
@@ -190,7 +190,7 @@ Wiring: `alloy-cli` constructs `SqliteProjectGraph`, wraps it in `Arc<dyn Projec
 | `GraphNodeId`, `GraphVersion` | `CrateId` (A2), `GraphSnapshotId` | — |
 | `StorageLayout::graph_dir` (created, unused) | `GraphLayout`, `graph.sqlite`, migrations v1 | schema v2+ |
 | `sessions.graph_version` column (never written) | Value produced by `rebuild` for the host to store | Session-pinned historical queries |
-| `DiagnosticEvent` + `parse_rustc_diagnostics` | `record_diagnostic` persistence + `Diagnostics` query | Diagnostic clustering |
+| `DiagnosticEvent` + `VerifyOutcome.diagnostics` seam | `record_diagnostic` persistence + `Diagnostics` query | cargo-JSON→`DiagnosticEvent` parser (RFC-0013/0014); diagnostic clustering |
 | `alloy-index` empty crate | Whole crate | `syn` pass, RA passthrough |
 | `StoreError`, PRAGMA/migration pattern | `GraphError`, `graph_schema_migrations` | — |
 
@@ -212,20 +212,26 @@ All signatures below are normative. `#[non_exhaustive]` is applied where later l
 ### 3.1 New identifiers
 
 ```rust
-// alloy-runtime::types::ids (amendment A2)
+// alloy-runtime::types::ids (amendment A2 — both minted here; the id
+// macros are private to this module)
 name_id!(
     /// Cargo package name as it appears in `[package] name` (RFC-0011).
     CrateId
 );
-
-// alloy-runtime::graph
 uuid_id!(
     /// Identifier of a recorded graph snapshot (RFC-0011 §4.7).
     GraphSnapshotId
 );
 ```
 
-`GraphNodeId` keeps its merged `uuid_id!` shape. This RFC does **not** mint node ids randomly; see rule **G3**.
+`GraphNodeId` keeps its merged `uuid_id!` shape. This RFC does **not** mint node ids randomly; see rule **G3**. The derivation itself is part of the seam (T1a–T1c test it there), so `alloy-runtime::graph` exports it:
+
+```rust
+// alloy-runtime::graph — the one blessed way to mint a graph node id (G3/G4).
+/// Derive the deterministic `GraphNodeId` for `(kind, stable_key)`.
+#[must_use]
+pub fn derive_node_id(kind: GraphNodeKind, stable_key: &str) -> GraphNodeId;
+```
 
 ### 3.2 Node and edge model
 
@@ -887,7 +893,7 @@ This satisfies V2 §7.2's "file digest invalidation of module subgraphs" without
 
 ### 6.7 Diagnostic and fix ingest
 
-The producer chain is: RFC-0010's verify adapter runs `cargo_check` through the MCP host → `parse_rustc_diagnostics` yields `Vec<DiagnosticEvent>` → the **runtime host** (not the worker) calls `record_diagnostic` for each. Spans are workspace-relativised on the way in (G12); a span path outside the workspace stores `None` for `primary_path` rather than an absolute host path.
+The producer chain is: RFC-0010's verify adapter runs `cargo_check` through the MCP host and surfaces `VerifyOutcome.diagnostics: Vec<DiagnosticEvent>` (the seam merged in `alloy-runtime::adapters`; the cargo-JSON→`DiagnosticEvent` parser itself arrives with the RFC-0013/0014 adapters) → the **runtime host** (not the worker) calls `record_diagnostic` for each. Spans are workspace-relativised on the way in (G12); a span path outside the workspace stores `None` for `primary_path` rather than an absolute host path.
 
 `record_fix` is called by the runtime host after an EditEngine transaction commits and its verify result is known, carrying the `TransactionId` and the patch's `ArtifactId`.
 
@@ -1193,7 +1199,7 @@ Lint attributes added to `crates/alloy-index/src/lib.rs`:
 | T8a | `graph_opens_beside_alloy_sqlite_without_touching_it` | S1, S2 — `alloy.sqlite` mtime and `schema_migrations` are unchanged |
 | T8b | `rebuild_then_reopen_preserves_version_and_digest` | Persistence across process restarts |
 | T8c | `worker_style_handle_answers_after_host_ingest` | End-to-end: host `rebuild` → `GraphViewHandle::query` |
-| T8d | `parsed_rustc_diagnostics_ingest_and_query_back` | Uses `alloy_runtime::parse_rustc_diagnostics` output as the input |
+| T8d | `verify_outcome_shaped_diagnostics_ingest_and_query_back` | Ingests `DiagnosticEvent`s shaped exactly like `VerifyOutcome.diagnostics` (spans, children, fingerprint) and queries them back |
 
 ### 13.8 CI grep rules (`crates/alloy-index/tests/rfc0011_ci_greps.rs`)
 
@@ -1312,7 +1318,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 66. `alloy-index` writes nothing outside `<data_dir>/graph/` and never writes `.env` (**SEC8**, T13).
 - [ ] 67. `NullProjectGraph` reads empty and fails writes with `Disabled` (**Q10**, T1e).
 - [ ] 68. Reopening after a rebuild preserves version and digest (**T8b**).
-- [ ] 69. `parse_rustc_diagnostics` output ingests and queries back unchanged (**T8d**).
+- [ ] 69. `VerifyOutcome.diagnostics`-shaped `DiagnosticEvent`s ingest and query back unchanged (**T8d**).
 - [ ] 70. `cargo doc --workspace --no-deps` is warning-free with `-D warnings`; every public item in §3 has a doc comment.
 
 ---
