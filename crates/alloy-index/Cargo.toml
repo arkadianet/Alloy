@@ -1,10 +1,28 @@
 [package]
 name = "alloy-index"
-description = "Alloy ProjectGraph index (stub until RFC-0011)"
+description = "Alloy ProjectGraph index (RFC-0011)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+# RFC-0011 SS12: no new external workspace dependency; default-features = false
+# on alloy-runtime keeps this crate free of any HTTP/TLS linkage (rule C3).
 [dependencies]
+alloy-runtime = { workspace = true, default-features = false }
+async-trait = { workspace = true }
+globset = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
