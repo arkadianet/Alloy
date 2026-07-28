@@ -9,9 +9,12 @@ Models are plugins; structured execution, tools, and project state are the produ
 
 > ### ⚠️ Status: pre-alpha — not usable yet
 >
-> Alloy does not edit code, call a model, or run a tool today. The runtime host,
-> durable event log, session/run control plane, and observability layer are in
-> tree; the model router (RFC-0007) and tool bus (RFC-0005/0006) are not.
+> The substrate is in tree: runtime host, durable event log, session/run
+> control plane, observability, sandbox broker, MCP host + builtins, model
+> router (BYOM — any OpenAI-compatible endpoint, including local servers),
+> EditEngine, Task DAG/planner, and the scheduler. What's missing is the
+> layer that connects them into a product: capability workers (RFC-0013)
+> and the CLI run path (RFC-0015). Nothing drives a model end to end yet.
 >
 > **The only thing that runs is `alloy host`** — it starts the runtime, idles, and
 > shuts down cleanly on `Ctrl-C`/`SIGTERM`. That is a lifecycle smoke test, not a
@@ -70,8 +73,8 @@ flowchart TB
 
   classDef done fill:#1f6f3f,stroke:#0d3b21,color:#fff
   classDef todo fill:#4a4a4a,stroke:#2b2b2b,color:#ccc,stroke-dasharray:4 3
-  class CLI,SP,STORE,OBS done
-  class SCHED,WORK,ROUTER,MCP,EDIT,PROV,TOOLS,GRAPH todo
+  class CLI,SP,STORE,OBS,SCHED,ROUTER,MCP,EDIT,PROV,TOOLS done
+  class WORK,GRAPH todo
 ```
 
 Solid green is implemented; dashed grey is specified but not yet built.
@@ -94,13 +97,14 @@ clippy/fmt clean, no in-scope TODOs, review approved).
 | [0002](docs/rfcs/RFC-0002-storage-artifacts-session-events.md) | SQLite event log, artifact CAS, handoff | ✅ Implemented |
 | [0003](docs/rfcs/RFC-0003-session-manager-run-controller.md) | Session manager & RunController | ✅ Implemented |
 | [0004](docs/rfcs/RFC-0004-observability-cost-metering.md) | DecisionLog, CostMeter, redaction | ✅ Implemented |
-| [0005](docs/rfcs/RFC-0005-sandbox-broker.md) | Sandbox broker (Landlock/Seatbelt/container) | 🚧 In progress |
-| [0006](docs/rfcs/RFC-0006-mcp-host-builtins.md) | MCP host & in-process builtins | 📋 Planned |
-| [0007](docs/rfcs/RFC-0007-model-router-provider.md) | Model router & provider — *first real LLM call* | 📋 Planned |
-| [0008](docs/rfcs/RFC-0008-edit-engine.md) | EditEngine (TextPatch + git checkpoint) | 📋 Planned |
-| [0009](docs/rfcs/RFC-0009-task-dag-templates-planner.md) | Task DAG, templates & planner | 📋 Planned |
-| [0010](docs/rfcs/RFC-0010-scheduler-runtime-adapters.md) | Scheduler & runtime adapters | 📋 Planned |
-| [0011](docs/rfcs/RFC-0011-project-graph.md) – [0016](docs/rfcs/RFC-0016-eval-harness-holdout-gates.md) | ProjectGraph, context engine, capabilities, language backend, CLI/profiles, eval harness | 📋 Planned |
+| [0005](docs/rfcs/RFC-0005-sandbox-broker.md) | Sandbox broker (Landlock/Seatbelt/container) | ✅ Implemented |
+| [0006](docs/rfcs/RFC-0006-mcp-host-builtins.md) | MCP host & in-process builtins | ✅ Implemented |
+| [0007](docs/rfcs/RFC-0007-model-router-provider.md) | Model router & provider (BYOM, OpenAI-compatible) | ✅ Implemented |
+| [0008](docs/rfcs/RFC-0008-edit-engine.md) | EditEngine (TextPatch + git checkpoint) | ✅ Implemented |
+| [0009](docs/rfcs/RFC-0009-task-dag-templates-planner.md) | Task DAG, templates & planner | ✅ Implemented |
+| [0010](docs/rfcs/RFC-0010-scheduler-runtime-adapters.md) | Scheduler & runtime adapters | ✅ Implemented |
+| [0011](docs/rfcs/RFC-0011-project-graph.md) – [0015](docs/rfcs/RFC-0015-cli-profiles-config.md) | ProjectGraph, context engine, capability workers, language backend, CLI/profiles | 📋 Planned |
+| [0016](docs/rfcs/RFC-0016-eval-harness-holdout-gates.md) | Eval harness & holdout gates | ✅ Day-1 skeleton (ControlPlane driver deferred) |
 
 Full sequencing, effort estimates, and milestone gates:
 [implementation roadmap](docs/roadmap/IMPLEMENTATION-ROADMAP.md).
@@ -189,7 +193,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 [`ci.yml`](.github/workflows/ci.yml) gates the workspace. A second workflow,
 `sandbox.yml`, covers platform-specific sandbox backends (Landlock required,
-Seatbelt and container advisory) and arrives with RFC-0005.
+Seatbelt and container advisory).
 
 Architecture V2 is **frozen**. RFCs implement it; they do not redesign it. Where an
 RFC and V2 conflict, V2 wins — see [change control](docs/roadmap/IMPLEMENTATION-ROADMAP.md).
