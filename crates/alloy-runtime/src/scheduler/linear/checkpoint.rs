@@ -1600,6 +1600,293 @@ mod tests {
         }
     }
 
+    // ---- §5.8.1 write order: artifacts → CAS → events (AC 22) ----
+
+    /// Shared call-order journal for the recorded stores below.
+    #[derive(Clone, Default)]
+    struct CallLog(Arc<std::sync::Mutex<Vec<&'static str>>>);
+    impl CallLog {
+        fn push(&self, op: &'static str) {
+            self.0.lock().unwrap().push(op);
+        }
+        fn take(&self) -> Vec<&'static str> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    struct RecordedDags {
+        inner: Arc<dyn DagStore>,
+        log: CallLog,
+    }
+    #[async_trait::async_trait]
+    impl DagStore for RecordedDags {
+        async fn put(&self, dag: &TaskDag) -> Result<(), StoreError> {
+            self.log.push("dag.put");
+            self.inner.put(dag).await
+        }
+        async fn put_if_generation(
+            &self,
+            dag: &TaskDag,
+            expected: Option<u64>,
+        ) -> Result<(), StoreError> {
+            self.log.push("dag.cas");
+            self.inner.put_if_generation(dag, expected).await
+        }
+        async fn replace_for_replan(
+            &self,
+            dag: &TaskDag,
+            expected_generation: u64,
+        ) -> Result<(), crate::storage::ReplanReplaceError> {
+            self.inner
+                .replace_for_replan(dag, expected_generation)
+                .await
+        }
+        async fn get(&self, dag_id: DagId) -> Result<Option<TaskDag>, StoreError> {
+            self.inner.get(dag_id).await
+        }
+        async fn delete(&self, dag_id: DagId) -> Result<(), StoreError> {
+            self.inner.delete(dag_id).await
+        }
+        async fn list_by_session(&self, session_id: SessionId) -> Result<Vec<DagId>, StoreError> {
+            self.inner.list_by_session(session_id).await
+        }
+    }
+
+    struct RecordedArtifacts {
+        inner: Arc<dyn ArtifactStore>,
+        log: CallLog,
+    }
+    #[async_trait::async_trait]
+    impl ArtifactStore for RecordedArtifacts {
+        async fn put(&self, req: ArtifactPut) -> Result<ArtifactId, StoreError> {
+            self.log.push("artifact.put");
+            self.inner.put(req).await
+        }
+        async fn get(&self, id: ArtifactId) -> Result<crate::storage::ArtifactBlob, StoreError> {
+            self.inner.get(id).await
+        }
+        async fn meta(&self, id: ArtifactId) -> Result<crate::storage::ArtifactMeta, StoreError> {
+            self.inner.meta(id).await
+        }
+        async fn get_by_digest(
+            &self,
+            digest: &crate::types::ids::Digest,
+        ) -> Result<Option<ArtifactId>, StoreError> {
+            self.inner.get_by_digest(digest).await
+        }
+        async fn delete(&self, id: ArtifactId) -> Result<(), StoreError> {
+            self.inner.delete(id).await
+        }
+    }
+
+    struct RecordedEvents {
+        inner: Arc<dyn EventStore>,
+        log: CallLog,
+    }
+    #[async_trait::async_trait]
+    impl crate::events::EventSink for RecordedEvents {
+        async fn append_runtime(
+            &self,
+            ev: crate::events::RuntimeEvent,
+        ) -> Result<(), crate::events::EventSinkError> {
+            self.log.push("event.append");
+            self.inner.append_runtime(ev).await
+        }
+        async fn append_session(
+            &self,
+            ev: NewSessionEvent,
+        ) -> Result<crate::types::ids::EventSeq, crate::events::EventSinkError> {
+            self.log.push("event.append");
+            self.inner.append_session(ev).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl EventStore for RecordedEvents {
+        async fn list_session_events(
+            &self,
+            session: SessionId,
+            after: Option<EventSeq>,
+            limit: usize,
+        ) -> Result<Vec<crate::events::SessionEvent>, StoreError> {
+            self.inner.list_session_events(session, after, limit).await
+        }
+        async fn replay_session<F>(
+            &self,
+            session: SessionId,
+            mut on_event: F,
+        ) -> Result<Option<EventSeq>, StoreError>
+        where
+            F: FnMut(&crate::events::SessionEvent) -> Result<(), StoreError> + Send,
+        {
+            let mut after = None;
+            let mut last = None;
+            loop {
+                let page = self
+                    .inner
+                    .list_session_events(session, after, MAX_EVENTS_PAGE)
+                    .await?;
+                if page.is_empty() {
+                    break;
+                }
+                let page_len = page.len();
+                for ev in &page {
+                    after = Some(ev.seq);
+                    last = Some(ev.seq);
+                    on_event(ev)?;
+                }
+                if page_len < MAX_EVENTS_PAGE {
+                    break;
+                }
+            }
+            Ok(last)
+        }
+        async fn last_seq(&self, session: SessionId) -> Result<Option<EventSeq>, StoreError> {
+            self.inner.last_seq(session).await
+        }
+        async fn list_runtime_events(
+            &self,
+            after_rowid: Option<i64>,
+            limit: usize,
+        ) -> Result<Vec<(i64, crate::events::RuntimeEvent)>, StoreError> {
+            self.inner.list_runtime_events(after_rowid, limit).await
+        }
+        async fn has_session_event_for_run(
+            &self,
+            session: SessionId,
+            run: RunId,
+            type_: SessionEventType,
+        ) -> Result<bool, StoreError> {
+            self.inner
+                .has_session_event_for_run(session, run, type_)
+                .await
+        }
+        async fn has_run_accepted_event(&self, run: RunId) -> Result<bool, StoreError> {
+            self.inner.has_run_accepted_event(run).await
+        }
+        async fn has_run_finished_event(&self, run: RunId) -> Result<bool, StoreError> {
+            self.inner.has_run_finished_event(run).await
+        }
+        async fn import_handoff_snapshot(
+            &self,
+            snap: crate::storage::HandoffSnapshot,
+        ) -> Result<(), StoreError> {
+            self.inner.import_handoff_snapshot(snap).await
+        }
+    }
+
+    /// AC 22: assert one checkpoint's journal obeys §5.8.1 — every artifact
+    /// write precedes the single CAS, every event append follows it, and no
+    /// non-CAS blob write (`DagStore::put`) happens at all.
+    #[track_caller]
+    fn assert_write_order(log: &[&'static str], expect_artifact: bool, label: &str) {
+        assert!(
+            !log.contains(&"dag.put"),
+            "{label}: checkpoints must never use the admin put: {log:?}"
+        );
+        let cas_count = log.iter().filter(|s| **s == "dag.cas").count();
+        assert_eq!(cas_count, 1, "{label}: exactly one CAS expected: {log:?}");
+        let cas = log.iter().position(|s| *s == "dag.cas").unwrap();
+        let artifact_count = log.iter().filter(|s| **s == "artifact.put").count();
+        if expect_artifact {
+            assert!(
+                artifact_count > 0,
+                "{label}: expected an artifact write: {log:?}"
+            );
+        }
+        for (i, op) in log.iter().enumerate() {
+            match *op {
+                "artifact.put" => {
+                    assert!(i < cas, "{label}: artifact write after the CAS: {log:?}")
+                }
+                "event.append" => assert!(i > cas, "{label}: event append before the CAS: {log:?}"),
+                _ => {}
+            }
+        }
+        assert!(
+            log.contains(&"event.append"),
+            "{label}: expected at least one event append: {log:?}"
+        );
+    }
+
+    /// AC 22: drive the representative `cN_*` methods through recorded
+    /// store doubles and assert the artifacts → CAS → events order for each
+    /// — the RFC's own "Recorded store" mechanism rather than code
+    /// inspection.
+    #[tokio::test]
+    async fn checkpoint_write_order_is_artifacts_then_cas_then_events() {
+        let fx = Fixture::new().await;
+        let log = CallLog::default();
+        let checkpoint = Checkpoint::new(
+            Arc::new(RecordedDags {
+                inner: fx.storage.dags(),
+                log: log.clone(),
+            }),
+            Arc::new(RecordedArtifacts {
+                inner: fx.storage.artifacts(),
+                log: log.clone(),
+            }),
+            Arc::new(RecordedEvents {
+                inner: fx.storage.events(),
+                log: log.clone(),
+            }),
+            Arc::clone(&fx.metrics),
+        );
+        let session = SessionId::new();
+        let ctx = fx.ctx(session);
+
+        // C3 (no artifact) then C4 (output artifact) on one dispatch chain.
+        let a = NodeId::new();
+        let mut dag = seeded_dag(&fx, session, vec![plain_node(a, NodeState::Ready)]).await;
+        checkpoint.c3_dispatch(&mut dag, ctx, a, 1).await.unwrap();
+        assert_write_order(&log.take(), false, "c3_dispatch");
+        let payload = serde_json::to_vec(&serde_json::json!({"schema_version":1})).unwrap();
+        checkpoint
+            .c4_succeed(&mut dag, ctx, a, 1, payload)
+            .await
+            .unwrap();
+        assert_write_order(&log.take(), true, "c4_succeed");
+
+        // C8 retry: failure artifact before the CAS.
+        let b = NodeId::new();
+        let mut dag = seeded_dag(&fx, session, vec![plain_node(b, NodeState::Running)]).await;
+        checkpoint
+            .c8_retry(&mut dag, ctx, b, 1, &sample_failure(b), 2, 0)
+            .await
+            .unwrap();
+        assert_write_order(&log.take(), true, "c8_retry");
+
+        // C7 terminal-failed: failure artifact before the CAS.
+        let c = NodeId::new();
+        let mut dag = seeded_dag(&fx, session, vec![plain_node(c, NodeState::Running)]).await;
+        checkpoint
+            .c7_terminal_failed(&mut dag, ctx, c, Some(1), &sample_failure(c), &[])
+            .await
+            .unwrap();
+        assert_write_order(&log.take(), true, "c7_terminal_failed");
+
+        // C9c gate deny: failure artifact before the CAS.
+        let gate_id = GateId::new();
+        let g = NodeId::new();
+        let mut dag = seeded_dag(&fx, session, vec![gate_node(g, gate_id)]).await;
+        dag.nodes.get_mut(&g).unwrap().state = NodeState::WaitingApproval;
+        dag.state = DagState::WaitingApproval;
+        fx.storage.dags().put(&dag).await.unwrap();
+        log.take(); // discard the seeding put above
+        let deny = FailureIr {
+            node: g,
+            error_class: ErrorClass::Approval,
+            retry: RetryDisposition::NonRetryable,
+            diagnostics: vec![],
+            notes: "approval denied".into(),
+        };
+        checkpoint
+            .c9c_gate_deny(&mut dag, ctx, g, GateDecision::Deny, &deny, &[])
+            .await
+            .unwrap();
+        assert_write_order(&log.take(), true, "c9c_gate_deny");
+        fx.close().await;
+    }
+
     // ---- StoreError mapping ----
 
     #[test]

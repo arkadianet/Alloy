@@ -3031,6 +3031,1619 @@ mod tests {
         fx.close().await;
     }
 
+    // ---- Appendix F multi-row binding (AC 76) ----
+
+    /// Seed a run row bound to `dag_id` with an explicit state and
+    /// `created_at`, for Appendix F multi-candidate tests.
+    async fn seed_run_row_at(
+        fx: &Fixture,
+        session_id: SessionId,
+        dag_id: DagId,
+        state: &str,
+        unix_secs: i64,
+    ) -> RunId {
+        let run_id = RunId::new();
+        let goal = RunGoalRecord {
+            goal: Goal {
+                text: "fix it".into(),
+                constraints: vec![],
+                attachments: vec![],
+            },
+            dag_id,
+        };
+        let at = Timestamp(time::OffsetDateTime::from_unix_timestamp(unix_secs).unwrap());
+        let row = RunRow {
+            id: run_id,
+            session_id,
+            goal_json: serde_json::to_value(&goal).unwrap(),
+            state: state.into(),
+            created_at: at.clone(),
+            updated_at: at,
+        };
+        fx.storage.sessions().upsert_run(&row).await.unwrap();
+        run_id
+    }
+
+    /// Minimal stored DAG for binding-resolution tests plus a scheduler to
+    /// call [`LinearScheduler::resolve_run_binding`] on directly.
+    async fn binding_fixture(fx: &Fixture, session: SessionId) -> (TaskDag, LinearScheduler) {
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-binding"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        (dag, sched)
+    }
+
+    /// AC 76 / Appendix F RB6: with several candidate rows, a non-terminal
+    /// `Running` row wins over a newer non-`Running` row.
+    #[tokio::test]
+    async fn rb6_prefers_the_running_row_over_a_newer_non_running_row() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag, sched) = binding_fixture(&fx, session).await;
+
+        let running = seed_run_row_at(&fx, session, dag.id, "running", 1_000).await;
+        let _newer_pending = seed_run_row_at(&fx, session, dag.id, "pending", 2_000).await;
+
+        let row = sched.resolve_run_binding(&dag).await.unwrap();
+        assert_eq!(row.id, running, "RB6 must prefer the Running row");
+        fx.close().await;
+    }
+
+    /// AC 76 / Appendix F RB5: with no `Running` row, the last row under
+    /// (`created_at` ascending, `run_id` ascending) wins — i.e. the maximum;
+    /// on equal `created_at` the higher `run_id` breaks the tie.
+    #[tokio::test]
+    async fn rb5_orders_candidates_by_created_at_then_run_id() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag, sched) = binding_fixture(&fx, session).await;
+
+        // Distinct created_at: the newer row wins regardless of id order.
+        let _older = seed_run_row_at(&fx, session, dag.id, "pending", 1_000).await;
+        let newer = seed_run_row_at(&fx, session, dag.id, "pending", 2_000).await;
+        let row = sched.resolve_run_binding(&dag).await.unwrap();
+        assert_eq!(row.id, newer, "RB5 must pick the max created_at");
+
+        // Equal created_at: run_id ascending breaks the tie, max wins.
+        let tie_a = seed_run_row_at(&fx, session, dag.id, "pending", 3_000).await;
+        let tie_b = seed_run_row_at(&fx, session, dag.id, "pending", 3_000).await;
+        let expected = if tie_a > tie_b { tie_a } else { tie_b };
+        let row = sched.resolve_run_binding(&dag).await.unwrap();
+        assert_eq!(
+            row.id, expected,
+            "RB5 tie-break is run_id ascending, last wins"
+        );
+        fx.close().await;
+    }
+
+    // ---- §5.7.9 closed-receiver classification (AC 39) ----
+
+    /// Gate adapter whose waiter always "closes" (`AdapterError::Internal`),
+    /// optionally flipping the run row to a target `RunControlState` string
+    /// first — so `gate_closed_receiver` observes exactly that durable state.
+    struct ClosedReceiverGate {
+        sessions: Arc<dyn SessionRows>,
+        flip_to: Option<&'static str>,
+        calls: StdMutex<u32>,
+    }
+    impl ClosedReceiverGate {
+        fn new(sessions: Arc<dyn SessionRows>, flip_to: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                sessions,
+                flip_to,
+                calls: StdMutex::new(0),
+            })
+        }
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+    #[async_trait]
+    impl GateHumanAdapter for ClosedReceiverGate {
+        async fn wait_approval(
+            &self,
+            ctx: &NodeExecContext,
+            _gate: GateId,
+        ) -> Result<Approval, AdapterError> {
+            *self.calls.lock().unwrap() += 1;
+            if let Some(state) = self.flip_to {
+                let mut row = self
+                    .sessions
+                    .get_run(ctx.meta.run_id)
+                    .await
+                    .unwrap()
+                    .expect("run row exists");
+                row.state = state.into();
+                self.sessions.upsert_run(&row).await.unwrap();
+            }
+            Err(AdapterError::Internal("waiter closed".into()))
+        }
+    }
+
+    /// Fresh single-node gate DAG (Pending) plus its "running" run row.
+    async fn seed_pending_gate_dag(
+        fx: &Fixture,
+        session: SessionId,
+    ) -> (DagId, NodeId, GateId, RunId) {
+        let dag_id = DagId::new();
+        let node_id = NodeId::new();
+        let gate_id = GateId::new();
+        let input = fx
+            .put_goal_envelope(dag_id, node_id, NodeKind::GateHuman)
+            .await;
+        let mut node = adapter_node(node_id, NodeKind::GateHuman, input);
+        node.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "review".into(),
+        });
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(node_id, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let run_id = fx.seed_run(session, dag_id, "running").await;
+        (dag_id, node_id, gate_id, run_id)
+    }
+
+    fn closed_receiver_scheduler(fx: &Fixture, gate: Arc<ClosedReceiverGate>) -> LinearScheduler {
+        fx.build_scheduler(
+            fx._dir.path().join("s-closed-recv"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            gate,
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        )
+    }
+
+    /// §5.7.9 active-states row: a closed waiter while the run row stays
+    /// `Running` re-registers up to `GATE_REREGISTER_MAX` (3) times, then
+    /// becomes `SchedError::Internal`. The call count pins the bound:
+    /// 1 initial wait + 3 re-registrations.
+    #[tokio::test]
+    async fn closed_receiver_while_running_reregisters_thrice_then_internal() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, ..) = seed_pending_gate_dag(&fx, session).await;
+        let gate = ClosedReceiverGate::new(fx.storage.sessions(), None);
+        let sched = closed_receiver_scheduler(&fx, Arc::clone(&gate));
+
+        let err = sched.run(dag_id).await.unwrap_err();
+        assert!(
+            matches!(&err, SchedError::Internal(m) if m.contains("gate waiter closed in state Running")),
+            "expected Internal(closed in Running), got {err:?}"
+        );
+        assert_eq!(gate.calls(), 4, "1 initial wait + GATE_REREGISTER_MAX (3)");
+        fx.close().await;
+    }
+
+    /// §5.7.9 `Cancelling`/`Cancelled` row: a closed waiter with a durable
+    /// cancel takes the cancel path and terminalizes the DAG `Cancelled`.
+    #[tokio::test]
+    async fn closed_receiver_while_cancelling_takes_the_cancel_path() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, ..) = seed_pending_gate_dag(&fx, session).await;
+        let gate = ClosedReceiverGate::new(fx.storage.sessions(), Some("cancelling"));
+        let sched = closed_receiver_scheduler(&fx, Arc::clone(&gate));
+
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Cancelled);
+        assert_eq!(gate.calls(), 1, "no re-registration on the cancel row");
+        fx.close().await;
+    }
+
+    /// §5.7.9 `Failed` row, no durable resolution: the gate terminalizes as
+    /// `Expired` with an `Approval`-class failure carrying the closed-waiter
+    /// note — never a re-registration loop.
+    #[tokio::test]
+    async fn closed_receiver_while_failed_without_resolution_expires_the_gate() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, node_id, ..) = seed_pending_gate_dag(&fx, session).await;
+        let gate = ClosedReceiverGate::new(fx.storage.sessions(), Some("failed"));
+        let sched = closed_receiver_scheduler(&fx, Arc::clone(&gate));
+
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(node_id));
+        let failure = outcome.failure.expect("failure ir");
+        assert_eq!(failure.error_class, ErrorClass::Approval);
+        assert_eq!(failure.retry, RetryDisposition::NonRetryable);
+        assert!(
+            failure.notes.contains("gate waiter closed; run failed"),
+            "unexpected notes: {}",
+            failure.notes
+        );
+        fx.close().await;
+    }
+
+    /// §5.7.9 `Failed` row with a durable `deny`: the durable resolution is
+    /// followed (GD3 denied failure), not the closed-waiter expiry.
+    #[tokio::test]
+    async fn closed_receiver_while_failed_with_durable_deny_applies_deny() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, node_id, gate_id, run_id) = seed_pending_gate_dag(&fx, session).await;
+        fx.storage
+            .events()
+            .append_session(crate::events::NewSessionEvent {
+                session_id: session,
+                run_id: Some(run_id),
+                type_: crate::events::SessionEventType::ApprovalResolved,
+                payload: serde_json::json!({
+                    "gate_id": gate_id.to_string(),
+                    "decision": "deny",
+                    "generation": 1u64,
+                }),
+            })
+            .await
+            .unwrap();
+        let gate = ClosedReceiverGate::new(fx.storage.sessions(), Some("failed"));
+        let sched = closed_receiver_scheduler(&fx, Arc::clone(&gate));
+
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(node_id));
+        let failure = outcome.failure.expect("failure ir");
+        assert_eq!(failure.error_class, ErrorClass::Approval);
+        assert_eq!(failure.notes, "approval denied");
+        fx.close().await;
+    }
+
+    /// §5.7.9 `Failed` row with a durable `allow`: contradictory durable
+    /// state is an `Invariant`, never silently allowed or expired.
+    #[tokio::test]
+    async fn closed_receiver_while_failed_with_durable_allow_is_invariant() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, _node_id, gate_id, run_id) = seed_pending_gate_dag(&fx, session).await;
+        fx.storage
+            .events()
+            .append_session(crate::events::NewSessionEvent {
+                session_id: session,
+                run_id: Some(run_id),
+                type_: crate::events::SessionEventType::ApprovalResolved,
+                payload: serde_json::json!({
+                    "gate_id": gate_id.to_string(),
+                    "decision": "allow",
+                    "generation": 1u64,
+                }),
+            })
+            .await
+            .unwrap();
+        let gate = ClosedReceiverGate::new(fx.storage.sessions(), Some("failed"));
+        let sched = closed_receiver_scheduler(&fx, Arc::clone(&gate));
+
+        let err = sched.run(dag_id).await.unwrap_err();
+        assert!(
+            matches!(&err, SchedError::Invariant(m) if m.contains("resolution is Allow")),
+            "expected Invariant(Failed-with-Allow), got {err:?}"
+        );
+        fx.close().await;
+    }
+
+    /// §5.7.9 `Succeeded` row: a run that claims success while its gate is
+    /// still pending is an `Invariant`.
+    #[tokio::test]
+    async fn closed_receiver_while_succeeded_is_invariant() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, ..) = seed_pending_gate_dag(&fx, session).await;
+        let gate = ClosedReceiverGate::new(fx.storage.sessions(), Some("succeeded"));
+        let sched = closed_receiver_scheduler(&fx, Arc::clone(&gate));
+
+        let err = sched.run(dag_id).await.unwrap_err();
+        assert!(
+            matches!(&err, SchedError::Invariant(m) if m.contains("run succeeded while gate pending")),
+            "expected Invariant(succeeded-while-pending), got {err:?}"
+        );
+        fx.close().await;
+    }
+
+    /// §5.7.9 `ReplanRequested` row: the replan path wins and the DAG lands
+    /// in `ReplanRequired` with no failure attribution.
+    #[tokio::test]
+    async fn closed_receiver_while_replan_requested_takes_the_replan_path() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, ..) = seed_pending_gate_dag(&fx, session).await;
+        let gate = ClosedReceiverGate::new(fx.storage.sessions(), Some("replan_requested"));
+        let sched = closed_receiver_scheduler(&fx, Arc::clone(&gate));
+
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::ReplanRequired);
+        assert_eq!(outcome.failed_node, None);
+        assert_eq!(outcome.failure, None);
+        fx.close().await;
+    }
+
+    // ---- gate-before-C3 ordering (AC 71) and no scheduler model/tool
+    // ---- emission (AC 38) ----
+
+    /// Run an `Analyze → GateHuman(allow)` chain to `Succeeded` and return
+    /// the session events plus the recording decision log.
+    async fn run_analyze_gate_chain(
+        fx: &Fixture,
+        session: SessionId,
+    ) -> (
+        NodeId,
+        Vec<crate::events::SessionEvent>,
+        Arc<RecordingDecisionLog>,
+    ) {
+        let dag_id = DagId::new();
+        let analyze = NodeId::new();
+        let gate = NodeId::new();
+        let gate_id = GateId::new();
+        let analyze_input = fx
+            .put_goal_envelope(dag_id, analyze, NodeKind::Analyze)
+            .await;
+        let gate_input = fx
+            .put_placeholder_input(dag_id, gate, NodeKind::GateHuman, vec![])
+            .await;
+        let mut gate_node_val = adapter_node(gate, NodeKind::GateHuman, gate_input);
+        gate_node_val.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "ship it".into(),
+        });
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([
+                (
+                    analyze,
+                    llm_node(analyze, NodeKind::Analyze, analyze_input, adapter_retry()),
+                ),
+                (gate, gate_node_val),
+            ]),
+            edges: vec![DependencyEdge {
+                from: analyze,
+                to: gate,
+                kind: EdgeKind::Sequence,
+            }],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let capabilities = StaticCapability::new(vec![Ok(CapabilityOutcome::Succeeded {
+            payload: serde_json::json!({"analysis": "ok"}),
+        })]);
+        let gate_human = StaticGate::new(fx.plane.clone(), vec![Ok(Approval::Allow)]);
+        let (sched, decisions) = fx.build_scheduler_full(
+            fx._dir.path().join("s-gate-order"),
+            capabilities,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            gate_human,
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 200)
+            .await
+            .unwrap();
+        (gate, events, decisions)
+    }
+
+    /// AC 71: a `GateHuman` node is never C3-dispatched to `Running` while
+    /// its gate is unresolved — every durable event that moves the gate node
+    /// to `running` sits *after* the durable `ApprovalResolved` in the log.
+    #[tokio::test]
+    async fn gate_node_reaches_running_only_after_a_durable_resolution() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (gate, events, _decisions) = run_analyze_gate_chain(&fx, session).await;
+
+        let resolved_seq = events
+            .iter()
+            .find(|e| e.type_ == crate::events::SessionEventType::ApprovalResolved)
+            .map(|e| e.seq)
+            .expect("allow must write a durable ApprovalResolved");
+        let gate_running: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.type_ == crate::events::SessionEventType::NodeState
+                    && e.payload.get("node_id").and_then(serde_json::Value::as_str)
+                        == Some(gate.to_string().as_str())
+                    && e.payload.get("to").and_then(serde_json::Value::as_str) == Some("running")
+            })
+            .collect();
+        assert!(
+            !gate_running.is_empty(),
+            "the allow fold must move the gate through running"
+        );
+        for ev in gate_running {
+            assert!(
+                ev.seq > resolved_seq,
+                "gate node moved to running (seq {:?}) before its resolution (seq {resolved_seq:?})",
+                ev.seq
+            );
+        }
+        fx.close().await;
+    }
+
+    /// AC 38: the scheduler layer itself never records `ModelCall` or
+    /// `ToolCall` decisions — those belong to workers/tools (RFC-0004
+    /// attribution). A full capability + gate run must leave both recorders
+    /// empty while still recording ordinary decisions.
+    #[tokio::test]
+    async fn scheduler_never_records_model_or_tool_calls() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (_gate, _events, decisions) = run_analyze_gate_chain(&fx, session).await;
+
+        assert!(
+            decisions.recorded_model_calls().is_empty(),
+            "scheduler must not emit ModelCall records"
+        );
+        assert!(
+            decisions.recorded_tool_calls().is_empty(),
+            "scheduler must not emit ToolCall records"
+        );
+        fx.close().await;
+    }
+
+    // ---- gate resume crash points (ACs 33/35/36) ----
+
+    /// Seed a durably `WaitingApproval` single-gate DAG (the pre-crash
+    /// state), its `waiting_approval` run row, and the prior process's
+    /// durable `ApprovalRequested`. Optionally seed a durable resolution.
+    async fn seed_waiting_gate_resume(
+        fx: &Fixture,
+        session: SessionId,
+        resolution: Option<&str>,
+    ) -> (DagId, NodeId, GateId, RunId) {
+        let dag_id = DagId::new();
+        let gate = NodeId::new();
+        let gate_id = GateId::new();
+        let gate_input = fx
+            .put_placeholder_input(dag_id, gate, NodeKind::GateHuman, vec![])
+            .await;
+        let mut gate_node_val = adapter_node(gate, NodeKind::GateHuman, gate_input);
+        gate_node_val.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "risky".into(),
+        });
+        gate_node_val.state = NodeState::WaitingApproval;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(gate, gate_node_val)]),
+            edges: vec![],
+            state: DagState::WaitingApproval,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let run_id = fx
+            .seed_run(session, dag_id, RunControlState::WaitingApproval.as_str())
+            .await;
+        fx.storage
+            .events()
+            .append_session(crate::events::NewSessionEvent {
+                session_id: session,
+                run_id: Some(run_id),
+                type_: crate::events::SessionEventType::ApprovalRequested,
+                payload: serde_json::json!({
+                    "gate_id": gate_id.to_string(),
+                    "reason": "risky",
+                    "timeout_ms": 30_000u64,
+                    "generation": 1u64,
+                }),
+            })
+            .await
+            .unwrap();
+        if let Some(decision) = resolution {
+            fx.storage
+                .events()
+                .append_session(crate::events::NewSessionEvent {
+                    session_id: session,
+                    run_id: Some(run_id),
+                    type_: crate::events::SessionEventType::ApprovalResolved,
+                    payload: serde_json::json!({
+                        "gate_id": gate_id.to_string(),
+                        "decision": decision,
+                        "generation": 1u64,
+                    }),
+                })
+                .await
+                .unwrap();
+        }
+        (dag_id, gate, gate_id, run_id)
+    }
+
+    /// AC 36: resume with a durable `expired` resolution terminalizes from
+    /// the scan alone — `expire_gate` is not called again (the run row is
+    /// left exactly as seeded) and no second `ApprovalResolved` is written.
+    #[tokio::test]
+    async fn gate_resume_with_durable_expired_terminalizes_without_reexpiring() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, gate, _gate_id, run_id) =
+            seed_waiting_gate_resume(&fx, session, Some("expired")).await;
+
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-resume-expired"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman), // must never wait
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(gate));
+        let failure = outcome.failure.expect("failure ir");
+        assert_eq!(failure.error_class, ErrorClass::Approval);
+        assert_eq!(failure.retry, RetryDisposition::NonRetryable);
+
+        // `expire_gate` was not re-driven: the run row is untouched and the
+        // seeded resolution is still the only one.
+        let row = fx
+            .storage
+            .sessions()
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state, "waiting_approval",
+            "run row must not be rewritten"
+        );
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 100)
+            .await
+            .unwrap();
+        let resolved = events
+            .iter()
+            .filter(|e| e.type_ == crate::events::SessionEventType::ApprovalResolved)
+            .count();
+        assert_eq!(resolved, 1, "no second ApprovalResolved may be written");
+        fx.close().await;
+    }
+
+    /// AC 35 (also AC 33's `WaitingApproval` crash point): resume with no
+    /// durable resolution re-registers the waiter only — the surviving
+    /// `ApprovalRequested` is *not* re-emitted (GR3 repairs only a missing
+    /// one) and the gate then resolves normally.
+    #[tokio::test]
+    async fn gate_resume_waiting_without_resolution_reregisters_without_a_second_request() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, _gate, _gate_id, _run_id) = seed_waiting_gate_resume(&fx, session, None).await;
+
+        let gate_human = StaticGate::new(fx.plane.clone(), vec![Ok(Approval::Allow)]);
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-resume-waiting"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            gate_human,
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 100)
+            .await
+            .unwrap();
+        let requested = events
+            .iter()
+            .filter(|e| e.type_ == crate::events::SessionEventType::ApprovalRequested)
+            .count();
+        assert_eq!(
+            requested, 1,
+            "the surviving ApprovalRequested must not be duplicated on resume"
+        );
+        fx.close().await;
+    }
+
+    /// AC 33's post-fold crash point: the allow fold's C9b completed (gate
+    /// node durably `Succeeded`) but the process died before the terminal
+    /// C7. Resume must finish the DAG naturally without consulting any
+    /// adapter.
+    #[tokio::test]
+    async fn gate_resume_after_completed_fold_finishes_the_dag_naturally() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let gate = NodeId::new();
+        let gate_id = GateId::new();
+        let gate_input = fx
+            .put_placeholder_input(dag_id, gate, NodeKind::GateHuman, vec![])
+            .await;
+        let mut gate_node_val = adapter_node(gate, NodeKind::GateHuman, gate_input);
+        gate_node_val.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "risky".into(),
+        });
+        gate_node_val.state = NodeState::Succeeded;
+        gate_node_val.output_ref = Some(fx.put_node_output(dag_id, gate).await);
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(gate, gate_node_val)]),
+            edges: vec![],
+            state: DagState::Running, // C7 never landed
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-resume-folded"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+        assert_eq!(outcome.failed_node, None);
+        let stored = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(stored.state, DagState::Succeeded, "C7 must land on resume");
+        fx.close().await;
+    }
+
+    // ---- R4b vs concurrent unowned cancel (AC 88) ----
+
+    /// `DagStore` interposer: serves the first `get` for `target` from the
+    /// real store, then immediately writes the RC4-shaped terminal blob a
+    /// concurrent unowned `cancel` would have committed — so the R4b re-load
+    /// (the second `get`) observes the cancel's write.
+    struct CancelBetweenLoadsDagStore {
+        inner: Arc<dyn DagStore>,
+        target: DagId,
+        fired: StdMutex<bool>,
+        gets: std::sync::atomic::AtomicU32,
+    }
+    #[async_trait]
+    impl DagStore for CancelBetweenLoadsDagStore {
+        async fn put(&self, dag: &TaskDag) -> Result<(), crate::storage::StoreError> {
+            self.inner.put(dag).await
+        }
+        async fn put_if_generation(
+            &self,
+            dag: &TaskDag,
+            expected: Option<u64>,
+        ) -> Result<(), crate::storage::StoreError> {
+            self.inner.put_if_generation(dag, expected).await
+        }
+        async fn replace_for_replan(
+            &self,
+            dag: &TaskDag,
+            expected_generation: u64,
+        ) -> Result<(), crate::storage::ReplanReplaceError> {
+            self.inner
+                .replace_for_replan(dag, expected_generation)
+                .await
+        }
+        async fn get(&self, dag_id: DagId) -> Result<Option<TaskDag>, crate::storage::StoreError> {
+            let res = self.inner.get(dag_id).await?;
+            if dag_id == self.target {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let fire = {
+                    let mut fired = self.fired.lock().unwrap();
+                    !std::mem::replace(&mut *fired, true)
+                };
+                if fire {
+                    if let Some(mut cancelled) = res.clone() {
+                        for n in cancelled.nodes.values_mut() {
+                            n.state = NodeState::Cancelled;
+                        }
+                        cancelled.state = DagState::Cancelled;
+                        self.inner.put(&cancelled).await?;
+                    }
+                }
+            }
+            Ok(res)
+        }
+        async fn delete(&self, dag_id: DagId) -> Result<(), crate::storage::StoreError> {
+            self.inner.delete(dag_id).await
+        }
+        async fn list_by_session(
+            &self,
+            session_id: SessionId,
+        ) -> Result<Vec<DagId>, crate::storage::StoreError> {
+            self.inner.list_by_session(session_id).await
+        }
+    }
+
+    /// AC 88 / R4b: when a concurrent unowned `cancel` commits its terminal
+    /// write between R1's load and R4b's re-load, the re-load observes it
+    /// and short-circuits at R9 — assembling the `Cancelled` outcome instead
+    /// of executing over (and overwriting) the cancel's write.
+    #[tokio::test]
+    async fn r4b_reload_short_circuits_on_a_concurrent_unowned_cancel_write() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let interposed = Arc::new(CancelBetweenLoadsDagStore {
+            inner: fx.storage.dags(),
+            target: dag_id,
+            fired: StdMutex::new(false),
+            gets: std::sync::atomic::AtomicU32::new(0),
+        });
+        let deps = LinearSchedulerDeps {
+            dags: Arc::clone(&interposed) as Arc<dyn DagStore>,
+            artifacts: fx.storage.artifacts(),
+            events: fx.storage.events(),
+            sessions: fx.storage.sessions(),
+            session_plane: fx.plane.clone(),
+            runs: fx.plane.runs(),
+            verify_compile: Arc::new(crate::adapters::UnavailableVerifyCompile),
+            verify_test: Arc::new(crate::adapters::UnavailableVerifyTest),
+            gate_human: Arc::new(crate::adapters::UnavailableGateHuman),
+            // Unavailable: any dispatch would fail the run — proof R9 won.
+            capabilities: Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            decisions: Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()))
+                as Arc<dyn crate::obs::DecisionLog>,
+            cost_meters: Arc::new(ProcessCostMeterFactory::new()),
+            runtime_cancel: CancellationToken::new(),
+            budget_policy: BudgetPolicy::default(),
+            run_timeout: Duration::from_secs(30),
+            config: {
+                let mut c = SchedConfig::new(fx._dir.path().join("s-r4b-race"));
+                c.validate_on_load = false;
+                c
+            },
+        };
+        let sched = LinearScheduler::new_for_test(deps).unwrap();
+
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(
+            outcome.state,
+            DagState::Cancelled,
+            "R9 must assemble, not execute"
+        );
+        assert_eq!(outcome.failed_node, None);
+        assert!(
+            interposed.gets.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "R4b must re-load under ownership"
+        );
+        // The cancel's write survives untouched — no fresh execution overwrote it.
+        let stored = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(stored.state, DagState::Cancelled);
+        assert_eq!(stored.nodes[&a].state, NodeState::Cancelled);
+        fx.close().await;
+    }
+
+    // ---- T7/T8 timeout attribution (AC 65) ----
+
+    /// Capability that never completes — only a deadline can end it.
+    struct HangingCapability;
+    #[async_trait]
+    impl CapabilityExecutor for HangingCapability {
+        async fn execute(
+            &self,
+            _ctx: &CapabilityExecContext,
+        ) -> Result<CapabilityOutcome, CapabilityExecError> {
+            std::future::pending().await
+        }
+    }
+
+    /// AC 65 / T8: the shared attribution chain in isolation — selected
+    /// Ready verbatim, else lowest Ready, else lowest Pending, else None.
+    #[test]
+    fn attribution_target_follows_the_t8_fallback_chain() {
+        let dag_id = DagId::new();
+        let mut ids: Vec<NodeId> = (0..4).map(|_| NodeId::new()).collect();
+        ids.sort();
+        let (p_low, p_high, r_low, r_high) = (ids[0], ids[1], ids[2], ids[3]);
+        let mut nodes = BTreeMap::new();
+        for (&id, state) in ids.iter().zip([
+            NodeState::Pending,
+            NodeState::Pending,
+            NodeState::Ready,
+            NodeState::Ready,
+        ]) {
+            let mut n = llm_node(id, NodeKind::Analyze, ArtifactId::new(), adapter_retry());
+            n.state = state;
+            nodes.insert(id, n);
+        }
+        let mut dag = TaskDag {
+            id: dag_id,
+            session_id: SessionId::new(),
+            generation: 1,
+            nodes,
+            edges: vec![],
+            state: DagState::Running,
+        };
+
+        // A selected Ready node is used verbatim, even over a lower Ready.
+        assert_eq!(attribution_target(&dag, Some(r_high)), Some(r_high));
+        // No selection: lowest Ready wins over every Pending.
+        assert_eq!(attribution_target(&dag, None), Some(r_low));
+        // No Ready left: lowest Pending.
+        for id in [r_low, r_high] {
+            dag.nodes.get_mut(&id).unwrap().state = NodeState::Succeeded;
+        }
+        assert_eq!(attribution_target(&dag, None), Some(p_low));
+        // Nothing attributable: None (run_timeout_path turns this into an
+        // Invariant rather than inventing a node).
+        for id in [p_low, p_high] {
+            dag.nodes.get_mut(&id).unwrap().state = NodeState::Skipped;
+        }
+        assert_eq!(attribution_target(&dag, None), None);
+    }
+
+    /// Single hanging-capability DAG for the T7 deadline-attribution tests.
+    async fn seed_hanging_node(
+        fx: &Fixture,
+        session: SessionId,
+        node_timeout_ms: u64,
+    ) -> (DagId, NodeId) {
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(a, NodeKind::Analyze, input, adapter_retry());
+        node.timeout_ms = node_timeout_ms;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+        (dag_id, a)
+    }
+
+    /// AC 65 / T7: on an exact tie (`remaining_run == node.timeout_ms`) the
+    /// run budget is the binding constraint — the elapsed deadline is a run
+    /// timeout (NonRetryable), not a retryable node timeout. Pins the `<=`
+    /// in `run_attributed`.
+    #[tokio::test(start_paused = true)]
+    async fn t7_deadline_tie_attributes_to_the_run_not_the_node() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let run_timeout = Duration::from_millis(100);
+        let (dag_id, node) = seed_hanging_node(&fx, session, 100).await;
+
+        let sched = Arc::new(fx.build_scheduler(
+            fx._dir.path().join("s-t7-tie"),
+            Arc::new(HangingCapability),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            run_timeout,
+        ));
+        let handle = tokio::spawn({
+            let sched = Arc::clone(&sched);
+            async move { sched.run(dag_id).await }
+        });
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let outcome = handle.await.unwrap().unwrap();
+
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(
+            outcome.failed_node,
+            Some(node),
+            "T7 hint names the in-flight node"
+        );
+        let failure = outcome.failure.expect("failure ir");
+        assert_eq!(failure.error_class, ErrorClass::Timeout);
+        assert_eq!(
+            failure.retry,
+            RetryDisposition::NonRetryable,
+            "a tie is a run timeout (T8 shape), never a retryable node timeout"
+        );
+        assert!(
+            failure.notes.contains("run timeout"),
+            "unexpected notes: {}",
+            failure.notes
+        );
+        fx.close().await;
+    }
+
+    /// AC 65 / T7 converse: a node deadline strictly inside the run budget
+    /// stays node-attributed — `ErrorClass::Timeout` and Retryable.
+    #[tokio::test(start_paused = true)]
+    async fn t7_node_deadline_inside_run_budget_is_a_retryable_node_timeout() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, node) = seed_hanging_node(&fx, session, 50).await;
+
+        let sched = Arc::new(fx.build_scheduler(
+            fx._dir.path().join("s-t7-node"),
+            Arc::new(HangingCapability),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        ));
+        let handle = tokio::spawn({
+            let sched = Arc::clone(&sched);
+            async move { sched.run(dag_id).await }
+        });
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let outcome = handle.await.unwrap().unwrap();
+
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(node));
+        let failure = outcome.failure.expect("failure ir");
+        assert_eq!(failure.error_class, ErrorClass::Timeout);
+        assert_eq!(failure.retry, RetryDisposition::Retryable);
+        assert!(
+            failure.notes.contains("node timeout"),
+            "unexpected notes: {}",
+            failure.notes
+        );
+        fx.close().await;
+    }
+
+    // ---- BE4 post-CAS half (AC 82) ----
+
+    /// AC 82's post-CAS half: `record_gate_decision` runs *after*
+    /// `c9c_gate_deny`'s CAS, so a decision-sink outage there is logged and
+    /// swallowed — the deny still terminalizes the DAG instead of aborting
+    /// the already-committed checkpoint.
+    #[tokio::test]
+    async fn be4_post_cas_gate_decision_failure_is_logged_not_aborted() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, node_id, ..) = seed_pending_gate_dag(&fx, session).await;
+
+        let deps = LinearSchedulerDeps {
+            dags: fx.storage.dags(),
+            artifacts: fx.storage.artifacts(),
+            events: fx.storage.events(),
+            sessions: fx.storage.sessions(),
+            session_plane: fx.plane.clone(),
+            runs: fx.plane.runs(),
+            verify_compile: Arc::new(crate::adapters::UnavailableVerifyCompile),
+            verify_test: Arc::new(crate::adapters::UnavailableVerifyTest),
+            gate_human: StaticGate::new(fx.plane.clone(), vec![Ok(Approval::Deny)]),
+            capabilities: Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            decisions: Arc::new(AlwaysFailingDecisionLog),
+            cost_meters: Arc::new(ProcessCostMeterFactory::new()),
+            runtime_cancel: CancellationToken::new(),
+            budget_policy: BudgetPolicy::default(),
+            run_timeout: Duration::from_secs(30),
+            config: {
+                let mut c = SchedConfig::new(fx._dir.path().join("s-be4-post"));
+                c.validate_on_load = false;
+                c
+            },
+        };
+        let sched = LinearScheduler::new_for_test(deps).unwrap();
+
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Failed, "deny must still land");
+        assert_eq!(outcome.failed_node, Some(node_id));
+        let failure = outcome.failure.expect("failure ir");
+        assert_eq!(failure.error_class, ErrorClass::Approval);
+        assert_eq!(failure.notes, "approval denied");
+        let stored = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(stored.state, DagState::Failed, "the CAS must be durable");
+        fx.close().await;
+    }
+
+    // ---- R8 meter rebuild on resume (AC 62) ----
+
+    /// AC 62 / R8 (B7/B8): a resumed run's meter is *assigned* from the
+    /// durable event rebuild, never added onto a stale in-process meter — a
+    /// prior attempt's leftover accumulation must not double the totals.
+    #[tokio::test]
+    async fn resumed_run_meter_is_rebuilt_not_double_counted() {
+        use crate::obs::CostMeterFactory as _;
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let run_id = fx.seed_run(session, dag_id, "running").await;
+
+        // The durable truth: exactly one model call for this run.
+        let log =
+            crate::obs::EventDecisionLog::from_handle(fx._rt.handle(), Arc::clone(&fx.storage))
+                .unwrap();
+        crate::obs::DecisionLog::record_model_call(
+            &log,
+            crate::obs::ModelCallRecord::new(
+                session,
+                crate::types::ids::ProviderId::new("p").unwrap(),
+                ModelTier::Standard,
+            )
+            .run(run_id)
+            .tokens(Some(10), Some(2))
+            .usd(Some(0.1)),
+        )
+        .await
+        .unwrap();
+
+        // The hazard: the process-local meter still holds the prior
+        // attempt's in-memory accumulation of that same call.
+        let factory = Arc::new(ProcessCostMeterFactory::new());
+        factory.meter_for(run_id).with_mut(|m| {
+            m.add_model_usage(ModelTier::Standard, Some(10), Some(2), Some(0.1));
+        });
+
+        let deps = LinearSchedulerDeps {
+            dags: fx.storage.dags(),
+            artifacts: fx.storage.artifacts(),
+            events: fx.storage.events(),
+            sessions: fx.storage.sessions(),
+            session_plane: fx.plane.clone(),
+            runs: fx.plane.runs(),
+            verify_compile: Arc::new(crate::adapters::UnavailableVerifyCompile),
+            verify_test: Arc::new(crate::adapters::UnavailableVerifyTest),
+            gate_human: Arc::new(crate::adapters::UnavailableGateHuman),
+            capabilities: StaticCapability::new(vec![Ok(CapabilityOutcome::Succeeded {
+                payload: serde_json::json!({"analysis": "ok"}),
+            })]),
+            decisions: Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()))
+                as Arc<dyn crate::obs::DecisionLog>,
+            cost_meters: Arc::clone(&factory) as Arc<_>,
+            runtime_cancel: CancellationToken::new(),
+            budget_policy: BudgetPolicy::default(),
+            run_timeout: Duration::from_secs(30),
+            config: {
+                let mut c = SchedConfig::new(fx._dir.path().join("s-meter"));
+                c.validate_on_load = false;
+                c
+            },
+        };
+        let sched = LinearScheduler::new_for_test(deps).unwrap();
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        // R8 assigned the rebuilt meter: one durable call, not the durable
+        // call plus the stale in-process copy.
+        let snap = factory.meter_for(run_id).with_mut(|m| m.snapshot());
+        assert_eq!(snap.model_calls, 1, "meter must be rebuilt, not summed");
+        assert_eq!(snap.tokens_in, 10);
+        assert_eq!(snap.tokens_out, 2);
+        assert!((snap.usd_spent.unwrap() - 0.1).abs() < 1e-9);
+        fx.close().await;
+    }
+
+    // ---- §4.4 ownership release on panic (AC 49) ----
+
+    /// Capability that parks until the test fires `trigger`, then panics —
+    /// a worker bug unwinding out of the run body. Deliberately not keyed on
+    /// the cancel token: the dispatch `select!` drops the capability future
+    /// on cancellation, so a cancel-triggered panic would race with a clean
+    /// checkpoint cancel instead of deterministically unwinding.
+    struct PanicOnTriggerCapability {
+        executing: Arc<std::sync::atomic::AtomicBool>,
+        trigger: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl CapabilityExecutor for PanicOnTriggerCapability {
+        async fn execute(
+            &self,
+            _ctx: &CapabilityExecContext,
+        ) -> Result<CapabilityOutcome, CapabilityExecError> {
+            let notified = self.trigger.notified();
+            self.executing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            notified.await;
+            panic!("worker bug: panic mid-execute");
+        }
+    }
+
+    /// AC 49 / §4.4 G1-G3: a panic unwinding out of the run body still
+    /// releases DAG ownership via `OwnedGuard::drop`, records the panic as
+    /// the cancel result (so a waiting `cancel` resolves immediately instead
+    /// of burning its full drain grace), and leaves the DAG re-acquirable.
+    #[tokio::test]
+    async fn owned_guard_drop_releases_ownership_when_the_run_body_panics() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let executing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = Arc::new(tokio::sync::Notify::new());
+        let sched = Arc::new(fx.build_scheduler(
+            fx._dir.path().join("s-panic"),
+            Arc::new(PanicOnTriggerCapability {
+                executing: Arc::clone(&executing),
+                trigger: Arc::clone(&trigger),
+            }),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        ));
+        let run_sched = Arc::clone(&sched);
+        let run_handle = tokio::spawn(async move { run_sched.run(dag_id).await });
+
+        // Wait until the capability is parked in execute(), then grab the
+        // live OwnedDag handle a concurrent `cancel` would be waiting on.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !executing.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "capability never started executing"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let owned = sched
+            .lookup_owned(dag_id)
+            .unwrap()
+            .expect("run must own the DAG while executing");
+
+        // Fire the panic; the run task surfaces it...
+        trigger.notify_waiters();
+        let join = run_handle.await;
+        assert!(
+            join.is_err_and(|e| e.is_panic()),
+            "run body must have panicked"
+        );
+
+        // ...and `OwnedGuard::drop` recorded the panic as the cancel result
+        // and notified: a waiter on the pre-panic handle resolves right away
+        // with the truthful outcome instead of burning its drain grace.
+        let result = owned
+            .wait_for_completion(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("drop must have set a result and notified");
+        assert!(
+            matches!(&result, Err(SchedError::Internal(m)) if m.contains("run body panicked")),
+            "expected the recorded panic outcome, got {result:?}"
+        );
+        // ...and ownership was released by `OwnedGuard::drop` (G1): the map
+        // is empty and a fresh `run` is not `AlreadyOwned`.
+        assert!(sched.lookup_owned(dag_id).unwrap().is_none());
+        let second = sched.run(dag_id).await;
+        assert!(
+            !matches!(second, Err(SchedError::AlreadyOwned(_))),
+            "ownership must not leak after a panic, got {second:?}"
+        );
+        fx.close().await;
+    }
+
+    // ---- §5.7.2 resolution-scan generation filter (AC 79) ----
+
+    /// AC 79: `scan_gate_resolution` ignores an `ApprovalResolved` recorded
+    /// against a stale generation — only an event carrying the scanned
+    /// generation resolves the gate, and among those the newest wins.
+    #[tokio::test]
+    async fn scan_gate_resolution_ignores_a_stale_generation_event() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let gate_id = GateId::new();
+        let run_id = RunId::new();
+        let ctx = CheckpointCtx {
+            session_id: session,
+            run_id: Some(run_id),
+        };
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-scan-gen"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let append_resolution = |decision: &'static str, generation: u64| {
+            let events = fx.storage.events();
+            async move {
+                events
+                    .append_session(crate::events::NewSessionEvent {
+                        session_id: session,
+                        run_id: Some(run_id),
+                        type_: crate::events::SessionEventType::ApprovalResolved,
+                        payload: serde_json::json!({
+                            "gate_id": gate_id.to_string(),
+                            "decision": decision,
+                            "generation": generation,
+                        }),
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // A generation-1 allow alone must not resolve a generation-2 scan.
+        append_resolution("allow", 1).await;
+        let got = sched
+            .scan_gate_resolution(dag_id, ctx, gate_id, 2)
+            .await
+            .unwrap();
+        assert_eq!(got, None, "stale-generation allow must be ignored");
+
+        // The same event is still visible to its own generation's scan.
+        let got = sched
+            .scan_gate_resolution(dag_id, ctx, gate_id, 1)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(GateResolution::Allow));
+
+        // With a matching generation-2 deny appended, the generation-2 scan
+        // resolves to it — the stale gen-1 allow still never leaks in.
+        append_resolution("deny", 2).await;
+        let got = sched
+            .scan_gate_resolution(dag_id, ctx, gate_id, 2)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(GateResolution::Deny));
+        fx.close().await;
+    }
+
+    // ---- §5.7.8 expire_gate retry loop (AC 80) ----
+
+    /// Single-gate DAG with a short real-time deadline plus a `NeverGate`
+    /// scheduler, for the `expire_gate` retry tests. Returns the spawned run
+    /// handle once the plane's gate waiter is durably registered (run row
+    /// `waiting_approval`) — the point after which the next run-row upsert
+    /// belongs to `expire_gate`.
+    async fn spawn_expiring_gate_run(
+        fx: &Fixture,
+        session: SessionId,
+    ) -> (
+        DagId,
+        NodeId,
+        RunId,
+        tokio::task::JoinHandle<Result<DagOutcome, SchedError>>,
+    ) {
+        let dag_id = DagId::new();
+        let gate = NodeId::new();
+        let gate_id = GateId::new();
+        let gate_input = fx
+            .put_placeholder_input(dag_id, gate, NodeKind::GateHuman, vec![])
+            .await;
+        let mut gate_node_val = adapter_node(gate, NodeKind::GateHuman, gate_input);
+        gate_node_val.approval = Some(crate::dag::ApprovalSpec {
+            gate: gate_id,
+            reason: "risky".into(),
+        });
+        gate_node_val.timeout_ms = 50;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(gate, gate_node_val)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        let run_id = fx.seed_run(session, dag_id, "running").await;
+
+        let sched = Arc::new(fx.build_scheduler(
+            fx._dir.path().join("s-expire-retry"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(NeverGate {
+                plane: fx.plane.clone(),
+            }),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        ));
+        let handle = tokio::spawn(async move { sched.run(dag_id).await });
+
+        // Wait (bounded) for the waiter registration to land durably; after
+        // this there are no plane-side run-row writes until `expire_gate`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let row = fx.storage.sessions().get_run(run_id).await.unwrap();
+            if row.is_some_and(|r| r.state == "waiting_approval") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "gate waiter never registered"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        (dag_id, gate, run_id, handle)
+    }
+
+    /// AC 80 / §5.7.8: a transient `Err(other)` from `expire_gate` is
+    /// retried after `EXPIRE_RETRY_BACKOFF`; the second attempt succeeds and
+    /// the expiry is durable (ApprovalResolved `expired` + run row `failed`).
+    #[tokio::test]
+    async fn expire_gate_transient_error_is_retried_then_durable() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (_dag_id, gate_node, run_id, handle) = spawn_expiring_gate_run(&fx, session).await;
+
+        // Exactly one injected failure: attempt 1 eats it, attempt 2 lands.
+        fx.plane.fail_next_run_upsert();
+
+        let outcome = handle.await.unwrap().unwrap();
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(gate_node));
+        let failure = outcome.failure.expect("failure ir");
+        assert_eq!(failure.error_class, ErrorClass::Approval);
+        assert_eq!(
+            failure.notes, "approval timeout",
+            "retry succeeded — not the exhaust shape"
+        );
+
+        // The retry made the control-plane expiry durable after all.
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 100)
+            .await
+            .unwrap();
+        let resolved = events
+            .iter()
+            .find(|e| e.type_ == crate::events::SessionEventType::ApprovalResolved)
+            .expect("second attempt must write ApprovalResolved");
+        assert_eq!(resolved.payload["decision"], serde_json::json!("expired"));
+        let row = fx
+            .storage
+            .sessions()
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "failed", "persist_expiry moved the run row");
+        fx.close().await;
+    }
+
+    /// AC 80 / §5.7.8 GT3(iii): when every `expire_gate` attempt fails with
+    /// `Err(other)`, the scheduler exhausts `EXPIRE_RETRY_MAX` (3) and
+    /// terminalizes locally rather than propagating `Err` or leaving the DAG
+    /// `WaitingApproval` — the control plane never records the expiry.
+    #[tokio::test]
+    async fn expire_gate_exhausts_retries_and_terminalizes_locally() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, gate_node, run_id, handle) = spawn_expiring_gate_run(&fx, session).await;
+
+        // Re-arm the one-shot injector continuously so every attempt's
+        // step-5 upsert fails. Only `expire_gate` writes run rows from here
+        // on, so the arming cannot hit an unrelated write.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armer = {
+            let plane = fx.plane.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    plane.fail_next_run_upsert();
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            })
+        };
+
+        let outcome = handle.await.unwrap().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        armer.join().unwrap();
+
+        assert_eq!(outcome.state, DagState::Failed);
+        assert_eq!(outcome.failed_node, Some(gate_node));
+        let failure = outcome.failure.expect("failure ir");
+        assert_eq!(failure.error_class, ErrorClass::Approval);
+        assert_eq!(failure.retry, RetryDisposition::NonRetryable);
+        assert!(
+            failure
+                .notes
+                .contains("expire_gate failed after 3 attempts"),
+            "expected the exhaust notes, got: {}",
+            failure.notes
+        );
+
+        // GT3(iii) is local: no durable ApprovalResolved, run row untouched,
+        // but the DAG itself is durably terminal (not WaitingApproval).
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 100)
+            .await
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.type_ == crate::events::SessionEventType::ApprovalResolved),
+            "control-plane expiry must never have landed"
+        );
+        let row = fx
+            .storage
+            .sessions()
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, "waiting_approval", "run row was never moved");
+        let stored = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(stored.state, DagState::Failed);
+        fx.close().await;
+    }
+
+    // ---- R2/R3 entry errors (ACs 12/13) ----
+
+    /// AC 12: `run` on a DAG with no bound run row fails with
+    /// `RunBindingMissing` (§5.1 R3 / Appendix F RB1) before any ownership
+    /// or state write.
+    #[tokio::test]
+    async fn run_without_a_bound_run_row_is_run_binding_missing() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        // Deliberately no `seed_run`: nothing binds this DAG to a run.
+
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s1"),
+            Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        );
+        let err = sched.run(dag_id).await.unwrap_err();
+        assert!(
+            matches!(err, SchedError::RunBindingMissing(d) if d == dag_id),
+            "expected RunBindingMissing({dag_id}), got {err:?}"
+        );
+        // R3 precedes R4 ownership and every checkpoint: the stored blob is
+        // untouched and no session event was appended.
+        let stored = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(stored.state, DagState::Pending);
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 50)
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "no events expected, got {events:?}");
+        fx.close().await;
+    }
+
+    /// AC 13: with `validate_on_load = true` (the production default), `run`
+    /// on an invalid stored blob fails at R2 with `Invariant` and issues no
+    /// CAS — the invalid blob is left exactly as stored.
+    #[tokio::test]
+    async fn run_with_validate_on_load_rejects_invalid_blob_without_cas() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        // V5 violation: a self-loop edge on the only node.
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, llm_node(a, NodeKind::Analyze, input, adapter_retry()))]),
+            edges: vec![DependencyEdge {
+                from: a,
+                to: a,
+                kind: EdgeKind::Sequence,
+            }],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+        let deps = LinearSchedulerDeps {
+            dags: fx.storage.dags(),
+            artifacts: fx.storage.artifacts(),
+            events: fx.storage.events(),
+            sessions: fx.storage.sessions(),
+            session_plane: fx.plane.clone(),
+            runs: fx.plane.runs(),
+            verify_compile: Arc::new(crate::adapters::UnavailableVerifyCompile),
+            verify_test: Arc::new(crate::adapters::UnavailableVerifyTest),
+            gate_human: Arc::new(crate::adapters::UnavailableGateHuman),
+            capabilities: Arc::new(crate::adapters::UnavailableCapabilityExecutor),
+            decisions: decisions as Arc<dyn crate::obs::DecisionLog>,
+            cost_meters: Arc::new(ProcessCostMeterFactory::new()),
+            runtime_cancel: CancellationToken::new(),
+            budget_policy: BudgetPolicy::default(),
+            run_timeout: Duration::from_secs(30),
+            // Production default: validate_on_load stays true.
+            config: SchedConfig::new(fx._dir.path().join("s1")),
+        };
+        let sched = LinearScheduler::new_for_test(deps).unwrap();
+
+        let err = sched.run(dag_id).await.unwrap_err();
+        assert!(
+            matches!(err, SchedError::Invariant(_)),
+            "expected Invariant, got {err:?}"
+        );
+        // No CAS: the invalid blob is byte-identical in intent — same state,
+        // same node state, same edge list — and no session event exists.
+        let stored = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(stored.state, DagState::Pending);
+        assert_eq!(stored.nodes[&a].state, NodeState::Pending);
+        assert_eq!(stored.edges.len(), 1);
+        let events = fx
+            .storage
+            .events()
+            .list_session_events(session, None, 50)
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "no events expected, got {events:?}");
+        fx.close().await;
+    }
+
     /// FO1/FO2/FO3 fixture: a durably `Failed` single-node DAG, with the
     /// node's own `NodeState` event and artifact left to each test to seed
     /// (or not) below `Fixture::put_goal_envelope`'s placeholder input.

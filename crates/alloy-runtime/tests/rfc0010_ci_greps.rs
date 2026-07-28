@@ -7,17 +7,17 @@
 //! config is needed, and a violation is caught locally on `cargo test` too,
 //! not just in CI.
 //!
-//! # RFC-0010 §13 acceptance-criteria sweep — known test-coverage gaps
+//! # RFC-0010 §13 acceptance-criteria sweep — coverage-gap ledger (closed)
 //!
 //! A manual pass over all 95 ACs (cross-referencing test names, then
-//! reading source where names were ambiguous) found the following with no
-//! dedicated test today. Also tracked as RFC-0010 §15 Q8. Numbers are
-//! RFC-0010 §13 AC numbers.
+//! reading source where names were ambiguous) found ~20 ACs with no
+//! dedicated test. Also tracked as RFC-0010 §15 Q8. Numbers are RFC-0010
+//! §13 AC numbers.
 //!
 //! The sweep, and the reviewer rounds that followed it, turned up real
 //! implementation bugs as well as test debt. Those were fixed and tested
-//! rather than listed here: FO6/FN2 attribution (ACs 66/89/92), RF3+RF7
-//! resume wiring (ACs 23/24), B4's resume backoff (AC 26), the
+//! during review: FO6/FN2 attribution (ACs 66/89/92), RF3+RF7 resume
+//! wiring (ACs 23/24), B4's resume backoff (AC 26), the
 //! `CapabilityExecContext` budget/deadline contract, BE4's pre-CAS
 //! ordering on both the retry and budget paths (AC 82), the
 //! `pending_cancels` leak, §5.3.2 row 4 gate adoption, the run half of
@@ -29,69 +29,57 @@
 //! grounds that ER4 needed a `TaskNode.needs_reverify` field the codebase
 //! does not have. That reading was wrong: ER4 defines `needs_reverify` as a
 //! *derived* predicate over node states and edge reachability, so nothing
-//! needed to be added to `TaskNode`. They are genuinely covered now
-//! (`ready.rs`'s `needs_reverify_*` unit tests plus `loop_.rs`'s `er4_*` /
-//! `er5_*` end-to-end tests).
+//! needed to be added to `TaskNode`. They are covered by `ready.rs`'s
+//! `needs_reverify_*` unit tests plus `loop_.rs`'s `er4_*` / `er5_*`
+//! end-to-end tests.
 //!
-//! - **AC 12**: `run` on a DAG with no bound run row returns
-//!   `RunBindingMissing` — the code path exists, no test calls it directly.
-//! - **AC 13**: `run` with `validate_on_load` on an invalid blob returns
-//!   `Invariant` with no CAS issued — no dedicated test.
-//! - **AC 22**: checkpoint write order (artifacts → CAS → events) is
-//!   correct by code inspection for every `cN_*` method but untested via a
-//!   call-order-tracking store double, unlike the RFC's own suggested
-//!   "Recorded store" mechanism.
-//! - **AC 23/24** (*closed*): RF3/RF7 are wired into R9 via
-//!   `repair_gate_terminal`, and `adopt_running` now has end-to-end tests
-//!   for both §5.3.2 gate rows. General non-gate RF3-on-adoption is still
-//!   only unit-tested.
-//! - **AC 26** (*closed*): `b4_resumed_ready_node_with_prior_attempts_*`
-//!   covers the fresh-process restart on a paused clock, and
-//!   `b4_in_loop_retry_does_not_double_wait_*` pins the converse.
-//! - **AC 33**: gate-allow resume is tested from one intermediate crash
-//!   point, not "each" per the AC's plural wording.
-//! - **AC 35/36**: resume-with-`WaitingApproval`-and-no-resolution
-//!   (re-register only, no double `ApprovalRequested`/CAS) and
-//!   resume-with-durable-`expired` (terminalizes, `expire_gate` not called
-//!   again) both lack dedicated tests.
-//! - **AC 38**: the scheduler never emits `ModelCall`/`ToolCall` (true by
-//!   construction — nothing in `scheduler::` calls anything that would)
-//!   and cost-sum-no-double-counting have no regression test.
-//! - **AC 39**: `gate.rs`'s closed-receiver `RunControlState` classification
-//!   (§5.7.9) has zero dedicated tests — `gate.rs`'s own test module only
-//!   covers its pure helpers (`parse_gate_resolution` etc.), not this state
-//!   machine.
-//! - **AC 49**: `OwnedGuard::drop` releasing ownership when the run body
-//!   itself panics (not just cancels/errors) has no dedicated test.
-//! - **AC 62**: `reaccumulate_cost_from_events` has its own RFC-0004 test;
-//!   the scheduler-level "a resumed run's meter total doesn't double" isn't
-//!   independently tested at this layer.
-//! - **AC 64**: stall detection (DS4: unsatisfiable Data predecessor forces
-//!   a bulk-`Skipped` re-derive) has no dedicated test.
-//! - **AC 65** (partial): the general run-timeout path is tested; T7's
-//!   node-vs-run tie-break and T8's no-`Running`-node attribution fallback
-//!   chain aren't isolated in their own tests.
-//! - **AC 71**: `GateHuman` never reaching C3 while unresolved is true by
-//!   construction (`gate.rs` routes before `dispatch_node`) but untested as
-//!   a regression.
-//! - **AC 76**: Appendix F's multi-run-row tie-break (RB6 `Running`
-//!   preference, then RB5 `created_at`/`run_id` ordering) has no test with
-//!   more than one candidate row.
-//! - **AC 79**: a stale-generation `ApprovalResolved` being ignored by
-//!   `scan_gate_resolution`'s generation filter has no dedicated test.
-//! - **AC 80**: `expire_gate`'s `Err(other)` retry-up-to-`EXPIRE_RETRY_MAX`
-//!   loop is only exercised via its happy path (`gate_expiry_terminalizes_*`
-//!   in `loop_.rs`); the retry-then-exhaust behavior isn't.
-//! - **AC 82** (*partly closed*): the pre-CAS half is now pinned by
-//!   `be4_pre_cas_decision_failure_aborts_the_retry_checkpoint`. The
-//!   post-CAS half (logged, not aborted) still has no dedicated test.
-//! - **AC 88**: R4b's re-load observing a concurrent unowned-cancel's
-//!   terminal write (short-circuiting at R9 instead of overwriting) has no
-//!   dedicated race test.
+//! The remaining test-only debt was then paid down in a dedicated pass;
+//! every gap the sweep listed now has a named test:
 //!
-//! None of these block AC 57/73/83 (this file) or the sweep's own
-//! conclusion that P1-P9 collectively deliver the RFC's normative behavior;
-//! they're coverage debt, prioritized here for whoever picks this up next.
+//! - **AC 12** — `run_without_a_bound_run_row_is_run_binding_missing`.
+//! - **AC 13** — `run_with_validate_on_load_rejects_invalid_blob_without_cas`.
+//! - **AC 22** — `checkpoint_write_order_is_artifacts_then_cas_then_events`
+//!   (`checkpoint.rs`): the RFC's "Recorded store" mechanism, driving
+//!   C3/C4/C7/C8/C9c through call-order-tracking store doubles.
+//! - **AC 23/24** — RF3/RF7 are wired into R9 via `repair_gate_terminal`;
+//!   `adopt_running` has end-to-end tests for both §5.3.2 gate rows.
+//!   General non-gate RF3-on-adoption remains unit-tested only
+//!   (`repair_node_state_*`).
+//! - **AC 26** — `b4_resumed_ready_node_with_prior_attempts_*` plus
+//!   `b4_in_loop_retry_does_not_double_wait_*`.
+//! - **AC 33** — each crash point: `WaitingApproval` +
+//!   durable allow (`gate_resume_with_durable_resolution_never_calls_adapter`),
+//!   `Ready` (`resume_with_a_ready_gate_rescans_the_durable_approval`),
+//!   `Running` (`adopt_running_gate_with_durable_allow_resumes_the_fold`),
+//!   post-C9b (`gate_resume_after_completed_fold_finishes_the_dag_naturally`).
+//! - **AC 35** — `gate_resume_waiting_without_resolution_reregisters_without_a_second_request`.
+//! - **AC 36** — `gate_resume_with_durable_expired_terminalizes_without_reexpiring`.
+//! - **AC 38** — `scheduler_never_records_model_or_tool_calls`.
+//! - **AC 39** — the seven `closed_receiver_while_*` tests cover every
+//!   §5.7.9 `RunControlState` row, including the `GATE_REREGISTER_MAX`
+//!   bound and the Failed-with-contradictory-resolution invariant.
+//! - **AC 49** — `owned_guard_drop_releases_ownership_when_the_run_body_panics`.
+//! - **AC 62** — `resumed_run_meter_is_rebuilt_not_double_counted`.
+//! - **AC 64** — `ds4_stalled_dag_is_terminalized_instead_of_wedged`.
+//! - **AC 65** — `attribution_target_follows_the_t8_fallback_chain` plus
+//!   `t7_deadline_tie_attributes_to_the_run_not_the_node` /
+//!   `t7_node_deadline_inside_run_budget_is_a_retryable_node_timeout`.
+//! - **AC 71** — `gate_node_reaches_running_only_after_a_durable_resolution`.
+//! - **AC 76** — `rb6_prefers_the_running_row_over_a_newer_non_running_row`
+//!   and `rb5_orders_candidates_by_created_at_then_run_id`.
+//! - **AC 79** — `scan_gate_resolution_ignores_a_stale_generation_event`.
+//! - **AC 80** — `expire_gate_transient_error_is_retried_then_durable` and
+//!   `expire_gate_exhausts_retries_and_terminalizes_locally`.
+//! - **AC 82** — pre-CAS halves:
+//!   `be4_pre_cas_decision_failure_aborts_the_retry_checkpoint` /
+//!   `be4_pre_cas_budget_decision_failure_aborts_the_stop_checkpoint`;
+//!   post-CAS half:
+//!   `be4_post_cas_gate_decision_failure_is_logged_not_aborted`.
+//! - **AC 88** — `r4b_reload_short_circuits_on_a_concurrent_unowned_cancel_write`.
+//!
+//! Unless a path is qualified, the tests above live in `loop_.rs`'s test
+//! module. This ledger is only useful if it is true — if a test above is
+//! renamed or removed, update this list in the same change.
 
 use std::path::{Path, PathBuf};
 
