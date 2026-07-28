@@ -1264,6 +1264,14 @@ async fn run_approve_with_waiter() {
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].payload["decision"], json!("allow_once"));
     assert_eq!(resolved[0].payload["gate_id"], json!(gate.to_string()));
+    // A8: without `generation`, RFC-0010 §5.7.2's resume scan cannot filter a
+    // GateId reused across a replan, and would apply a stale resolution to
+    // the new generation's gate.
+    assert_eq!(
+        resolved[0].payload["generation"],
+        json!(0),
+        "A8 requires ApprovalResolved to carry the DAG generation"
+    );
 
     // Second approve for the same gate finds no waiter.
     h.set_run_state(run, RunControlState::WaitingApproval).await;
@@ -1272,6 +1280,62 @@ async fn run_approve_with_waiter() {
         RunError::UnknownGate(got) if got == gate
     ));
     assert_eq!(h.plane.metrics().approvals_resolved, 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn run_expire_gate_resolves_with_expired_decision_and_generation() {
+    // A4/A8: `expire_gate` mirrors `approve(Deny)` with `decision: "expired"`
+    // and MUST carry `generation` for the same §5.7.2 scan-filtering reason
+    // `approve` does. Nothing pinned that on the expiry path.
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+    h.set_run_state(run, RunControlState::Accepted).await;
+    let gate = GateId::new();
+    let rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::WaitingApproval);
+
+    h.runs().expire_gate(run, gate).await.unwrap();
+
+    // The waiter is released (dropped, not delivered an Approval): §5.7.8
+    // terminalizes rather than resuming the fold.
+    assert!(rx.await.is_err(), "expiry must not deliver an Approval");
+    assert_eq!(h.run_state(run).await, RunControlState::Failed);
+
+    let resolved: Vec<_> = h
+        .session_events(session)
+        .await
+        .into_iter()
+        .filter(|e| e.type_ == SessionEventType::ApprovalResolved)
+        .collect();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].payload["decision"], json!("expired"));
+    assert_eq!(resolved[0].payload["gate_id"], json!(gate.to_string()));
+    assert_eq!(
+        resolved[0].payload["generation"],
+        json!(0),
+        "A8 applies to expire_gate exactly as it does to approve"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn run_expire_gate_without_a_waiter_is_not_an_error() {
+    // A7: idempotent with respect to a missing waiter — the scheduler retries
+    // expiry (§5.7.8 EXPIRE_RETRY_MAX) and must not see a hard error just
+    // because the waiter already went away.
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+    h.set_run_state(run, RunControlState::WaitingApproval).await;
+
+    h.runs()
+        .expire_gate(run, GateId::new())
+        .await
+        .expect("A7: no registered waiter is not an error");
     h.close().await;
 }
 

@@ -466,10 +466,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_code_changes_fingerprint_from_empty_string_code() {
-        // Sanity: None-code and Some("")-code both frame identically (both
-        // contribute an empty byte run before the separator) — documented
-        // via equality rather than asserted as a difference.
+    fn missing_code_and_empty_string_code_fingerprint_identically() {
+        // The name has to match the assertion. `None` and `Some("")` frame
+        // identically (each contributes an empty byte run before the
+        // separator), so this pins an equality, not a difference — the old
+        // name claimed the opposite of what the body checks.
         let none_code = diagnostic_fingerprint(None, DiagnosticLevel::Error, "m", None);
         let empty_code = diagnostic_fingerprint(Some(""), DiagnosticLevel::Error, "m", None);
         assert_eq!(none_code, empty_code);

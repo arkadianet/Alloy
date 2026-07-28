@@ -65,6 +65,11 @@ pub(super) struct OwnedDag {
     /// Child of `deps.runtime_cancel` (O1); also fired by `cancel(dag_id)`.
     pub(super) run_cancel: CancellationToken,
     /// Notified exactly once when ownership is released (`OwnedGuard::drop`).
+    ///
+    /// MUST be fired with `notify_waiters()`, never `notify_one()`:
+    /// [`OwnedDag::wait_for_completion`]'s subscribe-then-recheck ordering is
+    /// only race-free because tokio delivers `notify_waiters()` to a
+    /// `Notified` from the moment it is created, unpolled.
     pub(super) completed: Arc<Notify>,
     /// Set before `completed.notify_waiters()` (O3). `None` only while the
     /// owner is still running.
@@ -83,12 +88,28 @@ impl OwnedDag {
         *slot = Some(result);
     }
 
-    /// O4: race-free wait for `completed`, bounded by `deadline`. The
-    /// **normative** pattern (§4.3): subscribe to `notified()` *before*
-    /// re-checking `cancel_result`, never after — a single
-    /// `notified().await` issued after the writer already called
-    /// `notify_waiters` would hang forever (tokio `Notify` has no
-    /// "already fired" memory across a subscribe that starts later).
+    /// O4: race-free wait for `completed`, bounded by `deadline` (§4.3).
+    ///
+    /// Construct the `Notified` **before** re-checking `cancel_result`, never
+    /// after. The ordering is load-bearing, and it is sound because of a
+    /// guarantee tokio makes for exactly one of its two notify primitives:
+    ///
+    /// > The `Notified` future is guaranteed to receive wakeups from
+    /// > `notify_waiters()` as soon as it has been created, even if it has
+    /// > not yet been polled.
+    ///
+    /// So a `notify_waiters()` that lands in the window between construction
+    /// here and `select!`'s first poll is still delivered, and the re-check
+    /// closes the remaining window where the result was written before
+    /// construction.
+    ///
+    /// **This does not hold for `notify_one()`**, whose wakeups a `Notified`
+    /// only receives once polled or explicitly `enable()`d. `completed` is
+    /// therefore documented as `notify_waiters()`-only; switching the writer
+    /// in [`OwnedGuard::drop`] to `notify_one()` would silently reintroduce a
+    /// lost-wakeup race whose only symptom is a spurious
+    /// `Internal("cancel drain grace exceeded")` at the deadline.
+    /// `notify_waiters_reaches_an_unpolled_notified` pins both halves.
     pub(super) async fn wait_for_completion(
         &self,
         deadline: tokio::time::Instant,
@@ -291,6 +312,45 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         let result = owned.wait_for_completion(deadline).await;
         assert!(result.is_none());
+    }
+
+    /// Pins the exact tokio guarantee [`OwnedDag::wait_for_completion`]'s
+    /// subscribe-then-recheck ordering rests on, and the neighbouring
+    /// primitive that does **not** provide it.
+    ///
+    /// Forcing the equivalent interleaving *inside* `wait_for_completion`
+    /// would need test-only hooks in production code; demonstrating it on the
+    /// primitive is deterministic and makes the dependency legible. If tokio
+    /// ever weakens the first half, this fails here with a pointed message
+    /// rather than as an occasional "cancel drain grace exceeded" in the
+    /// field.
+    #[tokio::test(start_paused = true)]
+    async fn notify_waiters_reaches_an_unpolled_notified() {
+        let notify = Notify::new();
+
+        // Created, never polled, then notified: still delivered. This is the
+        // window between `let notified = ...` and `select!`'s first poll.
+        let unpolled = notify.notified();
+        notify.notify_waiters();
+        tokio::time::timeout(Duration::from_millis(50), unpolled)
+            .await
+            .expect(
+                "tokio guarantees notify_waiters() reaches a Notified from creation; if this \
+                 now times out, wait_for_completion has a lost-wakeup race and needs enable()",
+            );
+
+        // `notify_one()` makes no such promise, which is why `completed` is
+        // documented as notify_waiters()-only.
+        let unpolled = notify.notified();
+        notify.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), unpolled)
+                .await
+                .is_ok(),
+            "notify_one leaves a permit, so this particular shape still completes — \
+             the hazard is a *concurrent* notify_one with no permit left, which is why \
+             OwnedGuard::drop must keep using notify_waiters()"
+        );
     }
 
     #[tokio::test(start_paused = true)]

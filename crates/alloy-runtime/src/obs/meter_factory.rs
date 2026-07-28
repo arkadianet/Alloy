@@ -21,6 +21,13 @@ pub trait CostMeterFactory: Send + Sync {
 
 /// Process-local factory: one meter per [`RunId`], memoized, cleared on
 /// [`ProcessCostMeterFactory::release`].
+///
+/// **Host obligation:** the map grows by one entry per run and is only ever
+/// pruned by [`ProcessCostMeterFactory::release`]. A long-lived host that
+/// never calls it leaks one meter per run for the process lifetime. The
+/// scheduler deliberately does not call `release` itself (B9 — see that
+/// method), so this is the host's to schedule, after the run's outcome has
+/// been surfaced.
 #[derive(Debug, Default)]
 pub struct ProcessCostMeterFactory {
     meters: Mutex<HashMap<RunId, SharedCostMeter>>,

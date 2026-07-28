@@ -271,13 +271,25 @@ impl SessionService for SessionServiceView {
             // stuck non-terminal forever otherwise: `start` refuses a
             // terminal run row, so nothing else ever revisits it.
             if state.is_terminal() {
-                if let Some(dag_id) = dag_id {
-                    let terminal = match state {
-                        RunControlState::Succeeded => DagState::Succeeded,
-                        RunControlState::Failed => DagState::Failed,
-                        RunControlState::Cancelled => DagState::Cancelled,
-                        _ => unreachable!("RunControlState::is_terminal() covers exactly these"),
-                    };
+                // Total match rather than a catch-all `unreachable!()`: today
+                // `is_terminal()` covers exactly the three mapped arms, so the
+                // panic was sound — but a background resume sweep is a steep
+                // place to discover that a newly added terminal variant broke
+                // the assumption. A state with no `DagState` counterpart skips
+                // reconciliation; adding one to `RunControlState` now breaks
+                // this match at compile time instead.
+                let terminal = match state {
+                    RunControlState::Succeeded => Some(DagState::Succeeded),
+                    RunControlState::Failed => Some(DagState::Failed),
+                    RunControlState::Cancelled => Some(DagState::Cancelled),
+                    RunControlState::Created
+                    | RunControlState::Accepted
+                    | RunControlState::Running
+                    | RunControlState::WaitingApproval
+                    | RunControlState::Cancelling
+                    | RunControlState::ReplanRequested => None,
+                };
+                if let (Some(dag_id), Some(terminal)) = (dag_id, terminal) {
                     if let Err(e) = self
                         .inner
                         .handle

@@ -150,7 +150,11 @@ pub enum AdapterError {
     #[error("internal: {0}")]
     Internal(String),
     /// A tool ran and failed, carrying the merged RFC-0006 taxonomy.
-    #[error("tool failure: {0}")]
+    ///
+    /// Fixed message, not `{0}`: the inner error is already reachable via
+    /// `#[source]`, and interpolating it too makes every `{:#}` / error-chain
+    /// renderer print it twice.
+    #[error("tool failure")]
     ToolFailure(#[source] crate::types::tools::ToolError),
     /// Sandbox / token / disclosure denial. NOT a compile or test failure.
     #[error("permission denied: {0}")]

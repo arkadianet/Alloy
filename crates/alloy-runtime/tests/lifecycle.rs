@@ -346,7 +346,7 @@ impl Scheduler for SlowCancelScheduler {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn drain_a1_deadline_computed_before_cancel_await() {
     // Amendment A1 / DR1: a `cancel()` that runs long past `grace` must not
     // get the whole `grace` budget *on top of* however long it takes —
@@ -374,7 +374,11 @@ async fn drain_a1_deadline_computed_before_cancel_await() {
             _ = entered => {}
         }
 
-        let start = std::time::Instant::now();
+        // TD1/TD2: paused clock, so this measures the *virtual* time drain
+        // actually waited. A wall-clock margin here is inherently flaky on a
+        // loaded CI runner, and the whole point is a deterministic ordering
+        // between `grace` and `cancel_delay`.
+        let start = tokio::time::Instant::now();
         rt.drain(grace).await.unwrap();
         start.elapsed()
         // `run_fut` drops here — it never resolves on its own (this double
@@ -382,9 +386,9 @@ async fn drain_a1_deadline_computed_before_cancel_await() {
     };
 
     // Pre-A1 behavior would be >= cancel_delay (300ms) *plus* another grace
-    // window on top. 200ms is comfortably above the expected ~100-110ms and
-    // comfortably below the pre-fix floor, so this distinguishes the two
-    // without being timing-flaky.
+    // window on top. Under a paused clock the post-fix value is exactly
+    // `grace`, so any bound strictly between 100ms and 300ms separates the
+    // two; 200ms keeps the intent legible.
     assert!(
         elapsed < Duration::from_millis(200),
         "drain took {elapsed:?}; expected close to grace ({grace:?}), not grace + cancel_delay"

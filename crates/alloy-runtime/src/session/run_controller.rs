@@ -394,20 +394,26 @@ impl RunControllerView {
             // and strand the DAG blob non-terminal forever — nothing else
             // ever revisits a run row that's already terminal (RC2 treats
             // it as a no-op), so no later call terminalizes the DAG either.
-            if durable == RunControlState::WaitingApproval {
-                if let Ok(outcome) = &result {
-                    if matches!(outcome.state, DagState::Failed | DagState::Cancelled) {
-                        info!(
-                            run_id = %run,
-                            state = durable.as_str(),
-                            dag_state = ?outcome.state,
-                            "start outcome applied: terminal outcome overrides waiting_approval (A5)"
-                        );
-                        let outcome = result.expect("matched Ok above");
-                        return self.apply_ok_outcome(&row, session, run, outcome).await;
-                    }
+            // Match the owned `result` once, so the terminal arm *has* the
+            // outcome by value rather than borrowing to test it and then
+            // re-unwrapping with a panic-capable `expect`. This is the
+            // control plane: a panic here takes run completion down for the
+            // whole session.
+            let result = match result {
+                Ok(outcome)
+                    if durable == RunControlState::WaitingApproval
+                        && matches!(outcome.state, DagState::Failed | DagState::Cancelled) =>
+                {
+                    info!(
+                        run_id = %run,
+                        state = durable.as_str(),
+                        dag_state = ?outcome.state,
+                        "start outcome applied: terminal outcome overrides waiting_approval (A5)"
+                    );
+                    return self.apply_ok_outcome(&row, session, run, outcome).await;
                 }
-            }
+                other => other,
+            };
             // `Running` / `WaitingApproval` (non-terminal) / `ReplanRequired` outcomes
             // keep merging here, as do the other control-protected durable states
             // (`replan_requested` / `cancelling` / `cancelled` keep winning outright).

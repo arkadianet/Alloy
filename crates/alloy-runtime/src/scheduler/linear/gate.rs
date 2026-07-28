@@ -531,8 +531,18 @@ impl LinearScheduler {
         rc: &RunCtx<'_>,
         node_id: NodeId,
         gate_id: GateId,
-        _adapter_err: Option<AdapterError>,
+        adapter_err: Option<AdapterError>,
     ) -> Result<StepOutcome, SchedError> {
+        // The classification below is driven by durable `RunControlState`
+        // (§5.7.9), not by this error — but dropping it entirely makes a
+        // closed-waiter bug undiagnosable, since the adapter's reason is the
+        // only account of *why* the receiver closed.
+        if let Some(err) = &adapter_err {
+            tracing::warn!(
+                %gate_id, %node_id, error = %err,
+                "gate waiter closed; classifying via durable RunControlState"
+            );
+        }
         let run_row = self
             .deps
             .sessions
@@ -745,9 +755,16 @@ impl LinearScheduler {
                 return Ok(Duration::from_millis(timeout_ms));
             }
         };
+        // GR4. `Timestamp` is wall-clock, but the deadline this feeds is a
+        // monotonic `tokio::time` timer, so the two can disagree whenever the
+        // host clock is stepped (NTP, suspend/resume, a manual set). Clamping
+        // into `[0, timeout_ms]` keeps a backwards step from producing a
+        // *longer* remaining deadline than the gate was ever granted; a
+        // forwards step already collapses to `ZERO` and expires, which is the
+        // fail-closed direction.
         let elapsed_ms = (crate::types::ids::Timestamp::now().0 - first_ts.0)
             .whole_milliseconds()
-            .max(0) as u64;
+            .clamp(0, i128::from(timeout_ms)) as u64;
         Ok(Duration::from_millis(timeout_ms).saturating_sub(Duration::from_millis(elapsed_ms)))
     }
 }
