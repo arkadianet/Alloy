@@ -34,6 +34,7 @@ pub mod dag;
 pub mod edit;
 pub mod error;
 pub mod events;
+pub mod graph;
 pub mod logging;
 pub mod obs;
 pub mod planner;
@@ -68,6 +69,11 @@ pub use error::{AdapterError, RunError, RuntimeError, SchedError, SessionError};
 pub use events::{
     EventSink, EventSinkError, HandoffSnapshot, InMemoryEventSink, NewSessionEvent, RuntimeEvent,
     SessionEvent, SessionEventType,
+};
+pub use graph::{
+    derive_node_id, FileChange, FileChangeKind, FixEvent, GraphEdge, GraphEdgeKind, GraphError,
+    GraphFidelity, GraphNode, GraphNodeKind, GraphQuery, GraphView, GraphViewHandle, IngestReport,
+    NullProjectGraph, ProjectGraph,
 };
 pub use obs::{
     apply_prompt_retention, apply_tool_retention, hash_content, hash_prompt, hash_tool_body,
@@ -111,9 +117,10 @@ pub use types::diagnostic::{
     DiagnosticEvent, DiagnosticLevel, ErrorClass, FailureIr, RetryDisposition, SpanRef,
 };
 pub use types::ids::{
-    ArtifactId, CapabilityId, CheckpointId, DagId, DiagnosticId, Digest, DigestError, DigestHasher,
-    EndpointId, EventSeq, GateId, GraphNodeId, GraphVersion, IdError, LanguageId, NodeId,
-    ProfileId, ProviderId, RunId, ServerId, SessionId, Timestamp, TransactionId,
+    ArtifactId, CapabilityId, CheckpointId, CrateId, DagId, DiagnosticId, Digest, DigestError,
+    DigestHasher, EndpointId, EventSeq, GateId, GraphNodeId, GraphSnapshotId, GraphVersion,
+    IdError, LanguageId, NodeId, ProfileId, ProviderId, RunId, ServerId, SessionId, Timestamp,
+    TransactionId,
 };
 pub use types::metrics::{RuntimeMetrics, WorkerMetrics};
 pub use types::permission::{ExecAllow, Glob, Grant, HostAllow, PermissionToken};
