@@ -40,6 +40,30 @@ pub fn runtime_to_run(e: RuntimeError) -> RunError {
         }
         RuntimeError::Scheduler(SchedError::Unavailable) => RunError::SchedulerUnavailable,
         RuntimeError::Scheduler(SchedError::Internal(s)) => RunError::Internal(s),
+        RuntimeError::Scheduler(SchedError::Config(m)) => {
+            RunError::Internal(format!("scheduler config: {m}"))
+        }
+        RuntimeError::Scheduler(SchedError::Conflict { dag_id }) => {
+            RunError::InvalidPhase(format!("dag generation conflict: {dag_id}"))
+        }
+        RuntimeError::Scheduler(SchedError::Invariant(m)) => {
+            RunError::Internal(format!("scheduler invariant: {m}"))
+        }
+        RuntimeError::Scheduler(SchedError::Store(m)) => {
+            RunError::Internal(format!("scheduler store: {m}"))
+        }
+        RuntimeError::Scheduler(SchedError::AlreadyOwned(id)) => {
+            RunError::InvalidPhase(format!("dag already owned: {id}"))
+        }
+        RuntimeError::Scheduler(SchedError::RunBindingMissing(id)) => {
+            RunError::Internal(format!("no run bound to dag {id}"))
+        }
+        RuntimeError::Scheduler(SchedError::Ownership(m)) => {
+            RunError::Internal(format!("scheduler ownership: {m}"))
+        }
+        // `SchedError` is `#[non_exhaustive]`: this crate defines it, so the match
+        // above must stay exhaustive over every named variant — a trailing `_` here
+        // would be unreachable under `-D warnings` (RFC-0010 amendment A3).
         RuntimeError::EventSinkBusy => RunError::Internal("event sink busy".into()),
         RuntimeError::EventSink(e) => RunError::Internal(e.to_string()),
         RuntimeError::AlreadyStopped => RunError::InvalidPhase("runtime stopped".into()),
@@ -109,5 +133,42 @@ mod tests {
             op: "run",
         });
         assert!(matches!(e, RunError::InvalidPhase(_)));
+    }
+
+    #[test]
+    fn rfc0010_sched_error_variants_map_per_boundary_table() {
+        use crate::types::ids::DagId;
+
+        let dag_id = DagId::new();
+        assert!(matches!(
+            runtime_to_run(RuntimeError::Scheduler(SchedError::Config("x".into()))),
+            RunError::Internal(_)
+        ));
+        assert!(matches!(
+            runtime_to_run(RuntimeError::Scheduler(SchedError::Conflict { dag_id })),
+            RunError::InvalidPhase(_)
+        ));
+        assert!(matches!(
+            runtime_to_run(RuntimeError::Scheduler(SchedError::Invariant("x".into()))),
+            RunError::Internal(_)
+        ));
+        assert!(matches!(
+            runtime_to_run(RuntimeError::Scheduler(SchedError::Store("x".into()))),
+            RunError::Internal(_)
+        ));
+        assert!(matches!(
+            runtime_to_run(RuntimeError::Scheduler(SchedError::AlreadyOwned(dag_id))),
+            RunError::InvalidPhase(_)
+        ));
+        assert!(matches!(
+            runtime_to_run(RuntimeError::Scheduler(SchedError::RunBindingMissing(
+                dag_id
+            ))),
+            RunError::Internal(_)
+        ));
+        assert!(matches!(
+            runtime_to_run(RuntimeError::Scheduler(SchedError::Ownership("x".into()))),
+            RunError::Internal(_)
+        ));
     }
 }

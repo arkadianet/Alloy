@@ -15,6 +15,23 @@ pub trait Scheduler: Send + Sync {
 
     /// Cancel an active DAG.
     async fn cancel(&self, dag_id: DagId) -> Result<(), SchedError>;
+
+    /// Reconcile a DAG blob toward a durable terminal control-plane state it
+    /// never observed on its own (RFC-0010 §5.20, amendment A2/A6) — e.g. a
+    /// gate deny/expiry that terminalized the *run* row while the *DAG* blob
+    /// is still `waiting_approval` because the scheduler never got to see
+    /// it. `terminal` MUST be `Succeeded` | `Failed` | `Cancelled`.
+    ///
+    /// Default: [`SchedError::Unavailable`] (matches every other
+    /// unimplemented `Scheduler` method's placeholder behavior — only
+    /// `LinearScheduler` overrides this).
+    async fn reconcile_terminal_run(
+        &self,
+        _dag_id: DagId,
+        _terminal: DagState,
+    ) -> Result<(), SchedError> {
+        Err(SchedError::Unavailable)
+    }
 }
 
 /// Terminal/observable DAG outcome.

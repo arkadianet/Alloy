@@ -45,13 +45,22 @@ pub enum RuntimeError {
     Internal(String),
 }
 
-/// Scheduler errors (RFC-0010 fills behavior; trait compiles today).
-#[derive(Debug, Error)]
+/// Scheduler errors (RFC-0010 §3.2).
+///
+/// `Err(SchedError)` is reserved for "no durable [`crate::DagOutcome`] was
+/// written" — planned failures (compile/test exhaustion, gate deny/expiry,
+/// budget/run timeout, cancellation) return `Ok(DagOutcome)` instead.
+///
+/// `Clone`: `OwnedDag::cancel_result` (§4.3 O3) needs to store a copy of the
+/// terminal `Err` alongside the one `run` actually returns. Every variant is
+/// plain data (`String`/`DagId`), so this is free.
+#[derive(Debug, Clone, Error)]
+#[non_exhaustive]
 pub enum SchedError {
-    /// No real scheduler registered.
+    /// No real scheduler registered (`NullScheduler` only).
     #[error("unavailable")]
     Unavailable,
-    /// Run cancelled.
+    /// Run cancelled without a durable outcome (prefer `Ok(DagOutcome)`).
     #[error("cancelled")]
     Cancelled,
     /// Unknown DAG id.
@@ -60,6 +69,30 @@ pub enum SchedError {
     /// Internal scheduler error.
     #[error("internal: {0}")]
     Internal(String),
+    /// Invalid construction / parallelism / `data_dir` configuration.
+    #[error("config: {0}")]
+    Config(String),
+    /// Generation CAS conflict — the scheduler MUST stop checkpointing.
+    #[error("generation conflict for dag {dag_id}")]
+    Conflict {
+        /// The DAG whose generation moved under the scheduler.
+        dag_id: DagId,
+    },
+    /// Contract violation (multiple Ready nodes, corrupt DAG, impossible state).
+    #[error("invariant: {0}")]
+    Invariant(String),
+    /// Store / artifact / event I/O failure after mapping.
+    #[error("store: {0}")]
+    Store(String),
+    /// Another in-process run already owns this DAG.
+    #[error("dag already owned: {0}")]
+    AlreadyOwned(DagId),
+    /// No run row binds this DAG.
+    #[error("no run bound to dag {0}")]
+    RunBindingMissing(DagId),
+    /// Scheduler ownership could not be established (OS lock, poisoned map).
+    #[error("ownership: {0}")]
+    Ownership(String),
 }
 
 /// Session service errors (behavior in RFC-0003).
@@ -100,8 +133,9 @@ pub enum RunError {
     UnknownGate(GateId),
 }
 
-/// Runtime adapter errors (impl in RFC-0010 / 0006).
+/// Runtime adapter errors (RFC-0010 §3.3).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AdapterError {
     /// Adapter not wired yet.
     #[error("unavailable")]
@@ -109,10 +143,29 @@ pub enum AdapterError {
     /// Cancelled via token.
     #[error("cancelled")]
     Cancelled,
-    /// Underlying tool failure.
+    /// Legacy free-form tool failure (retained; new code prefers `ToolFailure`).
     #[error("tool: {0}")]
     Tool(String),
     /// Internal adapter error.
     #[error("internal: {0}")]
     Internal(String),
+    /// A tool ran and failed, carrying the merged RFC-0006 taxonomy.
+    ///
+    /// Fixed message, not `{0}`: the inner error is already reachable via
+    /// `#[source]`, and interpolating it too makes every `{:#}` / error-chain
+    /// renderer print it twice.
+    #[error("tool failure")]
+    ToolFailure(#[source] crate::types::tools::ToolError),
+    /// Sandbox / token / disclosure denial. NOT a compile or test failure.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+    /// Adapter-observed deadline (host `call_timeout`, sandbox `exec_timeout`).
+    #[error("timeout")]
+    Timeout,
+    /// MCP host draining or stopped.
+    #[error("shutting down")]
+    ShuttingDown,
+    /// Artifact store failure while persisting a raw log.
+    #[error("artifact: {0}")]
+    Artifact(String),
 }

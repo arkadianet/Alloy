@@ -23,6 +23,7 @@ use super::traits::{clamp_events_page_limit, Session, SessionService};
 use crate::error::SessionError;
 use crate::events::{NewSessionEvent, SessionEvent, SessionEventType};
 use crate::runtime::RuntimePhase;
+use crate::scheduler::DagState;
 use crate::storage::{store_to_session, EventStore, RunRow, SessionRows};
 use crate::types::budget::{CreateSession, Goal};
 use crate::types::ids::{DagId, EventSeq, RunId, SessionId, Timestamp};
@@ -261,6 +262,48 @@ impl SessionService for SessionServiceView {
             }
             if self.inner.has_live(run) {
                 continue;
+            }
+            // A6: best-effort DAG-blob reconciliation for a terminal run row.
+            // A gate deny/expiry writes `RunControlState::Failed` directly,
+            // independent of whether a scheduler is currently running that
+            // DAG — if it crashed (or was simply never started in this
+            // process) before observing that resolution, the DAG blob is
+            // stuck non-terminal forever otherwise: `start` refuses a
+            // terminal run row, so nothing else ever revisits it.
+            if state.is_terminal() {
+                // Total match rather than a catch-all `unreachable!()`: today
+                // `is_terminal()` covers exactly the three mapped arms, so the
+                // panic was sound — but a background resume sweep is a steep
+                // place to discover that a newly added terminal variant broke
+                // the assumption. A state with no `DagState` counterpart skips
+                // reconciliation; adding one to `RunControlState` now breaks
+                // this match at compile time instead.
+                let terminal = match state {
+                    RunControlState::Succeeded => Some(DagState::Succeeded),
+                    RunControlState::Failed => Some(DagState::Failed),
+                    RunControlState::Cancelled => Some(DagState::Cancelled),
+                    RunControlState::Created
+                    | RunControlState::Accepted
+                    | RunControlState::Running
+                    | RunControlState::WaitingApproval
+                    | RunControlState::Cancelling
+                    | RunControlState::ReplanRequested => None,
+                };
+                if let (Some(dag_id), Some(terminal)) = (dag_id, terminal) {
+                    if let Err(e) = self
+                        .inner
+                        .handle
+                        .reconcile_terminal_run(dag_id, terminal)
+                        .await
+                    {
+                        warn!(
+                            run_id = %run,
+                            dag_id = %dag_id,
+                            error = %e,
+                            "resume: reconcile_terminal_run failed; continuing"
+                        );
+                    }
+                }
             }
             if let Err(e) = self.rearm_run(&row, state, dag_id).await {
                 // Match corrupt-row handling: one bad re-arm must not abort the rest of

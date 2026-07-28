@@ -336,7 +336,11 @@ async fn cargo_check_fixture_sandboxed() {
         skip_or_panic("cargo not on PATH");
         return;
     }
-    let homes = OperatorHomes::resolve().expect("operator homes");
+    let homes_root = tempfile::tempdir().unwrap();
+    let Some(homes) = hermetic_homes(homes_root.path()) else {
+        skip_or_panic("could not stage a hermetic CARGO_HOME");
+        return;
+    };
 
     let fixtures = copy_fixtures_tree();
     let jail = fixtures.path().canonicalize().unwrap();
@@ -383,6 +387,27 @@ async fn cargo_check_fixture_sandboxed() {
     assert_eq!(result.content["backend"], "landlock");
 }
 
+/// A `CARGO_HOME` containing only a copy of the real `cargo`.
+///
+/// The jail grants read on `$CARGO_HOME/{registry,git,bin}` but deliberately
+/// *not* on `$CARGO_HOME/config.toml`, and cargo treats an EACCES on that
+/// file as a hard error rather than "absent". So on any machine whose
+/// operator has a `~/.cargo/config.toml` — common; a shared
+/// `build.target-dir` is the usual reason — this test died with
+/// `could not load Cargo configuration` before compiling anything, and was
+/// permanently red locally while staying green on CI (which has no such
+/// file). `RUSTUP_HOME` stays real so the shim still resolves a toolchain,
+/// and the fixture crates resolve by path, so an empty registry costs
+/// nothing.
+#[cfg(target_os = "linux")]
+fn hermetic_homes(root: &Path) -> Option<OperatorHomes> {
+    let real = OperatorHomes::resolve().ok()?;
+    let cargo_home = root.join("cargo-home");
+    std::fs::create_dir_all(cargo_home.join("bin")).ok()?;
+    std::fs::copy(which_cargo()?, cargo_home.join("bin/cargo")).ok()?;
+    Some(OperatorHomes::new(cargo_home, real.rustup_home))
+}
+
 #[cfg(target_os = "linux")]
 fn skip_or_panic(reason: &str) {
     assert!(
@@ -393,7 +418,7 @@ fn skip_or_panic(reason: &str) {
 }
 
 #[cfg(target_os = "linux")]
-fn which_cargo() -> Option<String> {
+fn which_cargo() -> Option<PathBuf> {
     [
         std::env::var_os("CARGO").map(PathBuf::from),
         Some(PathBuf::from("/usr/bin/cargo")),
@@ -403,7 +428,6 @@ fn which_cargo() -> Option<String> {
     .into_iter()
     .flatten()
     .find(|p| p.is_file())
-    .map(|p| p.display().to_string())
 }
 
 /// Copy `tests/fixtures` into a unique tempdir so concurrent cargo-check tests

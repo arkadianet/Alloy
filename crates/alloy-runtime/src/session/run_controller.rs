@@ -22,7 +22,7 @@ use crate::error::{RunError, RuntimeError, SchedError};
 use crate::events::{NewSessionEvent, RuntimeEvent, SessionEventType};
 use crate::runtime::RuntimePhase;
 use crate::scheduler::{DagOutcome, DagState};
-use crate::storage::{EventStore, RunRow, SessionRows};
+use crate::storage::{DagStore, EventStore, RunRow, SessionRows};
 use crate::types::ids::{DagId, GateId, RunId, SessionId, Timestamp};
 
 /// Phase gate for `start` / `approve` / `request_replan` / `register_gate_waiter`.
@@ -96,6 +96,26 @@ pub(super) async fn upsert_state(
 fn parse_goal(row: &RunRow) -> Result<RunGoalRecord, RunError> {
     serde_json::from_value(row.goal_json.clone())
         .map_err(|e| RunError::Internal(format!("corrupt goal_json for run {}: {e}", row.id)))
+}
+
+/// Amendment A8: `approve`/`expire_gate` resolve the DAG generation via the
+/// run's `goal_json.dag_id` -> `DagStore::get`. A missing DAG is `Internal`
+/// (RFC-0010 §3.15 note under amendment A8).
+async fn resolve_dag_generation(
+    inner: &SessionInner,
+    row: &RunRow,
+) -> Result<(DagId, u64), RunError> {
+    let dag_id = parse_goal(row)?.dag_id;
+    let dag = inner
+        .storage
+        .dags()
+        .get(dag_id)
+        .await
+        .map_err(store_to_run)?
+        .ok_or_else(|| {
+            RunError::Internal(format!("dag not found for generation resolution: {dag_id}"))
+        })?;
+    Ok((dag_id, dag.generation))
 }
 
 /// Append a session event for a run through the active sink.
@@ -363,8 +383,40 @@ impl RunControllerView {
         let durable = parse_state(&row)?;
 
         if is_control_protected(durable) {
-            // A cancel, replan, or gate registration landed while we awaited. Preserving
-            // it is the contract, so this is an expected merge rather than a fault.
+            // A5: `waiting_approval` is the one control-protected state a
+            // *terminal* scheduler outcome overrides rather than merges
+            // under. A gate deny/expiry writes `RunControlState::Failed`
+            // directly (`approve`/`expire_gate`), independent of whether
+            // `run_dag` is even in flight for this DAG right now. If the
+            // scheduler *also* observed a terminal Failed/Cancelled outcome
+            // (it re-scanned the same resolution, or was cancelled) before
+            // `run_dag` returned, merging would silently drop that outcome
+            // and strand the DAG blob non-terminal forever — nothing else
+            // ever revisits a run row that's already terminal (RC2 treats
+            // it as a no-op), so no later call terminalizes the DAG either.
+            // Match the owned `result` once, so the terminal arm *has* the
+            // outcome by value rather than borrowing to test it and then
+            // re-unwrapping with a panic-capable `expect`. This is the
+            // control plane: a panic here takes run completion down for the
+            // whole session.
+            let result = match result {
+                Ok(outcome)
+                    if durable == RunControlState::WaitingApproval
+                        && matches!(outcome.state, DagState::Failed | DagState::Cancelled) =>
+                {
+                    info!(
+                        run_id = %run,
+                        state = durable.as_str(),
+                        dag_state = ?outcome.state,
+                        "start outcome applied: terminal outcome overrides waiting_approval (A5)"
+                    );
+                    return self.apply_ok_outcome(&row, session, run, outcome).await;
+                }
+                other => other,
+            };
+            // `Running` / `WaitingApproval` (non-terminal) / `ReplanRequired` outcomes
+            // keep merging here, as do the other control-protected durable states
+            // (`replan_requested` / `cancelling` / `cancelled` keep winning outright).
             info!(
                 run_id = %run,
                 state = durable.as_str(),
@@ -495,16 +547,22 @@ impl RunControllerView {
     }
 
     /// §6.5 durable writes for a resolved gate, performed before notifying the waiter.
+    ///
+    /// `generation` is amendment A8: every `ApprovalResolved` payload (from
+    /// `approve` and from `expire_gate`) MUST carry the DAG generation at
+    /// resolution time so RFC-0010 §5.7.2's scan can filter stale
+    /// generations after a replan.
     async fn persist_approval(
         &self,
         row: &RunRow,
         gate: GateId,
         decision: Approval,
         durable: RunControlState,
+        generation: u64,
     ) -> Result<(), PersistApprovalError> {
         let session = row.session_id;
         let run = row.id;
-        let resolved = json!({ "gate_id": gate, "decision": decision });
+        let resolved = json!({ "gate_id": gate, "decision": decision, "generation": generation });
 
         if decision == Approval::Deny {
             // `durable` is still `waiting_approval`, so acceptance is implied even when the
@@ -575,6 +633,64 @@ impl RunControllerView {
             err,
             row_committed: true,
         })
+    }
+
+    /// §3.15 steps 5-9: durable writes for an expired gate. Structurally
+    /// identical to [`Self::persist_approval`]'s Deny branch (row-first,
+    /// then events), with `decision: "expired"` and a `reason` field the
+    /// deny payload doesn't carry.
+    async fn persist_expiry(
+        &self,
+        row: &RunRow,
+        gate: GateId,
+        generation: u64,
+        accepted: bool,
+    ) -> Result<(), RunError> {
+        let session = row.session_id;
+        let run = row.id;
+        let resolved = json!({
+            "gate_id": gate,
+            "decision": "expired",
+            "reason": "approval_timeout",
+            "generation": generation,
+        });
+
+        upsert_state(&self.inner, row, RunControlState::Failed).await?; // step 5
+        self.inner.gates.clear_run(run); // step 6
+
+        append_run_event(
+            &self.inner,
+            session,
+            run,
+            SessionEventType::ApprovalResolved,
+            resolved,
+        )
+        .await?; // step 7
+        append_run_completed(
+            &self.inner,
+            session,
+            run,
+            DagState::Failed,
+            Some("approval_timeout"),
+        )
+        .await?; // step 8
+
+        if accepted {
+            match parse_goal(row) {
+                Ok(record) => {
+                    emit_run_finished(
+                        &self.inner,
+                        run,
+                        synthetic_outcome(record.dag_id, DagState::Failed),
+                    )
+                    .await?; // step 9
+                }
+                Err(e) => {
+                    warn!(run_id = %run, error = %e, "corrupt goal_json: skipping RunFinished for expired gate");
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -749,7 +865,18 @@ impl RunController for RunControllerView {
             .take(run, gate)
             .ok_or(RunError::UnknownGate(gate))?;
 
-        if let Err(e) = self.persist_approval(&row, gate, decision, state).await {
+        let (_dag_id, generation) = match resolve_dag_generation(&self.inner, &row).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.inner.gates.restore(run, gate, sender);
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = self
+            .persist_approval(&row, gate, decision, state, generation)
+            .await
+        {
             // Restore only when the row write itself failed. If the state already left
             // `waiting_approval`, putting the sender back permanently strands Deny waiters
             // (terminal guards block every release path) — drop it so they observe closure.
@@ -765,6 +892,48 @@ impl RunController for RunControllerView {
 
         self.inner.metrics.bump_approvals_resolved();
         info!(run_id = %run, gate_id = %gate, decision = ?decision, "approval resolved");
+        Ok(())
+    }
+
+    /// RFC-0010 §3.15 amendment A4 — mirrors `approve(Deny)` with
+    /// `decision: "expired"`. Steps numbered per §3.15's table.
+    async fn expire_gate(&self, run: RunId, gate: GateId) -> Result<(), RunError> {
+        require_running(&self.inner, "expire_gate")?; // step 1 (phase)
+        let _lock = self.inner.lock_run(run).await; // step 1 (per-run mutex)
+
+        let row = load_run(&self.inner, run).await?; // step 2
+        let state = parse_state(&row)?;
+        match state {
+            // step 3
+            RunControlState::WaitingApproval => {}
+            RunControlState::Cancelled | RunControlState::Succeeded | RunControlState::Failed => {
+                return Err(RunError::InvalidPhase("terminal".into()));
+            }
+            RunControlState::Cancelling => {
+                return Err(RunError::InvalidPhase("cancelling".into()));
+            }
+            RunControlState::ReplanRequested => {
+                return Err(RunError::InvalidPhase("replan pending".into()));
+            }
+            RunControlState::Created | RunControlState::Accepted | RunControlState::Running => {
+                return Err(RunError::InvalidPhase("not waiting approval".into()));
+            }
+        }
+
+        // step 4 (A7: a missing waiter is not an error — drop unconditionally).
+        drop(self.inner.gates.take(run, gate));
+
+        // Sample acceptance before the terminal write prunes the process-local marker
+        // (mirrors `persist_approval`'s Deny branch — `durable` is still
+        // `waiting_approval` here, so acceptance is implied regardless).
+        let accepted = self.inner.was_accepted(run, state);
+        let (_dag_id, generation) = resolve_dag_generation(&self.inner, &row).await?;
+
+        self.persist_expiry(&row, gate, generation, accepted)
+            .await?; // steps 5-9
+
+        self.inner.metrics.bump_approvals_resolved(); // step 10
+        info!(run_id = %run, gate_id = %gate, "approval expired");
         Ok(())
     }
 

@@ -31,6 +31,7 @@
 //! | `builtins` | argument validation, argv derivation, dispatch |
 //! | `patch` | the [`PatchApplyBackend`] seam and its stub |
 //! | `handle` | [`ToolHandle`] |
+//! | `tool_caller` | [`ToolHandleToolCaller`] + `map_mcp_error` (RFC-0010 §3.5) — the only module allowed to name `McpError` in an exhaustive match |
 //! | `recording` | [`RecordingMcpPlatform`] test double |
 //! | `metrics` | [`McpMetricsSnapshot`] counters |
 //! | `schema` | normative JSON Schemas + committed snapshots |
@@ -53,6 +54,7 @@ pub(crate) mod platform;
 pub(crate) mod recording;
 pub(crate) mod registry;
 pub(crate) mod schema;
+pub(crate) mod tool_caller;
 
 pub use builtins::cargo_check::CargoCheckArgs;
 pub use builtins::cargo_test::CargoTestArgs;
@@ -68,3 +70,4 @@ pub use patch::{
 };
 pub use platform::McpPlatform;
 pub use recording::RecordingMcpPlatform;
+pub use tool_caller::{map_mcp_error, ToolHandleToolCaller};

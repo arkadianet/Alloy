@@ -20,7 +20,8 @@ use crate::events::{EventSink, NewSessionEvent, RuntimeEvent, SessionEvent, Sess
 use crate::runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
 use crate::scheduler::{DagOutcome, DagState, Scheduler};
 use crate::storage::{
-    install_sqlite_event_sink, AlloyStorage, EventStore, RunRow, SessionRows, StorageOpenOptions,
+    install_sqlite_event_sink, AlloyStorage, DagStore, EventStore, RunRow, SessionRows,
+    StorageOpenOptions,
 };
 use crate::types::budget::{BudgetPolicy, BudgetSnapshot, CreateSession, Goal};
 use crate::types::ids::{DagId, EventSeq, GateId, LanguageId, ProfileId, RunId, SessionId};
@@ -44,6 +45,8 @@ struct MockScheduler {
     release: Arc<Notify>,
     cancels: Mutex<Vec<DagId>>,
     fail_next_cancel: AtomicBool,
+    reconciles: Mutex<Vec<(DagId, DagState)>>,
+    fail_next_reconcile: AtomicBool,
 }
 
 impl MockScheduler {
@@ -54,6 +57,8 @@ impl MockScheduler {
             release: Arc::new(Notify::new()),
             cancels: Mutex::new(Vec::new()),
             fail_next_cancel: AtomicBool::new(false),
+            reconciles: Mutex::new(Vec::new()),
+            fail_next_reconcile: AtomicBool::new(false),
         })
     }
 
@@ -63,6 +68,14 @@ impl MockScheduler {
 
     fn fail_next_cancel(&self) {
         self.fail_next_cancel.store(true, Ordering::SeqCst);
+    }
+
+    fn reconciled_calls(&self) -> Vec<(DagId, DagState)> {
+        self.reconciles.lock().unwrap().clone()
+    }
+
+    fn fail_next_reconcile(&self) {
+        self.fail_next_reconcile.store(true, Ordering::SeqCst);
     }
 }
 
@@ -94,6 +107,18 @@ impl Scheduler for MockScheduler {
         self.cancels.lock().unwrap().push(dag_id);
         if self.fail_next_cancel.swap(false, Ordering::SeqCst) {
             return Err(SchedError::Internal("injected cancel failure".into()));
+        }
+        Ok(())
+    }
+
+    async fn reconcile_terminal_run(
+        &self,
+        dag_id: DagId,
+        terminal: DagState,
+    ) -> Result<(), SchedError> {
+        self.reconciles.lock().unwrap().push((dag_id, terminal));
+        if self.fail_next_reconcile.swap(false, Ordering::SeqCst) {
+            return Err(SchedError::Internal("injected reconcile failure".into()));
         }
         Ok(())
     }
@@ -201,6 +226,29 @@ impl Harness {
         serde_json::from_value::<RunGoalRecord>(self.run_row(run).await.goal_json)
             .unwrap()
             .dag_id
+    }
+
+    /// Seed the minimal `TaskDag` row `approve`/`expire_gate` need to resolve a
+    /// generation (amendment A8). Production always has this row by the time a
+    /// gate exists (the scheduler's C1 checkpoint writes it before first
+    /// dispatch); tests that jump a run straight to `waiting_approval` without
+    /// running a real scheduler must seed it explicitly.
+    async fn seed_dag(&self, run: RunId) -> DagId {
+        let session_id = self.run_row(run).await.session_id;
+        let dag_id = self.dag_id(run).await;
+        self.storage
+            .dags()
+            .put(&crate::dag::TaskDag {
+                id: dag_id,
+                session_id,
+                generation: 0,
+                nodes: Default::default(),
+                edges: Vec::new(),
+                state: DagState::WaitingApproval,
+            })
+            .await
+            .unwrap();
+        dag_id
     }
 
     async fn session_events(&self, session: SessionId) -> Vec<SessionEvent> {
@@ -465,6 +513,56 @@ async fn session_resume_rearms_crash_recovery_states() {
     assert_eq!(events.len(), before + 1);
     assert_eq!(events.last().unwrap().type_, SessionEventType::RunCompleted);
     assert_eq!(events.last().unwrap().run_id, Some(cancelling));
+    assert_eq!(h.plane.metrics().sessions_resumed, 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn session_resume_calls_reconcile_terminal_run_for_every_terminal_row_a6() {
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([]));
+    let session = h.create_session().await;
+    let failed = h.submit(session).await;
+    let succeeded = h.submit(session).await;
+    let cancelled = h.submit(session).await;
+    let running = h.submit(session).await; // non-terminal: must NOT be reconciled
+    h.set_run_state(failed, RunControlState::Failed).await;
+    h.set_run_state(succeeded, RunControlState::Succeeded).await;
+    h.set_run_state(cancelled, RunControlState::Cancelled).await;
+    h.set_run_state(running, RunControlState::Running).await;
+
+    h.sessions().resume(session).await.unwrap();
+
+    let mut calls = sched.reconciled_calls();
+    calls.sort_by_key(|(dag, _)| *dag);
+    let mut expected = vec![
+        (h.dag_id(failed).await, DagState::Failed),
+        (h.dag_id(succeeded).await, DagState::Succeeded),
+        (h.dag_id(cancelled).await, DagState::Cancelled),
+    ];
+    expected.sort_by_key(|(dag, _)| *dag);
+    assert_eq!(calls, expected);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn session_resume_reconcile_failure_is_best_effort_and_does_not_abort() {
+    // A6: "best effort, warn on error, never abort resume" — a failing
+    // reconcile must not stop the rest of resume's work (metrics bump,
+    // other rows' re-arming).
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([]));
+    sched.fail_next_reconcile();
+    let session = h.create_session().await;
+    let failed = h.submit(session).await;
+    let running = h.submit(session).await;
+    h.set_run_state(failed, RunControlState::Failed).await;
+    h.set_run_state(running, RunControlState::Running).await;
+
+    let resumed = h.sessions().resume(session).await.unwrap();
+    assert_eq!(resumed.id, session);
+    assert_eq!(sched.reconciled_calls().len(), 1); // still attempted
+    assert_eq!(h.run_state(running).await, RunControlState::Accepted); // still re-armed
     assert_eq!(h.plane.metrics().sessions_resumed, 1);
     h.close().await;
 }
@@ -857,6 +955,7 @@ async fn start_lock_not_held_across_run_dag() {
     )]));
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
 
     let runs = h.runs();
     let started = tokio::spawn(async move { runs.start(run).await });
@@ -1143,6 +1242,7 @@ async fn run_approve_with_waiter() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.set_run_state(run, RunControlState::Accepted).await;
     let gate = GateId::new();
     let rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
@@ -1164,6 +1264,14 @@ async fn run_approve_with_waiter() {
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].payload["decision"], json!("allow_once"));
     assert_eq!(resolved[0].payload["gate_id"], json!(gate.to_string()));
+    // A8: without `generation`, RFC-0010 §5.7.2's resume scan cannot filter a
+    // GateId reused across a replan, and would apply a stale resolution to
+    // the new generation's gate.
+    assert_eq!(
+        resolved[0].payload["generation"],
+        json!(0),
+        "A8 requires ApprovalResolved to carry the DAG generation"
+    );
 
     // Second approve for the same gate finds no waiter.
     h.set_run_state(run, RunControlState::WaitingApproval).await;
@@ -1176,6 +1284,62 @@ async fn run_approve_with_waiter() {
 }
 
 #[tokio::test]
+async fn run_expire_gate_resolves_with_expired_decision_and_generation() {
+    // A4/A8: `expire_gate` mirrors `approve(Deny)` with `decision: "expired"`
+    // and MUST carry `generation` for the same §5.7.2 scan-filtering reason
+    // `approve` does. Nothing pinned that on the expiry path.
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+    h.set_run_state(run, RunControlState::Accepted).await;
+    let gate = GateId::new();
+    let rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::WaitingApproval);
+
+    h.runs().expire_gate(run, gate).await.unwrap();
+
+    // The waiter is released (dropped, not delivered an Approval): §5.7.8
+    // terminalizes rather than resuming the fold.
+    assert!(rx.await.is_err(), "expiry must not deliver an Approval");
+    assert_eq!(h.run_state(run).await, RunControlState::Failed);
+
+    let resolved: Vec<_> = h
+        .session_events(session)
+        .await
+        .into_iter()
+        .filter(|e| e.type_ == SessionEventType::ApprovalResolved)
+        .collect();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].payload["decision"], json!("expired"));
+    assert_eq!(resolved[0].payload["gate_id"], json!(gate.to_string()));
+    assert_eq!(
+        resolved[0].payload["generation"],
+        json!(0),
+        "A8 applies to expire_gate exactly as it does to approve"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn run_expire_gate_without_a_waiter_is_not_an_error() {
+    // A7: idempotent with respect to a missing waiter — the scheduler retries
+    // expiry (§5.7.8 EXPIRE_RETRY_MAX) and must not see a hard error just
+    // because the waiter already went away.
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+    h.set_run_state(run, RunControlState::WaitingApproval).await;
+
+    h.runs()
+        .expire_gate(run, GateId::new())
+        .await
+        .expect("A7: no registered waiter is not an error");
+    h.close().await;
+}
+
+#[tokio::test]
 async fn run_approve_deny_during_run_dag_joins_cleanly() {
     let h = Harness::new().await;
     // Scheduler blocks inside run_dag until released, then reports Failed — the shape a
@@ -1183,6 +1347,7 @@ async fn run_approve_deny_during_run_dag_joins_cleanly() {
     let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(DagState::Failed)]));
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
 
     let runs = h.runs();
     let started = tokio::spawn(async move { runs.start(run).await });
@@ -1209,11 +1374,79 @@ async fn run_approve_deny_during_run_dag_joins_cleanly() {
 }
 
 #[tokio::test]
+async fn run_terminal_outcome_overrides_stale_waiting_approval_a5() {
+    // Amendment A5: unlike the sibling test above (where `approve` flips the
+    // row to `failed` *before* the scheduler returns, so `apply_start_outcome`
+    // takes the already-terminal-durable join path), here nothing ever calls
+    // `approve`/`expire_gate` — durable state is still `waiting_approval`
+    // when a terminal `Ok(Failed)` outcome comes back. The old code merged
+    // this away (`is_control_protected` unconditionally won for
+    // `waiting_approval`), stranding the run non-terminal forever: nothing
+    // else ever revisits a row once a live run has moved past it.
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(DagState::Failed)]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+
+    let runs = h.runs();
+    let started = tokio::spawn(async move { runs.start(run).await });
+    sched.entered.notified().await;
+
+    let gate = GateId::new();
+    let _rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::WaitingApproval);
+
+    sched.release.notify_one();
+    started.await.unwrap().unwrap();
+
+    assert_eq!(h.run_state(run).await, RunControlState::Failed);
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::RunCompleted)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(h.count_finished(run).await, 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn run_non_terminal_outcome_still_merges_under_waiting_approval() {
+    // A5 explicitly keeps this case merging: a `Running`/`WaitingApproval`/
+    // `ReplanRequired` outcome under a `waiting_approval` durable row is not
+    // a conflict to resolve, just the normal "gate still pending" shape.
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(
+        DagState::WaitingApproval,
+    )]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+
+    let runs = h.runs();
+    let started = tokio::spawn(async move { runs.start(run).await });
+    sched.entered.notified().await;
+
+    let gate = GateId::new();
+    let _rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::WaitingApproval);
+
+    sched.release.notify_one();
+    started.await.unwrap().unwrap();
+
+    assert_eq!(h.run_state(run).await, RunControlState::WaitingApproval);
+    assert_eq!(h.count_finished(run).await, 0); // merged, not finalized
+    h.close().await;
+}
+
+#[tokio::test]
 async fn run_approve_deny_fails_run() {
     let h = Harness::new().await;
     h.install_scheduler(MockScheduler::new([Plan::State(DagState::WaitingApproval)]));
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.runs().start(run).await.unwrap();
     assert_eq!(h.run_state(run).await, RunControlState::WaitingApproval);
 
@@ -1240,6 +1473,7 @@ async fn run_approve_persists_before_notify() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.set_run_state(run, RunControlState::Accepted).await;
     let gate = GateId::new();
     let mut rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
@@ -1293,6 +1527,7 @@ async fn run_approve_deny_drops_waiter_when_append_fails() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.set_run_state(run, RunControlState::Accepted).await;
     let gate = GateId::new();
     let mut rx = h.plane.register_gate_waiter(run, gate).await.unwrap();
@@ -1429,6 +1664,7 @@ async fn run_approve_deny_emits_run_finished_after_redispatch() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
 
     // First dispatch announces acceptance, then fails to find a scheduler.
     assert!(matches!(
@@ -1452,6 +1688,7 @@ async fn run_approve_deny_emits_run_finished_after_redispatch() {
     // A run this process never dispatched still gets its terminal event: durable state
     // having left `created` is what proves acceptance was already announced.
     let restored = h.submit(session).await;
+    h.seed_dag(restored).await;
     h.set_run_state(restored, RunControlState::WaitingApproval)
         .await;
     let gate = GateId::new();
@@ -1691,6 +1928,7 @@ async fn register_gate_waiter_replaces_prior_waiter() {
     let h = Harness::new().await;
     let session = h.create_session().await;
     let run = h.submit(session).await;
+    h.seed_dag(run).await;
     h.set_run_state(run, RunControlState::Accepted).await;
     let gate = GateId::new();
 

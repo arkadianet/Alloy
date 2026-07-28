@@ -71,3 +71,11 @@ harness = false
 [[bench]]
 name = "dag_validate"
 harness = false
+
+[[bench]]
+name = "scheduler_ready_derive"
+harness = false
+
+[[bench]]
+name = "diagnostics_fingerprint"
+harness = false

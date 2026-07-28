@@ -318,6 +318,184 @@ async fn cancel_token_on_shutdown() {
     assert!(token.is_cancelled());
 }
 
+/// `cancel()` never returns on its own (mirrors a real §5.12 blocking
+/// `cancel` whose own grace exceeds the drain's) unless something fires
+/// `release` — which only `cancel` itself does, after `cancel_delay`.
+struct SlowCancelScheduler {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    cancel_delay: Duration,
+}
+#[async_trait]
+impl Scheduler for SlowCancelScheduler {
+    async fn run(&self, dag_id: DagId) -> Result<DagOutcome, SchedError> {
+        self.entered.notify_waiters();
+        self.release.notified().await;
+        Ok(DagOutcome {
+            dag_id,
+            generation: 0,
+            state: DagState::Cancelled,
+            failed_node: None,
+            failure: None,
+        })
+    }
+    async fn cancel(&self, _dag_id: DagId) -> Result<(), SchedError> {
+        tokio::time::sleep(self.cancel_delay).await;
+        self.release.notify_waiters();
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_a1_deadline_computed_before_cancel_await() {
+    // Amendment A1 / DR1: a `cancel()` that runs long past `grace` must not
+    // get the whole `grace` budget *on top of* however long it takes —
+    // `drain` bounds the cancel await itself via the deadline computed
+    // before that await starts, so this returns close to `grace`, not
+    // `grace + cancel_delay`.
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = AlloyRuntime::new();
+    rt.configure(test_config(dir.path())).unwrap();
+    let handle = rt.start().await.unwrap();
+    let dag = DagId::new();
+    let sched = Arc::new(SlowCancelScheduler {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        cancel_delay: Duration::from_millis(300),
+    });
+    handle.set_scheduler(sched.clone()).unwrap();
+
+    let grace = Duration::from_millis(100);
+    let elapsed = {
+        let entered = sched.entered.notified();
+        let mut run_fut = std::pin::pin!(rt.run(dag));
+        tokio::select! {
+            _ = &mut run_fut => panic!("finished early"),
+            _ = entered => {}
+        }
+
+        // TD1/TD2: paused clock, so this measures the *virtual* time drain
+        // actually waited. A wall-clock margin here is inherently flaky on a
+        // loaded CI runner, and the whole point is a deterministic ordering
+        // between `grace` and `cancel_delay`.
+        let start = tokio::time::Instant::now();
+        rt.drain(grace).await.unwrap();
+        start.elapsed()
+        // `run_fut` drops here — it never resolves on its own (this double
+        // ignores cancellation), so it must not be awaited.
+    };
+
+    // Pre-A1 behavior would be >= cancel_delay (300ms) *plus* another grace
+    // window on top. Under a paused clock the post-fix value is exactly
+    // `grace`, so any bound strictly between 100ms and 300ms separates the
+    // two; 200ms keeps the intent legible.
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "drain took {elapsed:?}; expected close to grace ({grace:?}), not grace + cancel_delay"
+    );
+
+    rt.shutdown().await.unwrap();
+}
+
+struct RecordingReconcileScheduler {
+    calls: Arc<std::sync::Mutex<Vec<(DagId, DagState)>>>,
+}
+#[async_trait]
+impl Scheduler for RecordingReconcileScheduler {
+    async fn run(&self, dag_id: DagId) -> Result<DagOutcome, SchedError> {
+        Ok(DagOutcome {
+            dag_id,
+            generation: 0,
+            state: DagState::Succeeded,
+            failed_node: None,
+            failure: None,
+        })
+    }
+    async fn cancel(&self, _dag_id: DagId) -> Result<(), SchedError> {
+        Ok(())
+    }
+    async fn reconcile_terminal_run(
+        &self,
+        dag_id: DagId,
+        terminal: DagState,
+    ) -> Result<(), SchedError> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((dag_id, terminal));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn reconcile_terminal_run_forwards_to_scheduler() {
+    // Amendment A2: forwards to `Scheduler::reconcile_terminal_run`, and is
+    // reachable in `Running` without going through the single-flight
+    // `run_dag` gate (no `set_scheduler`/`run` admission dance needed here).
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = AlloyRuntime::new();
+    rt.configure(test_config(dir.path())).unwrap();
+    let handle = rt.start().await.unwrap();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    handle
+        .set_scheduler(Arc::new(RecordingReconcileScheduler {
+            calls: Arc::clone(&calls),
+        }))
+        .unwrap();
+
+    let dag = DagId::new();
+    handle
+        .reconcile_terminal_run(dag, DagState::Failed)
+        .await
+        .unwrap();
+    assert_eq!(
+        *calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![(dag, DagState::Failed)]
+    );
+    rt.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reconcile_terminal_run_default_is_scheduler_unavailable() {
+    // `NullScheduler` inherits the trait default (matches `run`'s own
+    // Unavailable placeholder) — no special-casing to `SchedulerUnavailable`
+    // the way `run_dag` does (mirrors `cancel_dag`'s mapping, not `run_dag`'s).
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = AlloyRuntime::new();
+    rt.configure(test_config(dir.path())).unwrap();
+    let handle = rt.start().await.unwrap();
+    let err = handle
+        .reconcile_terminal_run(DagId::new(), DagState::Failed)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeError::Scheduler(SchedError::Unavailable)
+    ));
+    rt.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reconcile_terminal_run_rejects_wrong_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = AlloyRuntime::new();
+    rt.configure(test_config(dir.path())).unwrap();
+    let handle = rt.handle();
+    let err = handle
+        .reconcile_terminal_run(DagId::new(), DagState::Failed)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        RuntimeError::InvalidPhase {
+            current: RuntimePhase::Configured,
+            ..
+        }
+    ));
+}
+
 #[tokio::test]
 async fn drop_without_shutdown_does_not_panic() {
     let dir = tempfile::tempdir().unwrap();

@@ -12,6 +12,7 @@ mod cost;
 mod decision;
 mod error;
 mod hash;
+mod meter_factory;
 mod query;
 mod recording;
 mod redact;
@@ -24,6 +25,7 @@ pub use decision::{
 };
 pub use error::ObsError;
 pub use hash::{hash_content, hash_prompt, hash_tool_body};
+pub use meter_factory::{CostMeterFactory, ProcessCostMeterFactory};
 pub use query::{
     list_decision_events, parse_decision_event, parse_model_call_event, parse_tool_call_event,
     reaccumulate_cost_from_events, DecisionPage,

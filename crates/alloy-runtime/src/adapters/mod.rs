@@ -1,5 +1,22 @@
 //! Runtime node adapters (Verify*/GateHuman) — stubs until RFC-0010/0006.
 
+mod capability;
+mod diagnostics;
+mod gate;
+mod perms;
+mod tool_caller;
+mod verify;
+
+pub use capability::{
+    CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityOutcome,
+    UnavailableCapabilityExecutor,
+};
+pub use diagnostics::{diagnostic_fingerprint, parse_rustc_diagnostics};
+pub use gate::SessionGateHumanAdapter;
+pub use perms::{SessionVerifyPermissions, VerifyClass, VerifyPermissions};
+pub use tool_caller::{ToolCaller, ToolCallerError};
+pub use verify::{McpVerifyCompileAdapter, McpVerifyTestAdapter};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -46,6 +63,11 @@ pub struct NodeExecRef {
     pub node_id: NodeId,
     /// Workspace root.
     pub workspace_root: std::path::PathBuf,
+    /// 1-based attempt index for this dispatch (RFC-0010 §3.1.1 NX1).
+    ///
+    /// MUST be `>= 1` whenever a node is dispatched (checkpoint C3). Gate
+    /// **wait** contexts (unresolved, no C3 yet) use `0`.
+    pub attempt: u32,
 }
 
 /// Runtime execution context (not serde; holds cancellation).

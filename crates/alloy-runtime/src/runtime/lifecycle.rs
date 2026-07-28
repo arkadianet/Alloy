@@ -155,7 +155,16 @@ impl AlloyRuntime {
     }
 
     /// Phase: `Running` → `Draining`.
+    ///
+    /// Amendment A1 (RFC-0010 §5.12.5, DR1): `deadline` is computed **before**
+    /// awaiting `Scheduler::cancel`, and that await is itself bounded by the
+    /// remaining budget — RFC-0010 §5.12 makes `cancel` genuinely block until
+    /// the run's own terminal checkpoint lands, so a deadline taken only
+    /// after that await returns would let a slow (or grace-exceeding) cancel
+    /// consume the entire `grace` budget before the in-flight wait even
+    /// starts, silently doubling the effective drain window.
     pub async fn drain(&self, grace: Duration) -> Result<(), RuntimeError> {
+        let deadline = tokio::time::Instant::now() + grace; // A1: FIRST.
         let (active_dag, newly) = self.handle.inner.begin_drain()?;
         if newly {
             let _ = self
@@ -168,12 +177,23 @@ impl AlloyRuntime {
 
         let sched = self.handle.scheduler();
         if let Some(dag_id) = active_dag {
-            let _ = sched.cancel(dag_id).await;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, sched.cancel(dag_id)).await {
+                Ok(Ok(())) => {}
+                // DR4: a cancel error during drain is logged, never fatal —
+                // the in-flight wait below still runs and can still force
+                // progress via `runtime_cancel` once the grace elapses.
+                Ok(Err(e)) => {
+                    tracing::warn!(dag_id = %dag_id, error = %e, "drain: scheduler.cancel failed");
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(dag_id = %dag_id, "drain: scheduler.cancel timed out");
+                }
+            }
         }
 
-        let start = tokio::time::Instant::now();
         while self.handle.run_in_flight() {
-            if start.elapsed() >= grace {
+            if tokio::time::Instant::now() >= deadline {
                 tracing::warn!(
                     grace_ms = grace.as_millis(),
                     "drain grace elapsed; cancelling in-flight work"

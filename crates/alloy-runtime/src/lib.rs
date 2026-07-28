@@ -13,8 +13,9 @@
 //! - [`events`] — session event envelopes and [`EventSink`]
 //! - [`storage`] — SQLite event log, artifact CAS, DAG blobs, handoff (RFC-0002/0009)
 //! - [`runtime`] — [`AlloyRuntime`] host lifecycle
-//! - [`scheduler`] — [`Scheduler`] trait + [`NullScheduler`]
-//! - [`adapters`] — Verify*/GateHuman stub traits
+//! - [`scheduler`] — [`Scheduler`] trait, [`LinearScheduler`] (RFC-0010), [`NullScheduler`]
+//! - [`adapters`] — Verify/GateHuman/Capability seams plus the MCP-backed
+//!   verify adapters (RFC-0010)
 //! - [`session`] — [`SessionPlane`] control plane: Session/RunController (RFC-0003)
 //! - [`obs`] — DecisionLog, CostMeter, redaction/query helpers (RFC-0004)
 //! - [`router`] — sealed model routing, provider traits, and HTTP provider (RFC-0007)
@@ -45,8 +46,12 @@ pub mod storage;
 pub mod types;
 
 pub use adapters::{
-    Approval, GateHumanAdapter, NodeExecContext, NodeExecRef, UnavailableGateHuman,
-    UnavailableVerifyCompile, UnavailableVerifyTest, VerifyCompileAdapter, VerifyOutcome,
+    diagnostic_fingerprint, parse_rustc_diagnostics, Approval, CapabilityExecContext,
+    CapabilityExecError, CapabilityExecutor, CapabilityOutcome, GateHumanAdapter,
+    McpVerifyCompileAdapter, McpVerifyTestAdapter, NodeExecContext, NodeExecRef,
+    SessionGateHumanAdapter, SessionVerifyPermissions, ToolCaller, ToolCallerError,
+    UnavailableCapabilityExecutor, UnavailableGateHuman, UnavailableVerifyCompile,
+    UnavailableVerifyTest, VerifyClass, VerifyCompileAdapter, VerifyOutcome, VerifyPermissions,
     VerifyTestAdapter,
 };
 pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
@@ -73,10 +78,10 @@ pub use obs::{
     apply_prompt_retention, apply_tool_retention, hash_content, hash_prompt, hash_tool_body,
     list_decision_events, maybe_signal_budget_warning, parse_decision_event,
     parse_model_call_event, parse_tool_call_event, reaccumulate_cost_from_events,
-    redact_json_strings, redact_secrets, BudgetCheck, CostByTier, CostMeter, CostSnapshot,
-    DecisionKind, DecisionLog, DecisionPage, DecisionRecord, EventDecisionLog, ModelCallRecord,
-    ModelUsdSource, ObsError, RecordingDecisionLog, RetentionPolicy, SharedCostMeter, TierCost,
-    ToolCallRecord,
+    redact_json_strings, redact_secrets, BudgetCheck, CostByTier, CostMeter, CostMeterFactory,
+    CostSnapshot, DecisionKind, DecisionLog, DecisionPage, DecisionRecord, EventDecisionLog,
+    ModelCallRecord, ModelUsdSource, ObsError, ProcessCostMeterFactory, RecordingDecisionLog,
+    RetentionPolicy, SharedCostMeter, TierCost, ToolCallRecord,
 };
 pub use planner::{
     DisabledLlmPlanService, PlanContext, PlanError, PlanProducedPayload, PlanResult, PlanService,
@@ -93,7 +98,11 @@ pub use router::{
 #[cfg(feature = "http-provider")]
 pub use router::{OpenAiCompatibleProvider, OpenAiCompatibleSpec};
 pub use runtime::{AlloyRuntime, RuntimeHandle, RuntimePhase};
-pub use scheduler::{DagOutcome, DagState, NullScheduler, Scheduler};
+pub use scheduler::{
+    backoff_delay, derive_dag_state, promotable_nodes, ready_nodes, DagOutcome, DagState,
+    DeriveFlags, LinearScheduler, LinearSchedulerDeps, NullScheduler, SchedConfig, Scheduler,
+    SchedulerMetrics,
+};
 pub use session::{
     clamp_events_page_limit, ReplanReason, RunControlState, RunController, RunGoalRecord, Session,
     SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE,
