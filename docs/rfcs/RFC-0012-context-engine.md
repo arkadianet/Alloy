@@ -509,6 +509,10 @@ pub enum DegradationReason {
 ```rust
 /// Non-V2 per-call inputs the host already holds. Kept off `AssembleRequest`
 /// so the V2 struct stays verbatim (C4).
+///
+/// `#[non_exhaustive]`: callers outside `alloy-runtime` construct via
+/// `AssembleInputs::default()` plus field mutation — struct literals and
+/// functional-record-update syntax are unavailable across the crate boundary.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct AssembleInputs {
@@ -804,7 +808,7 @@ pub struct ContextMetricsSnapshot {
 
 **Inputs.** `EventStore::list_session_events(session, ..)` for `AssembleRequest.session`, plus `AssembleInputs.input`.
 
-**Selection.** The window is the last `max_conversation_events` **raw** events (default 200, additionally clamped by the store's `MAX_EVENTS_PAGE`), fetched via `EventStore::last_seq` followed by one `list_session_events` page with `after = Some(EventSeq(last.saturating_sub(max_conversation_events as u64)))` — the store's cursor is forward-only, so the window is computed from the tail, never by paging from zero. Inside the window, admit only these `SessionEventType`s, each rendered from the payload fields pinned in Appendix F:
+**Selection.** The window is the last `max_conversation_events` **raw** events (default 200, additionally clamped by the store's `MAX_EVENTS_PAGE`), fetched via `EventStore::last_seq` followed by one `list_session_events` page with `after = Some(EventSeq(last.saturating_sub(max_conversation_events as u64)))` — except when the session is shorter than the window (`last < max_conversation_events`, i.e. the subtraction saturates to 0), where `after = None` so that seq 0 stays inside the **exclusive** cursor's window. The store's cursor is forward-only, so the window is computed from the tail, never by paging from zero. Inside the window, admit only these `SessionEventType`s, each rendered from the payload fields pinned in Appendix F:
 
 | Event type | Rendered as | Notes |
 | --- | --- | --- |
@@ -844,7 +848,7 @@ An empty `GraphView` is **normal**, not exceptional: it is precisely what RFC-00
 
 **(c) Diagnostics.** `AssembleInputs.diagnostics` first (the current attempt's `FailureIr.diagnostics`, RFC-0010), then the graph's recorded `Diagnostics` view when the former is empty. A pinned `ContextHandle::Diagnostic(id)` is resolved by scanning `inputs.diagnostics` first; if absent, one `GraphQuery::Diagnostics` query is issued and scanned for the id — an explicit exception to the only-when-empty rule, still within the A13 query bound — and if still absent the pin is `MustIncludeNotFound` (B11). Clamp to `max_diagnostics`, order by D11. Each renders as `level[code] path:line:col — message`, with `children` flattened to at most three lines each and `raw_json` **never** rendered (D17).
 
-**Assembly.** One `ChatRole::User` message per sub-part that has content, in the fixed order files → graph → diagnostics, each inside its own untrusted-content fence (SEC3).
+**Assembly.** One `ChatRole::User` message per sub-part that has content, in the fixed order files → graph → diagnostics. Files and diagnostics are fenced **per item** — one `working_set:file` fence per excerpt, one `working_set:diagnostics` fence per diagnostic (SEC3's strict reading: every store-derived string sits inside a fence, and each such fence carries a single whole-section citation); the graph projection renders as one fenced section with per-node citations (CIT2).
 
 ### 4.4 Domain 3 — Artifacts (weight 0.25)
 
@@ -854,7 +858,7 @@ An empty `GraphView` is **normal**, not exceptional: it is precisely what RFC-00
 
 **Rationale.** V2 §20 R5 ("token explosion") and the MVP's lazy-disclosure posture both say a prompt should carry *references* with digests and let a tool fetch the body. The metadata line plus digest is the reference; RFC-0006's tools are the fetch.
 
-**Assembly.** One `ChatRole::User` message listing artifacts, one line per artifact, admitted bodies fenced beneath their line.
+**Assembly.** One `ChatRole::User` message; each artifact renders inside its own `artifacts:artifact` fence — the metadata line first, then the admitted body beneath it when present (SEC3's strict reading: store-derived metadata strings are fenced too, never bare).
 
 ### 4.5 Reserved domains (Stub)
 
@@ -1045,6 +1049,8 @@ alloy://must_include/{handle-kind}/{key}
 }
 ```
 
+`graph.queried` is **memo-stable** (K8): on a memo hit it reports the query count stored in the entry when the projection was built, not the queries actually issued, so packs stay byte-identical across hits (A1).
+
 ---
 
 ## 8. Caching, staleness and eviction (normative)
@@ -1064,10 +1070,11 @@ Key: `(SessionId, NodeId, GraphVersion, seed-set digest, graph_radius)`. Value: 
 | **K5** | The memo is per-engine and in-process. Nothing is persisted; no `alloy.sqlite` table, no `graph.sqlite` table, no file. |
 | **K6** | `mark_stale(id, reason)` removes the entry with that `SummaryId` and returns `Ok(())`; an unknown id returns `SummaryNotFound`. It never silently succeeds on a miss. |
 | **K7** | No timer, no task, no thread. Memo maintenance happens on the calling task inside `assemble` / `evict` / `mark_stale`. |
+| **K8** | A memo hit MUST reproduce the manifest exactly as a miss would: each entry stores the query count it represents, and `graph.queried` reports that stored count — never the (zero) queries actually issued on the hit — so identical inputs yield byte-identical packs across hits (A1). Actually-issued query counts feed only `ContextMetricsSnapshot.graph_queries`. |
 
 ### 8.2 `SummaryId` semantics
 
-A `SummaryId` names a memoized projection, not an LLM summary — MVP produces no summaries (A12). The id is minted per memo insert, surfaced in the manifest's `graph` object, and is the handle RFC-0015 or RFC-0008 uses to invalidate after an edit (`StaleReason::EditApplied`). When summarization lands, it reuses this id space without a type change (C5).
+A `SummaryId` names a memoized projection, not an LLM summary — MVP produces no summaries (A12). The id is minted per memo insert and is the `mark_stale` handle RFC-0015 or RFC-0008 uses to invalidate after an edit (`StaleReason::EditApplied`); it is surfaced through host-side APIs only and MUST NOT appear in rendered bytes or the `domains` manifest — a per-insert random id would break A1's byte-determinism (§7.3's example accordingly omits it). When summarization lands, it reuses this id space without a type change (C5).
 
 ### 8.3 Eviction
 
@@ -1277,7 +1284,7 @@ Rule **C6**: **no new `[workspace.dependencies]` entry.** Everything needed is a
 | T8c | `assemble_after_diagnostic_ingest_includes_a_diagnostics_citation` | The draft's original integration criterion |
 | T8d | `pack_round_trips_through_serde_and_into_a_completion_request` | RFC-0007 binding: `PromptPack.messages` → `CompletionRequest.messages` unchanged |
 | T8e | `pack_contains_no_absolute_host_path` | SEC4 — scans the serialised pack for `workspace_root` and for a leading `/` or `C:\` in any path field |
-| T8f | `pack_contains_no_secret_from_a_planted_env_style_line` | SEC2 — plants an `AWS_SECRET_ACCESS_KEY=…` line in a fixture file, asserts redaction |
+| T8f | `pack_contains_no_secret_from_a_planted_env_style_line` | SEC2 — plants an `AWS_API_KEY=…` line in a fixture file (a name the merged RFC-0004 redactor matches: `*_api_key` / `*_secret` / `*_token` / `*_password`), asserts redaction. Widening the pattern set — e.g. `AWS_SECRET_ACCESS_KEY` — is RFC-0004 scope, not this RFC's |
 | T8g | `assemble_succeeds_with_a_null_graph_end_to_end` | E1 — the M7 "empty graph projection" path |
 | T8h | `two_processes_assemble_identical_bytes` | A1 across process boundaries |
 
@@ -1494,13 +1501,14 @@ let req = AssembleRequest {
         lines: Some((10, 40)),
     }],
 };
-let inputs = AssembleInputs {
-    run: Some(run),
-    input: Some(node_envelope),   // NodeInputPayload::Goal(goal) — goal.text: "fix the borrow error in toy-core"
-    diagnostics: vec![e0502],     // from FailureIr.diagnostics (RFC-0010)
-    budget: Some(TokenBudget { max_input: 32_000, max_output: 4_096 }),
-    focus_paths: vec!["crates/toy-core/src/io.rs".into()],
-};
+// `AssembleInputs` is `#[non_exhaustive]` (§3.5): no struct literal
+// outside `alloy-runtime` — construct via `default()` + field mutation.
+let mut inputs = AssembleInputs::default();
+inputs.run = Some(run);
+inputs.input = Some(node_envelope);   // NodeInputPayload::Goal(goal) — goal.text: "fix the borrow error in toy-core"
+inputs.diagnostics = vec![e0502];     // from FailureIr.diagnostics (RFC-0010)
+inputs.budget = Some(TokenBudget { max_input: 32_000, max_output: 4_096 });
+inputs.focus_paths = vec!["crates/toy-core/src/io.rs".into()];
 ```
 
 ### A.2 Graph queries issued (exactly three kinds, D14)
