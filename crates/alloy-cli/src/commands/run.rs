@@ -16,6 +16,7 @@ use alloy_runtime::{
 use serde_json::json;
 
 use super::gate::{self, GateMode};
+use super::rollback;
 use crate::args::RunArgs;
 use crate::assembly::{self, FullAssembly};
 use crate::errx::{CliError, Exit};
@@ -82,7 +83,7 @@ pub async fn exec(ctx: Ctx, args: RunArgs) -> Result<Exit, CliError> {
     let mut full = assembly::assemble_full(base, &ctx.workspace_abs, ctx.readonly()).await?;
 
     tracing::debug!(
-        edit_engine_assembled = full.edit_engine_assembled,
+        edit_engine_assembled = full.edit_engine.is_some(),
         scheduler_refs = std::sync::Arc::strong_count(&full.scheduler),
         "composition root assembled"
     );
@@ -226,7 +227,15 @@ async fn run_after_assembly(
             return Ok(exit);
         }
         attempt += 1;
+        // Undo this attempt's edits before the next one is submitted, so
+        // attempt N+1 patches the pre-run tree instead of stacking on top of
+        // N's wrong edit. A refusal is reported, never fatal; the next
+        // iteration's pre-plan probe re-reads whatever tree is left.
+        let rolled = rollback::rollback_run(full, ctx, session, run, dag_id).await;
         if !ctx.quiet {
+            if let Some(line) = rollback::summary(&rolled) {
+                eprintln!("{line}");
+            }
             eprintln!(
                 "run failed with {errors} compile error(s) still present; \
                  retrying with fresh diagnostics ({attempt}/{})",

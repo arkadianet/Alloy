@@ -491,8 +491,9 @@ fn yes_auto_approves_and_completes() {
 }
 
 /// A server whose *first* edit response is a wrong fix (it introduces a
-/// fresh type error); every later edit response patches that wrong state
-/// correctly. Analyze responses are shared.
+/// fresh type error); every later edit response patches the *original*
+/// broken line — which only applies if the retry loop rolled the wrong
+/// patch back first. Analyze responses are shared.
 fn start_wrong_first_server() -> u16 {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -518,7 +519,7 @@ fn start_wrong_first_server() -> u16 {
                 } else {
                     serde_json::json!({
                         "patch": SECOND_FIX_DIFF,
-                        "summary": "replace the bool literal with 42",
+                        "summary": "replace the string literal with 42",
                         "confidence": 0.9,
                     })
                 }
@@ -545,13 +546,16 @@ fn start_wrong_first_server() -> u16 {
 }
 
 const WRONG_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = \"not a number\";\n+    let x: i32 = true;\n     println!(\"{}\", x);\n }\n";
-const SECOND_FIX_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = true;\n+    let x: i32 = 42;\n     println!(\"{}\", x);\n }\n";
+/// Deliberately anchored on the *original* `"not a number"` line: it can
+/// only apply if the failed attempt's `let x: i32 = true;` was rolled back.
+const SECOND_FIX_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = \"not a number\";\n+    let x: i32 = 42;\n     println!(\"{}\", x);\n }\n";
 
 /// The bounded retry loop: a wrong first patch fails verify, the driver
-/// re-checks the edited workspace, seeds the *new* diagnostics, and the
-/// second run fixes what the first one actually broke. Exit 0 overall.
+/// rolls the failed attempt's edit transaction back so the workspace is the
+/// original broken tree again, re-checks it, seeds those diagnostics, and
+/// the second attempt patches the *original* content. Exit 0 overall.
 #[test]
-fn retry_recovers_from_a_wrong_first_patch() {
+fn retry_rolls_back_the_wrong_first_patch_before_retrying() {
     let Some(e2e) = setup_with(start_wrong_first_server()) else {
         return;
     };
@@ -569,6 +573,19 @@ fn retry_recovers_from_a_wrong_first_patch() {
         stderr.contains("retrying"),
         "retry marker missing: {stderr}"
     );
+    // The rollback is announced, not silent — and it undid the one
+    // transaction the failed attempt applied, with nothing refused.
+    assert!(
+        stderr.contains("rolled back 1/1 edit transaction(s)"),
+        "rollback marker missing: {stderr}"
+    );
+    assert!(
+        !stderr.contains("was refused"),
+        "rollback should not have been refused: {stderr}"
+    );
+    // Only reachable if the second attempt patched the restored original
+    // content: `SECOND_FIX_DIFF` does not apply to the wrong-patched tree.
     let main_rs = std::fs::read_to_string(e2e.ws.path().join("src/main.rs")).unwrap();
     assert!(main_rs.contains("let x: i32 = 42;"), "{main_rs}");
+    assert!(!main_rs.contains("true"), "wrong patch survived: {main_rs}");
 }
