@@ -69,11 +69,11 @@ On the day this RFC merges: a `rebuild` of a Rust workspace produces Workspace/C
 
 | Family | Range | Topic | Section |
 | --- | --- | --- | --- |
-| **LB** | LB1–LB12 | Trait, value types, backend behaviour | §3 |
+| **LB** | LB1–LB12 (incl. LB2a) | Trait, value types, backend behaviour | §3 |
 | **RS** | RS1–RS13 | Reserved seams — what M7 must not do | §4 |
 | **SY** | SY1–SY15 | `syn` deep pass, determinism, caps | §5 |
 | **DN** | DN1–DN8 | Diagnostic normalisation | §6 |
-| **TC** | TC1–TC6 | Toolchain awareness | §7 |
+| **TC** | TC1–TC6 (incl. TC1a) | Toolchain awareness | §7 |
 | **LE** | LE1–LE4 | `lower_edit` fail-closed | §8 |
 | **LC** | LC1–LC7 | Crate placement, dependencies, `syn` gating | §9 |
 | **SC** | SC1–SC7 | Security posture | §10 |
@@ -178,6 +178,8 @@ Verbatim as §2.1 (LB1), placed in `crates/alloy-runtime/src/lang/mod.rs`.
 ### 3.2 Value types introduced by this RFC
 
 None of these identifiers exist in the tree today; all are introduced here, in `alloy-runtime::lang`, and pinned there by T20.
+
+Rule **LB2a**: every `#[non_exhaustive]` struct below (`LanguageManifest`, `TestReport`) MUST ship a `::new(...)` constructor taking the currently-required fields. `RustBackend` lives in `alloy-index` and so cannot use a struct literal across the crate boundary — without constructors the types are uninhabitable by their only producer. Later fields are added with defaults inside `new`, preserving the point of `#[non_exhaustive]`.
 
 ```rust
 /// Static, I/O-free description of a backend (LB2).
@@ -307,7 +309,9 @@ pub trait ToolchainRunner: Send + Sync {
     async fn check_json(&self, root: &Path, scope: &Scope) -> Result<String, LangError>;
     /// `cargo test` for `sel`; returns (exit-ok, captured output).
     async fn test(&self, root: &Path, sel: &TestSelector) -> Result<(bool, String), LangError>;
-    /// `rustc -V` / `cargo -V` probe, cached by the caller.
+    /// Toolchain identity. **Not a live probe at Beta** — see TC1a: the
+    /// value is injected by the composition root, and this method fails
+    /// closed when none was supplied.
     async fn probe(&self) -> Result<RustToolchain, LangError>;
 }
 
@@ -361,7 +365,7 @@ This is the section that pays for itself before a line of Beta code is written. 
 | **RS4** | Fidelity MUST be produced by exactly one function reading `graph_meta.model_version`, not by a literal at each construction site. Today the only literal outside the seam is `store.rs`'s `source: GraphFidelity::Manifest`; amendment A-0014-4 turns it into a call. MUST NOT add new literals. | T17 |
 | **RS5** | `Session.language_backends` MUST stay `Vec<LanguageId>` with its non-empty validation and its `language_backends_json` column. MUST NOT be narrowed to a bool, a single id, or dropped as unused. | T22 |
 | **RS6** | `LanguageId` MUST stay a `name_id!` catalog id. MUST NOT become `enum Language { Rust }` — that shape makes a second backend a breaking change to every persisted session row. | T22 |
-| **RS7** | MUST NOT add a second cargo-JSON → `DiagnosticEvent` parser, and MUST NOT move `parse_rustc_diagnostics` out of the crate root re-export. RFC-0014 delegates to it; two parsers means two fingerprint schemes and a broken dedupe. | T23 |
+| **RS7** | MUST NOT add a second cargo-JSON → `DiagnosticEvent` parser, and MUST NOT move `parse_rustc_diagnostics` out of the crate root re-export. RFC-0014 delegates to it; two parsers means two fingerprint schemes and a broken dedupe. **Named exemption:** `crates/alloy-eval/src/recording.rs` also matches `"compiler-message"` — it is RFC-0016's offline fixture extractor, produces `ExpectedDiagnostic` (not `DiagnosticEvent`), and participates in no dedupe. It is the *only* permitted second matcher; a third is a violation. | T26 |
 | **RS8** | `syn` MUST NOT appear in `[workspace.dependencies]` or any crate manifest before this RFC is implemented. Adding it early is dead weight under DoD gate 9 and hides the moment fidelity changes. | T18 |
 | **RS9** | MUST NOT create `alloy-lang-*` crates, a `crate-type = ["cdylib"]` target, or any dynamic-loading mechanism (V2 §16, ADR F-15, ≤5-crate rule). | T19 |
 | **RS10** | The control plane MUST stay language-agnostic: no `LanguageBackend`/`LanguageId` field on `CapabilityContext` or `CapabilityOutput`, no `language_backend` MCP tool, no language branch in the scheduler. Workers see the graph through `GraphViewHandle` only. | T24 |
@@ -401,7 +405,7 @@ This is the section that pays for itself before a line of Beta code is written. 
 | --- | --- |
 | **SY11** | A `use` declaration produces an `Imports` edge from the **importing module node** to the target node, and only when the target resolves to a node already in this graph. Cross-workspace targets (`std::`, registry crates) produce **no edge and no node** (G7). |
 | **SY12** | Group imports (`use a::{b, c}`) expand to one edge per leaf; `use a::*` produces one edge to `a`'s module node; `use a::b as c` targets `b`; `pub use` is an ordinary `Imports` edge. Duplicate `(from, to, imports)` rows collapse on the existing primary key. |
-| **SY13** | Path resolution is **syntactic**, not semantic: `crate::`, `self::`, `super::` and a leading in-workspace crate ident are resolved against the module tree just built. Anything else is unresolved and produces nothing. Confidence stays `1.0`; graded confidence for glob imports is deferred (§14, OQ2). |
+| **SY13** | Path resolution is **syntactic**, not semantic. Admissible leading segments are: `crate::`, `self::`, `super::`, an in-workspace crate ident, **and an ident naming a module the importing module itself declares** — `mod reader;` in `io.rs` makes `use reader::Reader;` resolve relative to `toy_core::io`. Without this clause the most common in-file re-export shape (`mod x; pub use x::Item;`) resolves to nothing, as Appendix B demonstrates. All are resolved against the module tree just built. Anything else is unresolved and produces nothing. Confidence stays `1.0`; graded confidence for glob imports is deferred (§14, OQ2). |
 
 ### 5.4 Determinism and caps
 
@@ -436,6 +440,7 @@ This is the section that pays for itself before a line of Beta code is written. 
 | # | Rule |
 | --- | --- |
 | **TC1** | `manifest()` reports only statically-known facts (`file_extensions = ["rs"]`, `root_markers = ["Cargo.toml"]`, `index_fidelity = SynDeep`). Toolchain identity is obtained by `ToolchainRunner::probe`, cached per backend instance, and never fetched during construction (LB12). |
+| **TC1a** | **`probe` has no transport at Beta, and MUST NOT invent one.** The MCP host registers exactly `apply_patch`, `cargo_check`, `cargo_test`, `fs_read`; this RFC forbids host changes (RS10, §1.4), and `cargo -V` / `rustc -V` cannot ride `build_tool_call`'s fixed cargo argv. Therefore `McpToolchainRunner::with_probed_toolchain(RustToolchain)` receives the value from the **composition root** (RFC-0015), which is where a `rustc -V` execution can be authorised; `probe` returns it. Constructed without one, `probe` **fails closed** with `LangError::Toolchain("no probed toolchain supplied")` — it never shells out, never guesses, and never returns a placeholder record. A real probe transport (a `toolchain_version` builtin or a CLI-side exec) is **RFC-0015/RFC-0006 scope**, not this RFC's. |
 | **TC2** | `detect(root)` is pure filesystem: `root/Cargo.toml` exists and parses with a `[workspace]` or `[package]` table — the same predicate RFC-0011 §6.3 uses. No subprocess, no network. Returns `Ok(false)`, not an error, for a non-Rust root. |
 | **TC3** | Edition is read from `[package] edition` and used to select the parse target. An unknown or future edition parses with the newest supported grammar and records a warning; it never fails the pass. |
 | **TC4** | `rust-toolchain.toml`'s channel, when present, is surfaced in `LanguageManifest.toolchain_hints`. It is a hint: enforcing a pin belongs to RFC-0016's harness (`EvalHarness.pin_toolchain_channel`), not here. |
@@ -567,7 +572,7 @@ uuid          = { workspace = true }
 | **T16** | `model_version_bump_truncates_and_reingests` — build a graph with `GRAPH_MODEL_VERSION = 1` fixtures, open with the Beta build, assert nodes/edges/files were wiped, `graph_version` reset, and the re-ingest produced `Item` rows; assert **no** SQL migration ran (`GRAPH_SCHEMA_VERSION` still `1`) | SY1, SY2 |
 | **T17** | `fidelity_is_syn_deep_exactly_when_model_version_is_two` — over a fresh store and a truncated-and-reingested store | A-0014-4, RS4 |
 | **T18** | `toy_workspace_gains_items_and_imports` — the Appendix B tree; exact node/edge counts | Appendix B |
-| **T19** | `diagnostics_entry_point_matches_verify_adapter_output` — same recorded cargo JSON through `McpVerifyCompileAdapter` and `RustBackend::diagnostics`; assert identical `Vec<DiagnosticEvent>` including fingerprints | DN1, DN7 |
+| **T19** | `diagnostics_entry_point_matches_verify_adapter_output` — same recorded cargo JSON through `McpVerifyCompileAdapter` and `RustBackend::diagnostics`; assert equal length, order, and **every field except `id`** (code, level, message, spans, children, package, `fingerprint`, `raw_json`). `DiagnosticId` is a fresh UUID per parse by RFC-0010's design (`DiagnosticId::new()` in `build_diagnostic_event`), so whole-struct equality is unsatisfiable; the **fingerprint** is the stable identity and is compared | DN1, DN7 |
 
 ### 12.4 CI greps (`crates/alloy-index/tests/rfc0014_ci_greps.rs`, RFC-0011 T7–T14 harness shape)
 
@@ -579,7 +584,7 @@ uuid          = { workspace = true }
 | **T23** | `rs3_graph_fidelity_still_has_three_variants` | RS3 |
 | **T24** | `rs4_fidelity_literal_appears_in_exactly_one_function` | RS4 |
 | **T25** | `rs5_rs6_language_id_and_session_field_shape_unchanged` — `name_id!(… LanguageId)` present; `language_backends: Vec<LanguageId>` present; the non-empty validation string present | RS5, RS6 |
-| **T26** | `rs7_single_rustc_json_parser` — the literal `"compiler-message"` appears in exactly one source file | RS7 |
+| **T26** | `rs7_single_rustc_json_parser` — the literal `"compiler-message"` appears in exactly two source files: `alloy-runtime/src/adapters/diagnostics.rs` (the parser) and `alloy-eval/src/recording.rs` (the RFC-0016 fixture extractor, exempted by RS7). The test asserts the **named set**, not a count, so a new matcher fails it | RS7 |
 | **T27** | `rs10_control_plane_has_no_language_field` — `LanguageBackend` absent from `CapabilityContext`/`CapabilityOutput`/scheduler sources; no `language_backend` tool registration in `alloy-tools/src` | RS10 |
 | **T28** | `lc5_no_process_execution_in_lang_seam` — `std::process::Command` absent from `alloy-runtime/src/lang/**` (RFC-0011 T12 already covers `alloy-index`) | LC5, SC1 |
 
@@ -627,7 +632,7 @@ Trait + value types; `RustBackend` with all eight methods; syn item/import pass 
 
 - [ ] 1. `LanguageBackend` is transcribed verbatim from V2 §16.1: same eight methods, same order, same signatures, `index` taking `&dyn ProjectGraph` (LB1).
 - [ ] 2. The trait lives in `crates/alloy-runtime/src/lang/mod.rs` (LC1).
-- [ ] 3. `LanguageManifest`, `Scope`, `TestSelector`, `TestReport`, `TextEdit`, `LangError`, `RustToolchain`, `ToolchainRunner` are all defined in `alloy-runtime::lang` and nowhere else (LB2–LB9, T20).
+- [ ] 3. `LanguageManifest`, `Scope`, `TestSelector`, `TestReport`, `TextEdit`, `LangError`, `RustToolchain`, `ToolchainRunner` are all defined in `alloy-runtime::lang` and nowhere else; `LanguageManifest` and `TestReport` each expose a `::new(...)` constructor so `alloy-index` can build them across the crate boundary (LB2, LB2a, LB3–LB9, T20).
 - [ ] 4. `id()` and `manifest()` are synchronous, I/O-free, and pass with a panicking runner (LB12, T1).
 - [ ] 5. `LangError` wraps `GraphError` via `#[from]` (LB8, T5).
 - [ ] 6. `LanguageRegistry` resolves `Session.language_backends`; an unregistered id is a session-create error (LB11).
@@ -650,7 +655,7 @@ Trait + value types; `RustBackend` with all eight methods; syn item/import pass 
 - [ ] 17. Fidelity is produced by one function reading `graph_meta.model_version`; no other literal exists (RS4, T24).
 - [ ] 18. `Session.language_backends` is still `Vec<LanguageId>` with its non-empty validation and its persisted column (RS5, T25).
 - [ ] 19. `LanguageId` is still a `name_id!` catalog id (RS6, T25).
-- [ ] 20. The literal `"compiler-message"` appears in exactly one source file (RS7, T26).
+- [ ] 20. The literal `"compiler-message"` appears only in `adapters/diagnostics.rs` and the RS7-exempted `alloy-eval/src/recording.rs` (RS7, T26).
 - [ ] 21. No `LanguageBackend`/`LanguageId` field on `CapabilityContext` or `CapabilityOutput`; no `language_backend` MCP tool; no language branch in the scheduler (RS10, T27).
 - [ ] 22. `NullProjectGraph` still reads empty / writes `Disabled` with a backend registered (RS13, T13).
 - [ ] 23. `SemanticEditOp` tags are unchanged (RS11).
@@ -679,13 +684,13 @@ Trait + value types; `RustBackend` with all eight methods; syn item/import pass 
 ### Diagnostics, test, toolchain, edits
 
 - [ ] 42. `RustBackend::diagnostics` delegates to `alloy_runtime::parse_rustc_diagnostics`; no second parser exists (DN1, T26).
-- [ ] 43. Given identical recorded cargo JSON, the backend and `McpVerifyCompileAdapter` produce identical `DiagnosticEvent`s including fingerprints (DN1, T19).
+- [ ] 43. Given identical recorded cargo JSON, the backend and `McpVerifyCompileAdapter` produce `DiagnosticEvent`s equal in every field except the per-parse `id`, fingerprints included (DN1, T19).
 - [ ] 44. The backend never spawns cargo; it goes through `ToolchainRunner` → MCP host → sandbox with a `PermissionToken` (DN2, SC1).
 - [ ] 45. `Scope::File` degrades to `Workspace` rather than guessing a package (DN3, T4).
 - [ ] 46. `diagnostics()` never calls `record_diagnostic`; the host ingests (DN5).
 - [ ] 47. RFC-0010's verify path is unchanged; `VerifyCompileAdapter` still owns scheduler-facing diagnostics (DN7).
 - [ ] 48. `TestReport` counts are `Option` and are `None` when the summary line is unrecognised; `ok` comes from exit status (LB5).
-- [ ] 49. `RustToolchain` is captured via `probe`, cached, and reported with the rebuild decision record (TC1, TC6).
+- [ ] 49. `RustToolchain` is injected via `McpToolchainRunner::with_probed_toolchain` and reported with the rebuild decision record; `probe` fails closed with `LangError::Toolchain` when none was supplied, and no source line shells out for `rustc -V` / `cargo -V` (TC1, TC1a, TC6).
 - [ ] 50. `RustToolchain` is not `alloy-eval::ToolchainRecord`; no `alloy-runtime → alloy-eval` dependency exists (TC5).
 - [ ] 51. All nine `SemanticEditOp` variants return `LangError::UnsupportedOp { op }` with `op == op_tag()` (LE1, LE2, T3).
 - [ ] 52. `lowerable_ops` is empty; no partial lowering is returned (LE1, LE3).
@@ -811,7 +816,7 @@ Five item nodes → **13 nodes**. Five new `Defines` edges (module → item) →
 
 | from | to | why |
 | --- | --- | --- |
-| `toy_core::io` | `toy_core::io::reader` | `mod reader;` + `pub use reader::Reader` resolves in-workspace |
+| `toy_core::io` | `toy_core::io::reader::Reader` | `pub use reader::Reader` — SY12 targets the **leaf item**, not the module; SY13's child-module clause makes the leading `reader` segment admissible |
 | `toy_core::io` | `toy_core::Config` | `use crate::Config` |
 | `toy_cli::main` | `toy_core::io` | `use toy_core::io` — `toy-core` is a workspace member |
 
