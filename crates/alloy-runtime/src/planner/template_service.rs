@@ -242,7 +242,8 @@ impl TemplatePlanService {
             ids: &ids,
             input_refs: &placeholders,
         });
-        if let Err(e) = DagValidator::validate(&candidate, ValidateOpts::default()) {
+        let opts = validate_opts_for(manifest);
+        if let Err(e) = DagValidator::validate(&candidate, opts) {
             tracing::warn!(error = %e, "plan validation failed");
             return Err(PlanError::Validation(e));
         }
@@ -263,7 +264,7 @@ impl TemplatePlanService {
         });
         // Re-validate after real input_refs are bound. Validator does not inspect
         // ArtifactId values, so this cannot fail if Phase A passed; kept as insurance.
-        DagValidator::validate(&dag, ValidateOpts::default())?;
+        DagValidator::validate(&dag, opts)?;
 
         // Snapshot
         let snapshot_bytes = serde_json::to_vec(&dag)
@@ -479,6 +480,15 @@ impl TemplatePlanService {
     }
 }
 
+/// Validation options for a manifest: a read-only template carries no gate
+/// to require (see [`TemplateManifest::is_read_only`]).
+fn validate_opts_for(manifest: &TemplateManifest) -> ValidateOpts {
+    ValidateOpts {
+        enforce_linear_mvp: true,
+        require_gates: !manifest.is_read_only(),
+    }
+}
+
 enum CasExpected {
     InsertOnly,
     Replan { expected_generation: u64 },
@@ -658,6 +668,32 @@ mod tests {
             events.clone() as Arc<dyn EventSink>,
         );
         (dir, storage, svc, events)
+    }
+
+    /// The read-only `review_diff` template plans and persists although it
+    /// carries no `GateHuman`: V11 guards mutation, and this template makes
+    /// none. Its single root node receives the goal (diff) envelope.
+    #[tokio::test]
+    async fn plan_review_diff_needs_no_gate() {
+        let (_dir, storage, svc, _events) = service().await;
+        let dag_id = DagId::new();
+        let mut ctx = plan_ctx(SessionId::new(), RunId::new(), dag_id);
+        ctx.template_override = Some(TemplateId::ReviewDiff);
+        ctx.goal.text = "review this diff".into();
+
+        let result = svc.plan(ctx).await.unwrap();
+        assert_eq!(result.template_id, TemplateId::ReviewDiff);
+        assert_eq!(result.dag.nodes.len(), 1);
+        let node = result.dag.nodes.values().next().unwrap();
+        assert_eq!(node.kind, NodeKind::Review);
+        assert_eq!(node.capability.as_ref().unwrap().as_str(), "review");
+
+        let blob = storage.artifacts().get(node.input_ref).await.unwrap();
+        let env: NodeInputEnvelope = serde_json::from_slice(&blob.bytes).unwrap();
+        match env.payload {
+            NodeInputPayload::Goal(goal) => assert_eq!(goal.text, "review this diff"),
+            other => panic!("review root must carry the goal, got {other:?}"),
+        }
     }
 
     #[tokio::test]

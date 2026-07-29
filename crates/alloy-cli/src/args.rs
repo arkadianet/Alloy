@@ -60,6 +60,8 @@ pub struct Globals {
 pub enum Commands {
     /// Take a goal to a compile-verified patch (or an honest failure).
     Run(RunArgs),
+    /// Review a unified diff and print the findings (read-only).
+    Review(ReviewArgs),
     /// List session events from durable storage.
     Events(EventsArgs),
     /// Resolve a human gate from any process.
@@ -118,6 +120,22 @@ pub struct RunArgs {
     /// Skip the graph bootstrap at session create (IX3).
     #[arg(long)]
     pub no_index: bool,
+}
+
+/// `alloy review --diff <PATH|->`.
+///
+/// The diff is supplied by the caller — the CLI never runs `git` itself
+/// (RFC-0015 rule B7): `git diff | alloy review --diff -`.
+#[derive(Debug, Args)]
+pub struct ReviewArgs {
+    /// Unified diff to review: a file path, or `-` for stdin (produce one
+    /// with `git diff <base>... | alloy review --diff -`).
+    #[arg(long, value_name = "PATH|-")]
+    pub diff: PathBuf,
+
+    /// Reuse an existing session instead of creating one (SQ5).
+    #[arg(long, value_parser = parse_session_id)]
+    pub session: Option<SessionId>,
 }
 
 /// `alloy events`.

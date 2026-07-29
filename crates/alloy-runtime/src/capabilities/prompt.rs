@@ -72,6 +72,18 @@ pub(crate) fn fence_tool(name: &str, content: &str, max_bytes: usize) -> String 
     )
 }
 
+/// `[alloy: truncated — {kept} of {total} bytes shown]` — the §5.4 marker
+/// in its byte-counting form.
+///
+/// The Alloy system frame teaches every model that text marked
+/// `[alloy: truncated …]` is incomplete, so any host or worker that cuts
+/// untrusted content MUST leave this behind rather than let the model read a
+/// short body as a whole one.
+#[must_use]
+pub fn truncation_marker(kept: usize, total: usize) -> String {
+    format!("[alloy: truncated — {kept} of {total} bytes shown]")
+}
+
 /// Prepend the capability's owned system instruction (§6.2).
 ///
 /// The instruction goes *before* any engine-contributed system message so

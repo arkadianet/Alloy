@@ -20,6 +20,9 @@ use crate::types::ids::{ArtifactId, CapabilityId, DagId, GateId, NodeId, Session
 pub enum TemplateId {
     /// Analyze → Edit → VerifyCompile → GateHuman repair chain.
     RepairLocalDiagnostic,
+    /// A single advisory `Review` node over a diff carried by the goal
+    /// (`alloy review`). Read-only: no Edit node, no gate, no verification.
+    ReviewDiff,
 }
 
 impl TemplateId {
@@ -28,6 +31,7 @@ impl TemplateId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RepairLocalDiagnostic => "repair_local_diagnostic",
+            Self::ReviewDiff => "review_diff",
         }
     }
 
@@ -36,6 +40,7 @@ impl TemplateId {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "repair_local_diagnostic" => Some(Self::RepairLocalDiagnostic),
+            "review_diff" => Some(Self::ReviewDiff),
             _ => None,
         }
     }
@@ -48,7 +53,7 @@ mod template_id_tests {
     /// Keep in sync when adding `TemplateId` variants.
     #[test]
     fn template_id_wire_names_match_serde() {
-        let all = [TemplateId::RepairLocalDiagnostic];
+        let all = [TemplateId::RepairLocalDiagnostic, TemplateId::ReviewDiff];
         for id in all {
             let json = serde_json::to_string(&id).expect("serialize");
             assert_eq!(json, format!("\"{}\"", id.as_str()));
@@ -71,6 +76,28 @@ pub struct TemplateManifest {
     pub nodes: Vec<TemplateNodeSpec>,
     /// Template edges (by local name).
     pub edges: Vec<TemplateEdgeSpec>,
+}
+
+impl TemplateManifest {
+    /// True when no node in this template can change the workspace or run
+    /// workspace code — every kind is `Plan`, `Analyze`, `Review`, or
+    /// `Aggregate`.
+    ///
+    /// V11's gate requirement (RFC-0009 §5.4 / V2 §10.2) puts a human in
+    /// front of an irreversible change. A template that makes none has
+    /// nothing to approve, so the planner (and a host scheduler running only
+    /// such templates) validates it with `require_gates = false`. Every
+    /// other kind — `Edit`, `VerifyCompile`, `VerifyTest` — either writes the
+    /// workspace or executes its code, and keeps the gate requirement.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.nodes.iter().all(|n| {
+            matches!(
+                n.kind,
+                NodeKind::Plan | NodeKind::Analyze | NodeKind::Review | NodeKind::Aggregate
+            )
+        })
+    }
 }
 
 /// Template node specification.
@@ -323,9 +350,34 @@ fn build_catalog() -> Vec<TemplateManifest> {
         ],
     };
 
+    // A one-node advisory review over the diff the goal carries. The
+    // `review` capability is `SideEffectClass::ReadOnly` (RFC-0013 VW5), so
+    // the template needs neither a verification node nor a human gate: it
+    // never changes the workspace.
+    let review = TemplateManifest {
+        id: TemplateId::ReviewDiff,
+        description: "Advisory diff review: one read-only Review node over the goal's diff".into(),
+        nodes: vec![TemplateNodeSpec {
+            name: "review".into(),
+            kind: NodeKind::Review,
+            capability: Some(cap("review")),
+            retry: llm_retry(),
+            budget: TokenBudget {
+                max_input: 32768,
+                max_output: 8192,
+            },
+            model_tier: ModelTier::Economy,
+            approval: None,
+            timeout_ms: 300_000,
+            enable_cache: false,
+        }],
+        edges: vec![],
+    };
+
     // Validate catalog integrity at init (crate bug → panic).
     validate_manifest(&repair);
-    vec![repair]
+    validate_manifest(&review);
+    vec![repair, review]
 }
 
 fn validate_manifest(m: &TemplateManifest) {
@@ -446,7 +498,7 @@ mod tests {
     #[test]
     fn catalog_parses() {
         let all = TemplateCatalog::all();
-        assert_eq!(all.len(), 1);
+        assert_eq!(all.len(), 2);
         let m = TemplateCatalog::get(TemplateId::RepairLocalDiagnostic);
         assert_eq!(m.id.as_str(), "repair_local_diagnostic");
         let mut names = std::collections::HashSet::new();
@@ -484,6 +536,52 @@ mod tests {
             assert!(n.cache_key.is_none());
             assert_eq!(n.state, NodeState::Pending);
         }
+    }
+
+    /// `review_diff` is the single-node advisory template `alloy review`
+    /// plans: one root `Review` node carrying the `review` capability, no
+    /// edges, no gate, and no node that can write the workspace.
+    #[test]
+    fn review_diff_is_one_read_only_review_node() {
+        let m = TemplateCatalog::get(TemplateId::ReviewDiff);
+        assert_eq!(m.id.as_str(), "review_diff");
+        assert_eq!(m.nodes.len(), 1);
+        assert!(m.edges.is_empty());
+        let spec = &m.nodes[0];
+        assert_eq!(spec.kind, NodeKind::Review);
+        assert_eq!(spec.capability.as_ref().unwrap().as_str(), "review");
+        assert!(spec.approval.is_none());
+        assert!(spec.budget.max_input > 0);
+
+        let ids = allocate_ids(m);
+        let mut input_refs = BTreeMap::new();
+        for nid in ids.nodes.values() {
+            input_refs.insert(*nid, ArtifactId::new());
+        }
+        let dag = build_topology(BuildTopology {
+            manifest: m,
+            dag_id: DagId::new(),
+            session_id: SessionId::new(),
+            generation: 1,
+            ids: &ids,
+            input_refs: &input_refs,
+        });
+        // V11 has nothing to require here: the template is read-only.
+        assert!(m.is_read_only());
+        assert!(!TemplateCatalog::get(TemplateId::RepairLocalDiagnostic).is_read_only());
+        DagValidator::validate(
+            &dag,
+            ValidateOpts {
+                enforce_linear_mvp: true,
+                require_gates: false,
+            },
+        )
+        .expect("review_diff validates");
+        assert_eq!(
+            DagValidator::validate(&dag, ValidateOpts::default()),
+            Err(crate::dag::DagValidationError::GatesAbsent),
+            "the relaxation is opt-in, not a change to V11"
+        );
     }
 
     #[test]

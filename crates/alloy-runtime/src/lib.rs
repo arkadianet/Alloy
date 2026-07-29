@@ -52,9 +52,10 @@ pub mod types;
 
 pub use adapters::{
     cargo_exit_verdict, diagnostic_fingerprint, parse_rustc_diagnostics, seed_graph_diagnostics,
-    Approval, CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityOutcome,
-    GateHumanAdapter, McpVerifyCompileAdapter, McpVerifyTestAdapter, NodeExecContext, NodeExecRef,
-    SeedReport, SessionGateHumanAdapter, SessionVerifyPermissions, ToolCaller, ToolCallerError,
+    AppliedEdit, AppliedEditSource, Approval, CapabilityExecContext, CapabilityExecError,
+    CapabilityExecutor, CapabilityOutcome, EventLogEdits, FixRecordingVerifier, GateHumanAdapter,
+    McpVerifyCompileAdapter, McpVerifyTestAdapter, NodeExecContext, NodeExecRef, SeedReport,
+    SessionGateHumanAdapter, SessionVerifyPermissions, ToolCaller, ToolCallerError,
     UnavailableCapabilityExecutor, UnavailableGateHuman, UnavailableVerifyCompile,
     UnavailableVerifyTest, Verdict, VerdictOutcome, Verifier, VerifyClass, VerifyPermissions,
 };
@@ -62,13 +63,14 @@ pub use adapters::{
 // EditAppliedPayload`) is deliberately not re-exported here: the crate root
 // already exports RFC-0008's session-event payload of the same name.
 pub use capabilities::{
-    system_instruction_digest, Capability, CapabilityContext, CapabilityDescriptor,
-    CapabilityRegistry, CapabilityVersion, EditWorker, PlanningProposalPayload, PlanningWorker,
-    ProcessRunRouterProvider, RegError, RegistryCapabilityExecutor, RepairPlanPayload, RepairStep,
-    RepairWorker, ResolveHints, ReviewFinding, ReviewPayload, ReviewSeverity, ReviewVerdict,
-    ReviewWorker, RunRouterProvider, SessionWorkerPermissions, SideEffectClass, WorkerConfig,
-    WorkerDeps, WorkerPermissions, WorkerToolClass, CAPABILITY_CATALOG, EDIT_SYSTEM,
-    MAX_LLM_CAPABILITIES, PAYLOAD_SCHEMA_VERSION, REPAIR_SYSTEM, REVIEW_SYSTEM,
+    system_instruction_digest, truncation_marker, Capability, CapabilityContext,
+    CapabilityDescriptor, CapabilityRegistry, CapabilityVersion, EditWorker,
+    PlanningProposalPayload, PlanningWorker, ProcessRunRouterProvider, RegError,
+    RegistryCapabilityExecutor, RepairPlanPayload, RepairStep, RepairWorker, ResolveHints,
+    ReviewFinding, ReviewPayload, ReviewSeverity, ReviewVerdict, ReviewWorker, RunRouterProvider,
+    SessionWorkerPermissions, SideEffectClass, WorkerConfig, WorkerDeps, WorkerPermissions,
+    WorkerToolClass, CAPABILITY_CATALOG, EDIT_SYSTEM, MAX_LLM_CAPABILITIES, PAYLOAD_SCHEMA_VERSION,
+    REPAIR_SYSTEM, REVIEW_SYSTEM,
 };
 pub use config::{default_router_toml, ConfigPaths, GatesConfig, RuntimeConfig, SandboxEcho};
 pub use context::{
@@ -87,9 +89,10 @@ pub use dag::{
     TemplateNodeSpec, ValidateOpts, ENVELOPE_SCHEMA_VERSION,
 };
 pub use edit::{
-    EditAppliedPayload, EditContext, EditEngine, EditError, EditRequest, EditRequestKind,
-    EditTransaction, EditValidation, FilePatch, Hunk, PatchSet, SemanticEditOp, TxState,
-    WorkspaceDigest, EDIT_APPLIED_SCHEMA,
+    rollback_run_edits, transactions_of_run, DeclinedRollback, EditAppliedPayload, EditContext,
+    EditEngine, EditError, EditRequest, EditRequestKind, EditTransaction, EditValidation,
+    FilePatch, Hunk, PatchSet, RollbackReport, SemanticEditOp, TxState, WorkspaceDigest,
+    EDIT_APPLIED_SCHEMA,
 };
 pub use error::{AdapterError, RunError, RuntimeError, SchedError, SessionError};
 pub use events::{
