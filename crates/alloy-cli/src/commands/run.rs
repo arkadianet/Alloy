@@ -181,6 +181,10 @@ async fn run_after_assembly(
     // diagnostics still present retries; gate denials, cancellations,
     // budget stops and clean exits return immediately.
     let mut attempt: u32 = 0;
+    // Set when the post-failure probe just seeded fresh diagnostics for the
+    // upcoming retry: the workspace has not changed since, so the bootstrap
+    // check would re-run cargo for an identical answer (review finding).
+    let mut seeded_by_probe = false;
     loop {
         let run = sessions.submit_goal(session, goal.clone()).await?;
         let dag_id = dag_id_for_run(full, run).await?;
@@ -193,7 +197,11 @@ async fn run_after_assembly(
         // worker's generation-1 prompt carries the real rustc diagnostics
         // instead of guessing from the goal text. Best-effort: a missing
         // toolchain or sandbox must never fail a run before it starts.
-        bootstrap_diagnostics(full, ctx, session, run, dag_id).await;
+        // Every retry iteration is immediately preceded by a successful
+        // probe (it is the retry condition), so the flag needs no reset.
+        if !seeded_by_probe {
+            bootstrap_diagnostics(full, ctx, session, run, dag_id).await;
+        }
 
         // §7.1 step 6 — plan (template selection is the plan service's, SQ1).
         let (policy_hash, tool_versions, compiler_fingerprint) = plan_fingerprints(ctx)?;
@@ -225,6 +233,7 @@ async fn run_after_assembly(
         if errors == 0 {
             return Ok(exit);
         }
+        seeded_by_probe = true;
         attempt += 1;
         if !ctx.quiet {
             eprintln!(

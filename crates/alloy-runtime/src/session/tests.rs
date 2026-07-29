@@ -1757,6 +1757,58 @@ async fn run_approve_accepts_durable_gate_request_before_state_flip() {
     h.close().await;
 }
 
+/// A durable `ApprovalRequested` only satisfies the phase guard while the
+/// gate is still OPEN: once a durable `ApprovalResolved` exists for it, a
+/// later approval on a non-waiting run must be rejected (external review
+/// finding on #54 — the first fallback re-approved resolved gates).
+#[tokio::test]
+async fn run_approve_rejects_resolved_durable_gate() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+    let gate = GateId::new();
+    for (type_, payload) in [
+        (
+            SessionEventType::ApprovalRequested,
+            json!({ "gate_id": gate.to_string() }),
+        ),
+        (
+            SessionEventType::ApprovalResolved,
+            json!({ "gate_id": gate.to_string(), "decision": "allow", "generation": 1 }),
+        ),
+    ] {
+        h.storage
+            .events()
+            .append_session(NewSessionEvent {
+                session_id: session,
+                run_id: Some(run),
+                type_,
+                payload,
+            })
+            .await
+            .unwrap();
+    }
+    h.set_run_state(run, RunControlState::Running).await;
+    assert!(matches!(
+        h.runs().approve(run, gate, Approval::Allow).await.unwrap_err(),
+        RunError::InvalidPhase(m) if m == "not waiting approval"
+    ));
+    // A RE-request after the resolution reopens the gate (GR3 re-emission).
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run),
+            type_: SessionEventType::ApprovalRequested,
+            payload: json!({ "gate_id": gate.to_string() }),
+        })
+        .await
+        .unwrap();
+    h.runs().approve(run, gate, Approval::Allow).await.unwrap();
+    h.close().await;
+}
+
 #[tokio::test]
 async fn run_approve_requires_waiting_approval() {
     let h = Harness::new().await;

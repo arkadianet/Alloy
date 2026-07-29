@@ -369,7 +369,7 @@ async fn cargo_check_fixture_sandboxed() {
     let fixture_root = jail.join("sbx_check");
     assert!(fixture_root.join("Cargo.toml").is_file());
 
-    let mut profile = SandboxProfile::default_for_jail(jail).unwrap();
+    let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
     profile.check_backend = SandboxBackend::Landlock;
     profile.exec_timeout = Duration::from_secs(120);
     let broker = match NativeSandboxBroker::with_operator_homes(profile, homes.clone()).await {
@@ -407,6 +407,16 @@ async fn cargo_check_fixture_sandboxed() {
     );
     assert_eq!(result.content["exit_code"], 0);
     assert_eq!(result.content["backend"], "landlock");
+    // The ancestor config's jail-escaping target-dir must not be honoured:
+    // nothing outside the jail, artifacts under the forced jail target.
+    assert!(
+        !fixtures.path().join("outside-target").exists(),
+        "cargo escaped the jail via the ancestor config target-dir"
+    );
+    assert!(
+        jail.join("target").is_dir(),
+        "forced CARGO_TARGET_DIR must place artifacts under the jail"
+    );
 }
 
 /// A `CARGO_HOME` containing only a copy of the real `cargo`.
