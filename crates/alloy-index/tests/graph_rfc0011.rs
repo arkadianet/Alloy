@@ -994,19 +994,15 @@ async fn symbol_resolves_exactly_and_never_prefix_matches() {
     g.close().await.unwrap();
 }
 
-// T6d/T6e/T6f: the four Stub kinds return empty truncated views (Q4–Q6).
+// T6d/T6f: the three remaining Stub kinds return empty truncated views
+// (Q4, Q5). `SimilarFixes` left the Stub set with amendment A-0011-5.
 #[tokio::test]
 async fn stub_queries_return_empty_truncated_views() {
     let fx = Fx::new();
     let g = built(&fx).await;
-    g.record_fix(sample_fix("E0502")).await.unwrap();
     let node = derive_node_id(GraphNodeKind::Module, "toy-core\0toy_core");
     let queries = vec![
         GraphQuery::Callers { fn_node: node },
-        GraphQuery::SimilarFixes {
-            diagnostic_code: "E0502".into(),
-            limit: 10,
-        },
         GraphQuery::Refs { node },
         GraphQuery::Impls { trait_node: node },
     ];
@@ -1015,7 +1011,7 @@ async fn stub_queries_return_empty_truncated_views() {
         assert!(view.is_empty(), "{q:?} must be empty");
         assert!(view.truncated, "{q:?} must set truncated");
     }
-    assert!(g.metrics().queries_stub >= 4);
+    assert!(g.metrics().queries_stub >= 3);
     g.close().await.unwrap();
 }
 
@@ -1227,9 +1223,10 @@ async fn record_diagnostic_round_trips_and_is_idempotent() {
     g.close().await.unwrap();
 }
 
-// T7c: fixes append and are never surfaced by SimilarFixes (IN14, Q6).
+// T7c: fixes append (duplicates permitted) and are surfaced by
+// SimilarFixes for their own code only (IN14; Q6 as amended by A-0011-5).
 #[tokio::test]
-async fn record_fix_appends_and_is_not_surfaced_by_similar_fixes() {
+async fn record_fix_appends_and_is_surfaced_by_similar_fixes() {
     let fx = Fx::new();
     let g = built(&fx).await;
     g.record_fix(sample_fix("E0502")).await.unwrap();
@@ -1241,9 +1238,62 @@ async fn record_fix_appends_and_is_not_surfaced_by_similar_fixes() {
         })
         .await
         .unwrap();
-    assert!(view.fixes.is_empty());
+    assert_eq!(view.fixes.len(), 2);
+    assert!(view.fixes.iter().all(|f| f.verified));
+    assert!(
+        !view.truncated,
+        "two rows under the limit is not truncation"
+    );
+    // A different code matches nothing.
+    let other = g
+        .query(GraphQuery::SimilarFixes {
+            diagnostic_code: "E0308".into(),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(other.fixes.is_empty());
     g.close().await.unwrap();
     assert_eq!(count(&fx.data, "SELECT COUNT(*) FROM graph_fixes"), 2);
+}
+
+// T7c2 (A-0011-5): SimilarFixes returns whole `FixEvent` rows, most recent
+// first, honouring the query's `limit`.
+#[tokio::test]
+async fn similar_fixes_returns_recent_rows_first_and_honours_limit() {
+    let fx = Fx::new();
+    let g = built(&fx).await;
+    let base = time::OffsetDateTime::now_utc() - time::Duration::hours(4);
+    let mut recorded = Vec::new();
+    for hour in 0..3_i64 {
+        let mut f = sample_fix("E0502");
+        f.recorded_at = Timestamp(base + time::Duration::hours(hour));
+        f.crate_id = Some(alloy_runtime::CrateId::new("toy-core").unwrap());
+        f.diagnostic = Some(DiagnosticId::new());
+        f.transaction = Some(alloy_runtime::TransactionId::new());
+        f.patch_artifact = Some(alloy_runtime::ArtifactId::new());
+        g.record_fix(f.clone()).await.unwrap();
+        recorded.push(f);
+    }
+    // A fix for another code must never leak in.
+    g.record_fix(sample_fix("E0308")).await.unwrap();
+
+    let view = g
+        .query(GraphQuery::SimilarFixes {
+            diagnostic_code: "E0502".into(),
+            limit: 2,
+        })
+        .await
+        .unwrap();
+    assert_eq!(view.fixes.len(), 2, "limit honoured");
+    assert!(view.truncated, "a third row existed behind the limit");
+    assert_eq!(
+        view.fixes[0], recorded[2],
+        "most recent first, round-tripped"
+    );
+    assert_eq!(view.fixes[1], recorded[1]);
+    assert!(view.nodes.is_empty() && view.diagnostics.is_empty());
+    g.close().await.unwrap();
 }
 
 // T7d: IN15 — records never bump the version.

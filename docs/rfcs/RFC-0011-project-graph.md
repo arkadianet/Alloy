@@ -84,7 +84,7 @@ Each deferral names the seam that will carry it, so nothing has to be redesigned
 4. `rebuild` MUST be **deterministic** (same tree → same node ids, same edge set, same content digest) and **idempotent** (a second `rebuild` over an unchanged tree MUST NOT bump `GraphVersion`) — rules **IN5**, **IN6**.
 5. Ingest MUST be **offline and exec-free**: filesystem reads and `Cargo.toml` parsing only. No subprocess, no network, no symlink traversal (rules **IN3**, **IN4**, **SEC5**).
 6. MVP ingest MUST create zero `Item` nodes and zero `Imports` edges. Those are **Stub** surfaces reserved for the Beta `syn` pass (rules **IN8**, **IN9**).
-7. `GraphQuery::Callers` and `GraphQuery::SimilarFixes` MUST return an empty `GraphView` — never an error, never fabricated rows (rule **Q5**, **Q6**). `Refs` and `Impls` MUST likewise return empty until RA passthrough lands (rule **Q4**).
+7. `GraphQuery::Callers` MUST return an empty `GraphView` — never an error, never fabricated rows (rule **Q5**). `Refs` and `Impls` MUST likewise return empty until RA passthrough lands (rule **Q4**). `GraphQuery::SimilarFixes` reads recorded fixes back since amendment A-0011-5a (§2.3a); it too never errors and never fabricates rows.
 8. `GraphViewHandle` MUST expose no mutation method and MUST NOT be constructible into a writer (rule **SEC1**).
 9. No `graph_query` MCP tool MUST exist for Alloy workers, in any crate (rule **SEC2**, CI-grepped).
 10. `alloy-index` MUST NOT append session events or decision records; it emits `tracing` spans and an atomic metrics snapshot only (rule **OB1**).
@@ -159,6 +159,18 @@ Three **additive** amendments are authorised by this RFC. Each is a derive or a 
 RFC-0002 conventions this RFC mirrors rather than re-uses (because `storage::open::{DbHandle, spawn_db}` are crate-private): single `Mutex<Option<Connection>>`, `PRAGMA foreign_keys=ON` → `busy_timeout` → `journal_mode=WAL` → `synchronous`, `OpenFlags::READ_WRITE|CREATE|NO_MUTEX`, integer migration ledger with refuse-newer, `spawn_blocking` wrapper, `close()` with WAL truncate-checkpoint, `Drop` warning when closed implicitly, and error mapping by `rusqlite::ErrorCode` (never by message substring).
 
 RFC-0002's `sessions.graph_version INTEGER NULL` column is the **only** cross-database link. Rule **S2**: `alloy-index` MUST NOT read or write `alloy.sqlite`. The runtime host writes the `GraphVersion` integer it obtained from `rebuild` into that column; there is no foreign key across files.
+
+### 2.3a Amendment A-0011-5 — the learning loop is closed (post-merge)
+
+`SimilarFixes` and `record_fix` shipped as a write-only pair: fixes were stored (IN14) and never read back (Q6), because V2 §7.2 forbids auto prompt injection of past fixes "before precision is measured". That measurement cannot happen while nothing writes fixes and nothing reads them. This amendment turns the pair on, keeping every safeguard that made the stub cheap to reverse.
+
+| # | Amendment | Rule amended | Statement |
+| --- | --- | --- | --- |
+| **A-0011-5a** | `SimilarFixes` is no longer a Stub | **Q6** | `SimilarFixes` MUST return the recorded `graph_fixes` rows whose `diagnostic_code` matches, most recent first (`recorded_at DESC`, insertion order as tie-break), capped by the query's own `limit` and by the store's query cap, setting `truncated` only when rows were left behind. It remains a read-only query (Q10) and still returns an empty view — never an error — when nothing matches. `Callers`, `Refs` and `Impls` stay Stub (Q4, Q5). |
+| **A-0011-5b** | The verify path records fixes | **IN1**, **IN14** | The runtime host's verify path MAY call `record_fix` as well as `record_diagnostic`. The permitted implementation is a `Verifier` decorator (`alloy-runtime::adapters::FixRecordingVerifier`) composed at the composition root: it records one `FixEvent` per diagnostic code that a failing verification reported, once a later verification of the same run passes *after a new `EditApplied`*. Ingest is bookkeeping — a graph error is logged and dropped, never returned as a verdict. |
+| **A-0011-5c** | Past fixes may reach a repair prompt | **SEC4**, RFC-0013 **RW4** | `RepairWorker` MAY issue `SimilarFixes` for the diagnostic codes it already holds and render the result as one bounded, fenced, User-role advisory note (≤ 4 codes, ≤ 8 rows, ≤ 1 KiB). It reads through `GraphViewHandle` exactly as it reads `Diagnostics`; **SEC4** is unchanged — no capability may write the graph, and no worker is handed an `Arc<dyn ProjectGraph>`. Patch *bodies* are still never injected: the note carries codes, packages, dates and artifact ids only. |
+
+Unchanged by this amendment: the `ProjectGraph` trait, the `GraphQuery` enum, `FixEvent`, and every SQL table (`graph_fixes` already indexes `(diagnostic_code, recorded_at)`), so there is no migration and `GRAPH_MODEL_VERSION` stays at its current value. Reversal is deleting the query arm and the decorator.
 
 ### 2.4 Crate placement decision (normative)
 
@@ -806,7 +818,7 @@ After quarantine the graph is empty at `GraphVersion(0)`; the caller's next `reb
 
 | Rule | Statement |
 | --- | --- |
-| **IN1** | Ingest MUST NOT be triggered by a capability worker, by the scheduler's node dispatch, or by any MCP tool. Permitted callers: `alloy-cli` (explicit `alloy index` / session bootstrap) and the runtime host's verify path (`record_diagnostic` only). |
+| **IN1** | Ingest MUST NOT be triggered by a capability worker, by the scheduler's node dispatch, or by any MCP tool. Permitted callers: `alloy-cli` (explicit `alloy index` / session bootstrap) and the runtime host's verify path (`record_diagnostic` and, since A-0011-5b, `record_fix`). |
 | **IN2** | Ingest MUST NOT run implicitly inside `query`. A stale graph answers with stale data and a truthful `version`; it never silently re-indexes mid-prompt. |
 | **IN3** | Ingest MUST enforce `IngestLimits`. Exceeding `max_files` / `max_crates` / `max_depth` MUST return `GraphError::LimitExceeded` and leave the previous version intact (S10). Oversized individual files are skipped and counted, not fatal. |
 | **IN4** | The walk MUST NOT follow symbolic links, and MUST NOT visit any path that escapes the workspace root after normalisation. Skipped entries are counted. |
@@ -913,7 +925,7 @@ Rule **SEC4** restates the boundary: no code path from `Capability::execute` rea
 | **Q3** | `Diagnostics { crate_id, since }` filters on `package = crate_id` when `Some` and `recorded_at >= since` when `Some`, ordered by `(recorded_at, diagnostic_id)` ascending, capped by `max_query_nodes`. |
 | **Q4** | `Refs` and `Impls` MUST return `GraphView::empty(version)` with `truncated = true`. **Stub** pending RA passthrough. They MUST NOT error. |
 | **Q5** | `Callers` MUST return `GraphView::empty(version)` with `truncated = true`. **Stub** — permanent until typed call edges exist (V2 §7.2). |
-| **Q6** | `SimilarFixes` MUST return `GraphView::empty(version)` with `truncated = true`, regardless of stored `graph_fixes` rows. **Stub** — V2 forbids auto prompt injection of fixes before precision is measured. |
+| **Q6** | *(amended by A-0011-5a, §2.3a)* `SimilarFixes` MUST return the `graph_fixes` rows matching `diagnostic_code`, most recent first, capped by the query's `limit`; `truncated` is set only when matching rows were left behind. Originally a Stub returning an empty view. |
 | **Q7** | `Subgraph { seeds, radius }` performs BFS over `Defines` edges in **both** directions from each seed. `radius` is clamped to `3`; `radius = 0` returns just the seeds. Unknown seed ids are ignored, not errors. |
 | **Q8** | Result ordering MUST be total and deterministic: nodes by `(kind, path, id)`, edges by `(from, to, kind)`, diagnostics by `(recorded_at, diagnostic_id)`. Two identical queries against an unchanged graph return byte-identical JSON. |
 | **Q9** | When a result would exceed `max_query_nodes`, it is truncated at the ordering boundary and `truncated = true`. Truncation MUST NOT be silent. |
@@ -1172,7 +1184,7 @@ Lint attributes added to `crates/alloy-index/src/lib.rs`:
 | T6b | `symbol_resolves_workspace_relative_file_path` | Q2(2) |
 | T6c | `symbol_does_not_prefix_match` | Q2 |
 | T6d | `callers_returns_empty_truncated_view` | Q5 |
-| T6e | `similar_fixes_returns_empty_even_with_stored_fixes` | Q6 |
+| T6e | *(superseded by A-0011-5a)* `similar_fixes_returns_recent_rows_first_and_honours_limit` | Q6 |
 | T6f | `refs_and_impls_return_empty_without_erroring` | Q4 |
 | T6g | `diagnostics_filters_by_crate_and_since` | Q3 |
 | T6h | `subgraph_radius_zero_returns_seeds_only` | Q7 |
@@ -1188,7 +1200,7 @@ Lint attributes added to `crates/alloy-index/src/lib.rs`:
 | --- | --- | --- |
 | T7a | `record_diagnostic_round_trips_through_diagnostics_query` | IN13 |
 | T7b | `record_diagnostic_is_idempotent_on_diagnostic_id` | IN13 |
-| T7c | `record_fix_appends_and_is_not_surfaced_by_similar_fixes` | IN14, Q6 |
+| T7c | `record_fix_appends_and_is_surfaced_by_similar_fixes` (renamed by A-0011-5a) | IN14, Q6 |
 | T7d | `record_diagnostic_and_record_fix_do_not_bump_version` | IN15 |
 | T7e | `snapshot_records_version_and_counts` | G10 |
 
@@ -1295,7 +1307,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 43. Incremental application and a full rebuild of the same post-change tree agree on the content digest (**IN10**, T5).
 - [ ] 44. `Symbol` resolves an exact Rust path and an exact workspace-relative file path, and never prefix-matches (**Q2**, T6a–T6c).
 - [ ] 45. `Callers` returns an empty view with `truncated = true` and never errors (**Q5**, T6d).
-- [ ] 46. `SimilarFixes` returns empty even when `graph_fixes` has rows (**Q6**, T6e).
+- [x] 46. *(superseded by A-0011-5a)* `SimilarFixes` returns the matching `graph_fixes` rows, most recent first, honouring `limit` (**Q6**, T7c/T7c2).
 - [ ] 47. `Refs` and `Impls` return empty without erroring (**Q4**, T6f).
 - [ ] 48. `Diagnostics` filters by `crate_id` and `since` and orders by `(recorded_at, diagnostic_id)` (**Q3**, T6g).
 - [ ] 49. `Subgraph` honours `radius = 0`, clamps to 3, traverses `Defines` in both directions, and ignores unknown seeds (**Q7**, T6h–T6j).

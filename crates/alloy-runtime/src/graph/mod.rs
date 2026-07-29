@@ -204,7 +204,8 @@ pub enum GraphQuery {
         /// Restrict to diagnostics recorded at or after this instant.
         since: Option<Timestamp>,
     },
-    /// Similar historical fixes. **Stub**: always empty (Q6).
+    /// Fixes recorded for a diagnostic code, most recent first. Live since
+    /// amendment A-0011-5; empty until something has been recorded (Q6).
     SimilarFixes {
         /// Diagnostic code the fix addressed (`E0502`, …).
         diagnostic_code: String,
@@ -233,8 +234,7 @@ pub struct GraphView {
     pub edges: Vec<GraphEdge>,
     /// Diagnostics, populated only by [`GraphQuery::Diagnostics`].
     pub diagnostics: Vec<DiagnosticEvent>,
-    /// Fix records, populated only by [`GraphQuery::SimilarFixes`] (always
-    /// empty in MVP).
+    /// Fix records, populated only by [`GraphQuery::SimilarFixes`].
     pub fixes: Vec<FixEvent>,
     /// Fidelity of the data backing this view (MVP: always `Manifest`).
     pub fidelity: GraphFidelity,
@@ -298,7 +298,7 @@ pub struct FixEvent {
     /// Diagnostic this fix addressed, when known.
     pub diagnostic: Option<DiagnosticId>,
     /// Diagnostic code the fix addressed (`E0502`, …) — the `SimilarFixes`
-    /// key.
+    /// lookup key.
     pub diagnostic_code: Option<String>,
     /// Owning package, when known.
     pub crate_id: Option<CrateId>,
