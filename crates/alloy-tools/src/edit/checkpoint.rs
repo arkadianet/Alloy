@@ -240,7 +240,7 @@ fn ensure_tracked_policy(
                 })
             }
             FilePatch::Create { .. } if tracked.contains(rel) => {
-                return Err(EditError::UntrackedPath {
+                return Err(EditError::CreateOnTrackedPath {
                     path: rel.to_string(),
                 })
             }
@@ -903,9 +903,11 @@ mod tests {
                 hunks: vec![],
             }],
         };
+        // Create-on-tracked is the inverse invariant and must not claim the
+        // path is untracked (issue #37 / RFC-0008 amendment A1).
         assert!(matches!(
             ensure_tracked_policy(&policy, &tracked, &patch),
-            Err(EditError::UntrackedPath { ref path }) if path == "a.txt"
+            Err(EditError::CreateOnTrackedPath { ref path }) if path == "a.txt"
         ));
         let _ = Glob("**".into());
     }

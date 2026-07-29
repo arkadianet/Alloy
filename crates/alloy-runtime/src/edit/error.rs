@@ -77,6 +77,15 @@ pub enum EditError {
         path: String,
     },
 
+    /// Create path is already in the git tracked set (RFC-0008 §5.6.1
+    /// item 4, split from `UntrackedPath` by amendment — the file exists;
+    /// the honest correction is Modify, not a different path).
+    #[error("create targets a tracked path (file exists): {path}")]
+    CreateOnTrackedPath {
+        /// Jail-relative path.
+        path: String,
+    },
+
     /// A tracked path matches deny-globs (secrets fail closed).
     #[error("tracked deny-glob path present: {path}")]
     TrackedDeniedPath {

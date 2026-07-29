@@ -91,6 +91,9 @@ fn map_edit_error(err: EditError) -> PatchApplyError {
         EditError::UntrackedPath { path } => {
             PatchApplyError::Conflict(format!("untracked path in patch: {path}"))
         }
+        EditError::CreateOnTrackedPath { path } => {
+            PatchApplyError::Conflict(format!("create targets a tracked path (file exists): {path}"))
+        }
         EditError::TrackedDeniedPath { path } => {
             PatchApplyError::PermissionDenied(PermissionDenial::PathNotCovered(path))
         }
