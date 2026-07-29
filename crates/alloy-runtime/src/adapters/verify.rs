@@ -2,9 +2,11 @@
 //!
 //! `McpVerifyCompileAdapter`/`McpVerifyTestAdapter` hold an injected
 //! `Arc<dyn ToolCaller>` (never `ToolHandle` — rule M5) and turn one
-//! `cargo_check`/`cargo_test` call into a `VerifyOutcome` or an
+//! `cargo_check`/`cargo_test` call into a [`Verdict`] or an
 //! `AdapterError`, per §5.13.1's tool-call construction and §5.13.2's
-//! total exit-code classification.
+//! total exit-code classification. Pass/fail/no-answer is decided by the
+//! shared [`super::cargo_exit_verdict`] (research §7.11 items 5/6), the
+//! same function `alloy-eval` uses — the two can no longer disagree.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,7 +17,7 @@ use serde_json::Value;
 use super::diagnostics::parse_rustc_diagnostics;
 use super::perms::{VerifyClass, VerifyPermissions};
 use super::tool_caller::{ToolCaller, ToolCallerError};
-use super::{NodeExecContext, VerifyCompileAdapter, VerifyOutcome, VerifyTestAdapter};
+use super::{cargo_exit_verdict, NodeExecContext, Verdict, VerdictOutcome, Verifier};
 use crate::error::AdapterError;
 use crate::storage::{ArtifactKind, ArtifactPut, ArtifactStore};
 use crate::types::tools::{ToolCall, ToolError, ToolName, ToolResult};
@@ -44,8 +46,8 @@ impl McpVerifyCompileAdapter {
 }
 
 #[async_trait]
-impl VerifyCompileAdapter for McpVerifyCompileAdapter {
-    async fn check(&self, ctx: &NodeExecContext) -> Result<VerifyOutcome, AdapterError> {
+impl Verifier for McpVerifyCompileAdapter {
+    async fn verify(&self, ctx: &NodeExecContext) -> Result<Verdict, AdapterError> {
         run_verify(
             &self.tools,
             &self.perms,
@@ -82,8 +84,8 @@ impl McpVerifyTestAdapter {
 }
 
 #[async_trait]
-impl VerifyTestAdapter for McpVerifyTestAdapter {
-    async fn test(&self, ctx: &NodeExecContext) -> Result<VerifyOutcome, AdapterError> {
+impl Verifier for McpVerifyTestAdapter {
+    async fn verify(&self, ctx: &NodeExecContext) -> Result<Verdict, AdapterError> {
         run_verify(
             &self.tools,
             &self.perms,
@@ -104,7 +106,7 @@ async fn run_verify(
     artifacts: &Arc<dyn ArtifactStore>,
     ctx: &NodeExecContext,
     class: VerifyClass,
-) -> Result<VerifyOutcome, AdapterError> {
+) -> Result<Verdict, AdapterError> {
     let token = perms.token_for(&ctx.meta, class).await?;
     let (name, arguments) = build_tool_call(class, &ctx.meta.workspace_root);
     let call = ToolCall::new(name, arguments)
@@ -119,10 +121,10 @@ async fn run_verify(
         .call(call, token)
         .await
         .map_err(map_tool_caller_error)?;
-    let outcome = classify_cargo_result(&result)?;
+    let ran = classify_cargo_result(&result)?;
 
-    // RL1-RL5: raw log MUST be put for both ok:true and ok:false, never on
-    // a genuine error path above (those return before this point).
+    // RL1-RL5: raw log MUST be put for every ran-to-a-verdict outcome, never
+    // on a genuine error path above (those return before this point).
     let raw_artifact = put_raw_log(artifacts, ctx, &result).await?;
 
     let diagnostics = match class {
@@ -130,17 +132,21 @@ async fn run_verify(
         VerifyClass::Test => vec![], // DG7: cargo_test output is not rustc JSON.
     };
 
-    Ok(match outcome {
-        CargoOutcome::Ok => VerifyOutcome {
-            ok: true,
-            diagnostics,
-            raw_artifact: Some(raw_artifact),
-        },
-        CargoOutcome::SoftFail => VerifyOutcome {
-            ok: false,
-            diagnostics,
-            raw_artifact: Some(raw_artifact),
-        },
+    let outcome = match ran {
+        // §7.11 items 5/6: the shared decision. Diagnostics win over a
+        // clean exit; non-101 exits and signals are no-answer, not Fail.
+        CargoRan::Exited(code) => cargo_exit_verdict(
+            Some(code),
+            diagnostics
+                .iter()
+                .any(|d| d.level == crate::types::diagnostic::DiagnosticLevel::Error),
+        ),
+        CargoRan::Inconclusive(reason) => VerdictOutcome::Inconclusive { reason },
+    };
+    Ok(Verdict {
+        outcome,
+        diagnostics,
+        raw_artifact: Some(raw_artifact),
     })
 }
 
@@ -194,25 +200,29 @@ async fn put_raw_log(
 }
 
 /// Outcome of §5.13.2's classification, before diagnostics/raw-log handling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CargoOutcome {
-    /// Exit 0.
-    Ok,
-    /// Exit 101, no signal, not truncated — a normal compile/test failure
-    /// (VC1: this is a soft outcome, not an error).
-    SoftFail,
+///
+/// This stage only decides "did cargo produce an answer worth judging";
+/// pass/fail itself belongs to [`cargo_exit_verdict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoRan {
+    /// Cargo ran to completion with this exit code.
+    Exited(i64),
+    /// Cargo ran but its answer is unusable (signal, truncated output, no
+    /// exit code) — surfaces as `VerdictOutcome::Inconclusive` (§7.11
+    /// item 6), never as an agent failure.
+    Inconclusive(String),
 }
 
 /// §5.13.2 VC1-VC5: total classification of a `ToolCaller::call` success.
 /// `content.exit_code` is authoritative when present (per the RFC table's
 /// own column framing); `is_error()`/`error()` select which branch applies.
-fn classify_cargo_result(result: &ToolResult) -> Result<CargoOutcome, AdapterError> {
+fn classify_cargo_result(result: &ToolResult) -> Result<CargoRan, AdapterError> {
     let exit_code = content_i64(&result.content, "exit_code");
     let signal = content_i64(&result.content, "signal");
 
     if !result.is_error() {
         return match exit_code {
-            Some(0) => Ok(CargoOutcome::Ok),
+            Some(0) => Ok(CargoRan::Exited(0)),
             None => Err(AdapterError::Internal(
                 "cargo result missing exit_code".into(),
             )),
@@ -233,32 +243,25 @@ fn classify_cargo_result(result: &ToolResult) -> Result<CargoOutcome, AdapterErr
     match err {
         ToolError::ExecutionFailed { .. } => {
             if let Some(sig) = signal {
-                // VC2: a signal is never Compile/Test — OOM/kill class.
-                return Err(AdapterError::ToolFailure(ToolError::Transient {
-                    code: "cargo_signal".into(),
-                    message: format!("signal {sig}"),
-                }));
+                // VC2: a signal is never a Compile/Test answer — OOM/kill.
+                // §7.11 item 6: an Inconclusive verdict, not a failure label.
+                return Ok(CargoRan::Inconclusive(format!(
+                    "cargo killed by signal {sig}"
+                )));
             }
             match exit_code {
                 Some(101) => {
                     if content_bool(&result.content, "stdout_truncated") {
-                        // VC5: truncated stdout on 101 is unreliable — retry.
-                        Err(AdapterError::ToolFailure(ToolError::Transient {
-                            code: "cargo_output_truncated".into(),
-                            message: "stdout truncated on exit 101".into(),
-                        }))
+                        // VC5: truncated stdout on 101 is unreliable.
+                        Ok(CargoRan::Inconclusive(
+                            "stdout truncated on exit 101".into(),
+                        ))
                     } else {
-                        Ok(CargoOutcome::SoftFail) // VC1: the only soft-fail signal.
+                        Ok(CargoRan::Exited(101)) // VC1: the compile/test failure signal.
                     }
                 }
-                Some(n) => Err(AdapterError::ToolFailure(ToolError::Permanent {
-                    code: format!("cargo_exit_{n}"),
-                    message: format!("cargo exited {n}"),
-                })),
-                None => Err(AdapterError::ToolFailure(ToolError::Transient {
-                    code: "cargo_no_exit".into(),
-                    message: "no exit code reported".into(),
-                })),
+                Some(n) => Ok(CargoRan::Exited(n)),
+                None => Ok(CargoRan::Inconclusive("no exit code reported".into())),
             }
         }
         ToolError::Transient { .. } | ToolError::Permanent { .. } => {
@@ -365,7 +368,7 @@ mod tests {
     #[test]
     fn exit_0_ok_is_ok_outcome() {
         let r = ok_result(0);
-        assert_eq!(classify_cargo_result(&r).unwrap(), CargoOutcome::Ok);
+        assert_eq!(classify_cargo_result(&r).unwrap(), CargoRan::Exited(0));
     }
 
     #[test]
@@ -384,18 +387,21 @@ mod tests {
     }
 
     #[test]
-    fn vc1_exit_101_no_signal_not_truncated_is_soft_fail() {
+    fn vc1_exit_101_no_signal_not_truncated_is_a_fail_verdict() {
         let r = failed_result(Some(101), None, false, exec_failed(Some(101), None));
-        assert_eq!(classify_cargo_result(&r).unwrap(), CargoOutcome::SoftFail);
+        assert_eq!(classify_cargo_result(&r).unwrap(), CargoRan::Exited(101));
+        // 101 is Fail on its own — independent of the diagnostics rule.
+        assert_eq!(cargo_exit_verdict(Some(101), false), VerdictOutcome::Fail);
     }
 
     #[test]
-    fn vc5_exit_101_truncated_stdout_is_transient() {
+    fn vc5_exit_101_truncated_stdout_is_inconclusive() {
+        // §7.11 item 6: unusable output is a no-answer verdict, never an
+        // agent failure and never a hard adapter error.
         let r = failed_result(Some(101), None, true, exec_failed(Some(101), None));
-        let err = classify_cargo_result(&r).unwrap_err();
         assert!(matches!(
-            err,
-            AdapterError::ToolFailure(ToolError::Transient { code, .. }) if code == "cargo_output_truncated"
+            classify_cargo_result(&r).unwrap(),
+            CargoRan::Inconclusive(reason) if reason.contains("truncated")
         ));
     }
 
@@ -407,18 +413,17 @@ mod tests {
             serde_json::json!({"exit_code": 0, "signal": null, "stdout_truncated": true}),
             1,
         );
-        assert_eq!(classify_cargo_result(&r).unwrap(), CargoOutcome::Ok);
+        assert_eq!(classify_cargo_result(&r).unwrap(), CargoRan::Exited(0));
     }
 
     #[test]
-    fn vc2_any_signal_is_transient_never_compile_regardless_of_exit_code() {
+    fn vc2_any_signal_is_inconclusive_never_compile_regardless_of_exit_code() {
         for exit_code in [None, Some(101), Some(9)] {
             let r = failed_result(exit_code, Some(9), false, exec_failed(exit_code, Some(9)));
-            let err = classify_cargo_result(&r).unwrap_err();
             assert!(
                 matches!(
-                    err,
-                    AdapterError::ToolFailure(ToolError::Transient { ref code, .. }) if code == "cargo_signal"
+                    classify_cargo_result(&r).unwrap(),
+                    CargoRan::Inconclusive(ref reason) if reason.contains("signal 9")
                 ),
                 "exit_code={exit_code:?}"
             );
@@ -426,23 +431,33 @@ mod tests {
     }
 
     #[test]
-    fn exit_code_outside_0_101_no_signal_is_permanent() {
+    fn exit_code_outside_0_101_is_inconclusive_verdict() {
+        // §7.11 item 6: cargo exiting 2 (bad args, ICE, …) decided nothing
+        // about the agent's patch — Inconclusive, not a failure label.
         let r = failed_result(Some(2), None, false, exec_failed(Some(2), None));
-        let err = classify_cargo_result(&r).unwrap_err();
+        assert_eq!(classify_cargo_result(&r).unwrap(), CargoRan::Exited(2));
         assert!(matches!(
-            err,
-            AdapterError::ToolFailure(ToolError::Permanent { code, .. }) if code == "cargo_exit_2"
+            cargo_exit_verdict(Some(2), false),
+            VerdictOutcome::Inconclusive { reason } if reason.contains("exited 2")
         ));
     }
 
     #[test]
-    fn no_exit_code_no_signal_is_transient_no_exit() {
+    fn no_exit_code_no_signal_is_inconclusive() {
         let r = failed_result(None, None, false, exec_failed(None, None));
-        let err = classify_cargo_result(&r).unwrap_err();
         assert!(matches!(
-            err,
-            AdapterError::ToolFailure(ToolError::Transient { code, .. }) if code == "cargo_no_exit"
+            classify_cargo_result(&r).unwrap(),
+            CargoRan::Inconclusive(reason) if reason.contains("no exit code")
         ));
+    }
+
+    /// §7.11 item 5: the shared decision closes the old blind spot — exit 0
+    /// with error-level diagnostics is Fail, exactly as `alloy-eval`'s
+    /// `compile_clean` always said.
+    #[test]
+    fn exit_0_with_error_diagnostics_is_fail() {
+        assert_eq!(cargo_exit_verdict(Some(0), true), VerdictOutcome::Fail);
+        assert_eq!(cargo_exit_verdict(Some(0), false), VerdictOutcome::Pass);
     }
 
     #[test]
@@ -654,8 +669,8 @@ mod tests {
             storage.artifacts(),
         );
         let ctx = exec_ctx();
-        let outcome = adapter.check(&ctx).await.unwrap();
-        assert!(outcome.ok);
+        let outcome = adapter.verify(&ctx).await.unwrap();
+        assert!(outcome.passed());
         assert_eq!(outcome.diagnostics.len(), 1);
         assert_eq!(
             outcome.diagnostics[0].level,
@@ -699,8 +714,8 @@ mod tests {
             Arc::new(AlwaysGrantPerms),
             storage.artifacts(),
         );
-        let outcome = adapter.check(&exec_ctx()).await.unwrap();
-        assert!(!outcome.ok);
+        let outcome = adapter.verify(&exec_ctx()).await.unwrap();
+        assert_eq!(outcome.outcome, VerdictOutcome::Fail);
         assert_eq!(outcome.diagnostics.len(), 1);
         assert!(
             outcome.raw_artifact.is_some(),
@@ -731,7 +746,7 @@ mod tests {
             Arc::new(AlwaysGrantPerms),
             storage.artifacts(),
         );
-        let outcome = adapter.test(&exec_ctx()).await.unwrap();
+        let outcome = adapter.verify(&exec_ctx()).await.unwrap();
         assert!(outcome.diagnostics.is_empty());
         storage.close().await.unwrap();
     }
@@ -745,7 +760,7 @@ mod tests {
             Arc::new(AlwaysGrantPerms),
             storage.artifacts(),
         );
-        let err = adapter.check(&exec_ctx()).await.unwrap_err();
+        let err = adapter.verify(&exec_ctx()).await.unwrap_err();
         assert!(matches!(err, AdapterError::ShuttingDown));
         storage.close().await.unwrap();
     }

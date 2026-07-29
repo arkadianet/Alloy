@@ -460,9 +460,49 @@ impl InProcessMcpHost {
         outcome.map(|result| result.with_call_id(call.call_id.clone()))
     }
 
+    /// Canonical `{arguments, outcome}` digest for a tool call.
+    /// Deterministic and *stable*: only the logical content is hashed —
+    /// `call_id` (per-call correlation) and `duration_ms` (wall clock) are
+    /// projected out, so the same arguments with the same logical outcome
+    /// hash identically across calls and processes. `serde_json`'s map is a
+    /// `BTreeMap`, so key order is sorted.
+    fn content_hash_for(
+        call: &ToolCall,
+        outcome: &Result<ToolResult, McpError>,
+    ) -> alloy_runtime::Digest {
+        let outcome_json = match outcome {
+            Ok(result) => serde_json::json!({
+                "ok": {
+                    "name": result.name.as_str(),
+                    "content": result.content,
+                    "is_error": result.is_error(),
+                    "error": result.error().map(std::string::ToString::to_string),
+                }
+            }),
+            Err(err) => serde_json::json!({ "mcp_error": err.to_string() }),
+        };
+        let canonical = serde_json::json!({
+            "arguments": call.arguments,
+            "outcome": outcome_json,
+        });
+        alloy_runtime::hash_tool_body(&canonical.to_string())
+    }
+
     /// Await the optional [`DecisionLog`] write. Skipped entirely when the call
     /// carries no session; obs failures warn and never change the return value.
-    async fn record_call(&self, call: &ToolCall, latency: Duration, denied: bool) {
+    ///
+    /// `content_hash` is populated **unconditionally** (research §7.11 item 2):
+    /// the hash of the canonical `{arguments, outcome}` JSON is the join key
+    /// that lets a run be reconstructed later, and unlike the body it survives
+    /// every retention policy. It is a digest, never content — no retention
+    /// or redaction decision applies to it.
+    async fn record_call(
+        &self,
+        call: &ToolCall,
+        outcome: &Result<ToolResult, McpError>,
+        latency: Duration,
+        denied: bool,
+    ) {
         let Some(log) = self.state.decision_log.get() else {
             return;
         };
@@ -477,7 +517,7 @@ impl InProcessMcpHost {
             tool_server: Some(BUILTIN_SERVER.to_string()),
             latency_ms: Some(u64::try_from(latency.as_millis()).unwrap_or(u64::MAX)),
             denied,
-            content_hash: None,
+            content_hash: Some(Self::content_hash_for(call, outcome)),
             body: None,
         };
         if let Err(err) = log.record_tool_call(record).await {
@@ -520,7 +560,8 @@ impl InProcessMcpHost {
             }
         }
 
-        self.record_call(&call, started.elapsed(), denied).await;
+        self.record_call(&call, &outcome, started.elapsed(), denied)
+            .await;
         drop(admitted);
         outcome
     }

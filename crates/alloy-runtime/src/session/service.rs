@@ -182,10 +182,17 @@ impl SessionService for SessionServiceView {
         };
         let id = session.id;
 
-        self.rows().upsert_session(&session).await.map_err(|e| {
-            warn!(error = %e, "session create failed");
-            store_to_session(e)
-        })?;
+        let provenance = req
+            .provenance
+            .clone()
+            .unwrap_or_else(crate::types::provenance::SessionProvenance::unknown);
+        self.rows()
+            .upsert_session(&session, &provenance)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "session create failed");
+                store_to_session(e)
+            })?;
 
         let payload = json!({
             "workspace_root": req.workspace_root.to_string_lossy(),
@@ -331,7 +338,12 @@ impl SessionService for SessionServiceView {
         let run = RunId::new();
         let dag_id = DagId::new();
         let now = Timestamp::now();
-        let record = RunGoalRecord { goal, dag_id };
+        let record = RunGoalRecord {
+            goal,
+            dag_id,
+            trajectory_id: Some(crate::types::ids::TrajectoryId::new()),
+            trajectory_schema: crate::session::TRAJECTORY_SCHEMA_VERSION,
+        };
         let goal_json = serde_json::to_value(&record)
             .map_err(|e| SessionError::Internal(format!("serialize goal record: {e}")))?;
 

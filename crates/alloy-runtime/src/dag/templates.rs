@@ -196,6 +196,20 @@ fn adapter_retry() -> RetryPolicy {
     }
 }
 
+/// Verify nodes admit `ErrorClass::Tool` retries: a `VerdictOutcome::
+/// Inconclusive` (signal-killed cargo, truncated output — research §7.11
+/// item 6) is an infrastructure no-answer, and one bounded re-run is the
+/// correct response. Genuine `Compile`/`Test` failures stay non-retryable.
+fn verify_retry() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 2,
+        backoff: Backoff::Fixed { delay_ms: 1000 },
+        retry_on: vec![ErrorClass::Tool],
+        escalate_after: None,
+        escalate_to_tier: None,
+    }
+}
+
 fn build_catalog() -> Vec<TemplateManifest> {
     let repair = TemplateManifest {
         id: TemplateId::RepairLocalDiagnostic,
@@ -233,7 +247,7 @@ fn build_catalog() -> Vec<TemplateManifest> {
                 name: "verify".into(),
                 kind: NodeKind::VerifyCompile,
                 capability: None,
-                retry: adapter_retry(),
+                retry: verify_retry(),
                 budget: TokenBudget {
                     max_input: 0,
                     max_output: 0,
@@ -536,12 +550,12 @@ mod tests {
             .find(|n| n.kind == NodeKind::VerifyCompile)
             .unwrap();
         assert!(verify.capability.is_none());
-        assert_eq!(verify.retry.max_attempts, 1);
+        assert_eq!(verify.retry.max_attempts, 2);
         assert!(matches!(
             verify.retry.backoff,
-            Backoff::Fixed { delay_ms: 0 }
+            Backoff::Fixed { delay_ms: 1000 }
         ));
-        assert!(verify.retry.retry_on.is_empty());
+        assert_eq!(verify.retry.retry_on, vec![ErrorClass::Tool]);
         assert!(verify.retry.escalate_after.is_none());
         assert!(verify.retry.escalate_to_tier.is_none());
         assert_eq!(verify.budget.max_input, 0);
