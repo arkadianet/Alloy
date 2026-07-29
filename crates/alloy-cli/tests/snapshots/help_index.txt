@@ -1,0 +1,13 @@
+Rebuild the project graph for this workspace
+
+Usage: alloy index [OPTIONS]
+
+Options:
+      --rebuild                Force a full rebuild (default: rebuild if stale)
+      --workspace <WORKSPACE>  Workspace root used to resolve config files and `.alloy` (CL2) [default: .]
+      --profile <PROFILE>      Catalog profile id: default | autonomous | readonly (CL4)
+      --stats                  Print the graph metrics snapshot and exit without writing (IX8)
+      --json                   Emit machine-readable JSON on stdout (CL3)
+      --quiet                  Suppress progress rendering on stderr (CL7)
+      --verbose                Raise the tracing filter (CL7)
+  -h, --help                   Print help

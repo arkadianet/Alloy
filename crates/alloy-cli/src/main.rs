@@ -1,50 +1,115 @@
-//! Alloy CLI (`alloy` binary) — RFC-0001 stub.
+//! Alloy CLI (`alloy` binary) — RFC-0015 composition root plus a terminal.
+//!
+//! `alloy-cli` parses argv, resolves config, builds every subsystem in one
+//! honest order (§6.2), hands the object graph to the control plane, and
+//! renders what the control plane returns. It contains no planning,
+//! scheduling, retry, budget, or verification decision (rule B1).
 //!
 //! Author: arkadianet
+
+#![forbid(unsafe_code)]
+
+mod args;
+mod assembly;
+mod commands;
+mod errx;
+mod outfmt;
+mod resolve;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use alloy_runtime::{AlloyRuntime, ConfigPaths, RuntimeConfig, RuntimePhase};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use tracing::error;
 
-#[derive(Debug, Parser)]
-#[command(name = "alloy", version, about = "Alloy AI Engineering Runtime", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
+use crate::args::{Cli, Commands};
+use crate::errx::{CliError, Exit};
 
-#[derive(Debug, Subcommand)]
-enum Commands {
-    /// Start the runtime host and wait for shutdown signal (lifecycle smoke).
-    Host {
-        /// Workspace root used to resolve `.alloy` and config files.
-        #[arg(long, default_value = ".")]
-        workspace: PathBuf,
-    },
-}
-
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // CL9 — argument parsing completes before any file, network, or process
+    // I/O, so `--help` / `--version` work in a directory with no config.
     let cli = Cli::parse();
-    match cli.command {
-        None => {
-            println!("alloy {}", env!("CARGO_PKG_VERSION"));
-            println!("Run `alloy --help` for usage.");
-            ExitCode::SUCCESS
-        }
-        Some(Commands::Host { workspace }) => match run_host(workspace).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                error!(error = %e, "host failed");
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
+
+    let body = async move {
+        match cli.command {
+            None => {
+                println!("alloy {}", env!("CARGO_PKG_VERSION"));
+                println!("Run `alloy --help` for usage.");
+                ExitCode::SUCCESS
             }
-        },
+            Some(Commands::Host) => {
+                // CL1 — preserved RFC-0001 behaviour.
+                match run_host(cli.globals.workspace.clone()).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        error!(error = %e, "host failed");
+                        eprintln!("error: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Some(command) => {
+                init_tracing_for(&cli.globals);
+                let json = cli.globals.json;
+                let name = command_name(&command);
+                match commands::dispatch(cli.globals, command).await {
+                    Ok(exit) => ExitCode::from(exit.code()),
+                    Err(e) => {
+                        report_error(name, json, &e);
+                        ExitCode::from(e.exit.code())
+                    }
+                }
+            }
+        }
+    };
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(body)
+}
+
+fn command_name(c: &Commands) -> &'static str {
+    match c {
+        Commands::Run(_) => "run",
+        Commands::Events(_) => "events",
+        Commands::Approve(_) => "approve",
+        Commands::Cancel(_) => "cancel",
+        Commands::Resume(_) => "resume",
+        Commands::Index(_) => "index",
+        Commands::Host => "host",
     }
+}
+
+/// Failure rendering: human diagnostics on stderr always; with `--json` the
+/// envelope (without config echo — resolution may be what failed) on stdout.
+fn report_error(command: &str, json: bool, e: &CliError) {
+    eprintln!("error: {e}");
+    if json {
+        let doc = outfmt::envelope(
+            command,
+            e.exit,
+            None,
+            serde_json::json!({ "error": e.message }),
+        );
+        println!("{doc}");
+    }
+}
+
+/// CL7 — `--verbose` raises the tracing filter; `--quiet` never changes
+/// stdout or the exit code (handlers consult it for stderr progress).
+fn init_tracing_for(globals: &args::Globals) {
+    if globals.verbose && std::env::var_os("RUST_LOG").is_none() {
+        std::env::set_var(
+            "RUST_LOG",
+            "alloy=debug,alloy_runtime=debug,alloy_tools=debug",
+        );
+    }
+    // OUT1 — CLI diagnostics go to stderr; stdout is results only.
+    alloy_runtime::logging::init_tracing_stderr();
 }
 
 async fn run_host(workspace: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -112,8 +177,29 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
     }
 }
 
+/// CR14/CR15/CR17 — arm the signal task for long-running subcommands
+/// (`run`, `resume`, `index`; CL8). First signal cancels the runtime token
+/// and nothing else; a second signal during drain escalates to an immediate
+/// exit with `EX_CANCELLED`.
+/// Takes a `cancel` closure instead of the token type so this crate never
+/// names the token crate directly (T9); callers pass a closure over
+/// `RuntimeHandle::cancellation()`.
+pub(crate) fn arm_signal_task(
+    cancel: impl FnOnce() + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if wait_for_shutdown_signal().await.is_ok() {
+            cancel();
+        }
+        if wait_for_shutdown_signal().await.is_ok() {
+            tracing::warn!("second signal: escalating past drain");
+            std::process::exit(i32::from(Exit::Cancelled.code()));
+        }
+    })
+}
+
 /// Drain (when Running) then shutdown — production signal path and test seam.
-async fn graceful_shutdown(
+pub(crate) async fn graceful_shutdown(
     rt: AlloyRuntime,
     grace: Duration,
 ) -> Result<(), alloy_runtime::RuntimeError> {

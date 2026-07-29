@@ -374,3 +374,71 @@ fn host_never_writes_dotenv() {
         "the host must never rewrite .env"
     );
 }
+
+// --- RFC-0015 §12.2 lifecycle additions -------------------------------------
+
+/// SEC1 — a sentinel `.env` is byte-identical after running every
+/// subcommand (process level; extends the merged loader regression).
+#[test]
+fn no_dotenv_written_by_any_subcommand() {
+    let dir = workspace();
+    let dotenv = dir.path().join(".env");
+    let sentinel = "SENTINEL=1\n# do not touch\n";
+    std::fs::write(&dotenv, sentinel).unwrap();
+
+    let bogus = "00000000-0000-4000-8000-000000000000";
+    let argsets: Vec<Vec<&str>> = vec![
+        vec!["run", "goal", "--dry-run"],
+        vec!["events", "--session", bogus],
+        vec![
+            "approve",
+            "--run",
+            bogus,
+            "--gate",
+            bogus,
+            "--decision",
+            "allow",
+        ],
+        vec!["cancel", "--run", bogus],
+        vec!["resume", "--session", bogus],
+        vec!["index", "--stats"],
+    ];
+    for args in argsets {
+        // Exit codes vary (bogus ids); the property under test is the file.
+        let _ = Command::new(env!("CARGO_BIN_EXE_alloy"))
+            .args(&args)
+            .current_dir(dir.path())
+            .env_remove("ALLOY_API_KEY")
+            .env_remove("ALLOY_DATA_DIR")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&dotenv).unwrap(),
+            sentinel,
+            "a subcommand touched .env: {args:?}"
+        );
+    }
+}
+
+/// SEC2 — a `.env` file setting the API key does **not** satisfy the
+/// router: credentials come from the process environment only.
+#[test]
+fn no_dotenv_read() {
+    let dir = workspace();
+    std::fs::write(dir.path().join(".env"), "ALLOY_API_KEY=from-dotenv\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_alloy"))
+        .args(["run", "fix it"])
+        .current_dir(dir.path())
+        .env_remove("ALLOY_API_KEY")
+        .env_remove("ALLOY_DATA_DIR")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3), "expected EX_CONFIG");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ALLOY_API_KEY"),
+        "error must name the variable: {stderr}"
+    );
+}

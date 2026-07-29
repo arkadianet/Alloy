@@ -1,0 +1,22 @@
+Alloy AI Engineering Runtime
+
+Usage: alloy [OPTIONS] [COMMAND]
+
+Commands:
+  run      Take a goal to a compile-verified patch (or an honest failure)
+  events   List session events from durable storage
+  approve  Resolve a human gate from any process
+  cancel   Cancel a run
+  resume   Resume a session and re-dispatch its non-terminal run
+  index    Rebuild the project graph for this workspace
+  host     Start the runtime host and wait for shutdown signal (RFC-0001, preserved unchanged — CL1)
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --workspace <WORKSPACE>  Workspace root used to resolve config files and `.alloy` (CL2) [default: .]
+      --profile <PROFILE>      Catalog profile id: default | autonomous | readonly (CL4)
+      --json                   Emit machine-readable JSON on stdout (CL3)
+      --quiet                  Suppress progress rendering on stderr (CL7)
+      --verbose                Raise the tracing filter (CL7)
+  -h, --help                   Print help
+  -V, --version                Print version

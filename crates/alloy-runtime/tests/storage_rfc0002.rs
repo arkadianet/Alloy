@@ -911,3 +911,35 @@ async fn crash_after_commit_reopen_sees_event() {
     assert_eq!(listed[0].seq, EventSeq(0));
     storage.close().await.unwrap();
 }
+
+/// RFC-0015 §5.6 amendment A3 — `sessions.graph_version` is writable, the
+/// write survives a later `upsert_session`, and a missing session id fails
+/// loudly instead of no-opping.
+#[tokio::test]
+async fn set_graph_version_writes_and_survives_upsert() {
+    let (_dir, storage) = open_temp().await;
+    let rows = storage.sessions();
+    let session = Session {
+        id: SessionId::new(),
+        workspace_root: "/tmp/ws".into(),
+        profile: ProfileId::new("default").unwrap(),
+        budget: BudgetPolicy::default(),
+        language_backends: vec![LanguageId::new("rust").unwrap()],
+        created_at: Timestamp::now(),
+    };
+    rows.upsert_session(&session).await.unwrap();
+    rows.set_graph_version(session.id, alloy_runtime::GraphVersion(7))
+        .await
+        .unwrap();
+    // The upsert conflict clause does not overwrite graph_version.
+    rows.upsert_session(&session).await.unwrap();
+    rows.set_graph_version(session.id, alloy_runtime::GraphVersion(8))
+        .await
+        .unwrap();
+
+    let missing = rows
+        .set_graph_version(SessionId::new(), alloy_runtime::GraphVersion(1))
+        .await;
+    assert!(matches!(missing, Err(StoreError::Corrupt(_))));
+    storage.close().await.unwrap();
+}

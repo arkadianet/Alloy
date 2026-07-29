@@ -87,17 +87,93 @@ pub struct RuntimeConfig {
     pub retain_full_prompts: bool,
     /// Retain tool bodies in logs (default false).
     pub retain_tool_bodies: bool,
-    /// Default run timeout.
+    /// Run timeout from the profile `[limits].run_timeout_secs` (RFC-0015 §5.6
+    /// amendment A2); defaults to 30 minutes when the table is absent.
     pub run_timeout: Duration,
     /// From profile `[budgets]`, or [`BudgetPolicy::default`] when the table is absent (RFC-0007 §7.6).
     pub budget_policy: BudgetPolicy,
     /// From profile `[context]`, or [`crate::context::ContextProfile::v2_defaults`]
     /// when the table is absent (RFC-0012 §4.6).
     pub context_profile: crate::context::ContextProfile,
+    /// `[profile].id` from the profile file (RFC-0015 PF4). `None` when the
+    /// `[profile]` table is absent (pre-RFC-0015 skeleton profiles).
+    pub profile_id: Option<String>,
+    /// Parsed `[gates]` table, or defaults (RFC-0015 §5.6 amendment A1).
+    pub gates: GatesConfig,
+    /// Opaque echo of `[sandbox]` for the RFC-0015 CR6 cross-check. `None`
+    /// when the table is absent (read-only subcommands tolerate that).
+    pub sandbox_echo: Option<SandboxEcho>,
+    /// Gate timeout from `[limits].gate_timeout_secs`; `None` waits
+    /// indefinitely (RFC-0015 §5.2 `[limits]`).
+    pub gate_timeout: Option<Duration>,
+}
+
+/// Parsed `[gates]` table (RFC-0015 amendment A1).
+///
+/// `allow_raw_bash` MUST be `false` and `require_cargo_check` MUST be `true`
+/// in every catalog profile (rules PF6/PF7); [`RuntimeConfig::load`] fails
+/// closed on violations, so a constructed value always satisfies both.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatesConfig {
+    /// Verification gate; MUST stay `true` (PF7).
+    #[serde(default = "default_true")]
+    pub require_cargo_check: bool,
+    /// Human gate on public API changes.
+    #[serde(default = "default_true")]
+    pub require_human_on_public_api: bool,
+    /// Human gate on new `unsafe`.
+    #[serde(default = "default_true")]
+    pub require_human_on_new_unsafe: bool,
+    /// Human gate on new dependencies.
+    #[serde(default = "default_true")]
+    pub require_human_on_new_dependency: bool,
+    /// Raw bash tool; MUST stay `false` (PF6).
+    #[serde(default)]
+    pub allow_raw_bash: bool,
+}
+
+impl Default for GatesConfig {
+    fn default() -> Self {
+        Self {
+            require_cargo_check: true,
+            require_human_on_public_api: true,
+            require_human_on_new_unsafe: true,
+            require_human_on_new_dependency: true,
+            allow_raw_bash: false,
+        }
+    }
+}
+
+/// Opaque `[sandbox]` echo for the RFC-0015 CR6 cross-check.
+///
+/// The schema owner is `alloy-tools::load_sandbox_profile`; this echo exists
+/// only so the composition root can assert both parsers read the same
+/// `network` / `quarantine_deps` values from the same file.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxEcho {
+    /// Backend for the check class.
+    pub check: String,
+    /// Backend for the test class.
+    pub test: String,
+    /// Network policy string; MUST be `"deny"` (PF8).
+    #[serde(default = "default_deny")]
+    pub network: String,
+    /// Dependency quarantine; MUST be `true` (PF8).
+    #[serde(default = "default_true")]
+    pub quarantine_deps: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProfileFile {
+    #[serde(default)]
+    profile: Option<ProfileSection>,
+    #[serde(default)]
+    gates: Option<GatesConfig>,
+    #[serde(default)]
+    sandbox: Option<SandboxEcho>,
     #[serde(default)]
     budgets: Option<BudgetsSection>,
     #[serde(default)]
@@ -106,17 +182,36 @@ struct ProfileFile {
     /// (`ContextProfile::from_toml_table`, rules D2/D19).
     #[serde(default)]
     context: Option<toml::Table>,
+    #[serde(default)]
+    limits: Option<LimitsSection>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileSection {
+    id: String,
+    #[serde(default)]
+    #[allow(dead_code)] // documentation-only field; parsed so PF14 accepts it
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BudgetsSection {
     #[serde(default = "default_usd")]
     max_usd_per_run: f64,
     #[serde(default = "default_tokens")]
     max_tokens_per_run: u64,
+    #[serde(default = "default_one")]
+    max_parallel_nodes: u32,
+    #[serde(default = "default_one")]
+    max_parallel_cargo: u32,
+    #[serde(default = "default_one")]
+    max_parallel_edits: u32,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObservabilitySection {
     #[serde(default)]
     retain_full_prompts: bool,
@@ -124,11 +219,32 @@ struct ObservabilitySection {
     retain_tool_bodies: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsSection {
+    #[serde(default = "default_run_timeout_secs")]
+    run_timeout_secs: u64,
+    #[serde(default)]
+    gate_timeout_secs: Option<u64>,
+}
+
 fn default_usd() -> f64 {
     5.0
 }
 fn default_tokens() -> u64 {
     2_000_000
+}
+fn default_one() -> u32 {
+    1
+}
+fn default_true() -> bool {
+    true
+}
+fn default_deny() -> String {
+    "deny".into()
+}
+fn default_run_timeout_secs() -> u64 {
+    60 * 30
 }
 
 impl RuntimeConfig {
@@ -180,13 +296,74 @@ impl RuntimeConfig {
             None => crate::context::ContextProfile::v2_defaults(),
         };
 
+        // RFC-0015 PF13: weights must be finite, non-negative, and sum to
+        // 1.0 ± 1e-6 (stricter than RFC-0012's own normalizing validate).
+        {
+            let w = &context_profile.weights;
+            let sum = f64::from(w.conversation) + f64::from(w.working_set) + f64::from(w.artifacts);
+            if !sum.is_finite() || (sum - 1.0).abs() > 1e-6 {
+                return Err(RuntimeError::Config(format!(
+                    "profile {} [context].weights must sum to 1.0 (got {sum}) (RFC-0015 PF13)",
+                    paths.profile.display()
+                )));
+            }
+        }
+
         let budget_policy = match profile.budgets {
             Some(b) => BudgetPolicy {
                 max_usd_per_run: b.max_usd_per_run,
                 max_tokens_per_run: b.max_tokens_per_run,
-                ..BudgetPolicy::default()
+                max_parallel_nodes: b.max_parallel_nodes,
+                max_parallel_cargo: b.max_parallel_cargo,
+                max_parallel_edits: b.max_parallel_edits,
             },
             None => BudgetPolicy::default(),
+        };
+
+        // RFC-0015 fail-closed profile validation (PF6/PF7/PF8/PF12).
+        let profile_display = paths.profile.display();
+        let gates = profile.gates.unwrap_or_default();
+        if gates.allow_raw_bash {
+            return Err(RuntimeError::Config(format!(
+                "profile {profile_display} [gates].allow_raw_bash must be false in every catalog profile (RFC-0015 PF6)"
+            )));
+        }
+        if !gates.require_cargo_check {
+            return Err(RuntimeError::Config(format!(
+                "profile {profile_display} [gates].require_cargo_check must be true in every catalog profile (RFC-0015 PF7)"
+            )));
+        }
+        if let Some(sandbox) = &profile.sandbox {
+            if sandbox.network != "deny" {
+                return Err(RuntimeError::Config(format!(
+                    "profile {profile_display} [sandbox].network must be \"deny\" (RFC-0015 PF8), got {:?}",
+                    sandbox.network
+                )));
+            }
+            if !sandbox.quarantine_deps {
+                return Err(RuntimeError::Config(format!(
+                    "profile {profile_display} [sandbox].quarantine_deps must be true (RFC-0015 PF8)"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("max_parallel_nodes", budget_policy.max_parallel_nodes),
+            ("max_parallel_cargo", budget_policy.max_parallel_cargo),
+            ("max_parallel_edits", budget_policy.max_parallel_edits),
+        ] {
+            if value != 1 {
+                return Err(RuntimeError::Config(format!(
+                    "profile {profile_display} [budgets].{name} must be 1 (RFC-0015 PF12; host parallel honesty), got {value}"
+                )));
+            }
+        }
+
+        let (run_timeout, gate_timeout) = match &profile.limits {
+            Some(l) => (
+                Duration::from_secs(l.run_timeout_secs),
+                l.gate_timeout_secs.map(Duration::from_secs),
+            ),
+            None => (Duration::from_secs(default_run_timeout_secs()), None),
         };
 
         Ok(Self {
@@ -197,9 +374,13 @@ impl RuntimeConfig {
             env_file_hint: paths.example_env,
             retain_full_prompts: profile.observability.retain_full_prompts,
             retain_tool_bodies: profile.observability.retain_tool_bodies,
-            run_timeout: Duration::from_secs(60 * 30),
+            run_timeout,
             budget_policy,
             context_profile,
+            profile_id: profile.profile.map(|p| p.id),
+            gates,
+            sandbox_echo: profile.sandbox,
+            gate_timeout,
         })
     }
 }

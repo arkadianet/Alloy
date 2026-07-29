@@ -69,7 +69,7 @@ pub use capabilities::{
     WorkerDeps, WorkerPermissions, WorkerToolClass, CAPABILITY_CATALOG, EDIT_SYSTEM,
     MAX_LLM_CAPABILITIES, PAYLOAD_SCHEMA_VERSION, REPAIR_SYSTEM, REVIEW_SYSTEM,
 };
-pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
+pub use config::{default_router_toml, ConfigPaths, GatesConfig, RuntimeConfig, SandboxEcho};
 pub use context::{
     AssembleInputs, AssembleRequest, BytesPerTokenEstimator, CompactStrategy, ContextEngine,
     ContextError, ContextHandle, ContextMetricsSnapshot, ContextProfile, DefaultContextEngine,
@@ -130,8 +130,9 @@ pub use scheduler::{
     SchedulerMetrics,
 };
 pub use session::{
-    clamp_events_page_limit, ReplanReason, RunControlState, RunController, RunGoalRecord, Session,
-    SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE,
+    clamp_events_page_limit, validate_mvp_profile, ReplanReason, RunControlState, RunController,
+    RunGoalRecord, Session, SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE,
+    MVP_PROFILES,
 };
 pub use storage::{
     install_sqlite_event_sink, store_to_runtime, store_to_session, AlloyStorage, ArtifactBlob,

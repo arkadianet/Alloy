@@ -1,0 +1,11 @@
+Start the runtime host and wait for shutdown signal (RFC-0001, preserved unchanged — CL1)
+
+Usage: alloy host [OPTIONS]
+
+Options:
+      --workspace <WORKSPACE>  Workspace root used to resolve config files and `.alloy` (CL2) [default: .]
+      --profile <PROFILE>      Catalog profile id: default | autonomous | readonly (CL4)
+      --json                   Emit machine-readable JSON on stdout (CL3)
+      --quiet                  Suppress progress rendering on stderr (CL7)
+      --verbose                Raise the tracing filter (CL7)
+  -h, --help                   Print help

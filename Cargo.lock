@@ -27,11 +27,14 @@ dependencies = [
 name = "alloy-cli"
 version = "0.1.0"
 dependencies = [
+ "alloy-index",
  "alloy-runtime",
+ "alloy-tools",
  "assert_cmd",
  "clap",
  "predicates",
  "rustix 0.38.44",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

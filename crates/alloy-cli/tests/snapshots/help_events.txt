@@ -1,0 +1,17 @@
+List session events from durable storage
+
+Usage: alloy events [OPTIONS]
+
+Options:
+      --session <SESSION>      Session id (default: the most recent session in this workspace)
+      --workspace <WORKSPACE>  Workspace root used to resolve config files and `.alloy` (CL2) [default: .]
+      --profile <PROFILE>      Catalog profile id: default | autonomous | readonly (CL4)
+      --run <RUN>              Filter to one run (display filter, applied after retrieval)
+      --after <AFTER>          Exclusive cursor: return events with seq > AFTER
+      --json                   Emit machine-readable JSON on stdout (CL3)
+      --limit <LIMIT>          Page size (clamped by the merged events-page limit, SQ6) [default: 100]
+      --quiet                  Suppress progress rendering on stderr (CL7)
+      --decisions-only         Only Decision | ModelCall | ToolCall events (obs query helper)
+      --verbose                Raise the tracing filter (CL7)
+      --follow                 Poll until the followed run is terminal or Ctrl-C (SQ7)
+  -h, --help                   Print help

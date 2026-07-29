@@ -204,6 +204,13 @@ impl SessionRows for NoSessions {
     async fn list_runs(&self, _session: SessionId) -> Result<Vec<RunRow>, StoreError> {
         Ok(vec![])
     }
+    async fn set_graph_version(
+        &self,
+        _id: SessionId,
+        _version: alloy_runtime::GraphVersion,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 /// Static grant minting that counts mints (PM5 evidence).

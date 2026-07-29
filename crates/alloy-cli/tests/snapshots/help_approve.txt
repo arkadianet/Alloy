@@ -1,0 +1,38 @@
+Resolve a human gate from any process
+
+Usage: alloy approve [OPTIONS] --run <RUN> --gate <GATE> --decision <DECISION>
+
+Options:
+      --run <RUN>
+          Run id
+
+      --workspace <WORKSPACE>
+          Workspace root used to resolve config files and `.alloy` (CL2)
+          
+          [default: .]
+
+      --gate <GATE>
+          Gate id
+
+      --profile <PROFILE>
+          Catalog profile id: default | autonomous | readonly (CL4)
+
+      --decision <DECISION>
+          allow | deny | allow-once
+
+          Possible values:
+          - allow:      `Approval::Allow`
+          - deny:       `Approval::Deny`
+          - allow-once: `Approval::AllowOnce`
+
+      --json
+          Emit machine-readable JSON on stdout (CL3)
+
+      --quiet
+          Suppress progress rendering on stderr (CL7)
+
+      --verbose
+          Raise the tracing filter (CL7)
+
+  -h, --help
+          Print help (see a summary with '-h')

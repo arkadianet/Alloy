@@ -1,0 +1,13 @@
+Resume a session and re-dispatch its non-terminal run
+
+Usage: alloy resume [OPTIONS] --session <SESSION>
+
+Options:
+      --session <SESSION>      Session id
+      --workspace <WORKSPACE>  Workspace root used to resolve config files and `.alloy` (CL2) [default: .]
+      --profile <PROFILE>      Catalog profile id: default | autonomous | readonly (CL4)
+      --run <RUN>              Run id (default: the session's single non-terminal run)
+      --json                   Emit machine-readable JSON on stdout (CL3)
+      --quiet                  Suppress progress rendering on stderr (CL7)
+      --verbose                Raise the tracing filter (CL7)
+  -h, --help                   Print help

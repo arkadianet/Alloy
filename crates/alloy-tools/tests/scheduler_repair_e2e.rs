@@ -415,6 +415,10 @@ planning = "standard"
                 run_timeout: Duration::from_secs(300),
                 budget_policy: BudgetPolicy::default(),
                 context_profile: alloy_runtime::ContextProfile::v2_defaults(),
+                profile_id: Some("default".into()),
+                gates: alloy_runtime::GatesConfig::default(),
+                sandbox_echo: None,
+                gate_timeout: None,
             })
             .unwrap();
             let handle = rt.start().await.unwrap();

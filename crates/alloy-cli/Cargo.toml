@@ -11,11 +11,17 @@ rust-version.workspace = true
 name = "alloy"
 path = "src/main.rs"
 
+# RFC-0015 T9: dependencies stay a subset of
+# {alloy-runtime, alloy-tools, alloy-index, clap, tokio, tracing, serde_json,
+#  anyhow-or-equivalent}. No HTTP client, no TOML parser of its own.
 [dependencies]
 alloy-runtime = { workspace = true, features = ["http-provider"] }
+alloy-tools = { path = "../alloy-tools" }
+alloy-index = { path = "../alloy-index" }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
