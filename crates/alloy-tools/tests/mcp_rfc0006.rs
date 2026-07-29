@@ -405,6 +405,19 @@ fn hermetic_homes(root: &Path) -> Option<OperatorHomes> {
     let cargo_home = root.join("cargo-home");
     std::fs::create_dir_all(cargo_home.join("bin")).ok()?;
     std::fs::copy(which_cargo()?, cargo_home.join("bin/cargo")).ok()?;
+    // Dogfood regression (2026-07-29): an operator config with a shared
+    // target-dir and a registry token. The broker binds a token-stripped
+    // copy over it; the forced CARGO_TARGET_DIR overrides the target-dir.
+    // Before that fix this exact file failed every sandboxed check with
+    // "could not load Cargo configuration".
+    std::fs::write(
+        cargo_home.join("config.toml"),
+        format!(
+            "[build]\ntarget-dir = \"{}\"\n\n[registry]\ntoken = \"hermetic-test-token\"\n",
+            root.join("outside-target").display()
+        ),
+    )
+    .ok()?;
     Some(OperatorHomes::new(cargo_home, real.rustup_home))
 }
 

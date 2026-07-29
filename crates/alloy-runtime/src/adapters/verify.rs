@@ -140,6 +140,9 @@ async fn run_verify(
             diagnostics
                 .iter()
                 .any(|d| d.level == crate::types::diagnostic::DiagnosticLevel::Error),
+            // Check: a failing build always yields error diagnostics, so a
+            // bare 101 is cargo's own failure. Test: failures yield none.
+            matches!(class, VerifyClass::Compile),
         ),
         CargoRan::Inconclusive(reason) => VerdictOutcome::Inconclusive { reason },
     };
@@ -417,8 +420,31 @@ mod tests {
     fn vc1_exit_101_no_signal_not_truncated_is_a_fail_verdict() {
         let r = failed_result(Some(101), None, false, exec_failed(Some(101), None));
         assert_eq!(classify_cargo_result(&r).unwrap(), CargoRan::Exited(101));
-        // 101 is Fail on its own — independent of the diagnostics rule.
-        assert_eq!(cargo_exit_verdict(Some(101), false), VerdictOutcome::Fail);
+        // Test class: 101 is Fail on its own — test failures produce no
+        // rustc error diagnostics by design (DG7).
+        assert_eq!(
+            cargo_exit_verdict(Some(101), false, false),
+            VerdictOutcome::Fail
+        );
+    }
+
+    /// Dogfood finding (2026-07-29): cargo exits 101 for its *own* failures
+    /// too — "could not load Cargo configuration" died before compiling
+    /// anything, and calling that a compile Fail sent the repair loop after
+    /// a phantom defect. For the check class a failing build always yields
+    /// rustc error diagnostics, so 101 without any is a no-answer.
+    #[test]
+    fn vc1b_check_class_101_without_diagnostics_is_inconclusive() {
+        assert!(matches!(
+            cargo_exit_verdict(Some(101), false, true),
+            VerdictOutcome::Inconclusive { ref reason }
+                if reason.contains("no error diagnostics")
+        ));
+        // With diagnostics present it stays a genuine compile Fail.
+        assert_eq!(
+            cargo_exit_verdict(Some(101), true, true),
+            VerdictOutcome::Fail
+        );
     }
 
     #[test]
@@ -464,7 +490,7 @@ mod tests {
         let r = failed_result(Some(2), None, false, exec_failed(Some(2), None));
         assert_eq!(classify_cargo_result(&r).unwrap(), CargoRan::Exited(2));
         assert!(matches!(
-            cargo_exit_verdict(Some(2), false),
+            cargo_exit_verdict(Some(2), false, true),
             VerdictOutcome::Inconclusive { reason } if reason.contains("exited 2")
         ));
     }
@@ -483,8 +509,14 @@ mod tests {
     /// `compile_clean` always said.
     #[test]
     fn exit_0_with_error_diagnostics_is_fail() {
-        assert_eq!(cargo_exit_verdict(Some(0), true), VerdictOutcome::Fail);
-        assert_eq!(cargo_exit_verdict(Some(0), false), VerdictOutcome::Pass);
+        assert_eq!(
+            cargo_exit_verdict(Some(0), true, true),
+            VerdictOutcome::Fail
+        );
+        assert_eq!(
+            cargo_exit_verdict(Some(0), false, true),
+            VerdictOutcome::Pass
+        );
     }
 
     #[test]

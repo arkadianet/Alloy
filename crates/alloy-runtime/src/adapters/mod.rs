@@ -145,17 +145,33 @@ impl Verdict {
 ///
 /// - exit 0 with no error-level diagnostics → `Pass`
 /// - exit 0 **with** error-level diagnostics → `Fail` (diagnostics win)
-/// - exit 101 → `Fail` (the normal compile/test failure signal)
+/// - exit 101 → `Fail` (the normal compile/test failure signal) — **unless**
+///   `fail_requires_diagnostics` is set and none were parsed, in which case
+///   cargo died before compiling anything (config load failure, internal
+///   error) and the verdict is `Inconclusive`. Check/compile callers pass
+///   `true` (a failing build always yields rustc error diagnostics); test
+///   callers pass `false` (test failures produce none by design, DG7).
 /// - any other exit, or no exit code → `Inconclusive` (cargo itself failed;
 ///   nothing about the agent's patch was decided)
 #[must_use]
-pub fn cargo_exit_verdict(exit_code: Option<i64>, has_error_diagnostics: bool) -> VerdictOutcome {
+pub fn cargo_exit_verdict(
+    exit_code: Option<i64>,
+    has_error_diagnostics: bool,
+    fail_requires_diagnostics: bool,
+) -> VerdictOutcome {
     match exit_code {
         Some(0) => {
             if has_error_diagnostics {
                 VerdictOutcome::Fail
             } else {
                 VerdictOutcome::Pass
+            }
+        }
+        Some(101) if fail_requires_diagnostics && !has_error_diagnostics => {
+            VerdictOutcome::Inconclusive {
+                reason: "cargo exited 101 with no error diagnostics (cargo itself failed \
+                         before compiling; environment, not a compile verdict)"
+                    .into(),
             }
         }
         Some(101) => VerdictOutcome::Fail,

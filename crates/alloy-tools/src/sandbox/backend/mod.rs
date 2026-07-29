@@ -210,10 +210,159 @@ pub fn credential_bind_targets(cargo_home: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Stage a shadow `CARGO_HOME` under `stage_dir` when the operator has a
+/// cargo config file (dogfood finding, 2026-07-29).
+///
+/// Cargo hard-errors when an existing `$CARGO_HOME/config.toml` is
+/// unreadable (EACCES ≠ absent), which failed every sandboxed verify on a
+/// host with any operator config. The file cannot join the RO allowlist —
+/// registry tokens may live in it (see the closed-set note above) — and
+/// Landlock rules are per-mount, so bind-over tricks do not compose. The
+/// child instead gets `CARGO_HOME` pointed at a shadow directory: symlinks
+/// to the real `registry`/`git`/`bin` (readable through the existing RO
+/// rules at their real paths) plus a sanitized copy of the config with
+/// `token`/`secret-key` (secrets) and `build.target-dir` (would escape the
+/// jail) stripped. A config that fails to read or parse becomes empty:
+/// valid empty config for cargo, fail-closed for secrets.
+///
+/// Returns `None` (use the real `CARGO_HOME`) when no config file exists.
+pub fn stage_shadow_cargo_home(
+    cargo_home: &Path,
+    stage_dir: &Path,
+) -> Result<Option<PathBuf>, SandboxError> {
+    let config_names: Vec<&str> = ["config.toml", "config"]
+        .into_iter()
+        .filter(|n| cargo_home.join(n).is_file())
+        .collect();
+    if config_names.is_empty() {
+        return Ok(None);
+    }
+    let shadow = stage_dir.join("cargo-home-shadow");
+    std::fs::create_dir_all(&shadow).map_err(SandboxError::Io)?;
+    #[cfg(unix)]
+    for entry in ["registry", "git", "bin"] {
+        let real = cargo_home.join(entry);
+        if real.exists() {
+            let link = shadow.join(entry);
+            if !link.exists() {
+                std::os::unix::fs::symlink(&real, &link).map_err(SandboxError::Io)?;
+            }
+        }
+    }
+    for name in config_names {
+        let real = cargo_home.join(name);
+        let sanitized = std::fs::read_to_string(&real)
+            .ok()
+            .and_then(|text| text.parse::<toml::Value>().ok())
+            .and_then(|mut value| {
+                strip_unsafe_config_keys(&mut value);
+                toml::to_string(&value).ok()
+            })
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    path = %real.display(),
+                    "operator cargo config unreadable or unparseable; staging empty config"
+                );
+                String::new()
+            });
+        std::fs::write(shadow.join(name), sanitized).map_err(SandboxError::Io)?;
+    }
+    Ok(Some(shadow))
+}
+
+/// Remove `token` / `secret-key` (secrets) and `target-dir` (a shared
+/// build cache outside the jail would fail the write sandbox) at every
+/// table depth.
+fn strip_unsafe_config_keys(value: &mut toml::Value) {
+    if let toml::Value::Table(table) = value {
+        let unsafe_keys: Vec<String> = table
+            .keys()
+            .filter(|k| matches!(&***k, "token" | "secret-key" | "target-dir"))
+            .cloned()
+            .collect();
+        for key in unsafe_keys {
+            table.remove(&key);
+        }
+        for (_, nested) in table.iter_mut() {
+            strip_unsafe_config_keys(nested);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sandbox::glob::{compile_deny_globs, default_deny_globs};
+
+    /// Dogfood finding (2026-07-29): cargo hard-errors when it cannot read
+    /// an existing `$CARGO_HOME/config.toml` (EACCES ≠ absent), so a host
+    /// with any operator cargo config failed every sandboxed verify. The
+    /// shadow home keeps registry/git/bin reachable and strips tokens and
+    /// the jail-escaping target-dir from the config.
+    #[test]
+    fn shadow_cargo_home_strips_tokens_and_target_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo");
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(cargo_home.join("registry")).unwrap();
+        std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            concat!(
+                "[build]\ntarget-dir = \"/srv/shared-target\"\n\n",
+                "[net]\ngit-fetch-with-cli = true\n\n",
+                "[registry]\ntoken = \"sekrit\"\n\n",
+                "[registries.internal]\ntoken = \"sekrit2\"\nindex = \"sparse+https://example.com/\"\n",
+            ),
+        )
+        .unwrap();
+        let shadow = stage_shadow_cargo_home(&cargo_home, &stage)
+            .unwrap()
+            .unwrap();
+        let sanitized = std::fs::read_to_string(shadow.join("config.toml")).unwrap();
+        assert!(!sanitized.contains("sekrit"), "{sanitized}");
+        assert!(!sanitized.contains("shared-target"), "{sanitized}");
+        assert!(sanitized.contains("git-fetch-with-cli"), "{sanitized}");
+        assert!(sanitized.contains("index"), "{sanitized}");
+        assert_eq!(
+            std::fs::read_link(shadow.join("registry")).unwrap(),
+            cargo_home.join("registry")
+        );
+        assert_eq!(
+            std::fs::read_link(shadow.join("bin")).unwrap(),
+            cargo_home.join("bin")
+        );
+        // No credentials file ever appears in the shadow.
+        assert!(!shadow.join("credentials.toml").exists());
+    }
+
+    /// Unparseable config → empty staged config (valid empty config for
+    /// cargo; fail-closed for secrets), and the legacy `config` name works.
+    #[test]
+    fn shadow_cargo_home_falls_back_to_empty_on_parse_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo");
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(cargo_home.join("config"), b"token = not toml [[").unwrap();
+        let shadow = stage_shadow_cargo_home(&cargo_home, &stage)
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(shadow.join("config")).unwrap(), "");
+    }
+
+    /// No operator config → `None`: the real `CARGO_HOME` stays in use.
+    #[test]
+    fn shadow_cargo_home_absent_config_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        assert!(stage_shadow_cargo_home(&cargo_home, dir.path())
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn deny_walk_budget_fail_closed() {

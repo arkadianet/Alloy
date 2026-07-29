@@ -220,15 +220,33 @@ pub(crate) fn parse_model_diff(diff: &str) -> Result<PatchSet, String> {
         while lines.peek().is_some_and(|l| l.starts_with("@@")) {
             let header = lines.next().expect("peeked");
             let mut hunk = parse_hunk_header(header)?;
-            // Consume exactly the counts the header declared: this makes the
-            // body unambiguous even when a deletion line itself begins with
-            // `---` (it can never be confused with a file header).
+            // Parse the body by *structure*, not by the header's declared
+            // counts: local models routinely mis-count, and trusting the
+            // header desynced the file loop into "unexpected line outside a
+            // hunk" (dogfood, 2026-07-29). A body line is any ` `/`-`/`+`
+            // sigil line; a `--- ` line is a deletion in the body unless the
+            // *next* line is a `+++ ` header (which is what the count rule
+            // existed to disambiguate). Counts are recomputed from the body;
+            // the header's numbers are treated as a hint only.
             let mut body: Vec<String> = Vec::new();
             let (mut seen_old, mut seen_new) = (0u32, 0u32);
-            while seen_old < hunk.old_lines || seen_new < hunk.new_lines {
-                let Some(l) = lines.next() else {
-                    return Err("diff ends inside a hunk body".into());
-                };
+            while let Some(&l) = lines.peek() {
+                if l.starts_with("@@") {
+                    break;
+                }
+                if l.starts_with("--- ") {
+                    // A file entry is always `--- ` + `+++ ` + `@@ ` (the
+                    // parser rejects entries without hunks), so anything
+                    // less — e.g. a body pair deleting `-- old` and adding
+                    // `++ new` — stays hunk content.
+                    let mut ahead = lines.clone();
+                    ahead.next();
+                    if ahead.next().is_some_and(|n| n.starts_with("+++ "))
+                        && ahead.peek().is_some_and(|n| n.starts_with("@@"))
+                    {
+                        break; // next file entry, not a deleted body line
+                    }
+                }
                 match l.as_bytes().first() {
                     Some(b' ') => {
                         seen_old += 1;
@@ -236,10 +254,16 @@ pub(crate) fn parse_model_diff(diff: &str) -> Result<PatchSet, String> {
                     }
                     Some(b'-') => seen_old += 1,
                     Some(b'+') => seen_new += 1,
-                    _ => return Err(format!("bad hunk body line: {l:.80}")),
+                    _ => break, // not a body line; outer structure resumes
                 }
                 body.push(l.to_owned());
+                lines.next();
             }
+            if seen_old == 0 && seen_new == 0 {
+                return Err("empty hunk body".into());
+            }
+            hunk.old_lines = seen_old;
+            hunk.new_lines = seen_new;
             // Optional trailing no-newline marker(s).
             while lines
                 .peek()
@@ -522,5 +546,68 @@ mod tests {
         };
         assert!(!hunks[0].eof_newline);
         assert!(!hunks[0].old_eof_no_newline);
+    }
+
+    /// Dogfood finding (2026-07-29, qwen2.5-coder:14b): local models
+    /// routinely mis-count hunk headers. The body is parsed by structure
+    /// (sigil lines) with counts recomputed, so an off-by-one header no
+    /// longer desyncs the file loop into "unexpected line outside a hunk".
+    #[test]
+    fn tolerates_wrong_hunk_counts_by_recomputing_from_body() {
+        // Header claims 3/3; body actually has 4 old / 4 new lines.
+        let diff = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -2,3 +2,3 @@ fn main() {\n fn main() {\n-    let x: i32 = \"no\";\n+    let x: i32 = 0;\n     println!();\n }\n";
+        let set = parse_model_diff(diff).unwrap();
+        let FilePatch::Modify { hunks, .. } = &set.files[0] else {
+            panic!("expected Modify");
+        };
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_lines, 4);
+        assert_eq!(hunks[0].new_lines, 4);
+        assert_eq!(hunks[0].lines.len(), 5);
+    }
+
+    /// A second `@@` hunk is recognized even when the first header's counts
+    /// were wrong (previously the leftover lines fell to the outer loop).
+    #[test]
+    fn tolerates_wrong_counts_before_second_hunk() {
+        let diff = "--- a/a.rs\n+++ b/a.rs\n@@ -1,1 +1,1 @@\n-x\n+y\n z\n@@ -9,1 +9,1 @@\n-p\n+q\n";
+        let set = parse_model_diff(diff).unwrap();
+        let FilePatch::Modify { hunks, .. } = &set.files[0] else {
+            panic!("expected Modify");
+        };
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].old_lines, 2);
+        assert_eq!(hunks[0].new_lines, 2);
+    }
+
+    /// The count-exactness rule existed to disambiguate deleted lines that
+    /// themselves begin with `---`. Structure parsing keeps that safe: a
+    /// `--- ` line only ends the hunk when the *next* line is a `+++ `
+    /// header.
+    #[test]
+    fn deletion_line_starting_with_dashes_stays_in_body() {
+        let diff = "--- a/a.md\n+++ b/a.md\n@@ -1,2 +1,1 @@\n---- separator\n context\n+ context\n";
+        // (body: deletion of "--- separator", context stays.)
+        let set = parse_model_diff(diff).unwrap();
+        let FilePatch::Modify { hunks, .. } = &set.files[0] else {
+            panic!("expected Modify");
+        };
+        assert_eq!(hunks[0].lines.len(), 3);
+    }
+
+    /// A body pair `--- old` / `+++ new` (deleting `-- old`, adding
+    /// `++ new`) is hunk content, not a file boundary: a real file entry is
+    /// always followed by an `@@` header (the parser rejects entries
+    /// without hunks), so only a pair followed by `@@` ends the hunk.
+    #[test]
+    fn body_dash_plus_pair_without_hunk_header_stays_in_body() {
+        let diff = "--- a/f.md\n+++ b/f.md\n@@ -1,2 +1,2 @@\n--- old\n+++ new\n context\n";
+        let set = parse_model_diff(diff).unwrap();
+        assert_eq!(set.files.len(), 1);
+        let FilePatch::Modify { hunks, .. } = &set.files[0] else {
+            panic!("expected Modify");
+        };
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines, vec!["--- old", "+++ new", " context"]);
     }
 }

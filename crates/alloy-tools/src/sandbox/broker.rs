@@ -213,10 +213,19 @@ impl NativeSandboxBroker {
             argv[0] = resolved.original_argv0.clone();
         }
 
+        // Operator cargo config present → the child sees a shadow CARGO_HOME
+        // with a sanitized config (cargo hard-errors on an unreadable one);
+        // registry/git/bin resolve through symlinks to the real, RO-ruled
+        // paths. The IsolateContext keeps the *real* home: RO roots and
+        // credential bind-overs must keep targeting real paths.
+        let shadow_cargo_home =
+            crate::sandbox::backend::stage_shadow_cargo_home(&homes.cargo_home, &exec.root)?;
+        let env_cargo_home = shadow_cargo_home.as_deref().unwrap_or(&homes.cargo_home);
+
         let env = scrub_env(&ScrubInput {
             child_home: &exec.home,
             child_tmpdir: &exec.tmp,
-            cargo_home: &homes.cargo_home,
+            cargo_home: env_cargo_home,
             rustup_home: &homes.rustup_home,
             cargo_target_dir: None,
             env_allow: &req.env_allow,
