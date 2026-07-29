@@ -97,6 +97,7 @@ mod tests {
             max_context: 8192,
             input_usd_per_mtok: input,
             output_usd_per_mtok: output,
+            temperature: None,
         }
     }
 

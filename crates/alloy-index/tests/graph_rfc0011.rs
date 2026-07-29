@@ -1227,6 +1227,40 @@ async fn record_diagnostic_round_trips_and_is_idempotent() {
     g.close().await.unwrap();
 }
 
+/// A full workspace check supersedes all prior diagnostics: the pre-plan
+/// seed clears before re-ingesting so retries never prompt with
+/// already-fixed errors (dogfood, 2026-07-29).
+#[tokio::test]
+async fn clear_diagnostics_removes_all_and_reports_count() {
+    let fx = Fx::new();
+    let g = built(&fx).await;
+    g.record_diagnostic(sample_diagnostic(
+        "toy-core",
+        "E0308",
+        "crates/toy-core/src/io.rs",
+    ))
+    .await
+    .unwrap();
+    g.record_diagnostic(sample_diagnostic(
+        "toy-cli",
+        "E0277",
+        "crates/toy-cli/src/main.rs",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(g.clear_diagnostics().await.unwrap(), 2);
+    let view = g
+        .query(GraphQuery::Diagnostics {
+            crate_id: None,
+            since: None,
+        })
+        .await
+        .unwrap();
+    assert!(view.diagnostics.is_empty(), "{:?}", view.diagnostics);
+    assert_eq!(g.clear_diagnostics().await.unwrap(), 0);
+    g.close().await.unwrap();
+}
+
 // T7c: fixes append and are never surfaced by SimilarFixes (IN14, Q6).
 #[tokio::test]
 async fn record_fix_appends_and_is_not_surfaced_by_similar_fixes() {

@@ -51,10 +51,10 @@ pub mod storage;
 pub mod types;
 
 pub use adapters::{
-    cargo_exit_verdict, diagnostic_fingerprint, parse_rustc_diagnostics, Approval,
-    CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityOutcome,
+    cargo_exit_verdict, diagnostic_fingerprint, parse_rustc_diagnostics, seed_graph_diagnostics,
+    Approval, CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityOutcome,
     GateHumanAdapter, McpVerifyCompileAdapter, McpVerifyTestAdapter, NodeExecContext, NodeExecRef,
-    SessionGateHumanAdapter, SessionVerifyPermissions, ToolCaller, ToolCallerError,
+    SeedReport, SessionGateHumanAdapter, SessionVerifyPermissions, ToolCaller, ToolCallerError,
     UnavailableCapabilityExecutor, UnavailableGateHuman, UnavailableVerifyCompile,
     UnavailableVerifyTest, Verdict, VerdictOutcome, Verifier, VerifyClass, VerifyPermissions,
 };

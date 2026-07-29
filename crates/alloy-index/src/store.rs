@@ -417,6 +417,20 @@ impl ProjectGraph for SqliteProjectGraph {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, name = "index.clear_diagnostics")]
+    async fn clear_diagnostics(&self) -> Result<u64, GraphError> {
+        let db = Arc::clone(&self.db);
+        let removed = spawn_graph_db(db, move |db| {
+            db.with_mut(|conn| {
+                conn.execute("DELETE FROM graph_diagnostics", [])
+                    .map(|n| n as u64)
+                    .map_err(|e| GraphError::Io(format!("clear diagnostics: {e}")))
+            })
+        })
+        .await?;
+        Ok(removed)
+    }
+
     #[tracing::instrument(skip_all, name = "index.record_fix")]
     async fn record_fix(&self, f: FixEvent) -> Result<(), GraphError> {
         let db = Arc::clone(&self.db);
