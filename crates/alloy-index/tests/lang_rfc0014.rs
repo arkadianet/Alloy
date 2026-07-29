@@ -446,24 +446,28 @@ async fn model_version_bump_truncates_and_reingests() {
     assert_eq!(report.version.0, 1);
     assert_eq!(report.items, 5, "re-ingest produced Item rows");
     assert_eq!(report.source, GraphFidelity::SynDeep);
-    assert_eq!(g.schema_version(), 1, "SY2: no SQL migration ran");
+    assert_eq!(
+        g.schema_version(),
+        2,
+        "S4: the model transition itself runs no SQL migration"
+    );
     g.close().await.unwrap();
     assert_eq!(
         count(&fx.data, "SELECT COUNT(*) FROM graph_schema_migrations"),
-        1,
-        "SY2: the v1 migration ledger is untouched"
+        2,
+        "the ledger still holds exactly the shipped migrations"
     );
     assert_eq!(
         count(&fx.data, "SELECT model_version FROM graph_meta"),
-        2,
-        "SY1: model_version is 2 after the transition"
+        3,
+        "SY1/A-0011-6: model_version is 3 after the transition"
     );
 }
 
-// T17 — A-0014-4/RS4: fidelity is SynDeep exactly when model_version is 2,
-// over a fresh store and a truncated-and-reingested store.
+// T17 — A-0014-4/RS4: fidelity is SynDeep from model_version 2 up (3 since
+// A-0011-6), over a fresh store and a truncated-and-reingested store.
 #[tokio::test]
-async fn fidelity_is_syn_deep_exactly_when_model_version_is_two() {
+async fn fidelity_is_syn_deep_from_model_version_two() {
     let fx = Fx::toy();
     let g = fx.open().await;
     let report = g.rebuild_reported(&fx.ws).await.unwrap();
@@ -517,7 +521,9 @@ async fn toy_workspace_gains_items_and_imports() {
     g.close().await.unwrap();
 
     assert_eq!(count(&fx.data, "SELECT COUNT(*) FROM graph_nodes"), 13);
-    assert_eq!(count(&fx.data, "SELECT COUNT(*) FROM graph_edges"), 15);
+    // 12 Defines + 3 Imports + 3 References (A-0011-6: open -> Config,
+    // open -> Reader, toy_cli main -> open).
+    assert_eq!(count(&fx.data, "SELECT COUNT(*) FROM graph_edges"), 18);
     assert_eq!(
         count(
             &fx.data,

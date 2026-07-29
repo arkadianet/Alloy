@@ -71,6 +71,21 @@ pub enum GraphEdgeKind {
     /// `use` relationship, written only for in-workspace targets. Ingested
     /// by the RFC-0014 `syn` deep pass (SY11–SY13).
     Imports,
+    /// Path or type usage resolving to an in-workspace item: signature
+    /// types, field types, struct literals, multi-segment path expressions
+    /// (amendment A-0011-6). Best-effort syntactic resolution — recorded
+    /// only when the target resolves unambiguously inside the workspace.
+    References,
+    /// Function call whose callee resolves to an in-workspace `fn` item
+    /// (amendment A-0011-6). Method calls are never resolved (no type
+    /// inference); calls from impl-block bodies are attributed to the
+    /// self-type item.
+    Calls,
+    /// Trait implementation: self-type item → trait item, one edge per
+    /// `impl Trait for Type` block whose **both** sides resolve to
+    /// in-workspace items (amendment A-0011-6). Inherent impls record
+    /// nothing.
+    Impls,
 }
 
 impl GraphEdgeKind {
@@ -80,6 +95,9 @@ impl GraphEdgeKind {
         match self {
             Self::Defines => "defines",
             Self::Imports => "imports",
+            Self::References => "references",
+            Self::Calls => "calls",
+            Self::Impls => "impls",
         }
     }
 }
@@ -182,17 +200,24 @@ pub enum GraphQuery {
         /// Exact Rust path or workspace-relative file path.
         path: String,
     },
-    /// References to a node. **Stub**: empty until RA passthrough (Q4).
+    /// Who references this node: the anchor plus incoming `References` and
+    /// `Imports` edges. Live since amendment A-0011-6 (Q4); an unknown
+    /// anchor is an empty view, never an error.
     Refs {
         /// Node whose references are requested.
         node: GraphNodeId,
     },
-    /// Impls of a trait node. **Stub**: empty until RA passthrough (Q4).
+    /// `Impls` edges touching this node in either direction: anchored at a
+    /// trait it answers "who implements it"; anchored at a type it answers
+    /// "which traits does it implement". Live since amendment A-0011-6
+    /// (Q4); an unknown anchor is an empty view, never an error.
     Impls {
-        /// Trait node.
+        /// Trait or self-type item node.
         trait_node: GraphNodeId,
     },
-    /// Callers of a fn node. **Stub**: always empty (Q5).
+    /// Who calls this fn node: the anchor plus incoming `Calls` edges. Live
+    /// since amendment A-0011-6 (Q5); an unknown anchor is an empty view,
+    /// never an error.
     Callers {
         /// Function node.
         fn_node: GraphNodeId,
@@ -238,7 +263,9 @@ pub struct GraphView {
     pub fixes: Vec<FixEvent>,
     /// Fidelity of the data backing this view (MVP: always `Manifest`).
     pub fidelity: GraphFidelity,
-    /// `true` when the query kind is a Stub or the result was capped (Q9).
+    /// `true` when the result was capped (Q9). Since amendment A-0011-6
+    /// this flag is literal: an empty answer that withheld nothing is not
+    /// truncated.
     pub truncated: bool,
 }
 
@@ -329,6 +356,12 @@ pub struct IngestReport {
     pub items: u32,
     /// Imports edges written (RFC-0014 amendment A-0014-3).
     pub imports: u32,
+    /// References edges written (RFC-0011 amendment A-0011-6).
+    pub references: u32,
+    /// Calls edges written (RFC-0011 amendment A-0011-6).
+    pub calls: u32,
+    /// Impls edges written (RFC-0011 amendment A-0011-6).
+    pub impls: u32,
     /// Files tracked for digest invalidation.
     pub files: u32,
     /// Files skipped by a cap or a skip rule (IN3).
@@ -607,6 +640,26 @@ mod tests {
             let json = serde_json::to_string(&q).unwrap();
             let back: GraphQuery = serde_json::from_str(&json).unwrap();
             assert_eq!(q, back);
+        }
+    }
+
+    // A-0011-6: the five edge kinds keep stable wire tags that agree
+    // between serde and `as_str` (the digest/domain-separation input).
+    #[test]
+    fn edge_kind_wire_tags_agree_between_serde_and_as_str() {
+        let kinds = [
+            (GraphEdgeKind::Defines, "defines"),
+            (GraphEdgeKind::Imports, "imports"),
+            (GraphEdgeKind::References, "references"),
+            (GraphEdgeKind::Calls, "calls"),
+            (GraphEdgeKind::Impls, "impls"),
+        ];
+        for (kind, tag) in kinds {
+            assert_eq!(kind.as_str(), tag);
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{tag}\""));
+            let back: GraphEdgeKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind);
         }
     }
 

@@ -9,20 +9,25 @@ use rusqlite::Connection;
 
 use crate::db::from_rusqlite;
 
-/// Schema version shipped by this crate (rule S3). Still `1` at Beta: the
-/// v1 `CHECK` lists already admit `'item'`/`'imports'` rows (RFC-0014 SY2 —
-/// no DDL, no migration).
-pub(crate) const GRAPH_SCHEMA_VERSION: u32 = 1;
+/// Schema version shipped by this crate (rule S3). `2` since amendment
+/// A-0011-6: the v1 `graph_edges` `CHECK` list admitted only
+/// `'defines'`/`'imports'`, so the `references`/`calls`/`impls` kinds need
+/// the table recreated with the expanded list (SQLite cannot alter a
+/// `CHECK`).
+pub(crate) const GRAPH_SCHEMA_VERSION: u32 = 2;
 
 /// Ingest-semantics version (rule S4). A mismatch truncates and re-ingests;
 /// it never migrates — the graph is a derived cache (G1). `2` since the
-/// RFC-0014 `syn` deep pass (SY1): a manifest-only v1 database is wiped and
-/// re-ingested deeply, never merged.
-pub(crate) const GRAPH_MODEL_VERSION: u32 = 2;
+/// RFC-0014 `syn` deep pass (SY1); `3` since amendment A-0011-6 records
+/// `references`/`calls`/`impls` edges: an edge set written by an older
+/// build is wiped and re-ingested, never merged.
+pub(crate) const GRAPH_MODEL_VERSION: u32 = 3;
 
 /// RS4 / amendment A-0014-4: the **only** place a fidelity value is decided.
 /// Every construction site reads `graph_meta.model_version` (directly or via
 /// [`GRAPH_MODEL_VERSION`]) and calls this, so fidelity cannot silently lie.
+/// Model `3` (A-0011-6) is still a `syn` parse — deeper population of the
+/// same fidelity, so no new [`GraphFidelity`] variant.
 pub(crate) fn fidelity_for_model_version(model_version: u32) -> GraphFidelity {
     if model_version >= 2 {
         GraphFidelity::SynDeep
@@ -126,6 +131,28 @@ CREATE TABLE graph_snapshots (
 CREATE INDEX idx_graph_snapshots_version ON graph_snapshots(graph_version);
 "#;
 
+// Amendment A-0011-6: recreate `graph_edges` with the expanded kind CHECK
+// (`references`/`calls`/`impls`). Rows are carried over verbatim; the model
+// bump (v3) then truncates them anyway for a clean re-ingest, but the copy
+// keeps this migration honest on its own.
+const V2_SQL: &str = r#"
+CREATE TABLE graph_edges_v2 (
+  from_id    TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+  to_id      TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL CHECK (kind IN ('defines','imports','references','calls','impls')),
+  confidence REAL NOT NULL DEFAULT 1.0,
+  PRIMARY KEY (from_id, to_id, kind)
+);
+
+INSERT INTO graph_edges_v2 (from_id, to_id, kind, confidence)
+  SELECT from_id, to_id, kind, confidence FROM graph_edges;
+
+DROP TABLE graph_edges;
+ALTER TABLE graph_edges_v2 RENAME TO graph_edges;
+
+CREATE INDEX idx_graph_edges_to ON graph_edges(to_id, kind);
+"#;
+
 /// Run pending migrations; return the schema version in effect.
 #[tracing::instrument(skip(conn), name = "index.migrate")]
 pub(crate) fn migrate(conn: &Connection, refuse_newer: bool) -> Result<u32, GraphError> {
@@ -171,6 +198,25 @@ pub(crate) fn migrate(conn: &Connection, refuse_newer: bool) -> Result<u32, Grap
         .map_err(from_rusqlite)?;
         tx.commit().map_err(from_rusqlite)?;
         tracing::info!(version = 1, "applied graph migration");
+    }
+
+    let current: u32 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM graph_schema_migrations",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(from_rusqlite)?;
+    if current < 2 {
+        let tx = conn.unchecked_transaction().map_err(from_rusqlite)?;
+        tx.execute_batch(V2_SQL).map_err(from_rusqlite)?;
+        tx.execute(
+            "INSERT INTO graph_schema_migrations (version, applied_at) VALUES (2, ?1)",
+            [crate::store::now_rfc3339()?],
+        )
+        .map_err(from_rusqlite)?;
+        tx.commit().map_err(from_rusqlite)?;
+        tracing::info!(version = 2, "applied graph migration");
     }
 
     let version: u32 = conn
@@ -222,6 +268,8 @@ mod tests {
     fn fidelity_tracks_model_version() {
         assert_eq!(fidelity_for_model_version(1), GraphFidelity::Manifest);
         assert_eq!(fidelity_for_model_version(2), GraphFidelity::SynDeep);
+        // A-0011-6: model 3 is a deeper population of the same syn parse.
+        assert_eq!(fidelity_for_model_version(3), GraphFidelity::SynDeep);
         assert_eq!(
             fidelity_for_model_version(GRAPH_MODEL_VERSION),
             GraphFidelity::SynDeep

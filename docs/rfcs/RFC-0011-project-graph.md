@@ -84,7 +84,7 @@ Each deferral names the seam that will carry it, so nothing has to be redesigned
 4. `rebuild` MUST be **deterministic** (same tree → same node ids, same edge set, same content digest) and **idempotent** (a second `rebuild` over an unchanged tree MUST NOT bump `GraphVersion`) — rules **IN5**, **IN6**.
 5. Ingest MUST be **offline and exec-free**: filesystem reads and `Cargo.toml` parsing only. No subprocess, no network, no symlink traversal (rules **IN3**, **IN4**, **SEC5**).
 6. MVP ingest MUST create zero `Item` nodes and zero `Imports` edges. Those are **Stub** surfaces reserved for the Beta `syn` pass (rules **IN8**, **IN9**).
-7. `GraphQuery::Callers` MUST return an empty `GraphView` — never an error, never fabricated rows (rule **Q5**). `Refs` and `Impls` MUST likewise return empty until RA passthrough lands (rule **Q4**). `GraphQuery::SimilarFixes` reads recorded fixes back since amendment A-0011-5a (§2.3a); it too never errors and never fabricates rows.
+7. *(amended by A-0011-6, §2.3b)* `GraphQuery::Callers`, `Refs` and `Impls` answer from the `calls`/`references`/`impls` edges the deep pass records — never an error, never fabricated rows (rules **Q4**, **Q5** as amended). `GraphQuery::SimilarFixes` reads recorded fixes back since amendment A-0011-5a (§2.3a); it too never errors and never fabricates rows.
 8. `GraphViewHandle` MUST expose no mutation method and MUST NOT be constructible into a writer (rule **SEC1**).
 9. No `graph_query` MCP tool MUST exist for Alloy workers, in any crate (rule **SEC2**, CI-grepped).
 10. `alloy-index` MUST NOT append session events or decision records; it emits `tracing` spans and an atomic metrics snapshot only (rule **OB1**).
@@ -171,6 +171,20 @@ RFC-0002's `sessions.graph_version INTEGER NULL` column is the **only** cross-da
 | **A-0011-5c** | Past fixes may reach a repair prompt | **SEC4**, RFC-0013 **RW4** | `RepairWorker` MAY issue `SimilarFixes` for the diagnostic codes it already holds and render the result as one bounded, fenced, User-role advisory note (≤ 4 codes, ≤ 8 rows, ≤ 1 KiB). It reads through `GraphViewHandle` exactly as it reads `Diagnostics`; **SEC4** is unchanged — no capability may write the graph, and no worker is handed an `Arc<dyn ProjectGraph>`. Patch *bodies* are still never injected: the note carries codes, packages, dates and artifact ids only. |
 
 Unchanged by this amendment: the `ProjectGraph` trait, the `GraphQuery` enum, `FixEvent`, and every SQL table (`graph_fixes` already indexes `(diagnostic_code, recorded_at)`), so there is no migration and `GRAPH_MODEL_VERSION` stays at its current value. Reversal is deleting the query arm and the decorator.
+
+### 2.3b Amendment A-0011-6 — `Refs` / `Impls` / `Callers` are un-stubbed (post-merge, 2026-07-29)
+
+Q4 and Q5 shipped as Stubs because the MVP graph had no edges that could answer them, and the deferred answer was pencilled in as rust-analyzer passthrough. The RFC-0014 `syn` deep pass changed the ground truth: the graph now holds real `Item` nodes and a real per-module `use` map, which is enough scope information to resolve a useful, **honest** subset of references, calls and impls without RA. This amendment records that subset and turns the three queries on. RA passthrough (`GraphFidelity::Analyzer`) remains the deferred path to *rustc-grade* answers; nothing here forecloses it.
+
+| # | Amendment | Rule amended | Statement |
+| --- | --- | --- | --- |
+| **A-0011-6a** | The deep pass records semantic edges | **G2**, §4.3, RFC-0014 SY5 (partially) | Three edge kinds are added to `GraphEdgeKind` (`#[non_exhaustive]`, additive): `References` (a type usage, struct-literal path, trait bound, or multi-segment value path resolving to a workspace item), `Calls` (a call expression whose callee resolves to a workspace module-level `fn` item; a call resolving to any other item — e.g. a tuple-struct constructor — is recorded as `References`), and `Impls` (one `impl Trait for Type` edge, self-type item → trait item, when **both** sides resolve; inherent and negative impls record nothing). Impl blocks and their methods still get no nodes (SY5 holds); references and calls inside an impl block are attributed to the self-type item. All three kinds carry `confidence = 1.0` (G11 unchanged): edges below the confidence bar are **not written** rather than written down-weighted. |
+| **A-0011-6b** | Resolution honesty rules | **G7** (restated, not weakened) | Resolution is syntactic, workspace-scoped, and best-effort. A leading segment resolves through, in order: `crate`/`self`/`super`/`::` prefixes; the module's own `use` bindings (rename-aware); workspace crate idents; the module's declared children; then unambiguous glob imports (two candidates → nothing). Never resolved, by design: method calls (no type inference), single-segment value paths (locals), generic parameters and `Self`, macro-generated code, patterns, `std`/registry paths. A missing edge is acceptable; an invented one is not. Known accepted imprecision: a body-local closure shadowing an in-scope `fn` name can mis-attribute a call, and `cfg`-gated variants are all recorded (SY7's posture). `GraphView.fidelity` stays `SynDeep` — these are parse-derived facts, not analyzer facts. |
+| **A-0011-6c** | `Refs`, `Impls`, `Callers` answer | **Q4**, **Q5**, §9.3 | `Refs { node }` returns the anchor plus incoming `References` **and** `Imports` edges (a `use` of an item is a reference to it). `Callers { fn_node }` returns the anchor plus incoming `Calls` edges. `Impls { trait_node }` returns `Impls` edges touching the anchor in **either** direction, so one query answers both "who implements this trait" and "which traits does this type implement". All three: Q8 ordering, Q9 truncation at the node-ordering boundary, Q10 read-only. An unknown anchor returns `GraphView::empty(version)` with `truncated = false` — nothing was withheld, and fabricating rows for an id the graph never minted would violate G7. The former unconditional `truncated = true` marker is gone: `truncated` is now always literal. |
+| **A-0011-6d** | Storage and versioning | **S3**, **S4** | `GRAPH_SCHEMA_VERSION` = 2: the v1 `graph_edges` kind `CHECK` admitted only `defines`/`imports`, so v2 recreates the table with the expanded list (rows carried over; refuse-newer unchanged). `GRAPH_MODEL_VERSION` = 3: an existing model-2 database is truncated and re-ingested on open (S4), never merged. `fidelity_for_model_version` maps 3 to `SynDeep` — deeper population of the same fidelity, no new `GraphFidelity` variant. |
+| **A-0011-6e** | Reporting | `IngestReport` doc contract | `IngestReport` gains `references`, `calls`, `impls` counters (same authorisation as A-0014-3). The workspace `syn` pin gains the `visit` feature (still non-macro, still LC7-minimal in spirit; the RFC-0014 T20 forbidden-feature list is untouched). |
+
+Reversal is deleting the three query arms, the collector/resolver in the pass, and bumping the model version again. Consumers that relied on the stub `truncated = true` marker (none were found in-tree; RFC-0012's D14 grep forbids constructing these queries in the context engine) must treat `truncated` literally.
 
 ### 2.4 Crate placement decision (normative)
 
@@ -686,7 +700,7 @@ impl ProjectGraph for SqliteProjectGraph { /* §6, §7 */ }
 | Rule | Statement |
 | --- | --- |
 | **G1** | The graph is a **derived cache**. Every persisted row MUST be reconstructible from the workspace tree. No row may be the only copy of anything. |
-| **G2** | Node kinds are exactly `Workspace`, `Crate`, `Module`, `Item`; edge kinds are exactly `Defines`, `Imports` (V2 §7.2). Adding a kind is a schema-model bump (S4), not an ad-hoc write. |
+| **G2** | *(amended by A-0011-6a)* Node kinds are exactly `Workspace`, `Crate`, `Module`, `Item`; edge kinds are exactly `Defines`, `Imports`, `References`, `Calls`, `Impls` (V2 §7.2 plus §2.3b). Adding a kind is a schema-model bump (S4), not an ad-hoc write — A-0011-6 bumped both (schema 2, model 3). |
 | **G3** | `GraphNodeId` MUST be **derived**, never random: `id = uuid_from(sha256("alloyg1\0" ‖ kind_tag ‖ "\0" ‖ stable_key))`, taking the first 16 digest bytes, forcing the UUID version nibble to `8` and the variant bits to `0b10`, formatting `8-4-4-4-12` lowercase hex, then `GraphNodeId::parse`. `ProjectGraph` implementations MUST NOT call `GraphNodeId::new()`. |
 | **G4** | `stable_key` MUST be workspace-relative and platform-independent: `Workspace` → `"."`; `Crate` → `"<package_name>\0<manifest_rel_path>"`; `Module` → `"<package_name>\0<module_path>"`; `Item` → `"<package_name>\0<module_path>\0<item_kind>\0<item_name>"`. All path separators normalised to `/` before hashing. |
 | **G5** | There is **no** `File` node kind. Files are tracked in `graph_files` for digest invalidation and referenced by `GraphNode.file`. |
@@ -713,8 +727,11 @@ impl ProjectGraph for SqliteProjectGraph { /* §6, §7 */ }
 
 | Kind | MVP populated? | Endpoints |
 | --- | --- | --- |
-| `Defines` | Yes | Workspace→Crate, Crate→root Module, Module→child Module |
-| `Imports` | **No — Stub (IN8)** | Module→Module / Module→Item (Beta) |
+| `Defines` | Yes | Workspace→Crate, Crate→root Module, Module→child Module, Module→Item (Beta) |
+| `Imports` | Beta (RFC-0014 SY11–SY13) | Module→Module / Module→Item |
+| `References` | Beta (A-0011-6a) | Item→Item (from an impl block: self-type Item→Item) |
+| `Calls` | Beta (A-0011-6a) | Item(fn or self type)→Item(fn) |
+| `Impls` | Beta (A-0011-6a) | Item(self type)→Item(trait) |
 
 ### 4.4 Diagnostics records
 
@@ -923,8 +940,8 @@ Rule **SEC4** restates the boundary: no code path from `Capability::execute` rea
 | **Q1** | `GraphQuery` has exactly the seven V2 §7.2 variants. New capability is added by populating existing variants, not by adding variants. |
 | **Q2** | `Symbol { path }` resolution order: (1) exact match on `graph_nodes.path`; (2) if `path` contains `/` or ends in `.rs`, exact match on `graph_files.path` → its owning module node; (3) otherwise empty. Never a fuzzy or prefix match. |
 | **Q3** | `Diagnostics { crate_id, since }` filters on `package = crate_id` when `Some` and `recorded_at >= since` when `Some`, ordered by `(recorded_at, diagnostic_id)` ascending, capped by `max_query_nodes`. |
-| **Q4** | `Refs` and `Impls` MUST return `GraphView::empty(version)` with `truncated = true`. **Stub** pending RA passthrough. They MUST NOT error. |
-| **Q5** | `Callers` MUST return `GraphView::empty(version)` with `truncated = true`. **Stub** — permanent until typed call edges exist (V2 §7.2). |
+| **Q4** | *(amended by A-0011-6c, §2.3b)* `Refs { node }` MUST return the anchor plus incoming `References` and `Imports` edges; `Impls { trait_node }` MUST return `Impls` edges touching the anchor in either direction. Q8 ordering, Q9 truncation, Q10 read-only. An unknown anchor is `GraphView::empty(version)` with `truncated = false`; neither query MUST ever error. Originally Stubs pending RA passthrough. |
+| **Q5** | *(amended by A-0011-6c, §2.3b)* `Callers { fn_node }` MUST return the anchor plus incoming `Calls` edges, under the same ordering/truncation/read-only rules as Q4. Typed call edges exist since A-0011-6a, which is what V2 §7.2 conditioned this on. An unknown anchor is an empty view with `truncated = false`; never an error. |
 | **Q6** | *(amended by A-0011-5a, §2.3a)* `SimilarFixes` MUST return the `graph_fixes` rows matching `diagnostic_code`, most recent first, capped by the query's `limit`; `truncated` is set only when matching rows were left behind. Originally a Stub returning an empty view. |
 | **Q7** | `Subgraph { seeds, radius }` performs BFS over `Defines` edges in **both** directions from each seed. `radius` is clamped to `3`; `radius = 0` returns just the seeds. Unknown seed ids are ignored, not errors. |
 | **Q8** | Result ordering MUST be total and deterministic: nodes by `(kind, path, id)`, edges by `(from, to, kind)`, diagnostics by `(recorded_at, diagnostic_id)`. Two identical queries against an unchanged graph return byte-identical JSON. |
@@ -943,7 +960,7 @@ Each live query is one or two indexed statements plus a bounded BFS. There is no
 | "Which module owns `crates/x/src/io.rs`?" | `Symbol { path: "crates/x/src/io.rs" }` | The module node + its `Defines` parent chain |
 | "What is near this module?" | `Subgraph { seeds, radius: 1..3 }` | Parent crate, sibling and child modules |
 | "What broke recently in crate X?" | `Diagnostics { crate_id, since }` | Recorded `DiagnosticEvent`s |
-| "Who calls this?" | `Callers` | Empty — WorkingSet omits the section (roadmap: "may have empty graph projection") |
+| "Who calls this?" | `Callers` | *(A-0011-6)* The recorded `Calls` edges; empty when nothing calls it |
 
 ---
 
@@ -993,7 +1010,7 @@ Runtime phase interaction: the graph is opened after `AlloyStorage` (it reuses i
 
 | Situation | Correct behaviour |
 | --- | --- |
-| `Callers` / `SimilarFixes` / `Refs` / `Impls` requested | Empty view, `truncated = true` (Q4–Q6) |
+| `Callers` / `SimilarFixes` / `Refs` / `Impls` finds nothing (or an unknown anchor) | Empty view, `truncated = false`, `Ok` (Q4–Q6 as amended) |
 | `Symbol` finds nothing | Empty view, `Ok` |
 | `Subgraph` seed id unknown | Ignored (Q7) |
 | A member manifest is malformed | Warning in `IngestReport` (IN12) |
@@ -1183,9 +1200,9 @@ Lint attributes added to `crates/alloy-index/src/lib.rs`:
 | T6a | `symbol_resolves_rust_path_exactly` | Q2(1) |
 | T6b | `symbol_resolves_workspace_relative_file_path` | Q2(2) |
 | T6c | `symbol_does_not_prefix_match` | Q2 |
-| T6d | `callers_returns_empty_truncated_view` | Q5 |
+| T6d | *(superseded by A-0011-6)* `former_stub_queries_answer_from_semantic_edges` + `callers_round_trips_incoming_calls_edges` | Q5 |
 | T6e | *(superseded by A-0011-5a)* `similar_fixes_returns_recent_rows_first_and_honours_limit` | Q6 |
-| T6f | `refs_and_impls_return_empty_without_erroring` | Q4 |
+| T6f | *(superseded by A-0011-6)* `refs_round_trips_incoming_references_and_imports` + `impls_answers_for_trait_and_for_type` | Q4 |
 | T6g | `diagnostics_filters_by_crate_and_since` | Q3 |
 | T6h | `subgraph_radius_zero_returns_seeds_only` | Q7 |
 | T6i | `subgraph_traverses_defines_both_directions_and_clamps_radius` | Q7 |
@@ -1248,8 +1265,8 @@ Trait seam · SQLite store with own migration ladder · manifest+layout ingest �
 | --- | --- | --- |
 | `Item` nodes, `Imports` edges | `GraphNodeKind::Item`, `GraphEdgeKind::Imports`, `GRAPH_MODEL_VERSION = 2` | Beta |
 | `cargo metadata` facts (deps, features) | `IngestReport.source`, `GraphFidelity` | Beta |
-| RA passthrough for `Refs`/`Impls` | `GraphFidelity::Analyzer` | Beta / M3 |
-| Typed `Calls` edges with confidence | `graph_edges.confidence`, `#[non_exhaustive]` edge kind | Post-Beta |
+| RA passthrough for `Refs`/`Impls` (rustc-grade answers; syn-grade shipped by A-0011-6) | `GraphFidelity::Analyzer` | Beta / M3 |
+| ~~Typed `Calls` edges~~ (landed via A-0011-6a at `confidence = 1.0`; sub-1.0 confidence weighting stays deferred) | `graph_edges.confidence` | Post-Beta |
 | `SimilarFixes` retrieval | `graph_fixes` table already populated | After precision measured |
 | Merkle multi-layer incremental | `graph_files.digest` | Deferred |
 | Background indexer | — | Deferred (ADR F-27) |
@@ -1306,9 +1323,9 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 42. `apply_incremental(&[])` returns the current version without a write (**T4g**).
 - [ ] 43. Incremental application and a full rebuild of the same post-change tree agree on the content digest (**IN10**, T5).
 - [ ] 44. `Symbol` resolves an exact Rust path and an exact workspace-relative file path, and never prefix-matches (**Q2**, T6a–T6c).
-- [ ] 45. `Callers` returns an empty view with `truncated = true` and never errors (**Q5**, T6d).
+- [x] 45. *(superseded by A-0011-6c)* `Callers` returns the anchor plus incoming `Calls` edges and never errors (**Q5**, T6d).
 - [x] 46. *(superseded by A-0011-5a)* `SimilarFixes` returns the matching `graph_fixes` rows, most recent first, honouring `limit` (**Q6**, T7c/T7c2).
-- [ ] 47. `Refs` and `Impls` return empty without erroring (**Q4**, T6f).
+- [x] 47. *(superseded by A-0011-6c)* `Refs` and `Impls` answer from the `references`/`imports`/`impls` edges without ever erroring (**Q4**, T6f).
 - [ ] 48. `Diagnostics` filters by `crate_id` and `since` and orders by `(recorded_at, diagnostic_id)` (**Q3**, T6g).
 - [ ] 49. `Subgraph` honours `radius = 0`, clamps to 3, traverses `Defines` in both directions, and ignores unknown seeds (**Q7**, T6h–T6j).
 - [ ] 50. Two identical queries over an unchanged graph produce byte-identical JSON (**Q8**, T6k).
@@ -1582,9 +1599,11 @@ Seven edges. Zero `imports` edges (IN8).
   "fidelity": "manifest", "truncated": false
 }
 
-// query(Callers { fn_node: <any> })   — Q5 Stub
+// query(Callers { fn_node: <unknown id> })   — Q5 as amended by A-0011-6:
+// an unknown anchor is empty and honestly untruncated; a known fn returns
+// the anchor plus its incoming `calls` edges.
 { "version": 1, "nodes": [], "edges": [], "diagnostics": [], "fixes": [],
-  "fidelity": "manifest", "truncated": true }
+  "fidelity": "manifest", "truncated": false }
 ```
 
 ### B.5 Incremental example
