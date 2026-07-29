@@ -31,6 +31,7 @@
 
 pub mod adapters;
 pub mod config;
+pub mod context;
 pub mod dag;
 pub mod edit;
 pub mod error;
@@ -56,6 +57,12 @@ pub use adapters::{
     VerifyTestAdapter,
 };
 pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
+pub use context::{
+    AssembleInputs, AssembleRequest, BytesPerTokenEstimator, CompactStrategy, ContextEngine,
+    ContextError, ContextHandle, ContextMetricsSnapshot, ContextProfile, DefaultContextEngine,
+    Degradation, DegradationReason, DomainId, DomainWeights, EvictPolicy, EvictReport, FileExcerpt,
+    GraphProjection, NullContextEngine, StaleReason, TokenEstimator, WorkingSet,
+};
 pub use dag::{
     allocate_ids, build_topology, compute_cache_key, goal_content_digest,
     mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest,
@@ -128,8 +135,8 @@ pub use types::diagnostic::{
 pub use types::ids::{
     ArtifactId, CapabilityId, CheckpointId, CrateId, DagId, DiagnosticId, Digest, DigestError,
     DigestHasher, EndpointId, EventSeq, GateId, GraphNodeId, GraphSnapshotId, GraphVersion,
-    IdError, LanguageId, NodeId, ProfileId, ProviderId, RunId, ServerId, SessionId, Timestamp,
-    TransactionId,
+    IdError, LanguageId, NodeId, ProfileId, ProviderId, RunId, ServerId, SessionId, SummaryId,
+    Timestamp, TransactionId,
 };
 pub use types::metrics::{RuntimeMetrics, WorkerMetrics};
 pub use types::permission::{ExecAllow, Glob, Grant, HostAllow, PermissionToken};

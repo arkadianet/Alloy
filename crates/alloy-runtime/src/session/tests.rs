@@ -148,6 +148,7 @@ impl Harness {
             retain_tool_bodies: false,
             run_timeout: Duration::from_secs(30),
             budget_policy: crate::types::budget::BudgetPolicy::default(),
+            context_profile: crate::context::ContextProfile::v2_defaults(),
         })
         .unwrap();
         let handle = rt.start().await.unwrap();

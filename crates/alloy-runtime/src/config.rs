@@ -91,6 +91,9 @@ pub struct RuntimeConfig {
     pub run_timeout: Duration,
     /// From profile `[budgets]`, or [`BudgetPolicy::default`] when the table is absent (RFC-0007 §7.6).
     pub budget_policy: BudgetPolicy,
+    /// From profile `[context]`, or [`crate::context::ContextProfile::v2_defaults`]
+    /// when the table is absent (RFC-0012 §4.6).
+    pub context_profile: crate::context::ContextProfile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +102,10 @@ struct ProfileFile {
     budgets: Option<BudgetsSection>,
     #[serde(default)]
     observability: ObservabilitySection,
+    /// Raw `[context]` table; RFC-0012 owns the schema
+    /// (`ContextProfile::from_toml_table`, rules D2/D19).
+    #[serde(default)]
+    context: Option<toml::Table>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +170,16 @@ impl RuntimeConfig {
 
         let (data_dir, data_dir_rule) = resolve_data_dir(&paths)?;
 
+        let context_profile = match &profile.context {
+            Some(table) => crate::context::ContextProfile::from_toml_table(table).map_err(|e| {
+                RuntimeError::Config(format!(
+                    "profile {} [context]: {e}",
+                    paths.profile.display()
+                ))
+            })?,
+            None => crate::context::ContextProfile::v2_defaults(),
+        };
+
         let budget_policy = match profile.budgets {
             Some(b) => BudgetPolicy {
                 max_usd_per_run: b.max_usd_per_run,
@@ -182,6 +199,7 @@ impl RuntimeConfig {
             retain_tool_bodies: profile.observability.retain_tool_bodies,
             run_timeout: Duration::from_secs(60 * 30),
             budget_policy,
+            context_profile,
         })
     }
 }

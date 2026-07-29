@@ -287,6 +287,7 @@ mod linux {
                 retain_tool_bodies: false,
                 run_timeout: Duration::from_secs(300),
                 budget_policy: BudgetPolicy::default(),
+                context_profile: alloy_runtime::ContextProfile::v2_defaults(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();
