@@ -123,9 +123,27 @@ impl CargoJsonRecording {
     ///
     /// Diagnostics are parsed first, so malformed NDJSON is
     /// [`EvalError::RecordingInvalid`] even when `exit_code == 0`.
+    ///
+    /// Research §7.11 item 5: the pass/fail decision is
+    /// [`alloy_runtime::cargo_exit_verdict`] — the same function the
+    /// runtime's verify adapters use — so this crate and the runtime can no
+    /// longer disagree about what "compiled" means.
     pub fn compile_clean(&self) -> Result<bool, EvalError> {
+        Ok(matches!(
+            self.verdict()?,
+            alloy_runtime::VerdictOutcome::Pass
+        ))
+    }
+
+    /// Three-valued verdict for this recording via the shared runtime
+    /// decision (§7.11 items 5/6).
+    pub fn verdict(&self) -> Result<alloy_runtime::VerdictOutcome, EvalError> {
         let diagnostics = self.diagnostics()?;
-        Ok(self.exit_code == 0 && !diagnostics.iter().any(|diag| diag.level == "error"))
+        let has_errors = diagnostics.iter().any(|diag| diag.level == "error");
+        Ok(alloy_runtime::cargo_exit_verdict(
+            Some(i64::from(self.exit_code)),
+            has_errors,
+        ))
     }
 }
 

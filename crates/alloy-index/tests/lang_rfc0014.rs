@@ -546,8 +546,8 @@ async fn toy_workspace_gains_items_and_imports() {
 #[tokio::test]
 async fn diagnostics_entry_point_matches_verify_adapter_output() {
     use alloy_runtime::adapters::{
-        NodeExecContext, NodeExecRef, ToolCaller, ToolCallerError, VerifyClass,
-        VerifyCompileAdapter, VerifyPermissions,
+        NodeExecContext, NodeExecRef, ToolCaller, ToolCallerError, Verifier, VerifyClass,
+        VerifyPermissions,
     };
     use alloy_runtime::storage::{AlloyStorage, StorageOpenOptions};
     use alloy_runtime::types::ids::{DagId, NodeId, ProfileId, RunId, SessionId};
@@ -657,7 +657,7 @@ async fn diagnostics_entry_point_matches_verify_adapter_output() {
         },
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
-    let outcome = adapter.check(&ctx).await.unwrap();
+    let outcome = adapter.verify(&ctx).await.unwrap();
     storage.close().await.unwrap();
 
     // Identical events including fingerprints. `DiagnosticEvent.id` is a
