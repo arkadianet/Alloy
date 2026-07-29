@@ -2220,7 +2220,6 @@ async fn ac29b_begin_complete_repair_generation_inside_dispatch() {
     // A waiter registered mid-dispatch (as a gate adapter would).
     let gate = GateId::new();
     let waiter = h.plane.register_gate_waiter(run, gate).await.unwrap();
-    let state_before = h.run_state(run).await;
 
     h.runs()
         .begin_repair_generation(run, &ReplanReason::UserRequested)
@@ -2235,8 +2234,8 @@ async fn ac29b_begin_complete_repair_generation_inside_dispatch() {
         requested[0].payload["reason"],
         serde_json::json!("user_requested")
     );
-    // RC1: the row was NOT parked at replan_requested.
-    assert_eq!(h.run_state(run).await, state_before);
+    // RC1: the row reads `running` for the loop — never `replan_requested`.
+    assert_eq!(h.run_state(run).await, RunControlState::Running);
 
     h.runs().complete_repair_generation(run, 2).await.unwrap();
     let resumed = h
@@ -2244,7 +2243,7 @@ async fn ac29b_begin_complete_repair_generation_inside_dispatch() {
         .await;
     assert_eq!(resumed.len(), 1);
     assert_eq!(resumed[0].payload["generation"], 2);
-    assert_eq!(h.run_state(run).await, state_before);
+    assert_eq!(h.run_state(run).await, RunControlState::Running);
 
     sched.release.notify_one();
     // The row is `waiting_approval` (the waiter registration wrote it), which

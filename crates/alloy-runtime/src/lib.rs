@@ -35,6 +35,7 @@ pub mod capabilities;
 pub mod config;
 pub mod context;
 pub mod dag;
+pub mod driver;
 pub mod edit;
 pub mod error;
 pub mod events;
@@ -87,6 +88,10 @@ pub use dag::{
     PredecessorOutput, RetryIncoherence, RetryPolicy, TaskDag, TaskNode, TemplateApprovalSpec,
     TemplateCatalog, TemplateEdgeSpec, TemplateId, TemplateIdMap, TemplateManifest,
     TemplateNodeSpec, ValidateOpts, ENVELOPE_SCHEMA_VERSION,
+};
+pub use driver::{
+    DriveError, DriverMetrics, GenerationDriver, GenerationDriverDeps, GenerationPolicy,
+    PlanFingerprints,
 };
 pub use edit::{
     rollback_run_edits, transactions_of_run, DeclinedRollback, EditAppliedPayload, EditContext,

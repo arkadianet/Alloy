@@ -13,15 +13,17 @@ use std::sync::Arc;
 
 use alloy_index::{GraphOpenOptions, SqliteProjectGraph};
 use alloy_runtime::{
-    install_sqlite_event_sink, AlloyRuntime, AlloyStorage, AppliedEditSource, CapabilityExecutor,
+    compiler_fingerprint_digest, install_sqlite_event_sink, policy_hash_digest,
+    tool_versions_digest, AlloyRuntime, AlloyStorage, AppliedEditSource, CapabilityExecutor,
     CapabilityRegistry, ContextEngine, DecisionLog, DefaultContextEngine, EditEngine,
-    EventDecisionLog, EventLogEdits, FixRecordingVerifier, GraphViewHandle, LinearScheduler,
-    LinearSchedulerDeps, McpVerifyCompileAdapter, McpVerifyTestAdapter, ModelProvider,
-    OpenAiCompatibleProvider, OpenAiCompatibleSpec, ProcessCostMeterFactory,
-    ProcessRunRouterProvider, ProjectGraph, RegistryCapabilityExecutor, RouterConfig,
-    RuntimeConfig, RuntimeHandle, SchedConfig, SecretString, SessionGateHumanAdapter, SessionId,
-    SessionPlane, SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService,
-    ToolCaller, ToolName, ToolSelector, Verifier, WorkerConfig, WorkerDeps, WorkerPermissions,
+    EventDecisionLog, EventLogEdits, FixRecordingVerifier, GenerationDriver, GenerationDriverDeps,
+    GenerationPolicy, GraphViewHandle, LinearScheduler, LinearSchedulerDeps,
+    McpVerifyCompileAdapter, McpVerifyTestAdapter, ModelProvider, OpenAiCompatibleProvider,
+    OpenAiCompatibleSpec, PlanFingerprints, ProcessCostMeterFactory, ProcessRunRouterProvider,
+    ProfileId, ProjectGraph, RegistryCapabilityExecutor, RouterConfig, RuntimeConfig,
+    RuntimeHandle, SchedConfig, SecretString, SessionGateHumanAdapter, SessionId, SessionPlane,
+    SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService, ToolCaller, ToolName,
+    ToolSelector, Verifier, WorkerConfig, WorkerDeps, WorkerPermissions,
 };
 use alloy_tools::mcp::{McpPlatform, ToolHandle, ToolHandleToolCaller};
 use alloy_tools::{
@@ -429,6 +431,37 @@ pub async fn assemble_full_with(
     handle.set_scheduler(Arc::clone(&sched) as _)?;
 
     let plan = TemplatePlanService::from_storage(&storage);
+
+    // RFC-0017 MG1 — construct the `GenerationDriver` and inject it as the
+    // §6.3 step-8 executor (AM-0003-2). Construct-and-inject only: the CLI
+    // call sequence is unchanged (B1/SQ2 — it still calls `runs.start`).
+    // The fingerprints are the same composition-root capture generation 1's
+    // plan uses; the driver reuses them for the rebuilt replan context.
+    let profile = ProfileId::new(cfg.profile_id.clone().unwrap_or_else(|| "default".into()))
+        .map_err(|e| CliError::new(Exit::Config, format!("profile id: {e}")))?;
+    let toolchain = alloy_tools::toolchain::capture_toolchain();
+    let target = alloy_tools::toolchain::host_triple();
+    let driver = GenerationDriver::new(GenerationDriverDeps {
+        handle: handle.clone(),
+        plans: Arc::new(TemplatePlanService::from_storage(&storage)),
+        runs: plane.runs(),
+        dags: storage.dags() as _,
+        sessions: storage.sessions() as _,
+        events: storage.events() as _,
+        decisions: Arc::clone(&decisions) as _,
+        cost_meters: Arc::clone(&cost_meters) as _,
+        budget_policy: cfg.budget_policy.clone(),
+        cancellation: handle.cancellation(),
+        fingerprints: PlanFingerprints {
+            policy_hash: policy_hash_digest(&profile, &cfg.budget_policy),
+            tool_versions: tool_versions_digest(&toolchain),
+            compiler_fingerprint: compiler_fingerprint_digest(&toolchain, &target),
+        },
+        policy: GenerationPolicy {
+            max_repair_generations: cfg.max_repair_generations,
+        },
+    });
+    plane.set_executor(Arc::new(driver));
 
     Ok(FullAssembly {
         base,

@@ -106,3 +106,42 @@ fn ac46_plan_writes_only_through_plan_persistence() {
         }
     }
 }
+
+/// AC 48 (RX2): the driver never emits a lifecycle event, never writes a
+/// run row, never calls `request_replan`, and never re-enters
+/// `RunController::start`. Test modules are excluded (fixtures drive runs
+/// through `start` on purpose); RX2 constrains the production driver.
+#[test]
+fn ac48_driver_never_touches_run_lifecycle() {
+    let files = crate_src_files("src/driver");
+    assert!(!files.is_empty(), "no driver sources found — walk broken");
+    let needles = [
+        "RunAccepted",
+        "RunCompleted",
+        "RunFinished",
+        "upsert_state",
+        "request_replan",
+        ".start(",
+    ];
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let mut in_tests = false;
+        for (idx, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("mod tests") {
+                in_tests = true;
+            }
+            if in_tests || is_comment_line(line) {
+                continue;
+            }
+            for needle in needles {
+                assert!(
+                    !line.contains(needle),
+                    "AC 48 violated: {}:{} references {needle}",
+                    file.display(),
+                    idx + 1
+                );
+            }
+        }
+    }
+}

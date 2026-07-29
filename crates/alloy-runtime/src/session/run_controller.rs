@@ -1140,6 +1140,20 @@ impl RunController for RunControllerView {
         }
         let row = load_run(&self.inner, run).await?;
 
+        // RC1: the row reads `running` for the whole loop — never
+        // `replan_requested` (§6.3 step 9(a) would treat that as a foreign
+        // control call winning the race). The write is skipped when a real
+        // control transition (`cancelling`, terminal) already landed; the
+        // driver's GN6 check observes those and declines.
+        match parse_state(&row)? {
+            RunControlState::Accepted
+            | RunControlState::WaitingApproval
+            | RunControlState::Running => {
+                upsert_state(&self.inner, &row, RunControlState::Running).await?;
+            }
+            _ => {}
+        }
+
         // SEC9b: an approval granted in generation N never carries into N+1.
         self.inner.gates.clear_run(run);
         append_run_event(

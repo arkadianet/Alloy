@@ -243,10 +243,7 @@ fn serialized_len(payload: &SeedPayload) -> usize {
 }
 
 /// GN4 seam: true when the SD9 projection of `f` yields **no** diagnostics —
-/// no diagnostics, no seed, no bump.
-// Wired into `GenerationDriver` admission (GN4) by the driver stage; until
-// then only tests exercise it from the lib target's perspective.
-#[allow(dead_code)]
+/// no diagnostics, no seed, no bump (read by `GenerationDriver` admission).
 pub(crate) fn seed_projection_is_empty(f: &FailureIr) -> bool {
     project_failure(f).diagnostics.is_empty()
 }
