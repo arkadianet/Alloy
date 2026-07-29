@@ -235,9 +235,15 @@ pub(crate) fn parse_model_diff(diff: &str) -> Result<PatchSet, String> {
                     break;
                 }
                 if l.starts_with("--- ") {
+                    // A file entry is always `--- ` + `+++ ` + `@@ ` (the
+                    // parser rejects entries without hunks), so anything
+                    // less — e.g. a body pair deleting `-- old` and adding
+                    // `++ new` — stays hunk content.
                     let mut ahead = lines.clone();
                     ahead.next();
-                    if ahead.peek().is_some_and(|n| n.starts_with("+++ ")) {
+                    if ahead.next().is_some_and(|n| n.starts_with("+++ "))
+                        && ahead.peek().is_some_and(|n| n.starts_with("@@"))
+                    {
                         break; // next file entry, not a deleted body line
                     }
                 }
@@ -587,5 +593,21 @@ mod tests {
             panic!("expected Modify");
         };
         assert_eq!(hunks[0].lines.len(), 3);
+    }
+
+    /// A body pair `--- old` / `+++ new` (deleting `-- old`, adding
+    /// `++ new`) is hunk content, not a file boundary: a real file entry is
+    /// always followed by an `@@` header (the parser rejects entries
+    /// without hunks), so only a pair followed by `@@` ends the hunk.
+    #[test]
+    fn body_dash_plus_pair_without_hunk_header_stays_in_body() {
+        let diff = "--- a/f.md\n+++ b/f.md\n@@ -1,2 +1,2 @@\n--- old\n+++ new\n context\n";
+        let set = parse_model_diff(diff).unwrap();
+        assert_eq!(set.files.len(), 1);
+        let FilePatch::Modify { hunks, .. } = &set.files[0] else {
+            panic!("expected Modify");
+        };
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines, vec!["--- old", "+++ new", " context"]);
     }
 }
