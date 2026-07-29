@@ -1,8 +1,9 @@
 //! PlanService: template selection, instantiation, CAS persist, PlanProduced (RFC-0009).
 //!
 //! Production callers construct [`TemplatePlanService::from_storage`] (or
-//! [`TemplatePlanService::new`]) and inject `Arc<dyn PlanService>` into
-//! PlanningWorker (RFC-0013) / CLI (RFC-0015).
+//! [`TemplatePlanService::new`]) and inject `Arc<dyn PlanService>` into the
+//! CLI / host (RFC-0015) — never into a capability worker (RFC-0013
+//! AM-0009-1 / rule PW2: topology has exactly one writer).
 
 mod llm_stub;
 mod template_service;

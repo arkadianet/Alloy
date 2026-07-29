@@ -270,6 +270,15 @@ impl SharedCostMeter {
         self.lock().add_worker_metrics(metrics, usd);
     }
 
+    /// `true` when both handles share one underlying meter (RFC-0013 BG1:
+    /// the run-scoped router MUST be bound to the same meter the scheduler
+    /// handed the worker; a clone of the same `Arc` counts, a fresh meter
+    /// does not).
+    #[must_use]
+    pub fn shares_state_with(&self, other: &SharedCostMeter) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Snapshot under the lock.
     #[must_use]
     pub fn snapshot(&self) -> CostSnapshot {

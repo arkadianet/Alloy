@@ -53,7 +53,9 @@ macro_rules! uuid_id {
 macro_rules! name_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+        // `Ord` is additive (RFC-0013): the capability registry keys a
+        // `BTreeMap<CapabilityId, _>` for deterministic iteration order.
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
