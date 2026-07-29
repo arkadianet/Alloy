@@ -87,9 +87,10 @@ pub use dag::{
     TemplateNodeSpec, ValidateOpts, ENVELOPE_SCHEMA_VERSION,
 };
 pub use edit::{
-    EditAppliedPayload, EditContext, EditEngine, EditError, EditRequest, EditRequestKind,
-    EditTransaction, EditValidation, FilePatch, Hunk, PatchSet, SemanticEditOp, TxState,
-    WorkspaceDigest, EDIT_APPLIED_SCHEMA,
+    rollback_run_edits, transactions_of_run, DeclinedRollback, EditAppliedPayload, EditContext,
+    EditEngine, EditError, EditRequest, EditRequestKind, EditTransaction, EditValidation,
+    FilePatch, Hunk, PatchSet, RollbackReport, SemanticEditOp, TxState, WorkspaceDigest,
+    EDIT_APPLIED_SCHEMA,
 };
 pub use error::{AdapterError, RunError, RuntimeError, SchedError, SessionError};
 pub use events::{
