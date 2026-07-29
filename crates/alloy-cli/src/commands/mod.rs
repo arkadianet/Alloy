@@ -11,6 +11,7 @@ mod gate;
 mod index;
 mod resume;
 mod review;
+mod rollback;
 mod run;
 
 use alloy_runtime::{EventSeq, RunId, SessionEvent, SessionEventType, SessionId, SessionService};

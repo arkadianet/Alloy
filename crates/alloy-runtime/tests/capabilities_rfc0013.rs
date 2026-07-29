@@ -12,9 +12,11 @@ use std::time::Duration;
 
 use alloy_runtime::adapters::{NodeExecRef, ToolCaller, ToolCallerError};
 use alloy_runtime::capabilities::EditAppliedPayload;
+use alloy_runtime::graph::{FileChange, FixEvent, GraphError, GraphQuery, GraphView, ProjectGraph};
 use alloy_runtime::storage::{
     ArtifactBlob, ArtifactMeta, ArtifactPut, ArtifactStore, SessionRows, StoreError,
 };
+use alloy_runtime::types::ids::{GraphSnapshotId, GraphVersion};
 use alloy_runtime::{
     AdapterError, ArtifactId, ArtifactKind, BudgetPolicy, CapabilityExecContext,
     CapabilityExecError, CapabilityExecutor, CapabilityId, CapabilityRegistry, ChatRole,
@@ -119,6 +121,61 @@ impl ToolCaller for QueueToolCaller {
             .unwrap()
             .pop_front()
             .ok_or_else(|| ToolCallerError::Internal("tool script exhausted".into()))
+    }
+}
+
+/// Read-only `ProjectGraph` double: answers `SimilarFixes` from a canned
+/// table and records the queries it saw. Every write is `Disabled`, so a
+/// worker that tried to write would fail loudly (SEC4).
+#[derive(Default)]
+struct FixesGraph {
+    fixes: HashMap<String, Vec<FixEvent>>,
+    seen: Mutex<Vec<GraphQuery>>,
+}
+
+impl FixesGraph {
+    fn with(fixes: HashMap<String, Vec<FixEvent>>) -> Self {
+        Self {
+            fixes,
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<GraphQuery> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ProjectGraph for FixesGraph {
+    async fn rebuild(&self, _root: &std::path::Path) -> Result<GraphVersion, GraphError> {
+        Err(GraphError::Disabled)
+    }
+    async fn apply_incremental(&self, _c: &[FileChange]) -> Result<GraphVersion, GraphError> {
+        Err(GraphError::Disabled)
+    }
+    async fn query(&self, q: GraphQuery) -> Result<GraphView, GraphError> {
+        self.seen.lock().unwrap().push(q.clone());
+        let mut view = GraphView::empty(GraphVersion(1));
+        if let GraphQuery::SimilarFixes {
+            diagnostic_code,
+            limit,
+        } = &q
+        {
+            if let Some(rows) = self.fixes.get(diagnostic_code) {
+                view.fixes = rows.iter().take(*limit).cloned().collect();
+            }
+        }
+        Ok(view)
+    }
+    async fn record_diagnostic(&self, _d: DiagnosticEvent) -> Result<(), GraphError> {
+        Err(GraphError::Disabled)
+    }
+    async fn record_fix(&self, _f: FixEvent) -> Result<(), GraphError> {
+        Err(GraphError::Disabled)
+    }
+    async fn snapshot(&self) -> Result<GraphSnapshotId, GraphError> {
+        Err(GraphError::Disabled)
     }
 }
 
@@ -309,6 +366,8 @@ struct FixtureSpec {
     supports_structured: bool,
     budget_policy: BudgetPolicy,
     config: WorkerConfig,
+    /// Read-only graph behind the worker handle; `None` ⇒ the null graph.
+    graph: Option<Arc<FixesGraph>>,
 }
 
 impl Default for FixtureSpec {
@@ -319,6 +378,7 @@ impl Default for FixtureSpec {
             supports_structured: true,
             budget_policy: BudgetPolicy::default(),
             config: WorkerConfig::default(),
+            graph: None,
         }
     }
 }
@@ -347,7 +407,10 @@ fn fixture(spec: FixtureSpec) -> Fixture {
         )),
         tools: Arc::clone(&tools) as Arc<dyn ToolCaller>,
         perms: Arc::clone(&perms) as _,
-        graph: GraphViewHandle::null(),
+        graph: match &spec.graph {
+            Some(g) => GraphViewHandle::new(Arc::clone(g) as Arc<dyn ProjectGraph>),
+            None => GraphViewHandle::null(),
+        },
         artifacts: Arc::clone(&artifacts) as Arc<dyn ArtifactStore>,
         decisions: Arc::clone(&decisions) as _,
         sessions: Arc::new(NoSessions),
@@ -639,6 +702,92 @@ async fn repair_worker_produces_plan_from_predecessor_failure_ir() {
         .filter(|d| d.kind == DecisionKind::Custom("worker_attempt".into()))
         .collect();
     assert_eq!(attempts.len(), 1);
+}
+
+fn past_fix(code: &str, hours_ago: i64) -> FixEvent {
+    FixEvent {
+        diagnostic: None,
+        diagnostic_code: Some(code.into()),
+        crate_id: alloy_runtime::CrateId::new("toy-core").ok(),
+        transaction: None,
+        patch_artifact: Some(ArtifactId::new()),
+        verified: true,
+        recorded_at: alloy_runtime::Timestamp(
+            time::OffsetDateTime::now_utc() - time::Duration::hours(hours_ago),
+        ),
+    }
+}
+
+#[tokio::test]
+async fn repair_worker_asks_for_similar_fixes_and_fences_them_into_the_prompt() {
+    // RW4 as amended (A-0011-5): the codes in hand drive one SimilarFixes
+    // read per code, and what comes back rides the PR11 User-role note.
+    let mut table = HashMap::new();
+    table.insert("E0308".to_string(), vec![past_fix("E0308", 3)]);
+    let graph = Arc::new(FixesGraph::with(table));
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+
+    // One SimilarFixes read for the one code seen, with a bounded limit.
+    let asked: Vec<_> = graph
+        .seen()
+        .into_iter()
+        .filter_map(|q| match q {
+            GraphQuery::SimilarFixes {
+                diagnostic_code,
+                limit,
+            } => Some((diagnostic_code, limit)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked.len(), 1, "one read per distinct code");
+    assert_eq!(asked[0].0, "E0308");
+    assert!(asked[0].1 > 0 && asked[0].1 <= 8, "bounded limit");
+
+    // The fence reaches the model as User content.
+    let requests = fx.provider.requests();
+    assert_eq!(requests.len(), 1);
+    let note = requests[0]
+        .messages
+        .iter()
+        .find(|m| m.role == ChatRole::User && m.content.contains("similar_fixes"))
+        .expect("similar-fixes note present");
+    assert!(note.content.contains("E0308"));
+    assert!(note.content.contains("verified"));
+    assert!(
+        note.content.len() < 2048,
+        "the note stays compact: {} bytes",
+        note.content.len()
+    );
+}
+
+#[tokio::test]
+async fn repair_worker_omits_the_similar_fixes_note_when_the_graph_has_none() {
+    // An empty graph must not add an empty fence (RW4/CX7 stay honest).
+    let graph = Arc::new(FixesGraph::default());
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    fx.executor.execute(&ctx).await.unwrap();
+    let requests = fx.provider.requests();
+    assert!(
+        !requests[0]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("similar_fixes")),
+        "no fence when there is nothing to show"
+    );
 }
 
 #[tokio::test]
