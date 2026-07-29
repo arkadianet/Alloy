@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::obs::{redact_secrets, truncate_utf8_bytes};
 use crate::types::diagnostic::{DiagnosticEvent, DiagnosticLevel, ErrorClass, FailureIr, SpanRef};
-use crate::types::ids::Digest;
+use crate::types::ids::{DiagnosticId, Digest};
 
 /// SD9(c): flattened `children` entries per seed diagnostic.
 pub(crate) const MAX_SEED_CHILDREN: usize = 8;
@@ -27,10 +27,24 @@ pub(crate) const MAX_SEED_STRING_BYTES: usize = 4 * 1024;
 /// SD9(g): serialized seed payload bound (RFC-0013 OC7 total bound).
 pub(crate) const MAX_SEED_PAYLOAD_BYTES: usize = 64 * 1024;
 
-/// Depth-1 child of a [`SeedDiagnostic`] (SD9(c)): no further nesting is
-/// representable — the type carries no `children` and no `raw_json`.
+/// Uninhabited element type for [`SeedChild::children`]: the array can only
+/// ever be empty, so SD9(c)'s depth-1 flatten stays structural while the
+/// serialized child still carries the `children: []` key that
+/// [`DiagnosticEvent`]'s strict decode requires (SD4 consumability).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) enum SeedNever {}
+
+/// Depth-1 child of a [`SeedDiagnostic`] (SD9(c)): deeper nesting is not
+/// representable ([`SeedNever`] is uninhabited) and no `raw_json` exists.
+///
+/// Serializes to a shape [`DiagnosticEvent`] decodes (SD4): the shipped
+/// `diagnostics_from_payloads` consumer parses seed diagnostics strictly, so
+/// `id`, `fingerprint`, and the (always empty) `children` key are retained
+/// on the wire even though SD9(b)'s keep-list does not name them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SeedChild {
+    /// Diagnostic id (opaque; retained for [`DiagnosticEvent`] decode).
+    pub id: DiagnosticId,
     /// Optional error code.
     pub code: Option<String>,
     /// Severity.
@@ -39,6 +53,10 @@ pub(crate) struct SeedChild {
     pub message: String,
     /// Related spans (capped, SD9(d)).
     pub spans: Vec<SpanRef>,
+    /// Stable fingerprint for dedupe.
+    pub fingerprint: Digest,
+    /// Always empty (structural — the element type is uninhabited).
+    pub children: Vec<SeedNever>,
 }
 
 /// Sanitized projection of a [`DiagnosticEvent`] (SD9). Deliberately a
@@ -46,6 +64,8 @@ pub(crate) struct SeedChild {
 /// SEC7's "never seeded verbatim".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SeedDiagnostic {
+    /// Diagnostic id (opaque; retained for [`DiagnosticEvent`] decode — SD4).
+    pub id: DiagnosticId,
     /// Optional error code (`E0308`, …).
     pub code: Option<String>,
     /// Severity.
@@ -141,10 +161,13 @@ fn flatten_children(children: &[DiagnosticEvent], out: &mut Vec<SeedChild>, trun
             code
         });
         out.push(SeedChild {
+            id: child.id,
             code,
             level: child.level,
             message,
             spans: project_spans(&child.spans, truncated),
+            fingerprint: child.fingerprint.clone(),
+            children: Vec::new(),
         });
         flatten_children(&child.children, out, truncated);
     }
@@ -180,6 +203,7 @@ fn project_diagnostic(d: &DiagnosticEvent, truncated: &mut bool) -> SeedDiagnost
     let mut children = Vec::new();
     flatten_children(&d.children, &mut children, truncated);
     SeedDiagnostic {
+        id: d.id,
         code,
         level: d.level,
         message,
@@ -350,10 +374,29 @@ mod tests {
         let children = &payload.diagnostics[0].children;
         assert!(!children.is_empty());
         assert!(children.len() <= MAX_SEED_CHILDREN);
-        // Depth 1 is structural: SeedChild has no children field.
+        // Depth 1 is structural: SeedChild's children element type is
+        // uninhabited, so the serialized array is always empty.
         let value = serde_json::to_value(children).unwrap();
         for child in value.as_array().unwrap() {
-            assert!(child.get("children").is_none());
+            assert_eq!(child["children"], serde_json::json!([]));
+        }
+    }
+
+    /// SD4 consumability: every serialized seed diagnostic (children
+    /// included) decodes as a strict [`DiagnosticEvent`], because the shipped
+    /// `diagnostics_from_payloads` consumer parses exactly that type — and
+    /// the decoded event carries no `raw_json`.
+    #[test]
+    fn seed_diagnostics_decode_as_diagnostic_events() {
+        let mut root = diag("outer");
+        root.children = vec![diag("inner")];
+        let payload = project_failure(&failure(vec![root]));
+        let value = serde_json::to_value(&payload).unwrap();
+        for item in value["diagnostics"].as_array().unwrap() {
+            let event: DiagnosticEvent = serde_json::from_value(item.clone())
+                .expect("seed diagnostic must decode as DiagnosticEvent (SD4)");
+            assert!(event.raw_json.is_none());
+            assert!(!event.children.is_empty() || event.message == "inner");
         }
     }
 

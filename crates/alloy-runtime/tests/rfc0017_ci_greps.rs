@@ -265,3 +265,110 @@ fn ac38_rationale_never_enters_downstream_prompts() {
         }
     }
 }
+
+/// AC 40 (B6 extended): `scheduler/**` imports neither `planner::` nor
+/// `driver::` — the scheduler stays a single-generation executor (RP4); the
+/// generation loop lives in `alloy_runtime::driver`.
+#[test]
+fn ac40_scheduler_imports_no_planner_or_driver() {
+    for file in scheduler_files() {
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        for (idx, line) in text.lines().enumerate() {
+            if is_comment_line(line) {
+                continue;
+            }
+            for needle in ["planner::", "driver::"] {
+                assert!(
+                    !line.contains(needle),
+                    "AC 40 violated: {}:{} references {needle}",
+                    file.display(),
+                    idx + 1
+                );
+            }
+        }
+    }
+}
+
+/// AC 42 (MG4 / B1 / SQ2): `alloy-cli` contains no run-retry machinery — no
+/// `max_retries` / `max-retries` symbol — and no execution entry point
+/// besides `RunController::start`: no `Scheduler::run`, `run_dag`, or
+/// `run_within` call. The interim issue-#53 CLI retry loop is gone; the
+/// in-run generation loop (RFC-0017 §5.5) replaced it.
+#[test]
+fn ac42_cli_has_no_retry_loop_and_no_scheduler_entry() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../alloy-cli/src");
+    let mut files = Vec::new();
+    walk_rs_files(&dir, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no alloy-cli sources found — walk broken"
+    );
+    let needles = [
+        "max_retries",
+        "max-retries",
+        "Scheduler::run",
+        "run_dag",
+        "run_within",
+    ];
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        for (idx, line) in text.lines().enumerate() {
+            if is_comment_line(line) {
+                continue;
+            }
+            for needle in needles {
+                assert!(
+                    !line.contains(needle),
+                    "AC 42 violated: {}:{} references {needle}",
+                    file.display(),
+                    idx + 1
+                );
+            }
+        }
+    }
+}
+
+/// AC 43: no `.env` file reference in RFC-0017's new modules (Alloy MUST
+/// NEVER write `.env`), and the five-crate map is unchanged — no sixth
+/// crate appeared.
+#[test]
+fn ac43_no_dotenv_writes_and_no_sixth_crate() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for rel in [
+        "src/planner",
+        "src/driver",
+        "src/dag/proposal.rs",
+        "src/session/run_executor.rs",
+    ] {
+        let root = manifest.join(rel);
+        let mut files = Vec::new();
+        if root.is_dir() {
+            walk_rs_files(&root, &mut files);
+        } else {
+            files.push(root);
+        }
+        for file in files {
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+            for (idx, line) in text.lines().enumerate() {
+                assert!(
+                    !line.contains("\".env"),
+                    "AC 43 violated: {}:{} names a .env file",
+                    file.display(),
+                    idx + 1
+                );
+            }
+        }
+    }
+    let crates_dir = manifest.join("..");
+    let crate_count = std::fs::read_dir(&crates_dir)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().is_dir())
+        .count();
+    assert_eq!(
+        crate_count, 5,
+        "the five-crate map is frozen (no sixth crate)"
+    );
+}

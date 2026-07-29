@@ -9,16 +9,22 @@
 //! the `apply_patch` builtin, and a gate approved through the real
 //! `RunController`.
 //!
-//! Traces RFC-0013 Appendix A (`repair_local_diagnostic`, generation 2):
-//! generation 1 runs with an inert capability stub so the real `cargo_check`
-//! soft-fails and harvests genuine rustc diagnostics; the test plays
-//! RFC-0009's (not-yet-built) auto-replan by bumping the DAG to generation 2
-//! whose root (`analyze`) input carries generation 1's failure body as a
-//! synthetic predecessor; generation 2 dispatches the real `RepairWorker`
-//! and `EditWorker`, whose scripted completions produce a plan and a unified
-//! diff that the patch builtin applies; `verify` passes; the gate opens and
-//! is approved; the DAG reaches `Succeeded` with every node carrying
-//! `output_ref` and the meter showing exactly two model calls (T20).
+//! Traces RFC-0013 Appendix A (`repair_local_diagnostic`, generation 2) —
+//! now on the **production path** (RFC-0017 MG5 / AC 22): generation 1 is
+//! planned by the real `TemplatePlanService`, dispatched through
+//! `RunController::start` with the `GenerationDriver` installed as the run
+//! executor, and runs with an inert capability stub so the real
+//! `cargo_check` soft-fails and harvests genuine rustc diagnostics; the
+//! driver admits the `VerifyCompile` `Fail` (GN1–GN7) and replans through
+//! `PlanService::replan`, whose `PlanPersistence` seeds generation 2's root
+//! (`analyze`) with the SD1–SD10 `FromPredecessors` envelope — no
+//! hand-crafted seed remains in this test; generation 2 dispatches the real
+//! `RepairWorker` and `EditWorker`, whose scripted completions produce a
+//! plan and a unified diff that the patch builtin applies; `verify` passes;
+//! the gate opens and is approved; the run reaches `Succeeded` with exactly
+//! one `RunAccepted` / `RunCompleted` / `RunFinished` (AM-0003-2), every
+//! node carrying `output_ref`, and the meter showing exactly two model
+//! calls (T20).
 //!
 //! This MUST live here, not in `alloy-runtime` (§11.3 / RFC-0013 §2.4): only
 //! this crate owns `ToolHandle`/`InProcessMcpHost`/`NativeSandboxBroker`.
@@ -53,25 +59,27 @@ mod linux {
     use alloy_runtime::runtime::AlloyRuntime;
     use alloy_runtime::session::SessionPlane;
     use alloy_runtime::storage::{
-        install_sqlite_event_sink, AlloyStorage, ArtifactKind, ArtifactPut, ArtifactStore,
-        DagStore, SessionRows, StorageOpenOptions,
+        install_sqlite_event_sink, AlloyStorage, ArtifactKind, ArtifactStore, DagStore, EventStore,
+        SessionRows, StorageOpenOptions,
     };
-    use alloy_runtime::types::ids::{ArtifactId, DagId, NodeId, ProfileId, RunId, SessionId};
+    use alloy_runtime::types::ids::{DagId, NodeId, ProfileId, RunId, SessionId};
     use alloy_runtime::SessionProvenance;
     use alloy_runtime::{
-        allocate_ids, build_topology, Approval, BudgetPolicy, BuildTopology, CapabilityExecContext,
-        CapabilityExecError, CapabilityExecutor, CapabilityId, CapabilityOutcome,
-        CapabilityRegistry, ChatMessage, ChatRole, CompletionRequest, ContextEngine, CostSnapshot,
-        DagState, DecisionKind, EndpointId, GateHumanAdapter, Goal, GraphViewHandle,
+        compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, Approval,
+        BudgetPolicy, CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityId,
+        CapabilityOutcome, CapabilityRegistry, ChatMessage, ChatRole, CompletionRequest,
+        ContextEngine, CostSnapshot, DagState, DecisionKind, EndpointId, GateHumanAdapter,
+        GenerationDriver, GenerationDriverDeps, GenerationPolicy, Goal, GraphViewHandle,
         LinearScheduler, LinearSchedulerDeps, McpVerifyCompileAdapter, ModelEndpoint,
         ModelProvider, ModelResponse, ModelTier, NodeInputEnvelope, NodeInputPayload, NodeKind,
-        NullContextEngine, PredecessorOutput, ProcessCostMeterFactory, ProcessRunRouterProvider,
-        ProviderId, RecordingDecisionLog, RegistryCapabilityExecutor, RepairPlanPayload,
-        ResponseFormat, RetentionPolicy, RouterConfig, RunControlState, RunGoalRecord, RunRow,
-        RuntimeConfig, SchedConfig, Scheduler, Session, SessionVerifyPermissions,
-        SessionWorkerPermissions, TaskDag, TemplateCatalog, TemplateId, Timestamp, ToolCaller,
-        ToolChoice, ToolName, ToolSelector, UnavailableVerifyTest, Usage, Verifier,
-        VerifyPermissions, WorkerConfig, WorkerDeps, EDIT_SYSTEM, REPAIR_SYSTEM,
+        NodeOutputEnvelope, NullContextEngine, PlanContext, PlanFingerprints, PlanProducedPayload,
+        PlanService, ProcessCostMeterFactory, ProcessRunRouterProvider, ProviderId,
+        RecordingDecisionLog, RegistryCapabilityExecutor, RepairPlanPayload, ResponseFormat,
+        RetentionPolicy, RouterConfig, RunControlState, RunGoalRecord, RunRow, RuntimeConfig,
+        RuntimeEvent, RuntimeHandle, SchedConfig, Session, SessionEventType,
+        SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService, Timestamp,
+        ToolCaller, ToolChoice, ToolName, ToolSelector, ToolchainRecord, UnavailableVerifyTest,
+        Usage, Verifier, VerifyPermissions, WorkerConfig, WorkerDeps, EDIT_SYSTEM, REPAIR_SYSTEM,
     };
     use alloy_tools::mcp::{
         InProcessMcpHost, McpHostConfig, McpPlatform, ToolHandle, ToolHandleToolCaller,
@@ -183,26 +191,35 @@ mod linux {
         Ok(())
     }
 
-    // --- generation 1 inert capabilities ------------------------------------
+    // --- generation-switching capabilities ----------------------------------
 
-    /// Generation 1 stand-in: RFC-0013 Appendix A starts its worked trace at
-    /// generation 2, so generation 1 only needs `analyze`/`edit` to succeed
-    /// inertly and let the real `cargo_check` harvest the diagnostics. Test
-    /// scope only — the production path is `RegistryCapabilityExecutor`.
-    struct InertGen1Capabilities;
+    /// Generation 1 stand-in behind a single scheduler: RFC-0013 Appendix A
+    /// starts its worked trace at generation 2, so generation 1 only needs
+    /// `analyze`/`edit` to succeed inertly and let the real `cargo_check`
+    /// harvest the diagnostics; every later generation dispatches the real
+    /// RFC-0013 registry. The switch keys on the input envelope's
+    /// generation, which the scheduler stamps at plan time — one scheduler,
+    /// one executor, both generations (the production wiring holds one
+    /// executor for the whole run).
+    struct GenerationSwitchCapabilities {
+        real: Arc<dyn CapabilityExecutor>,
+    }
 
     #[async_trait::async_trait]
-    impl CapabilityExecutor for InertGen1Capabilities {
+    impl CapabilityExecutor for GenerationSwitchCapabilities {
         async fn execute(
             &self,
             ctx: &CapabilityExecContext,
         ) -> Result<CapabilityOutcome, CapabilityExecError> {
+            if ctx.input.generation >= 2 {
+                return self.real.execute(ctx).await;
+            }
             match ctx.kind {
                 NodeKind::Analyze | NodeKind::Edit => Ok(CapabilityOutcome::Succeeded {
                     payload: serde_json::json!({ "generation_one": "inert" }),
                 }),
                 other => Err(CapabilityExecError::Internal(format!(
-                    "InertGen1Capabilities has no worker for {other:?}"
+                    "generation 1 has no worker for {other:?}"
                 ))),
             }
         }
@@ -398,6 +415,7 @@ planning = "standard"
     struct Fixture {
         dir: TempDir,
         rt: AlloyRuntime,
+        handle: RuntimeHandle,
         storage: Arc<AlloyStorage>,
         plane: SessionPlane,
     }
@@ -433,10 +451,11 @@ planning = "standard"
             )
             .await
             .unwrap();
-            let plane = SessionPlane::new(handle, Arc::clone(&storage));
+            let plane = SessionPlane::new(handle.clone(), Arc::clone(&storage));
             Self {
                 dir,
                 rt,
+                handle,
                 storage,
                 plane,
             }
@@ -480,104 +499,56 @@ planning = "standard"
                 id: run_id,
                 session_id,
                 goal_json: serde_json::to_value(&goal).unwrap(),
-                state: RunControlState::Accepted.as_str().into(),
+                // `created` so `start` runs the full acceptance path and the
+                // lifecycle-triple assertion is meaningful (AM-0003-2).
+                state: RunControlState::Created.as_str().into(),
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
             };
             self.storage.sessions().upsert_run(&row).await.unwrap();
             run_id
         }
+    }
 
-        async fn put_json_artifact(&self, value: &serde_json::Value) -> ArtifactId {
-            self.storage
-                .artifacts()
-                .put(ArtifactPut {
-                    bytes: serde_json::to_vec(value).unwrap(),
-                    kind: ArtifactKind::Blob,
-                    content_type: Some("application/json".into()),
-                    session_id: None,
-                    run_id: None,
-                    labels: serde_json::Map::new(),
-                })
-                .await
-                .unwrap()
+    /// The three `PlanContext` fingerprints (synthetic toolchain — the DAG
+    /// cache is off day-1, so they are provenance only).
+    fn fingerprints() -> PlanFingerprints {
+        let toolchain = ToolchainRecord {
+            channel: "1.97.1".into(),
+            rustc_version: "rustc 1.97.1 (e2e)".into(),
+            cargo_version: "cargo 1.97.1 (e2e)".into(),
+        };
+        PlanFingerprints {
+            policy_hash: policy_hash_digest(
+                &ProfileId::new("default").unwrap(),
+                &BudgetPolicy::default(),
+            ),
+            tool_versions: tool_versions_digest(&toolchain),
+            compiler_fingerprint: compiler_fingerprint_digest(
+                &toolchain,
+                "x86_64-unknown-linux-gnu",
+            ),
         }
     }
 
-    /// Build one generation of the `repair_local_diagnostic` template.
-    ///
-    /// `analyze_diagnostics`: `None` for a blind first attempt (the root gets
-    /// the plain `Goal`); `Some(_)` to synthesize a replan whose root carries
-    /// a `FromPredecessors` envelope holding those diagnostics — standing in
-    /// for RFC-0009's not-yet-built auto-replan.
-    async fn build_generation(
-        fx: &Fixture,
-        dag_id: DagId,
-        session_id: SessionId,
-        generation: u64,
-        analyze_diagnostics: Option<&serde_json::Value>,
-    ) -> (TaskDag, alloy_runtime::TemplateIdMap) {
-        let manifest = TemplateCatalog::get(TemplateId::RepairLocalDiagnostic);
-        let ids = allocate_ids(manifest);
-
-        let mut input_refs: BTreeMap<NodeId, ArtifactId> = BTreeMap::new();
-        let analyze_id = ids.nodes["analyze"];
-        let analyze_input_ref = match analyze_diagnostics {
-            None => {
-                let env = NodeInputEnvelope::new(
-                    dag_id,
-                    analyze_id,
-                    NodeKind::Analyze,
-                    generation,
-                    NodeInputPayload::Goal(Goal {
-                        text: GOAL_TEXT.into(),
-                        constraints: vec![],
-                        attachments: vec![],
-                    }),
-                );
-                fx.put_json_artifact(&serde_json::to_value(&env).unwrap())
-                    .await
-            }
-            Some(diagnostics) => {
-                let pred_artifact = fx.put_json_artifact(diagnostics).await;
-                let env = NodeInputEnvelope::new(
-                    dag_id,
-                    analyze_id,
-                    NodeKind::Analyze,
-                    generation,
-                    NodeInputPayload::FromPredecessors {
-                        preds: vec![PredecessorOutput {
-                            // Synthetic: generation 1's verify node, which is
-                            // not part of this generation's node set.
-                            node_id: NodeId::new(),
-                            kind: NodeKind::VerifyCompile,
-                            output_ref: pred_artifact,
-                        }],
-                    },
-                );
-                fx.put_json_artifact(&serde_json::to_value(&env).unwrap())
-                    .await
-            }
-        };
-        input_refs.insert(analyze_id, analyze_input_ref);
-
-        // Non-root nodes are C5-rewritten before dispatch; the placeholder
-        // only has to exist.
-        for name in ["edit", "verify", "gate"] {
-            let placeholder =
-                serde_json::json!({ "schema_version": 1, "alloy.envelope": "pending_pred" });
-            input_refs.insert(ids.nodes[name], fx.put_json_artifact(&placeholder).await);
+    fn plan_ctx(session: SessionId, run: RunId, dag: DagId) -> PlanContext {
+        let prints = fingerprints();
+        PlanContext {
+            session_id: session,
+            run_id: run,
+            dag_id: dag,
+            goal: Goal {
+                text: GOAL_TEXT.into(),
+                constraints: vec![],
+                attachments: vec![],
+            },
+            template_override: None,
+            policy_hash: prints.policy_hash,
+            tool_versions: prints.tool_versions,
+            compiler_fingerprint: prints.compiler_fingerprint,
+            prior_source: None,
+            prior_proposal_artifact: None,
         }
-
-        let dag = build_topology(BuildTopology {
-            manifest,
-            dag_id,
-            session_id,
-            generation,
-            ids: &ids,
-            input_refs: &input_refs,
-        });
-        (dag, ids)
     }
 
     /// Assemble a production `LinearScheduler` (not `new_for_test`) over the
@@ -724,47 +695,7 @@ planning = "standard"
             fx.storage.artifacts(),
         ));
 
-        // --- generation 1: inert workers, verify soft-fails ----------------
-        //
-        // Scoped so the scheduler — and with it the `scheduler.lock` file
-        // `OwnershipLock` holds for the process lifetime — is dropped before
-        // generation 2 constructs a second scheduler over the same data_dir.
-        let diagnostics_json = {
-            let (dag1, ids1) = build_generation(&fx, dag_id, session_id, 1, None).await;
-            fx.storage.dags().put(&dag1).await.unwrap();
-
-            let caps1: Arc<dyn CapabilityExecutor> = Arc::new(InertGen1Capabilities);
-            let scheduler = build_scheduler(
-                &fx,
-                sched_dir.clone(),
-                &caps1,
-                &verify_compile,
-                &decisions,
-                &cost_meters,
-            );
-            let outcome1 = scheduler.run(dag_id).await.unwrap();
-            assert_eq!(
-                outcome1.state,
-                DagState::Failed,
-                "gen1 outcome: {outcome1:?}"
-            );
-            assert_eq!(outcome1.failed_node, Some(ids1.nodes["verify"]));
-            let failure = outcome1.failure.expect("failed DAG carries a failure");
-            assert!(
-                failure
-                    .diagnostics
-                    .iter()
-                    .any(|d| d.code.as_deref() == Some("E0308")),
-                "expected the fixture's type error, got {:?}",
-                failure.diagnostics
-            );
-            serde_json::json!({
-                "diagnostics": failure.diagnostics,
-                "notes": failure.notes,
-            })
-        };
-
-        // --- generation 2: the real RFC-0013 registry ----------------------
+        // --- one executor for both generations (RFC-0017 production path) --
         let worker_tools: Arc<dyn ToolCaller> =
             Arc::new(ToolHandleToolCaller::new(ToolHandle::new(
                 Arc::clone(&host) as Arc<dyn McpPlatform>,
@@ -797,36 +728,70 @@ planning = "standard"
             config: WorkerConfig::default(),
         };
         let registry = CapabilityRegistry::mvp(deps).unwrap();
-        let caps2: Arc<dyn CapabilityExecutor> =
+        let real_caps: Arc<dyn CapabilityExecutor> =
             Arc::new(RegistryCapabilityExecutor::new(Arc::new(registry)));
+        let caps: Arc<dyn CapabilityExecutor> =
+            Arc::new(GenerationSwitchCapabilities { real: real_caps });
 
-        let (dag2, ids2) =
-            build_generation(&fx, dag_id, session_id, 2, Some(&diagnostics_json)).await;
-        fx.storage.dags().put(&dag2).await.unwrap();
-
-        let scheduler2 = Arc::new(build_scheduler(
+        // One production scheduler for the whole run, registered on the
+        // runtime handle so the driver's `run_dag_within` reaches it.
+        let scheduler = Arc::new(build_scheduler(
             &fx,
             sched_dir,
-            &caps2,
+            &caps,
             &verify_compile,
             &decisions,
             &cost_meters,
         ));
-        let gate_id = ids2.gates["gate"];
-        let runs = fx.plane.runs();
-        let sched_for_run = Arc::clone(&scheduler2);
-        let mut run_task = tokio::spawn(async move { sched_for_run.run(dag_id).await });
+        fx.handle.set_scheduler(scheduler as _).unwrap();
 
-        // Poll for `WaitingApproval` before approving. Real wall-clock
-        // `cargo_check` I/O means this cannot use a paused clock.
+        // Generation 1 is planned by the production plan service (root gets
+        // the plain Goal envelope) — no hand-built topology.
+        let plans = Arc::new(TemplatePlanService::from_storage(&fx.storage));
+        PlanService::plan(&*plans, plan_ctx(session_id, run_id, dag_id))
+            .await
+            .unwrap();
+
+        // The RFC-0017 GenerationDriver is the run's executor: it dispatches
+        // generation 1, admits the genuine VerifyCompile Fail, replans
+        // through `PlanService::replan` (which seeds generation 2's root per
+        // SD1–SD10), and dispatches generation 2 — all inside one
+        // `RunController::start`.
+        let driver = Arc::new(GenerationDriver::new(GenerationDriverDeps {
+            handle: fx.handle.clone(),
+            plans: Arc::clone(&plans) as _,
+            runs: fx.plane.runs(),
+            dags: fx.storage.dags() as _,
+            sessions: fx.storage.sessions() as _,
+            events: fx.storage.events() as _,
+            decisions: Arc::clone(&decisions) as _,
+            cost_meters: Arc::clone(&cost_meters) as _,
+            budget_policy: BudgetPolicy::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            fingerprints: fingerprints(),
+            policy: GenerationPolicy {
+                max_repair_generations: 2,
+            },
+        }));
+        fx.plane.set_executor(driver as _);
+
+        let runs = fx.plane.runs();
+        let start_runs = Arc::clone(&runs);
+        let mut run_task = tokio::spawn(async move { start_runs.start(run_id).await });
+
+        // Poll for `WaitingApproval` before approving (generation 2's gate).
+        // Real wall-clock `cargo_check` I/O means this cannot use a paused
+        // clock. Generation 1 fails at verify without opening a gate, so the
+        // first `WaitingApproval` the blob shows is generation 2's.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
         loop {
             if run_task.is_finished() {
-                let early = (&mut run_task).await.expect("scheduler task panicked");
-                panic!("gen2 run returned before the gate opened: {early:?}");
+                let early = (&mut run_task).await.expect("start task panicked");
+                panic!("run returned before the gate opened: {early:?}");
             }
             let dag = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
             if dag.state == DagState::WaitingApproval {
+                assert_eq!(dag.generation, 2, "the gate must belong to generation 2");
                 break;
             }
             assert!(
@@ -836,29 +801,146 @@ planning = "standard"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let waiting = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        let gate_id = waiting
+            .nodes
+            .values()
+            .find(|n| n.kind == NodeKind::GateHuman)
+            .and_then(|n| n.approval.as_ref())
+            .map(|a| a.gate)
+            .expect("generation 2 gate node carries an ApprovalSpec");
         runs.approve(run_id, gate_id, Approval::Allow)
             .await
             .unwrap();
 
-        let outcome2 = run_task
+        run_task
             .await
-            .expect("scheduler task panicked")
-            .expect("gen2 run failed");
-        assert_eq!(
-            outcome2.state,
-            DagState::Succeeded,
-            "gen2 outcome: {outcome2:?}"
-        );
+            .expect("start task panicked")
+            .expect("run failed");
         assert!(
             provider.is_exhausted(),
             "both scripted completions were consumed"
         );
 
-        // Every node carries output_ref; decode the two worker payloads.
+        // §6.3 stayed single-sourced across generations (AC 21b shape): one
+        // RunAccepted, one RunCompleted, one RunFinished, terminal row once.
+        let run_row = fx
+            .storage
+            .sessions()
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run_row.state, "succeeded");
+        let runtime_events = fx
+            .storage
+            .events()
+            .list_runtime_events(None, 1000)
+            .await
+            .unwrap();
+        let accepted = runtime_events
+            .iter()
+            .filter(
+                |(_, ev)| matches!(ev, RuntimeEvent::RunAccepted { run_id: r, .. } if *r == run_id),
+            )
+            .count();
+        let finished = runtime_events
+            .iter()
+            .filter(
+                |(_, ev)| matches!(ev, RuntimeEvent::RunFinished { run_id: r, .. } if *r == run_id),
+            )
+            .count();
+        let session_events = fx
+            .storage
+            .events()
+            .list_session_events(session_id, None, 1000)
+            .await
+            .unwrap();
+        let completed = session_events
+            .iter()
+            .filter(|e| e.type_ == SessionEventType::RunCompleted && e.run_id == Some(run_id))
+            .count();
+        assert_eq!(
+            (accepted, completed, finished),
+            (1, 1, 1),
+            "one lifecycle triple regardless of generation count"
+        );
+
+        // The replan was the production path: two PlanProduced events, the
+        // second a seeded replan (AM-0009-2/3).
+        let plans_produced: Vec<PlanProducedPayload> = session_events
+            .iter()
+            .filter(|e| e.type_ == SessionEventType::PlanProduced)
+            .map(|e| serde_json::from_value(e.payload.clone()).unwrap())
+            .collect();
+        assert_eq!(plans_produced.len(), 2);
+        assert!(plans_produced[1].replan);
+        assert_eq!(plans_produced[1].generation, 2);
+        assert_eq!(plans_produced[1].seeded_root, Some(true));
+
+        // Generation 2's root really carries generation 1's failure: the
+        // analyze input decodes as `FromPredecessors` whose synthetic pred
+        // resolves to the SD3 `replan_seed` envelope with the genuine E0308.
         let final_dag = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        assert_eq!(final_dag.generation, 2);
+        let analyze_node = final_dag
+            .nodes
+            .values()
+            .find(|n| n.kind == NodeKind::Analyze)
+            .unwrap();
+        let root_blob = fx
+            .storage
+            .artifacts()
+            .get(analyze_node.input_ref)
+            .await
+            .unwrap();
+        let root_env: NodeInputEnvelope = serde_json::from_slice(&root_blob.bytes).unwrap();
+        let NodeInputPayload::FromPredecessors { preds } = &root_env.payload else {
+            panic!("seeded root must be FromPredecessors, got {root_env:?}");
+        };
+        assert_eq!(preds.len(), 1, "exactly one synthetic seed predecessor");
+        assert_eq!(preds[0].kind, NodeKind::VerifyCompile);
+        let seed_blob = fx
+            .storage
+            .artifacts()
+            .get(preds[0].output_ref)
+            .await
+            .unwrap();
+        assert_eq!(
+            seed_blob
+                .meta
+                .labels
+                .get("alloy.envelope")
+                .and_then(|v| v.as_str()),
+            Some("replan_seed")
+        );
+        let seed_env: NodeOutputEnvelope = serde_json::from_slice(&seed_blob.bytes).unwrap();
+        assert_eq!(seed_env.generation, 1, "the seed speaks for generation 1");
+        assert_eq!(seed_env.payload["ok"], serde_json::json!(false));
+        let seed_codes: Vec<&str> = seed_env.payload["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["code"].as_str())
+            .collect();
+        assert!(
+            seed_codes.contains(&"E0308"),
+            "the genuine rustc E0308 must ride the seed, got {seed_codes:?}"
+        );
+
+        // Every node carries output_ref; decode the two worker payloads.
         let mut payloads: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
-        for name in ["analyze", "edit", "verify", "gate"] {
-            let node = &final_dag.nodes[&ids2.nodes[name]];
+        for (name, kind) in [
+            ("analyze", NodeKind::Analyze),
+            ("edit", NodeKind::Edit),
+            ("verify", NodeKind::VerifyCompile),
+            ("gate", NodeKind::GateHuman),
+        ] {
+            let node = final_dag
+                .nodes
+                .values()
+                .find(|n| n.kind == kind)
+                .unwrap_or_else(|| panic!("{name} node present"));
             let output_ref = node
                 .output_ref
                 .unwrap_or_else(|| panic!("{name} MUST carry output_ref at Succeeded"));

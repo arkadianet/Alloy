@@ -195,9 +195,21 @@ impl LlmPlanService {
         // pre-CAS `DagValidator` pass over ephemeral refs), then hand the
         // resource-assigned specs to `persist_validated`, which re-runs the
         // three phases and re-validates with real refs before the CAS.
+        // §9.1 `planner.compile` — the pipeline is pure/sync, so a plain
+        // entered span suffices (no await crosses it before the persist).
+        let compile_span = tracing::info_span!(
+            "planner.compile",
+            dag_id = %ctx.dag_id,
+            node_count = manifest.nodes.len(),
+            rejection_variant = tracing::field::Empty,
+        );
+        let compile_guard = compile_span.enter();
         let ids = match allocate_proposal_ids(manifest) {
             Ok(ids) => ids,
-            Err(rej) => return Ok(Err(rej)),
+            Err(rej) => {
+                compile_span.record("rejection_variant", tracing::field::debug(&rej));
+                return Ok(Err(rej));
+            }
         };
         let mut ephemeral = std::collections::BTreeMap::new();
         for nid in ids.nodes.values() {
@@ -214,12 +226,17 @@ impl LlmPlanService {
                 cfg: &self.cfg,
             },
         ) {
+            compile_span.record("rejection_variant", tracing::field::debug(&rej));
             return Ok(Err(rej));
         }
         let (specs, edges) = match resolve_proposal(manifest, &self.cfg) {
             Ok(pair) => pair,
-            Err(rej) => return Ok(Err(rej)),
+            Err(rej) => {
+                compile_span.record("rejection_variant", tracing::field::debug(&rej));
+                return Ok(Err(rej));
+            }
         };
+        drop(compile_guard);
         let template_id = TemplatePlanService::select(ctx);
         let result = self
             .inner
@@ -269,12 +286,37 @@ impl PlanService for LlmPlanService {
         if self.cfg.mode == PlannerMode::Template {
             return self.inner.plan(ctx).await;
         }
-        let manifest = match propose_bounded(&self.proposer, &self.cfg, &ctx).await {
+        // §9.1 `planner.propose` — outcome and sizes only; never goal text,
+        // never rationale.
+        let propose_span = tracing::info_span!(
+            "planner.propose",
+            session_id = %ctx.session_id,
+            run_id = %ctx.run_id,
+            dag_id = %ctx.dag_id,
+            outcome = tracing::field::Empty,
+            node_count = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+        );
+        let proposed = {
+            use tracing::Instrument as _;
+            propose_bounded(&self.proposer, &self.cfg, &ctx)
+                .instrument(propose_span.clone())
+                .await
+        };
+        if let Ok(manifest) = &proposed {
+            propose_span.record("node_count", manifest.nodes.len());
+            propose_span.record(
+                "bytes",
+                serde_json::to_vec(manifest).map(|b| b.len()).unwrap_or(0),
+            );
+        }
+        let manifest = match proposed {
             Ok(manifest) => manifest,
             // FB2b — cancellation propagates; no plan, no DAG row, no
             // fallback: a stop request is never answered by starting work.
             // LP8 still holds: the one decision names the stop.
             Err(ProposeError::Cancelled) => {
+                propose_span.record("outcome", "unavailable");
                 self.record_proposal_decision(
                     &ctx,
                     serde_json::json!({
@@ -288,7 +330,10 @@ impl PlanService for LlmPlanService {
                 return Err(PlanError::Internal("cancelled".into()));
             }
             // FB2 — every other ProposeError falls back.
-            Err(e) => return self.fall_back(ctx, e.to_string(), None).await,
+            Err(e) => {
+                propose_span.record("outcome", "unavailable");
+                return self.fall_back(ctx, e.to_string(), None).await;
+            }
         };
         // LP4 — auditable before compilation.
         let proposal_artifact = self.put_proposal_artifact(&ctx, &manifest).await?;
@@ -305,6 +350,7 @@ impl PlanService for LlmPlanService {
             .await?
         {
             Ok(result) => {
+                propose_span.record("outcome", "accepted");
                 self.metrics
                     .proposals_accepted
                     .fetch_add(1, Ordering::Relaxed);
@@ -322,6 +368,7 @@ impl PlanService for LlmPlanService {
                 Ok(result)
             }
             Err(rejection) => {
+                propose_span.record("outcome", "rejected");
                 self.fall_back(ctx, rejection.to_string(), Some(proposal_artifact))
                     .await
             }

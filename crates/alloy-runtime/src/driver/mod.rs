@@ -408,11 +408,26 @@ impl RunExecutor for GenerationDriver {
                 // outcome rather than the driver inventing one.
             }
 
-            let outcome = self
-                .deps
-                .handle
-                .run_dag_within(ctx.dag_id, remaining)
-                .await?;
+            // §9.1 `driver.generation` — identifiers and counters only.
+            let gen_span = tracing::info_span!(
+                "driver.generation",
+                run_id = %ctx.run_id,
+                dag_id = %ctx.dag_id,
+                bumps,
+                remaining_ms = remaining.as_millis() as u64,
+                generation = tracing::field::Empty,
+                admitted = tracing::field::Empty,
+                reject_reason = tracing::field::Empty,
+            );
+            let outcome = {
+                use tracing::Instrument as _;
+                self.deps
+                    .handle
+                    .run_dag_within(ctx.dag_id, remaining)
+                    .instrument(gen_span.clone())
+                    .await?
+            };
+            gen_span.record("generation", outcome.generation);
             self.metrics.generations_run.fetch_add(1, Ordering::Relaxed);
 
             // GN9 — everything except Failed passes through unconverted.
@@ -422,6 +437,8 @@ impl RunExecutor for GenerationDriver {
 
             match self.admission_reason(&ctx, &outcome, bumps).await {
                 Ok(Some(reason)) => {
+                    gen_span.record("admitted", false);
+                    gen_span.record("reject_reason", reason);
                     self.metrics
                         .replans_rejected
                         .fetch_add(1, Ordering::Relaxed);
@@ -436,7 +453,9 @@ impl RunExecutor for GenerationDriver {
                     );
                     return Ok(outcome);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    gen_span.record("admitted", true);
+                }
                 Err(e) => return Err(fold(e)),
             }
 

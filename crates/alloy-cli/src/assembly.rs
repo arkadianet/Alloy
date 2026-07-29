@@ -69,12 +69,8 @@ pub struct FullAssembly {
     /// The installed scheduler (kept for wiring assertions).
     pub scheduler: Arc<LinearScheduler>,
     /// PF10 — the assembled `GitEditEngine`, or `None` under readonly (where
-    /// refusal is structural). The retry loop needs it directly, not only
-    /// through the MCP patch backend, to roll a failed attempt's edits back.
+    /// refusal is structural).
     pub edit_engine: Option<Arc<dyn EditEngine>>,
-    /// The same worker permission source the patch builtin uses, so a
-    /// CLI-side rollback presents a token minted by one authority (PM5).
-    pub worker_perms: Arc<dyn WorkerPermissions>,
     /// Compile verifier, re-used for the pre-plan diagnostic seed (issue #53).
     pub verify_compile: Arc<dyn alloy_runtime::Verifier>,
 }
@@ -383,6 +379,7 @@ pub async fn assemble_full_with(
             ToolSelector::name(tool_name("apply_patch")),
         ],
     )));
+    // The same worker permission source the patch builtin uses (PM5).
     let worker_perms: Arc<dyn WorkerPermissions> = Arc::new(SessionWorkerPermissions::new(
         storage.sessions() as _,
         Some("**".into()),
@@ -517,7 +514,6 @@ pub async fn assemble_full_with(
         plan,
         scheduler: sched,
         edit_engine,
-        worker_perms,
         verify_compile: verify_compile as _,
     })
 }

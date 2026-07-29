@@ -332,7 +332,21 @@ impl PlanPersistence {
         );
         let bytes = encode_json(&envelope)
             .map_err(|e| PlanError::Internal(format!("seed envelope serde: {e}")))?;
-        let seed_id = self.put_labeled(bytes, req.ctx, "replan_seed").await?;
+        // §9.1 `planner.seed` — sizes and counts only, never diagnostic text.
+        let span = tracing::info_span!(
+            "planner.seed",
+            dag_id = %req.ctx.dag_id,
+            generation = req.generation,
+            diagnostic_count = projected.diagnostics.len(),
+            bytes = bytes.len(),
+            truncated = projected.truncated,
+        );
+        let seed_id = {
+            use tracing::Instrument as _;
+            self.put_labeled(bytes, req.ctx, "replan_seed")
+                .instrument(span)
+                .await?
+        };
         // SD5: exactly one synthetic predecessor; readers never resolve its
         // node id against the current node map.
         Ok(NodeInputPayload::FromPredecessors {
