@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapters;
+pub mod capabilities;
 pub mod config;
 pub mod context;
 pub mod dag;
@@ -55,6 +56,18 @@ pub use adapters::{
     UnavailableCapabilityExecutor, UnavailableGateHuman, UnavailableVerifyCompile,
     UnavailableVerifyTest, VerifyClass, VerifyCompileAdapter, VerifyOutcome, VerifyPermissions,
     VerifyTestAdapter,
+};
+// RFC-0013 exports. The `edit` capability payload (`capabilities::
+// EditAppliedPayload`) is deliberately not re-exported here: the crate root
+// already exports RFC-0008's session-event payload of the same name.
+pub use capabilities::{
+    system_instruction_digest, Capability, CapabilityContext, CapabilityDescriptor,
+    CapabilityRegistry, CapabilityVersion, EditWorker, PlanningProposalPayload, PlanningWorker,
+    ProcessRunRouterProvider, RegError, RegistryCapabilityExecutor, RepairPlanPayload, RepairStep,
+    RepairWorker, ResolveHints, ReviewFinding, ReviewPayload, ReviewSeverity, ReviewVerdict,
+    ReviewWorker, RunRouterProvider, SessionWorkerPermissions, SideEffectClass, WorkerConfig,
+    WorkerDeps, WorkerPermissions, WorkerToolClass, CAPABILITY_CATALOG, EDIT_SYSTEM,
+    MAX_LLM_CAPABILITIES, PAYLOAD_SCHEMA_VERSION, REPAIR_SYSTEM, REVIEW_SYSTEM,
 };
 pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
 pub use context::{

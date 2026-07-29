@@ -1,0 +1,370 @@
+//! `RepairWorker` (id `repair`, kind `Analyze`) — RFC-0013 §9.1, rules
+//! RW1–RW8.
+//!
+//! Given a goal (root node) or a predecessor failure body with rustc
+//! diagnostics (post-verification generation), produce a `RepairPlanPayload`
+//! describing a minimal, local, text-patchable fix. It never writes files
+//! and never emits a diff (RW5): patch authorship belongs to `edit` alone.
+
+use async_trait::async_trait;
+use serde::Deserialize;
+
+use crate::adapters::{CapabilityExecError, CapabilityOutcome};
+use crate::context::AssembleInputs;
+use crate::dag::{NodeInputPayload, NodeKind};
+use crate::graph::GraphQuery;
+use crate::types::budget::ModelTier;
+use crate::types::diagnostic::DiagnosticEvent;
+use crate::types::ids::CapabilityId;
+use crate::types::tools::{ToolName, ToolSelector};
+
+use super::super::deps::{CapabilityContext, WorkerConfig};
+use super::super::parse::is_jail_relative;
+use super::super::payload::{
+    clamp_string, RepairPlanPayload, RepairStep, MAX_PAYLOAD_STRING_BYTES, PAYLOAD_SCHEMA_VERSION,
+};
+use super::super::prompt::REPAIR_SYSTEM;
+use super::super::traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
+use super::{
+    diagnostics_from_payloads, finish_attempt, llm_exchange, load_pred_payloads, worker_span,
+    Attempt, WorkerError, WorkerSuccess,
+};
+
+/// RW2: diagnostics presented to the model are capped at this many.
+const MAX_DIAGNOSTICS: usize = 32;
+/// §8.2: max `target_files` entries.
+const MAX_TARGET_FILES: usize = 16;
+/// §8.2: max bytes of one step rationale.
+const MAX_RATIONALE_BYTES: usize = 512;
+
+/// Model response schema (PS5: `deny_unknown_fields`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairProposal {
+    summary: String,
+    target_files: Vec<String>,
+    steps: Vec<StepProposal>,
+    #[serde(default)]
+    needs_replan: bool,
+    #[serde(default)]
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepProposal {
+    file: String,
+    rationale: String,
+    #[serde(default)]
+    anchor_line: Option<u32>,
+}
+
+/// Diagnostic-analysis worker.
+#[derive(Debug, Clone)]
+pub struct RepairWorker {
+    config: WorkerConfig,
+}
+
+impl RepairWorker {
+    /// Construct with worker knobs.
+    #[must_use]
+    pub fn new(config: WorkerConfig) -> Self {
+        Self { config }
+    }
+
+    const VERSION: CapabilityVersion = CapabilityVersion::new(1, 0, 0);
+
+    fn capability_id() -> CapabilityId {
+        CapabilityId::new("repair").expect("static id")
+    }
+}
+
+#[async_trait]
+impl Capability for RepairWorker {
+    fn id(&self) -> CapabilityId {
+        Self::capability_id()
+    }
+
+    fn version(&self) -> CapabilityVersion {
+        Self::VERSION
+    }
+
+    fn describe(&self) -> CapabilityDescriptor {
+        CapabilityDescriptor {
+            id: Self::capability_id(),
+            version: Self::VERSION,
+            summary: "Analyse Rust diagnostics and propose a minimal repair plan".into(),
+            uses_model: true,
+            side_effects: SideEffectClass::ReadOnly,
+            kinds: vec![NodeKind::Analyze],
+        }
+    }
+
+    fn required_tools(&self) -> Vec<ToolSelector> {
+        vec![ToolSelector::name(
+            ToolName::new("fs_read").expect("static name"),
+        )]
+    }
+
+    fn preferred_tier(&self) -> ModelTier {
+        ModelTier::Standard
+    }
+
+    fn accepts_kind(&self, kind: NodeKind) -> bool {
+        kind == NodeKind::Analyze
+    }
+
+    async fn execute(
+        &self,
+        ctx: &CapabilityContext<'_>,
+    ) -> Result<CapabilityOutcome, CapabilityExecError> {
+        let span = worker_span(ctx);
+        let mut attempt = Attempt::new(self.preferred_tier(), ctx.effective_tier);
+        let result = {
+            use tracing::Instrument;
+            self.run(ctx, &mut attempt).instrument(span.clone()).await
+        };
+        finish_attempt(ctx, &self.describe(), &attempt, result, &span).await
+    }
+}
+
+impl RepairWorker {
+    /// One attempt (§9.1 sequence): cancel check → load predecessor
+    /// artifacts → graph read (best effort) → assemble → route → complete →
+    /// extract/validate → payload.
+    async fn run(
+        &self,
+        ctx: &CapabilityContext<'_>,
+        attempt: &mut Attempt,
+    ) -> Result<WorkerSuccess, WorkerError> {
+        if ctx.is_cancelled() {
+            return Err(WorkerError::cancelled());
+        }
+
+        // RW1: goal or predecessor decode.
+        let goal_text = match &ctx.input.payload {
+            NodeInputPayload::Goal(goal) => goal.text.clone(),
+            NodeInputPayload::FromPredecessors { .. } => String::new(),
+        };
+        let payloads = load_pred_payloads(ctx).await?;
+        let mut diagnostics = diagnostics_from_payloads(&payloads);
+
+        // RW4: graph read is best effort; an empty view is normal (M7 thin,
+        // CX7) and an error degrades to "no graph input", never a failure.
+        if let Ok(view) = ctx
+            .graph
+            .query(GraphQuery::Diagnostics {
+                crate_id: None,
+                since: None,
+            })
+            .await
+        {
+            diagnostics.extend(view.diagnostics);
+        }
+
+        // RW2: dedupe by fingerprint, sort by (path, start_line, code), cap.
+        diagnostics.sort_by_key(sort_key);
+        let mut seen = std::collections::BTreeSet::new();
+        diagnostics.retain(|d| seen.insert(d.fingerprint.as_hex().to_owned()));
+        let truncated = diagnostics.len() > MAX_DIAGNOSTICS;
+        diagnostics.truncate(MAX_DIAGNOSTICS);
+
+        let diag_paths: Vec<String> = diagnostics
+            .iter()
+            .flat_map(|d| d.spans.iter().map(|s| s.path.clone()))
+            .collect();
+
+        // PR3: node-local material rides the shipped `AssembleInputs`
+        // fields, never a worker-concatenated message body.
+        let inputs = AssembleInputs {
+            run: Some(ctx.run),
+            input: Some(ctx.input.clone()),
+            diagnostics: diagnostics.clone(),
+            budget: Some(ctx.budget.clone()),
+            focus_paths: diag_paths.clone(),
+        };
+
+        let (proposal, _pack) = llm_exchange(
+            ctx,
+            attempt,
+            &self.config,
+            REPAIR_SYSTEM,
+            &inputs,
+            &[],
+            |value| {
+                let proposal: RepairProposal =
+                    serde_json::from_value(value.clone()).map_err(|e| format!("schema: {e}"))?;
+                validate_proposal(&proposal, &diag_paths, &goal_text)?;
+                Ok(proposal)
+            },
+        )
+        .await?;
+
+        // RW7: model confidence clamped; absent ⇒ 0.5.
+        let confidence = proposal.confidence.unwrap_or(0.5).clamp(0.0, 1.0);
+
+        let mut summary = proposal.summary;
+        let summary_cut = clamp_string(&mut summary, MAX_PAYLOAD_STRING_BYTES);
+        let mut steps: Vec<RepairStep> = proposal
+            .steps
+            .into_iter()
+            .map(|s| {
+                let mut rationale = s.rationale;
+                clamp_string(&mut rationale, MAX_RATIONALE_BYTES);
+                RepairStep {
+                    file: s.file,
+                    rationale,
+                    anchor_line: s.anchor_line,
+                }
+            })
+            .collect();
+        // OC7 vector bound.
+        let steps_cut = super::super::payload::clamp_vec(
+            &mut steps,
+            super::super::payload::MAX_PAYLOAD_VEC_ENTRIES,
+        );
+
+        let mut payload = RepairPlanPayload {
+            schema_version: PAYLOAD_SCHEMA_VERSION,
+            capability: "repair".into(),
+            summary,
+            target_files: proposal.target_files,
+            steps,
+            diagnostics_addressed: diagnostics.iter().map(|d| d.fingerprint.clone()).collect(),
+            needs_replan: proposal.needs_replan, // RW8: still a success.
+            truncated: truncated || summary_cut || steps_cut,
+            confidence,
+            citations: attempt.citations.clone(),
+            artifacts: vec![],
+            metrics: attempt.metrics(ctx, None),
+        };
+        let mut value = serde_json::to_value(&payload).map_err(|e| {
+            WorkerError::Host(CapabilityExecError::Internal(format!(
+                "payload serialization failed: {e}" // CW10.
+            )))
+        })?;
+        // OC7 total bound: drop the largest list rather than truncate a
+        // citation (PR4 keeps citations intact).
+        if super::super::payload::exceeds_total_bound(&value) {
+            payload.steps.clear();
+            payload.truncated = true;
+            value = serde_json::to_value(&payload).map_err(|e| {
+                WorkerError::Host(CapabilityExecError::Internal(format!(
+                    "payload serialization failed: {e}"
+                )))
+            })?;
+        }
+        let payload = value;
+        Ok(WorkerSuccess {
+            payload,
+            confidence,
+        })
+    }
+}
+
+fn sort_key(d: &DiagnosticEvent) -> (String, u32, Option<String>) {
+    let (path, line) = d
+        .spans
+        .first()
+        .map_or((String::new(), 0), |s| (s.path.clone(), s.start_line));
+    (path, line, d.code.clone())
+}
+
+/// PS5 + RW5 + RW6 semantic validation.
+fn validate_proposal(
+    proposal: &RepairProposal,
+    diag_paths: &[String],
+    goal_text: &str,
+) -> Result<(), String> {
+    // RW5: prose only — a unified-diff header anywhere is a violation.
+    for text in std::iter::once(proposal.summary.as_str())
+        .chain(proposal.steps.iter().map(|s| s.rationale.as_str()))
+    {
+        if contains_diff_marker(text) {
+            return Err("diff content in prose field (patch authorship belongs to edit)".into());
+        }
+    }
+    // RW6.
+    if !proposal.needs_replan && proposal.target_files.is_empty() {
+        return Err("target_files must be non-empty unless needs_replan".into());
+    }
+    if proposal.target_files.len() > MAX_TARGET_FILES {
+        return Err(format!("more than {MAX_TARGET_FILES} target files"));
+    }
+    for path in &proposal.target_files {
+        if !is_jail_relative(path) {
+            return Err(format!("target path is not jail-relative: {path:.120}"));
+        }
+        // RW6: a target must trace to a workspace observation — a
+        // diagnostic span — or be named by the goal (a Create target).
+        let known = diag_paths.iter().any(|p| p == path) || goal_text.contains(path.as_str());
+        if !known {
+            return Err(format!(
+                "target file named by neither a diagnostic nor the goal: {path:.120}"
+            ));
+        }
+    }
+    for step in &proposal.steps {
+        if !is_jail_relative(&step.file) {
+            return Err(format!(
+                "step path is not jail-relative: {:.120}",
+                step.file
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn contains_diff_marker(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("@@"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proposal(files: Vec<&str>, rationale: &str, needs_replan: bool) -> RepairProposal {
+        RepairProposal {
+            summary: "fix it".into(),
+            target_files: files.into_iter().map(String::from).collect(),
+            steps: vec![StepProposal {
+                file: "src/lib.rs".into(),
+                rationale: rationale.into(),
+                anchor_line: None,
+            }],
+            needs_replan,
+            confidence: None,
+        }
+    }
+
+    #[test]
+    fn repair_worker_rejects_diff_in_rationale() {
+        // RW5.
+        let p = proposal(vec!["src/lib.rs"], "@@ -1 +1 @@ change this", false);
+        assert!(validate_proposal(&p, &["src/lib.rs".into()], "").is_err());
+        let ok = proposal(vec!["src/lib.rs"], "clone before the borrow", false);
+        assert!(validate_proposal(&ok, &["src/lib.rs".into()], "").is_ok());
+    }
+
+    #[test]
+    fn repair_worker_requires_target_files_unless_needs_replan() {
+        // RW6.
+        assert!(validate_proposal(&proposal(vec![], "x", false), &[], "").is_err());
+        assert!(validate_proposal(&proposal(vec![], "x", true), &[], "").is_ok());
+    }
+
+    #[test]
+    fn repair_worker_rejects_unknown_and_escaping_targets() {
+        // RW6 + PS5.
+        assert!(validate_proposal(&proposal(vec!["../x.rs"], "x", false), &[], "").is_err());
+        assert!(validate_proposal(&proposal(vec!["src/other.rs"], "x", false), &[], "").is_err());
+        // Named by the goal ⇒ acceptable Create target.
+        assert!(validate_proposal(
+            &proposal(vec!["src/other.rs"], "x", false),
+            &[],
+            "create src/other.rs"
+        )
+        .is_ok());
+    }
+}

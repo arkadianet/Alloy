@@ -110,6 +110,7 @@ dependencies = [
 name = "alloy-tools"
 version = "0.1.0"
 dependencies = [
+ "alloy-eval",
  "alloy-runtime",
  "async-trait",
  "globset",

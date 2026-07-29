@@ -1,30 +1,31 @@
-//! RFC-0010 §11.3 / AC69 — cross-subsystem end-to-end test.
+//! RFC-0010 §11.3 / RFC-0013 §15.4 — cross-subsystem end-to-end test.
 //!
 //! Real SQLite storage, a real `LinearScheduler` built through the
 //! production `LinearScheduler::new`, a real MCP host running `cargo_check`
 //! inside a real Landlock jail over a tiny fixture crate with a deliberate
-//! type error, a stub `CapabilityExecutor` standing in for the RFC-0013
-//! worker bodies, and a gate approved through the real `RunController`.
+//! type error, the **real RFC-0013 capability registry** (T20 replaced the
+//! RFC-0010 stub) completing against `alloy-eval`'s `ScriptedProvider`
+//! through the production `TomlModelRouter`, a real `GitEditEngine` behind
+//! the `apply_patch` builtin, and a gate approved through the real
+//! `RunController`.
 //!
-//! Traces Appendix K (`repair_local_diagnostic`) including the
-//! replan/second-generation step: generation 1's `verify` soft-fails against
-//! the broken fixture; the test plays the role of RFC-0009's (not-yet-built)
-//! auto-replan by bumping the DAG to generation 2 with a fresh node set whose
-//! root (`analyze`) input carries generation 1's `FailureIr` as a synthetic
-//! predecessor envelope; generation 2's `edit` step applies the fix; `verify`
-//! passes; the gate opens and is approved; the DAG reaches `Succeeded` with
-//! every node carrying `output_ref`.
+//! Traces RFC-0013 Appendix A (`repair_local_diagnostic`, generation 2):
+//! generation 1 runs with an inert capability stub so the real `cargo_check`
+//! soft-fails and harvests genuine rustc diagnostics; the test plays
+//! RFC-0009's (not-yet-built) auto-replan by bumping the DAG to generation 2
+//! whose root (`analyze`) input carries generation 1's failure body as a
+//! synthetic predecessor; generation 2 dispatches the real `RepairWorker`
+//! and `EditWorker`, whose scripted completions produce a plan and a unified
+//! diff that the patch builtin applies; `verify` passes; the gate opens and
+//! is approved; the DAG reaches `Succeeded` with every node carrying
+//! `output_ref` and the meter showing exactly two model calls (T20).
 //!
-//! This MUST live here, not in `alloy-runtime` (§11.3): only this crate owns
-//! `ToolHandle`/`InProcessMcpHost`/`NativeSandboxBroker`.
+//! This MUST live here, not in `alloy-runtime` (§11.3 / RFC-0013 §2.4): only
+//! this crate owns `ToolHandle`/`InProcessMcpHost`/`NativeSandboxBroker`.
 //!
 //! Skip policy: mirrors `sandbox_rfc0005.rs`'s `landlock_or_skip` — absent a
 //! real, working Landlock jail this test skips (not fails) unless
 //! `ALLOY_REQUIRE_LANDLOCK=1`.
-//!
-//! Everything below is Linux-only and lives inside one `cfg`-gated module so
-//! the macOS/Seatbelt job does not see a file full of unused imports under
-//! `-D warnings`.
 //!
 //! Author: arkadianet
 
@@ -45,7 +46,10 @@ mod linux {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use alloy_eval::{RequestFingerprint, ScriptOutcome, ScriptedProvider};
     use alloy_runtime::adapters::SessionGateHumanAdapter;
+    use alloy_runtime::capabilities::EditAppliedPayload as CapEditAppliedPayload;
+    use alloy_runtime::context::AssembleRequest;
     use alloy_runtime::runtime::AlloyRuntime;
     use alloy_runtime::session::SessionPlane;
     use alloy_runtime::storage::{
@@ -55,21 +59,26 @@ mod linux {
     use alloy_runtime::types::ids::{ArtifactId, DagId, NodeId, ProfileId, RunId, SessionId};
     use alloy_runtime::{
         allocate_ids, build_topology, Approval, BudgetPolicy, BuildTopology, CapabilityExecContext,
-        CapabilityExecError, CapabilityExecutor, CapabilityOutcome, DagState, GateHumanAdapter,
-        Goal, LinearScheduler, LinearSchedulerDeps, McpVerifyCompileAdapter, NodeInputEnvelope,
-        NodeInputPayload, NodeKind, PredecessorOutput, ProcessCostMeterFactory,
-        RecordingDecisionLog, RetentionPolicy, RunControlState, RunGoalRecord, RunRow,
-        RuntimeConfig, SchedConfig, Scheduler, Session, SessionVerifyPermissions, TaskDag,
-        TemplateCatalog, TemplateId, Timestamp, ToolCaller, ToolName, ToolSelector,
-        UnavailableVerifyTest, VerifyCompileAdapter, VerifyPermissions,
+        CapabilityExecError, CapabilityExecutor, CapabilityId, CapabilityOutcome,
+        CapabilityRegistry, ChatMessage, ChatRole, CompletionRequest, ContextEngine, CostSnapshot,
+        DagState, DecisionKind, EndpointId, GateHumanAdapter, Goal, GraphViewHandle,
+        LinearScheduler, LinearSchedulerDeps, McpVerifyCompileAdapter, ModelEndpoint,
+        ModelProvider, ModelResponse, ModelTier, NodeInputEnvelope, NodeInputPayload, NodeKind,
+        NullContextEngine, PredecessorOutput, ProcessCostMeterFactory, ProcessRunRouterProvider,
+        ProviderId, RecordingDecisionLog, RegistryCapabilityExecutor, RepairPlanPayload,
+        ResponseFormat, RetentionPolicy, RouterConfig, RunControlState, RunGoalRecord, RunRow,
+        RuntimeConfig, SchedConfig, Scheduler, Session, SessionVerifyPermissions,
+        SessionWorkerPermissions, TaskDag, TemplateCatalog, TemplateId, Timestamp, ToolCaller,
+        ToolChoice, ToolName, ToolSelector, UnavailableVerifyTest, Usage, VerifyCompileAdapter,
+        VerifyPermissions, WorkerConfig, WorkerDeps, EDIT_SYSTEM, REPAIR_SYSTEM,
     };
     use alloy_tools::mcp::{
-        InProcessMcpHost, McpHostConfig, McpPlatform, StubPatchApplyBackend, ToolHandle,
-        ToolHandleToolCaller,
+        InProcessMcpHost, McpHostConfig, McpPlatform, ToolHandle, ToolHandleToolCaller,
     };
     use alloy_tools::{
-        BackendStatus, NativeSandboxBroker, OperatorHomes, SandboxBackend, SandboxBroker,
-        SandboxProfile,
+        trusted_exec_path, BackendStatus, EditEnginePatchBackend, ExecClass, GitEditEngine,
+        GitEditEngineConfig, NativeSandboxBroker, OperatorHomes, PathPolicy, SandboxBackend,
+        SandboxBroker, SandboxExecRequest, SandboxProfile,
     };
     use tempfile::TempDir;
 
@@ -173,98 +182,216 @@ mod linux {
         Ok(())
     }
 
-    /// The fixed source the stub `edit` capability writes once it has seen
-    /// generation 1's diagnostics.
-    const FIXED_MAIN_RS: &str = "fn main() {\n    let x: i32 = 42;\n    println!(\"{}\", x);\n}\n";
+    // --- generation 1 inert capabilities ------------------------------------
 
-    // --- stub CapabilityExecutor (RFC-0013 worker bodies not landed) -------
-
-    /// Test-only `analyze`/`edit` worker.
-    ///
-    /// `analyze`: a blind first pass (`NodeInputPayload::Goal`) reports no fix
-    /// available; once handed generation 1's diagnostics through a
-    /// `FromPredecessors` envelope it reports a fix is available.
-    ///
-    /// `edit`: reads its own input (rewritten by the scheduler's C5 to
-    /// `analyze`'s real `output_ref`) and, only when `analyze` reported a fix,
-    /// writes [`FIXED_MAIN_RS`] into `ctx.meta.workspace_root`.
-    struct StubRepairCapabilities {
-        artifacts: Arc<dyn ArtifactStore>,
-    }
-
-    impl StubRepairCapabilities {
-        /// Decode every predecessor output envelope this node was handed.
-        async fn pred_payloads(
-            &self,
-            preds: &[PredecessorOutput],
-        ) -> Result<Vec<serde_json::Value>, CapabilityExecError> {
-            let mut out = Vec::with_capacity(preds.len());
-            for pred in preds {
-                let blob = self
-                    .artifacts
-                    .get(pred.output_ref)
-                    .await
-                    .map_err(|e| CapabilityExecError::Internal(e.to_string()))?;
-                out.push(
-                    serde_json::from_slice(&blob.bytes)
-                        .map_err(|e| CapabilityExecError::Internal(e.to_string()))?,
-                );
-            }
-            Ok(out)
-        }
-    }
+    /// Generation 1 stand-in: RFC-0013 Appendix A starts its worked trace at
+    /// generation 2, so generation 1 only needs `analyze`/`edit` to succeed
+    /// inertly and let the real `cargo_check` harvest the diagnostics. Test
+    /// scope only — the production path is `RegistryCapabilityExecutor`.
+    struct InertGen1Capabilities;
 
     #[async_trait::async_trait]
-    impl CapabilityExecutor for StubRepairCapabilities {
+    impl CapabilityExecutor for InertGen1Capabilities {
         async fn execute(
             &self,
             ctx: &CapabilityExecContext,
         ) -> Result<CapabilityOutcome, CapabilityExecError> {
             match ctx.kind {
-                NodeKind::Analyze => {
-                    let fix_available = match &ctx.input.payload {
-                        NodeInputPayload::Goal(_) => false,
-                        NodeInputPayload::FromPredecessors { preds } => {
-                            self.pred_payloads(preds).await?.iter().any(|v| {
-                                v.get("diagnostics")
-                                    .and_then(|d| d.as_array())
-                                    .is_some_and(|d| !d.is_empty())
-                            })
-                        }
-                    };
-                    Ok(CapabilityOutcome::Succeeded {
-                        payload: serde_json::json!({ "fix_available": fix_available }),
-                    })
-                }
-                NodeKind::Edit => {
-                    let NodeInputPayload::FromPredecessors { preds } = &ctx.input.payload else {
-                        return Err(CapabilityExecError::Internal(
-                            "edit node MUST have a FromPredecessors input".into(),
-                        ));
-                    };
-                    let fix_available = self.pred_payloads(preds).await?.iter().any(|v| {
-                        v.get("payload")
-                            .and_then(|p| p.get("fix_available"))
-                            .or_else(|| v.get("fix_available"))
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(true)
-                    });
-                    if fix_available {
-                        std::fs::write(ctx.meta.workspace_root.join("src/main.rs"), FIXED_MAIN_RS)
-                            .map_err(|e| CapabilityExecError::Internal(e.to_string()))?;
-                    }
-                    Ok(CapabilityOutcome::Succeeded {
-                        payload: serde_json::json!({ "patched": fix_available }),
-                    })
-                }
+                NodeKind::Analyze | NodeKind::Edit => Ok(CapabilityOutcome::Succeeded {
+                    payload: serde_json::json!({ "generation_one": "inert" }),
+                }),
                 other => Err(CapabilityExecError::Internal(format!(
-                    "StubRepairCapabilities has no worker for {other:?}"
+                    "InertGen1Capabilities has no worker for {other:?}"
                 ))),
             }
         }
     }
 
-    // --- fixture ----------------------------------------------------------
+    // --- scripted model -----------------------------------------------------
+
+    const GOAL_TEXT: &str = "fix the type error";
+
+    /// The diff the scripted `edit` completion returns; must apply cleanly
+    /// to the fixture's `src/main.rs`.
+    const FIX_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = \"not a number\";\n+    let x: i32 = 42;\n     println!(\"{}\", x);\n }\n";
+
+    fn router_toml() -> &'static str {
+        r#"
+[policy]
+default_tier = "standard"
+max_in_flight = 2
+shutdown_grace_ms = 50
+
+[[providers]]
+id = "provider"
+kind = "openai_compatible"
+base_url = "http://127.0.0.1:1"
+api_key_env = "ALLOY_E2E_UNUSED_KEY"
+
+[[providers.endpoints]]
+id = "endpoint"
+display_name = "Endpoint"
+model = "operator-configured"
+tiers = ["standard"]
+supports_structured_output = true
+max_context = 65536
+input_usd_per_mtok = 2.0
+output_usd_per_mtok = 4.0
+
+[capability_tiers]
+repair = "standard"
+edit = "standard"
+review = "standard"
+planning = "standard"
+"#
+    }
+
+    fn scripted_endpoint() -> ModelEndpoint {
+        ModelEndpoint {
+            id: EndpointId::new("endpoint").unwrap(),
+            provider: ProviderId::new("provider").unwrap(),
+            display_name: "Endpoint".into(),
+            model: "operator-configured".into(),
+            tiers: vec![ModelTier::Standard],
+            supports_tools: false,
+            supports_structured_output: true,
+            max_context: 65536,
+            input_usd_per_mtok: Some(2.0),
+            output_usd_per_mtok: Some(4.0),
+        }
+    }
+
+    /// Reconstruct the exact `CompletionRequest` a worker will send: the
+    /// `NullContextEngine` pack for `capability` with the worker's owned
+    /// system instruction prepended (RFC-0013 §6.2), structured output
+    /// requested (PR9). `ScriptedProvider` keys on this fingerprint.
+    async fn worker_request(capability: &str, system: &'static str) -> CompletionRequest {
+        let engine = NullContextEngine::with_goal(GOAL_TEXT);
+        let pack = engine
+            .assemble(AssembleRequest {
+                session: SessionId::new(),
+                node: NodeId::new(),
+                capability: CapabilityId::new(capability).unwrap(),
+                token_budget: 1024, // NullContextEngine output is budget-free.
+                must_include: vec![],
+            })
+            .await
+            .expect("null engine assembles");
+        let mut messages = vec![ChatMessage {
+            role: ChatRole::System,
+            content: system.to_owned(),
+        }];
+        messages.extend(pack.messages);
+        CompletionRequest {
+            messages,
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            response_format: ResponseFormat::JsonObject,
+            temperature: None,
+            max_output_tokens: None,
+        }
+    }
+
+    fn scripted_response(value: serde_json::Value) -> ScriptOutcome {
+        ScriptOutcome::Response(ModelResponse {
+            text: Some(value.to_string()),
+            structured: Some(value),
+            tool_calls: vec![],
+            usage: Usage {
+                input_tokens: Some(200),
+                output_tokens: Some(60),
+            },
+            provider_request_id: Some("scripted-1".into()),
+            finish_reason: Some("stop".into()),
+        })
+    }
+
+    async fn build_scripted_provider() -> Arc<ScriptedProvider> {
+        let provider =
+            ScriptedProvider::new(ProviderId::new("provider").unwrap(), scripted_endpoint())
+                .unwrap();
+        provider.insert(
+            RequestFingerprint::of(&worker_request("repair", REPAIR_SYSTEM).await),
+            scripted_response(serde_json::json!({
+                "summary": "the literal is a &str but the binding is typed i32; replace the string with an integer literal",
+                "target_files": ["src/main.rs"],
+                "steps": [{
+                    "file": "src/main.rs",
+                    "rationale": "replace the string literal with an i32 literal so the annotation holds",
+                    "anchor_line": 2,
+                }],
+                "needs_replan": false,
+                "confidence": 0.9,
+            })),
+        );
+        provider.insert(
+            RequestFingerprint::of(&worker_request("edit", EDIT_SYSTEM).await),
+            scripted_response(serde_json::json!({
+                "patch": FIX_DIFF,
+                "summary": "replace the string literal with 42",
+                "confidence": 0.85,
+            })),
+        );
+        Arc::new(provider)
+    }
+
+    // --- git init in the jail ----------------------------------------------
+
+    fn git_token(run_id: RunId) -> alloy_runtime::PermissionToken {
+        alloy_runtime::PermissionToken {
+            profile: ProfileId::new("default").unwrap(),
+            grants: vec![alloy_runtime::Grant::Exec(alloy_runtime::ExecAllow {
+                binary: "git".into(),
+                args_glob: None,
+            })],
+            expires: None,
+            run_id,
+        }
+    }
+
+    async fn run_git(broker: &Arc<NativeSandboxBroker>, jail: &Path, args: &[&str]) {
+        let mut argv = vec!["git".to_string()];
+        argv.extend(args.iter().map(|s| (*s).to_string()));
+        let result = broker
+            .exec(SandboxExecRequest::new(
+                argv,
+                jail.to_path_buf(),
+                git_token(RunId::new()),
+                ExecClass::Check,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "git {:?} stderr={}",
+            args,
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    /// The `GitEditEngine` checkpoints via git, so the workspace must be a
+    /// committed repository before the first `apply_patch` (RFC-0008 §5.6).
+    async fn init_git_repo(broker: &Arc<NativeSandboxBroker>, jail: &Path) {
+        run_git(broker, jail, &["init"]).await;
+        run_git(broker, jail, &["add", "."]).await;
+        run_git(
+            broker,
+            jail,
+            &[
+                "-c",
+                "user.name=alloy",
+                "-c",
+                "user.email=alloy@localhost",
+                "commit",
+                "-m",
+                "init",
+            ],
+        )
+        .await;
+    }
+
+    // --- fixture ------------------------------------------------------------
 
     struct Fixture {
         dir: TempDir,
@@ -332,7 +459,7 @@ mod linux {
             let run_id = RunId::new();
             let goal = RunGoalRecord {
                 goal: Goal {
-                    text: "fix the type error".into(),
+                    text: GOAL_TEXT.into(),
                     constraints: vec![],
                     attachments: vec![],
                 },
@@ -371,7 +498,7 @@ mod linux {
     /// `analyze_diagnostics`: `None` for a blind first attempt (the root gets
     /// the plain `Goal`); `Some(_)` to synthesize a replan whose root carries
     /// a `FromPredecessors` envelope holding those diagnostics — standing in
-    /// for RFC-0009's not-yet-built auto-replan (Appendix K steps 15/16).
+    /// for RFC-0009's not-yet-built auto-replan.
     async fn build_generation(
         fx: &Fixture,
         dag_id: DagId,
@@ -392,7 +519,7 @@ mod linux {
                     NodeKind::Analyze,
                     generation,
                     NodeInputPayload::Goal(Goal {
-                        text: "fix the type error".into(),
+                        text: GOAL_TEXT.into(),
                         constraints: vec![],
                         attachments: vec![],
                     }),
@@ -443,12 +570,15 @@ mod linux {
     }
 
     /// Assemble a production `LinearScheduler` (not `new_for_test`) over the
-    /// real MCP verify adapter.
+    /// real MCP verify adapter, a shared decision log, and a shared meter
+    /// factory (so generation 2's router meter is the run's meter).
     fn build_scheduler(
         fx: &Fixture,
         sched_dir: PathBuf,
         capabilities: &Arc<dyn CapabilityExecutor>,
         verify_compile: &Arc<dyn VerifyCompileAdapter>,
+        decisions: &Arc<RecordingDecisionLog>,
+        cost_meters: &Arc<ProcessCostMeterFactory>,
     ) -> LinearScheduler {
         let mut config = SchedConfig::new(sched_dir);
         config.max_backoff = Duration::from_secs(1);
@@ -464,8 +594,8 @@ mod linux {
             gate_human: Arc::new(SessionGateHumanAdapter::new(fx.plane.clone()))
                 as Arc<dyn GateHumanAdapter>,
             capabilities: Arc::clone(capabilities),
-            decisions: Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults())),
-            cost_meters: Arc::new(ProcessCostMeterFactory::new()),
+            decisions: Arc::clone(decisions) as _,
+            cost_meters: Arc::clone(cost_meters) as _,
             runtime_cancel: tokio_util::sync::CancellationToken::new(),
             budget_policy: BudgetPolicy::default(),
             run_timeout: Duration::from_secs(300),
@@ -474,109 +604,141 @@ mod linux {
         .unwrap()
     }
 
-    // --- the test ---------------------------------------------------------
+    // --- the flow ----------------------------------------------------------
 
-    #[tokio::test]
-    async fn repair_local_diagnostic_e2e_replans_and_succeeds() {
+    struct FlowResult {
+        analyze_payload: serde_json::Value,
+        edit_payload: serde_json::Value,
+        meter: CostSnapshot,
+        worker_attempts: usize,
+        model_calls_recorded: usize,
+        fixed_source: String,
+        patch_artifact_kind: ArtifactKind,
+    }
+
+    /// The full RFC-0013 §15.4 trace. `None` means an environment skip.
+    async fn run_repair_flow() -> Option<FlowResult> {
         if !landlock_or_skip().await {
-            return;
+            return None;
         }
         if which_cargo().is_none() {
             skip_or_panic("cargo not on PATH");
-            return;
+            return None;
         }
         let real_homes = match OperatorHomes::resolve() {
             Ok(h) => h,
             Err(e) => {
                 skip_or_panic(&format!("operator homes: {e}"));
-                return;
+                return None;
             }
         };
 
         let fixtures = copy_fixtures_tree();
-        let jail = fixtures.path().canonicalize().unwrap();
-        let workspace_root = jail.join("sbx_repair");
+        // The jail IS the crate workspace: patch paths and cargo both resolve
+        // against the same root (RFC-0008 path policy + RFC-0013 EW4).
+        let workspace_root = fixtures.path().join("sbx_repair").canonicalize().unwrap();
+        let jail = workspace_root.clone();
         assert!(workspace_root.join("Cargo.toml").is_file());
 
         let homes_root = tempfile::tempdir().unwrap();
         let Some(homes) = hermetic_cargo_home(homes_root.path(), &real_homes) else {
             skip_or_panic("could not stage a hermetic CARGO_HOME");
-            return;
+            return None;
         };
 
-        let mut profile = SandboxProfile::default_for_jail(jail).unwrap();
+        let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
         profile.check_backend = SandboxBackend::Landlock;
         profile.exec_timeout = Duration::from_secs(240);
-        let broker = match NativeSandboxBroker::with_operator_homes(profile, homes.clone()).await {
-            Ok(b) => b,
-            Err(e) => {
-                skip_or_panic(&format!("landlock broker unavailable: {e}"));
-                return;
-            }
-        };
+        let broker =
+            match NativeSandboxBroker::with_operator_homes(profile.clone(), homes.clone()).await {
+                Ok(b) => b,
+                Err(e) => {
+                    skip_or_panic(&format!("landlock broker unavailable: {e}"));
+                    return None;
+                }
+            };
+        let broker = Arc::new(broker);
+        init_git_repo(&broker, &jail).await;
+
+        let fx = Fixture::new().await;
+
+        // Real RFC-0008 edit engine behind the apply_patch builtin.
+        let read_only_roots: Vec<PathBuf> = Vec::new();
+        let path_policy = PathPolicy::from_profile(&profile, read_only_roots.clone()).unwrap();
+        let engine = Arc::new(
+            GitEditEngine::new(GitEditEngineConfig::new(
+                Arc::clone(&broker) as Arc<dyn SandboxBroker>,
+                path_policy,
+                trusted_exec_path(&homes),
+                fx.storage.artifacts(),
+                fx.storage.events(),
+            ))
+            .unwrap(),
+        );
         let host = Arc::new(
             InProcessMcpHost::new(
-                Arc::new(broker) as Arc<dyn SandboxBroker>,
+                Arc::clone(&broker) as Arc<dyn SandboxBroker>,
                 homes,
-                Vec::new(),
-                Arc::new(StubPatchApplyBackend),
+                read_only_roots,
+                Arc::new(EditEnginePatchBackend::new(
+                    engine as Arc<dyn alloy_runtime::EditEngine>,
+                )),
                 McpHostConfig::new(),
             )
             .unwrap(),
         );
 
-        let fx = Fixture::new().await;
         let session_id = fx.seed_session(workspace_root.clone()).await;
         let dag_id = DagId::new();
         let run_id = fx.seed_run(session_id, dag_id).await;
 
         let sched_dir = fx.dir.path().join("scheduler");
-        let capabilities: Arc<dyn CapabilityExecutor> = Arc::new(StubRepairCapabilities {
-            artifacts: fx.storage.artifacts(),
-        });
-        let tools: Arc<dyn ToolCaller> = Arc::new(ToolHandleToolCaller::new(ToolHandle::new(
-            Arc::clone(&host) as Arc<dyn McpPlatform>,
-            vec![ToolSelector::name(ToolName::new("cargo_check").unwrap())],
-        )));
-        let perms: Arc<dyn VerifyPermissions> = Arc::new(SessionVerifyPermissions::new(
+        let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+        let cost_meters = Arc::new(ProcessCostMeterFactory::new());
+
+        // Verify adapter over its own handle (cargo_check only).
+        let verify_tools: Arc<dyn ToolCaller> =
+            Arc::new(ToolHandleToolCaller::new(ToolHandle::new(
+                Arc::clone(&host) as Arc<dyn McpPlatform>,
+                vec![ToolSelector::name(ToolName::new("cargo_check").unwrap())],
+            )));
+        let verify_perms: Arc<dyn VerifyPermissions> = Arc::new(SessionVerifyPermissions::new(
             fx.storage.sessions(),
             Some("check*".into()),
             None,
         ));
         let verify_compile: Arc<dyn VerifyCompileAdapter> = Arc::new(McpVerifyCompileAdapter::new(
-            tools,
-            perms,
+            verify_tools,
+            verify_perms,
             fx.storage.artifacts(),
         ));
 
-        // --- generation 1: blind attempt, verify soft-fails ---------------
+        // --- generation 1: inert workers, verify soft-fails ----------------
         //
         // Scoped so the scheduler — and with it the `scheduler.lock` file
         // `OwnershipLock` holds for the process lifetime — is dropped before
-        // generation 2 constructs a second scheduler over the same
-        // `data_dir`. Without this the gen-2 build fails `Ownership` and none
-        // of the assertions below ever run.
-        let (diagnostics_json, verify_id_gen1) = {
+        // generation 2 constructs a second scheduler over the same data_dir.
+        let diagnostics_json = {
             let (dag1, ids1) = build_generation(&fx, dag_id, session_id, 1, None).await;
             fx.storage.dags().put(&dag1).await.unwrap();
 
-            let scheduler = build_scheduler(&fx, sched_dir.clone(), &capabilities, &verify_compile);
+            let caps1: Arc<dyn CapabilityExecutor> = Arc::new(InertGen1Capabilities);
+            let scheduler = build_scheduler(
+                &fx,
+                sched_dir.clone(),
+                &caps1,
+                &verify_compile,
+                &decisions,
+                &cost_meters,
+            );
             let outcome1 = scheduler.run(dag_id).await.unwrap();
-
-            let verify_id = ids1.nodes["verify"];
             assert_eq!(
                 outcome1.state,
                 DagState::Failed,
                 "gen1 outcome: {outcome1:?}"
             );
-            assert_eq!(outcome1.failed_node, Some(verify_id));
-            let failure = outcome1
-                .failure
-                .expect("FO6: a Failed DAG with an attributed node carries a failure");
-            assert!(
-                !failure.diagnostics.is_empty(),
-                "gen1 verify MUST capture rustc diagnostics: {failure:?}"
-            );
+            assert_eq!(outcome1.failed_node, Some(ids1.nodes["verify"]));
+            let failure = outcome1.failure.expect("failed DAG carries a failure");
             assert!(
                 failure
                     .diagnostics
@@ -585,30 +747,59 @@ mod linux {
                 "expected the fixture's type error, got {:?}",
                 failure.diagnostics
             );
-
-            (
-                serde_json::json!({
-                    "diagnostics": failure.diagnostics,
-                    "notes": failure.notes,
-                }),
-                verify_id,
-            )
+            serde_json::json!({
+                "diagnostics": failure.diagnostics,
+                "notes": failure.notes,
+            })
         };
 
-        // --- generation 2: informed attempt, verify passes, gate opens ----
+        // --- generation 2: the real RFC-0013 registry ----------------------
+        let worker_tools: Arc<dyn ToolCaller> =
+            Arc::new(ToolHandleToolCaller::new(ToolHandle::new(
+                Arc::clone(&host) as Arc<dyn McpPlatform>,
+                vec![
+                    ToolSelector::name(ToolName::new("fs_read").unwrap()),
+                    ToolSelector::name(ToolName::new("apply_patch").unwrap()),
+                ],
+            )));
+        let router_config = RouterConfig::from_str("e2e", router_toml()).unwrap();
+        let provider = build_scripted_provider().await;
+        let routers = Arc::new(ProcessRunRouterProvider::new(
+            router_config,
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            BudgetPolicy::default(),
+            Some(Arc::clone(&decisions) as _),
+        ));
+        let deps = WorkerDeps {
+            routers,
+            context: Arc::new(NullContextEngine::with_goal(GOAL_TEXT)),
+            tools: worker_tools,
+            perms: Arc::new(SessionWorkerPermissions::new(
+                fx.storage.sessions(),
+                Some("**".into()),
+                Some("**".into()),
+            )),
+            graph: GraphViewHandle::null(),
+            artifacts: fx.storage.artifacts(),
+            decisions: Arc::clone(&decisions) as _,
+            sessions: fx.storage.sessions(),
+            config: WorkerConfig::default(),
+        };
+        let registry = CapabilityRegistry::mvp(deps).unwrap();
+        let caps2: Arc<dyn CapabilityExecutor> =
+            Arc::new(RegistryCapabilityExecutor::new(Arc::new(registry)));
+
         let (dag2, ids2) =
             build_generation(&fx, dag_id, session_id, 2, Some(&diagnostics_json)).await;
-        assert_ne!(
-            ids2.nodes["verify"], verify_id_gen1,
-            "a replan mints a fresh node set"
-        );
         fx.storage.dags().put(&dag2).await.unwrap();
 
         let scheduler2 = Arc::new(build_scheduler(
             &fx,
             sched_dir,
-            &capabilities,
+            &caps2,
             &verify_compile,
+            &decisions,
+            &cost_meters,
         ));
         let gate_id = ids2.gates["gate"];
         let runs = fx.plane.runs();
@@ -616,10 +807,7 @@ mod linux {
         let mut run_task = tokio::spawn(async move { sched_for_run.run(dag_id).await });
 
         // Poll for `WaitingApproval` before approving. Real wall-clock
-        // `cargo_check` I/O means this cannot use a paused clock (§11.4 TD1
-        // governs the deterministic in-memory suite, not this one). Checking
-        // `run_task` each turn makes an early scheduler exit surface at once
-        // instead of after the full deadline.
+        // `cargo_check` I/O means this cannot use a paused clock.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
         loop {
             if run_task.is_finished() {
@@ -650,21 +838,218 @@ mod linux {
             DagState::Succeeded,
             "gen2 outcome: {outcome2:?}"
         );
-        assert_eq!(outcome2.failed_node, None);
-        assert!(outcome2.failure.is_none());
+        assert!(
+            provider.is_exhausted(),
+            "both scripted completions were consumed"
+        );
 
+        // Every node carries output_ref; decode the two worker payloads.
         let final_dag = fx.storage.dags().get(dag_id).await.unwrap().unwrap();
+        let mut payloads: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
         for name in ["analyze", "edit", "verify", "gate"] {
             let node = &final_dag.nodes[&ids2.nodes[name]];
-            assert!(
-                node.output_ref.is_some(),
-                "{name} MUST carry output_ref at Succeeded: {node:?}"
-            );
+            let output_ref = node
+                .output_ref
+                .unwrap_or_else(|| panic!("{name} MUST carry output_ref at Succeeded"));
+            let blob = fx.storage.artifacts().get(output_ref).await.unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&blob.bytes).unwrap();
+            payloads.insert(name, envelope["payload"].clone());
         }
-        // The repair really happened on disk, not just in the DAG blob.
-        let fixed = std::fs::read_to_string(workspace_root.join("src/main.rs")).unwrap();
-        assert_eq!(fixed, FIXED_MAIN_RS);
 
+        let edit_payload: CapEditAppliedPayload =
+            serde_json::from_value(payloads["edit"].clone()).unwrap();
+        let patch_artifact_kind = fx
+            .storage
+            .artifacts()
+            .meta(edit_payload.patch_artifact)
+            .await
+            .unwrap()
+            .kind;
+
+        // The repair really happened on disk, not just in the DAG blob.
+        let fixed_source = std::fs::read_to_string(workspace_root.join("src/main.rs")).unwrap();
+
+        let worker_attempts = decisions
+            .recorded_decisions()
+            .into_iter()
+            .filter(|d| d.kind == DecisionKind::Custom("worker_attempt".into()))
+            .count();
+        let model_calls_recorded = decisions.recorded_model_calls().len();
+        let meter = cost_meters.meter_for_snapshot(run_id);
+
+        let result = FlowResult {
+            analyze_payload: payloads["analyze"].clone(),
+            edit_payload: payloads["edit"].clone(),
+            meter,
+            worker_attempts,
+            model_calls_recorded,
+            fixed_source,
+            patch_artifact_kind,
+        };
         fx.close().await;
+        Some(result)
+    }
+
+    /// `CostMeterFactory` snapshot helper: the run meter accumulated by both
+    /// generations.
+    trait MeterSnapshot {
+        fn meter_for_snapshot(&self, run: RunId) -> CostSnapshot;
+    }
+
+    impl MeterSnapshot for ProcessCostMeterFactory {
+        fn meter_for_snapshot(&self, run: RunId) -> CostSnapshot {
+            use alloy_runtime::CostMeterFactory;
+            self.meter_for(run).snapshot()
+        }
+    }
+
+    // --- T20 ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn repair_local_diagnostic_e2e_with_scripted_provider() {
+        let Some(result) = run_repair_flow().await else {
+            return;
+        };
+
+        // The analyze payload decodes as a RepairPlanPayload.
+        let plan: RepairPlanPayload =
+            serde_json::from_value(result.analyze_payload.clone()).unwrap();
+        assert_eq!(plan.capability, "repair");
+        assert_eq!(plan.target_files, vec!["src/main.rs"]);
+        assert!(!plan.diagnostics_addressed.is_empty());
+
+        // The edit payload decodes as the capability EditAppliedPayload with
+        // backend-reported paths and a persisted patch artifact.
+        let applied: CapEditAppliedPayload =
+            serde_json::from_value(result.edit_payload.clone()).unwrap();
+        assert_eq!(applied.capability, "edit");
+        assert_eq!(applied.files_touched, vec!["src/main.rs"]);
+        assert!(applied.transaction_id.is_some());
+        assert!(!applied.dry_run);
+        assert_eq!(result.patch_artifact_kind, ArtifactKind::Patch);
+
+        // The fixture crate now compiles — the real cargo_check passed in
+        // generation 2 (the DAG reached Succeeded) and the fix is on disk.
+        assert!(result.fixed_source.contains("let x: i32 = 42;"));
+
+        // Exactly two model calls on the meter (BG2: metered once, by the
+        // router), two worker_attempt records, two ModelCall records, no
+        // duplicates.
+        assert_eq!(result.meter.model_calls, 2);
+        assert_eq!(result.worker_attempts, 2);
+        assert_eq!(result.model_calls_recorded, 2);
+    }
+
+    // --- T21 ----------------------------------------------------------------
+
+    /// Mask run-variant fields (ids and durations) per RFC-0013 T21.
+    fn mask(value: &serde_json::Value) -> serde_json::Value {
+        let mut value = value.clone();
+        if let Some(metrics) = value.get_mut("metrics") {
+            metrics["duration_ms"] = serde_json::json!(0);
+        }
+        for id_field in ["patch_artifact", "transaction_id"] {
+            if value.get(id_field).is_some() {
+                value[id_field] = serde_json::json!("masked");
+            }
+        }
+        if value.get("artifacts").is_some() {
+            value["artifacts"] = serde_json::json!([]);
+        }
+        value
+    }
+
+    #[tokio::test]
+    async fn scripted_repair_run_is_deterministic() {
+        let Some(first) = run_repair_flow().await else {
+            return;
+        };
+        let Some(second) = run_repair_flow().await else {
+            return;
+        };
+        assert_eq!(
+            mask(&first.analyze_payload),
+            mask(&second.analyze_payload),
+            "analyze payloads must match after masking ids and durations"
+        );
+        assert_eq!(
+            mask(&first.edit_payload),
+            mask(&second.edit_payload),
+            "edit payloads must match after masking ids and durations"
+        );
+    }
+
+    // --- T23 ----------------------------------------------------------------
+
+    /// Live-provider smoke (RFC-0013 T23). `#[ignore]`d: run only with
+    /// credentials configured — `ALLOY_LIVE_ROUTER_TOML` pointing at a real
+    /// `router.toml` whose `api_key_env` is set. Asserts a real completion
+    /// parses under PS1/PS2 so scripted and live runs stay reportable
+    /// separately (roadmap M7).
+    #[tokio::test]
+    #[ignore = "requires live provider credentials (ALLOY_LIVE_ROUTER_TOML)"]
+    async fn live_provider_smoke() {
+        use alloy_runtime::{ModelRouter, RoutingRequest, TomlModelRouter};
+
+        let Some(router_path) = std::env::var_os("ALLOY_LIVE_ROUTER_TOML") else {
+            panic!("set ALLOY_LIVE_ROUTER_TOML to run the live smoke");
+        };
+        let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+        let meter = alloy_runtime::SharedCostMeter::new();
+        let run = RunId::new();
+        let router = TomlModelRouter::from_paths(
+            Path::new(&router_path),
+            BudgetPolicy::default(),
+            Path::new("example.env"),
+            decisions,
+            meter,
+            run,
+        )
+        .unwrap();
+
+        let request = worker_request("repair", REPAIR_SYSTEM).await;
+        let routed = router
+            .route(RoutingRequest {
+                session: SessionId::new(),
+                run: Some(run),
+                node: None,
+                capability: CapabilityId::new("repair").unwrap(),
+                complexity: None,
+                budget_remaining: alloy_runtime::BudgetSnapshot {
+                    usd_spent: 0.0,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                },
+                requires_tools: false,
+                requires_structured_output: true,
+            })
+            .await
+            .unwrap();
+        let response = router
+            .complete(
+                &routed,
+                alloy_runtime::PromptPack {
+                    messages: request.messages,
+                    citations: vec![],
+                    domains: None,
+                },
+            )
+            .await
+            .unwrap();
+        // PS1/PS2: structured object, or a fenced/whole-body JSON object.
+        let parsed = response
+            .structured
+            .as_ref()
+            .is_some_and(serde_json::Value::is_object)
+            || response.text.as_deref().is_some_and(|t| {
+                serde_json::from_str::<serde_json::Value>(t.trim())
+                    .map(|v| v.is_object())
+                    .unwrap_or(false)
+                    || t.contains("```json")
+            });
+        assert!(
+            parsed,
+            "live completion did not parse under PS1/PS2: {response:?}"
+        );
     }
 }
