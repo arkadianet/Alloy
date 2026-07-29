@@ -608,6 +608,7 @@ async fn core_ir_serde_round_trips() {
         profile: profile.clone(),
         budget: alloy_runtime::BudgetPolicy::default(),
         language_backends: vec![alloy_runtime::LanguageId::new("rust").unwrap()],
+        provenance: None,
     };
     let json = serde_json::to_string(&cs).unwrap();
     let back: CreateSession = serde_json::from_str(&json).unwrap();

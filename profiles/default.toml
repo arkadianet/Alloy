@@ -11,6 +11,16 @@ max_tokens_per_run = 2_000_000
 retain_full_prompts = false
 retain_tool_bodies = false
 
+# Corpus capture (research §7.11 item 1) — distinct from [observability]:
+# retention is what the log keeps for debugging; capture is what may enter a
+# training corpus. Defaults are fail-closed: nothing captured, and capture
+# (when enabled) requires per-session consent (corpus_ok).
+[capture]
+enabled = false
+prompts = false
+tool_bodies = false
+require_consent = true
+
 # Sandbox (RFC-0005). On macOS prefer check = "container" when sandbox-exec
 # deny-default profiles are Unavailable (see docs/security/sandbox-residual-risk.md).
 # Container is an acceptable fallback for both check and test classes.

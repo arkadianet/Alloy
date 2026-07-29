@@ -142,6 +142,12 @@ uuid_id!(
     /// amendment A1).
     SummaryId
 );
+uuid_id!(
+    /// Identity of one run's trajectory record (research §7.11 item 7).
+    /// Minted at `submit_goal` beside `dag_id`, before any exporter exists,
+    /// so every run ever executed can be joined to a corpus row later.
+    TrajectoryId
+);
 
 name_id!(
     /// Profile catalog id (`default`, `autonomous`, `readonly`).
