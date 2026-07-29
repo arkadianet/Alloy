@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::RuntimeConfig;
 use crate::error::SessionError;
-use crate::events::{NewSessionEvent, SessionEventType};
+use crate::events::{NewSessionEvent, RuntimeEvent, SessionEventType};
 use crate::obs::error::ObsError;
 use crate::obs::redact::{
     apply_body_retention, redact_json_strings, redact_secrets, truncate_utf8_bytes,
@@ -340,6 +340,29 @@ impl EventDecisionLog {
             Err(e) => Err(ObsError::Store(e)),
         }
     }
+
+    /// Issue #22 — a dropped audit record leaves a durable host-channel
+    /// trace. Best-effort by design: the original error is what callers
+    /// see, and a failed escalation only warns (obs must never gate
+    /// execution, RFC-0006 §5.9).
+    async fn note_drop(&self, session: SessionId, record_type: &str, err: &ObsError) {
+        let ev = RuntimeEvent::AuditRecordDropped {
+            session: session.to_string(),
+            record_type: record_type.to_string(),
+            error: err.to_string(),
+        };
+        if let Err(e) = self.handle.emit(ev).await {
+            tracing::warn!(%session, record_type, error = %e, "audit-drop escalation failed");
+        }
+    }
+
+    async fn checked_session(&self, session: SessionId, record_type: &str) -> Result<(), ObsError> {
+        if let Err(e) = self.require_session(session).await {
+            self.note_drop(session, record_type, &e).await;
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -569,7 +592,7 @@ fn tool_to_payload(rec: ToolCallRecord) -> Result<serde_json::Value, ObsError> {
 #[async_trait]
 impl DecisionLog for EventDecisionLog {
     async fn record(&self, rec: DecisionRecord) -> Result<EventSeq, ObsError> {
-        self.require_session(rec.session).await?;
+        self.checked_session(rec.session, "decision").await?;
         let session = rec.session;
         let run = rec.run;
         let prepared = prepare_decision(rec, self.retention)?;
@@ -588,13 +611,15 @@ impl DecisionLog for EventDecisionLog {
             Ok(seq) => Ok(seq),
             Err(e) => {
                 tracing::error!(%session, ?run, ?kind, error = %e, "decision append failed");
-                Err(ObsError::Append(e))
+                let err = ObsError::Append(e);
+                self.note_drop(session, "decision", &err).await;
+                Err(err)
             }
         }
     }
 
     async fn record_model_call(&self, rec: ModelCallRecord) -> Result<EventSeq, ObsError> {
-        self.require_session(rec.session).await?;
+        self.checked_session(rec.session, "model_call").await?;
         let session = rec.session;
         let run = rec.run;
         let prepared = prepare_model_call(rec, self.retention)?;
@@ -612,13 +637,15 @@ impl DecisionLog for EventDecisionLog {
             Ok(seq) => Ok(seq),
             Err(e) => {
                 tracing::error!(%session, ?run, error = %e, "model_call append failed");
-                Err(ObsError::Append(e))
+                let err = ObsError::Append(e);
+                self.note_drop(session, "model_call", &err).await;
+                Err(err)
             }
         }
     }
 
     async fn record_tool_call(&self, rec: ToolCallRecord) -> Result<EventSeq, ObsError> {
-        self.require_session(rec.session).await?;
+        self.checked_session(rec.session, "tool_call").await?;
         let session = rec.session;
         let run = rec.run;
         let prepared = prepare_tool_call(rec, self.retention)?;
@@ -636,7 +663,9 @@ impl DecisionLog for EventDecisionLog {
             Ok(seq) => Ok(seq),
             Err(e) => {
                 tracing::error!(%session, ?run, error = %e, "tool_call append failed");
-                Err(ObsError::Append(e))
+                let err = ObsError::Append(e);
+                self.note_drop(session, "tool_call", &err).await;
+                Err(err)
             }
         }
     }

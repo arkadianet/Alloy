@@ -665,3 +665,53 @@ async fn metadata_secrets_masked_on_wire() {
     assert_eq!(rec.metadata["ok"], 1);
     h.shutdown().await;
 }
+
+/// Issue #22 — "if it isn't in the event log, it didn't happen" cuts both
+/// ways: when an audit record cannot be persisted (here: no session row),
+/// the failure itself must be observable. The record call still errs
+/// (RFC-0006 — obs never invents success, callers may swallow), and the
+/// host channel now carries an `audit_record_dropped` runtime event.
+#[tokio::test]
+async fn dropped_audit_record_emits_runtime_event() {
+    let h = Host::open(false, false).await;
+    let log = h.log();
+    let ghost = SessionId::new();
+    let err = log
+        .record_tool_call(ToolCallRecord {
+            session: ghost,
+            run: None,
+            node: None,
+            tool_name: "cargo_check".into(),
+            tool_server: Some("builtin".into()),
+            latency_ms: Some(3),
+            denied: true,
+            content_hash: None,
+            body: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObsError::Session(_)), "{err}");
+
+    let runtime = h
+        .storage
+        .events()
+        .list_runtime_events(None, 1000)
+        .await
+        .unwrap();
+    let dropped: Vec<_> = runtime
+        .iter()
+        .filter_map(|(_, ev)| match ev {
+            alloy_runtime::RuntimeEvent::AuditRecordDropped {
+                session,
+                record_type,
+                error,
+            } => Some((session.clone(), record_type.clone(), error.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dropped.len(), 1, "one drop event: {runtime:?}");
+    assert_eq!(dropped[0].0, ghost.to_string());
+    assert_eq!(dropped[0].1, "tool_call");
+    assert!(dropped[0].2.contains("not found"), "{}", dropped[0].2);
+    h.shutdown().await;
+}
