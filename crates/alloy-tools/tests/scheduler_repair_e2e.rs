@@ -57,6 +57,7 @@ mod linux {
         DagStore, SessionRows, StorageOpenOptions,
     };
     use alloy_runtime::types::ids::{ArtifactId, DagId, NodeId, ProfileId, RunId, SessionId};
+    use alloy_runtime::SessionProvenance;
     use alloy_runtime::{
         allocate_ids, build_topology, Approval, BudgetPolicy, BuildTopology, CapabilityExecContext,
         CapabilityExecError, CapabilityExecutor, CapabilityId, CapabilityOutcome,
@@ -69,7 +70,7 @@ mod linux {
         ResponseFormat, RetentionPolicy, RouterConfig, RunControlState, RunGoalRecord, RunRow,
         RuntimeConfig, SchedConfig, Scheduler, Session, SessionVerifyPermissions,
         SessionWorkerPermissions, TaskDag, TemplateCatalog, TemplateId, Timestamp, ToolCaller,
-        ToolChoice, ToolName, ToolSelector, UnavailableVerifyTest, Usage, VerifyCompileAdapter,
+        ToolChoice, ToolName, ToolSelector, UnavailableVerifyTest, Usage, Verifier,
         VerifyPermissions, WorkerConfig, WorkerDeps, EDIT_SYSTEM, REPAIR_SYSTEM,
     };
     use alloy_tools::mcp::{
@@ -415,6 +416,7 @@ planning = "standard"
                 run_timeout: Duration::from_secs(300),
                 budget_policy: BudgetPolicy::default(),
                 context_profile: alloy_runtime::ContextProfile::v2_defaults(),
+                capture: Default::default(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();
@@ -449,7 +451,7 @@ planning = "standard"
             };
             self.storage
                 .sessions()
-                .upsert_session(&session)
+                .upsert_session(&session, &SessionProvenance::unknown())
                 .await
                 .unwrap();
             session.id
@@ -464,6 +466,8 @@ planning = "standard"
                     attachments: vec![],
                 },
                 dag_id,
+                trajectory_id: Some(alloy_runtime::TrajectoryId::new()),
+                trajectory_schema: alloy_runtime::TRAJECTORY_SCHEMA_VERSION,
             };
             let row = RunRow {
                 id: run_id,
@@ -576,7 +580,7 @@ planning = "standard"
         fx: &Fixture,
         sched_dir: PathBuf,
         capabilities: &Arc<dyn CapabilityExecutor>,
-        verify_compile: &Arc<dyn VerifyCompileAdapter>,
+        verify_compile: &Arc<dyn Verifier>,
         decisions: &Arc<RecordingDecisionLog>,
         cost_meters: &Arc<ProcessCostMeterFactory>,
     ) -> LinearScheduler {
@@ -707,7 +711,7 @@ planning = "standard"
             Some("check*".into()),
             None,
         ));
-        let verify_compile: Arc<dyn VerifyCompileAdapter> = Arc::new(McpVerifyCompileAdapter::new(
+        let verify_compile: Arc<dyn Verifier> = Arc::new(McpVerifyCompileAdapter::new(
             verify_tools,
             verify_perms,
             fx.storage.artifacts(),

@@ -152,7 +152,14 @@ mod tests {
             language_backends: vec![],
             created_at: Timestamp::now(),
         };
-        storage.sessions().upsert_session(&session).await.unwrap();
+        storage
+            .sessions()
+            .upsert_session(
+                &session,
+                &crate::types::provenance::SessionProvenance::unknown(),
+            )
+            .await
+            .unwrap();
 
         let perms = SessionVerifyPermissions::new(
             storage.sessions(),
@@ -188,7 +195,14 @@ mod tests {
             language_backends: vec![],
             created_at: Timestamp::now(),
         };
-        storage.sessions().upsert_session(&session).await.unwrap();
+        storage
+            .sessions()
+            .upsert_session(
+                &session,
+                &crate::types::provenance::SessionProvenance::unknown(),
+            )
+            .await
+            .unwrap();
 
         let perms = SessionVerifyPermissions::new(
             storage.sessions(),
@@ -235,7 +249,14 @@ mod tests {
             language_backends: vec![],
             created_at: Timestamp::now(),
         };
-        storage.sessions().upsert_session(&session).await.unwrap();
+        storage
+            .sessions()
+            .upsert_session(
+                &session,
+                &crate::types::provenance::SessionProvenance::unknown(),
+            )
+            .await
+            .unwrap();
 
         // No test glob configured.
         let perms = SessionVerifyPermissions::new(storage.sessions(), Some("check *".into()), None);

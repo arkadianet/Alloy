@@ -21,7 +21,7 @@ mod traits;
 #[cfg(test)]
 mod tests;
 
-pub use goal_record::RunGoalRecord;
+pub use goal_record::{RunGoalRecord, TRAJECTORY_SCHEMA_VERSION};
 pub use metrics::SessionMetrics;
 pub use plane::SessionPlane;
 pub use run_state::RunControlState;

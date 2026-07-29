@@ -49,13 +49,12 @@ pub mod storage;
 pub mod types;
 
 pub use adapters::{
-    diagnostic_fingerprint, parse_rustc_diagnostics, Approval, CapabilityExecContext,
-    CapabilityExecError, CapabilityExecutor, CapabilityOutcome, GateHumanAdapter,
-    McpVerifyCompileAdapter, McpVerifyTestAdapter, NodeExecContext, NodeExecRef,
+    cargo_exit_verdict, diagnostic_fingerprint, parse_rustc_diagnostics, Approval,
+    CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityOutcome,
+    GateHumanAdapter, McpVerifyCompileAdapter, McpVerifyTestAdapter, NodeExecContext, NodeExecRef,
     SessionGateHumanAdapter, SessionVerifyPermissions, ToolCaller, ToolCallerError,
     UnavailableCapabilityExecutor, UnavailableGateHuman, UnavailableVerifyCompile,
-    UnavailableVerifyTest, VerifyClass, VerifyCompileAdapter, VerifyOutcome, VerifyPermissions,
-    VerifyTestAdapter,
+    UnavailableVerifyTest, Verdict, VerdictOutcome, Verifier, VerifyClass, VerifyPermissions,
 };
 // RFC-0013 exports. The `edit` capability payload (`capabilities::
 // EditAppliedPayload`) is deliberately not re-exported here: the crate root
@@ -77,13 +76,13 @@ pub use context::{
     GraphProjection, NullContextEngine, StaleReason, TokenEstimator, WorkingSet,
 };
 pub use dag::{
-    allocate_ids, build_topology, compute_cache_key, goal_content_digest,
-    mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest,
-    ApprovalSpec, Backoff, BuildTopology, CacheKey, CacheKeyMaterials, DagValidationError,
-    DagValidator, DependencyEdge, EdgeKind, NodeInputEnvelope, NodeInputPayload, NodeKind,
-    NodeOutputEnvelope, NodeState, PredecessorOutput, RetryIncoherence, RetryPolicy, TaskDag,
-    TaskNode, TemplateApprovalSpec, TemplateCatalog, TemplateEdgeSpec, TemplateId, TemplateIdMap,
-    TemplateManifest, TemplateNodeSpec, ValidateOpts, ENVELOPE_SCHEMA_VERSION,
+    allocate_ids, build_topology, compiler_fingerprint_digest, compute_cache_key,
+    goal_content_digest, policy_hash_digest, tool_versions_digest, ApprovalSpec, Backoff,
+    BuildTopology, CacheKey, CacheKeyMaterials, DagValidationError, DagValidator, DependencyEdge,
+    EdgeKind, NodeInputEnvelope, NodeInputPayload, NodeKind, NodeOutputEnvelope, NodeState,
+    PredecessorOutput, RetryIncoherence, RetryPolicy, TaskDag, TaskNode, TemplateApprovalSpec,
+    TemplateCatalog, TemplateEdgeSpec, TemplateId, TemplateIdMap, TemplateManifest,
+    TemplateNodeSpec, ValidateOpts, ENVELOPE_SCHEMA_VERSION,
 };
 pub use edit::{
     EditAppliedPayload, EditContext, EditEngine, EditError, EditRequest, EditRequestKind,
@@ -131,7 +130,7 @@ pub use scheduler::{
 };
 pub use session::{
     clamp_events_page_limit, ReplanReason, RunControlState, RunController, RunGoalRecord, Session,
-    SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE,
+    SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE, TRAJECTORY_SCHEMA_VERSION,
 };
 pub use storage::{
     install_sqlite_event_sink, store_to_runtime, store_to_session, AlloyStorage, ArtifactBlob,
@@ -149,10 +148,12 @@ pub use types::ids::{
     ArtifactId, CapabilityId, CheckpointId, CrateId, DagId, DiagnosticId, Digest, DigestError,
     DigestHasher, EndpointId, EventSeq, GateId, GraphNodeId, GraphSnapshotId, GraphVersion,
     IdError, LanguageId, NodeId, ProfileId, ProviderId, RunId, ServerId, SessionId, SummaryId,
-    Timestamp, TransactionId,
+    Timestamp, TrajectoryId, TransactionId,
 };
 pub use types::metrics::{RuntimeMetrics, WorkerMetrics};
 pub use types::permission::{ExecAllow, Glob, Grant, HostAllow, PermissionToken};
+pub use types::provenance::{ConsentRecord, SessionProvenance, PROVENANCE_SCHEMA_VERSION};
+pub use types::toolchain::ToolchainRecord;
 pub use types::tools::{
     token_expired, McpServerSpec, McpTransport, ToolCall, ToolError, ToolName, ToolResult,
     ToolSelector, ToolView,

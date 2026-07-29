@@ -104,6 +104,7 @@ mod tests {
                 run_timeout: Duration::from_secs(30),
                 budget_policy: BudgetPolicy::default(),
                 context_profile: crate::context::ContextProfile::v2_defaults(),
+                capture: Default::default(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();
@@ -139,6 +140,7 @@ mod tests {
                     profile: ProfileId::new("default").unwrap(),
                     budget: BudgetPolicy::default(),
                     language_backends: vec![LanguageId::new("rust").unwrap()],
+                    provenance: None,
                 })
                 .await
                 .unwrap();
