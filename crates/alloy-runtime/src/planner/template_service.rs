@@ -171,7 +171,10 @@ pub trait PlanService: Send + Sync {
 ///
 /// Construct via [`Self::from_storage`] (or [`Self::new`]) after
 /// [`crate::AlloyStorage::open`], then inject as `Arc<dyn PlanService>` into the
-/// PlanningWorker (RFC-0013) or CLI `alloy run` (RFC-0015). This crate does not
+/// **CLI / host** (`alloy run`, RFC-0015) — never into a capability worker:
+/// a worker holding a `PlanService` could write topology from inside a node,
+/// breaking the single-writer rule (V2 §6.4, ADR F-03; RFC-0013 AM-0009-1 /
+/// rule PW2). This crate does not
 /// change [`crate::RunController`] signatures (RFC-0009 §2.4); callers build
 /// [`PlanContext`] from [`crate::RunGoalRecord`] and call [`PlanService::plan`].
 pub struct TemplatePlanService {

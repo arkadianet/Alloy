@@ -9,7 +9,8 @@ use crate::types::ids::{Digest, SummaryId};
 use super::error::ContextError;
 use super::render::{sanitize_untrusted, system_frame, Section, SectionCitation};
 use super::types::{
-    AssembleRequest, CompactStrategy, DomainId, EvictPolicy, EvictReport, StaleReason,
+    AssembleInputs, AssembleRequest, CompactStrategy, DomainId, EvictPolicy, EvictReport,
+    StaleReason,
 };
 
 /// Bounded prompt assembly over labelled context domains (V2 §8).
@@ -17,6 +18,23 @@ use super::types::{
 pub trait ContextEngine: Send + Sync {
     /// Assemble a budgeted, cited `PromptPack`. Deterministic (A1).
     async fn assemble(&self, req: AssembleRequest) -> Result<PromptPack, ContextError>;
+
+    /// Assemble with host-held per-call inputs (RFC-0012 §3.5, consumed by
+    /// RFC-0013 workers through the trait object seam).
+    ///
+    /// Additive default (RFC-0013): engines that do not consume
+    /// [`AssembleInputs`] ignore it, preserving the shipped identity
+    /// `assemble(req) == assemble_with(req, AssembleInputs::default())`.
+    /// [`super::DefaultContextEngine`] overrides this with its inherent
+    /// implementation.
+    async fn assemble_with(
+        &self,
+        req: AssembleRequest,
+        inputs: AssembleInputs,
+    ) -> Result<PromptPack, ContextError> {
+        let _ = inputs;
+        self.assemble(req).await
+    }
 
     /// Compact a domain. **Stub** in MVP: no-op on a live domain (A12).
     async fn compact(

@@ -419,7 +419,9 @@ impl DagValidator {
     }
 }
 
-fn expected_capability(kind: NodeKind) -> Option<&'static str> {
+/// Kind ↔ capability-id map shared with the RFC-0013 registry (rule RG3):
+/// `capabilities::CapabilityRegistry::register` must agree with validation.
+pub(crate) fn expected_capability(kind: NodeKind) -> Option<&'static str> {
     match kind {
         NodeKind::Plan => Some("planning"),
         NodeKind::Analyze => Some("repair"),

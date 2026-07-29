@@ -2222,7 +2222,18 @@ impl DefaultContextEngine {
 #[async_trait]
 impl ContextEngine for DefaultContextEngine {
     async fn assemble(&self, req: AssembleRequest) -> Result<PromptPack, ContextError> {
-        self.assemble_with(req, AssembleInputs::default()).await
+        DefaultContextEngine::assemble_with(self, req, AssembleInputs::default()).await
+    }
+
+    // Trait-object entry for RFC-0013 workers: delegates to the inherent
+    // implementation so `Arc<dyn ContextEngine>` callers get the real
+    // host-input-aware assembly, not the ignore-inputs trait default.
+    async fn assemble_with(
+        &self,
+        req: AssembleRequest,
+        inputs: AssembleInputs,
+    ) -> Result<PromptPack, ContextError> {
+        DefaultContextEngine::assemble_with(self, req, inputs).await
     }
 
     async fn compact(
