@@ -89,6 +89,7 @@ fn endpoint() -> ModelEndpoint {
         max_context: 4096,
         input_usd_per_mtok: Some(2.0),
         output_usd_per_mtok: Some(4.0),
+        temperature: None,
     }
 }
 

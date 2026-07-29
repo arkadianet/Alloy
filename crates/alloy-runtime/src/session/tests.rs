@@ -1712,6 +1712,103 @@ async fn run_approve_deny_emits_run_finished_after_redispatch() {
     h.close().await;
 }
 
+/// Dogfood CI race (2026-07-29): the scheduler persists
+/// `DagState::WaitingApproval` before the run row flips to
+/// `waiting_approval`, so an approver acting on the published DAG state
+/// could land in the gap and be rejected — even though the durable
+/// `ApprovalRequested` already exists and SQ9 resolution would be picked
+/// up by the scheduler's durable scan. A durable gate request now
+/// satisfies the phase guard for a non-terminal run.
+#[tokio::test]
+async fn run_approve_accepts_durable_gate_request_before_state_flip() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+    let gate = GateId::new();
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run),
+            type_: SessionEventType::ApprovalRequested,
+            payload: json!({ "gate_id": gate.to_string() }),
+        })
+        .await
+        .unwrap();
+    h.set_run_state(run, RunControlState::Running).await;
+    h.runs().approve(run, gate, Approval::Allow).await.unwrap();
+    // Same guard on the deny side.
+    let run2 = h.submit(session).await;
+    h.seed_dag(run2).await;
+    let gate2 = GateId::new();
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run2),
+            type_: SessionEventType::ApprovalRequested,
+            payload: json!({ "gate_id": gate2.to_string() }),
+        })
+        .await
+        .unwrap();
+    h.set_run_state(run2, RunControlState::Running).await;
+    h.runs().approve(run2, gate2, Approval::Deny).await.unwrap();
+    h.close().await;
+}
+
+/// A durable `ApprovalRequested` only satisfies the phase guard while the
+/// gate is still OPEN: once a durable `ApprovalResolved` exists for it, a
+/// later approval on a non-waiting run must be rejected (external review
+/// finding on #54 — the first fallback re-approved resolved gates).
+#[tokio::test]
+async fn run_approve_rejects_resolved_durable_gate() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+    let gate = GateId::new();
+    for (type_, payload) in [
+        (
+            SessionEventType::ApprovalRequested,
+            json!({ "gate_id": gate.to_string() }),
+        ),
+        (
+            SessionEventType::ApprovalResolved,
+            json!({ "gate_id": gate.to_string(), "decision": "allow", "generation": 1 }),
+        ),
+    ] {
+        h.storage
+            .events()
+            .append_session(NewSessionEvent {
+                session_id: session,
+                run_id: Some(run),
+                type_,
+                payload,
+            })
+            .await
+            .unwrap();
+    }
+    h.set_run_state(run, RunControlState::Running).await;
+    assert!(matches!(
+        h.runs().approve(run, gate, Approval::Allow).await.unwrap_err(),
+        RunError::InvalidPhase(m) if m == "not waiting approval"
+    ));
+    // A RE-request after the resolution reopens the gate (GR3 re-emission).
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run),
+            type_: SessionEventType::ApprovalRequested,
+            payload: json!({ "gate_id": gate.to_string() }),
+        })
+        .await
+        .unwrap();
+    h.runs().approve(run, gate, Approval::Allow).await.unwrap();
+    h.close().await;
+}
+
 #[tokio::test]
 async fn run_approve_requires_waiting_approval() {
     let h = Harness::new().await;

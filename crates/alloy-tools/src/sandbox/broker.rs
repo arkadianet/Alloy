@@ -165,10 +165,13 @@ impl NativeSandboxBroker {
 
         let exec = ExecDir::create(self.base_policy.jail(), &Uuid::new_v4().to_string())?;
 
-        // Allowlisted operator subtrees are readable (§5.5). Build artifacts
-        // persist under the jail's own `target/` (do not force a per-exec
-        // `CARGO_TARGET_DIR` that is deleted on every return).
-        let read_only_roots = allowlisted_ro_subtrees(&homes.cargo_home, &homes.rustup_home);
+        // Allowlisted operator subtrees are readable (§5.5), plus token-free
+        // ancestor cargo configs (cargo merges config from every workspace
+        // ancestor and hard-errors on an unreadable one — dogfood 2026-07-29).
+        let mut read_only_roots = allowlisted_ro_subtrees(&homes.cargo_home, &homes.rustup_home);
+        read_only_roots.extend(crate::sandbox::backend::ancestor_cargo_configs(
+            self.base_policy.jail(),
+        ));
         let policy = PathPolicy::from_profile(&self.profile, read_only_roots.clone())?;
         // `from_profile` re-canonicalizes the jail. Backends bind
         // `profile.fs_jail` verbatim, so a jail that moved since construction
@@ -221,13 +224,17 @@ impl NativeSandboxBroker {
         let shadow_cargo_home =
             crate::sandbox::backend::stage_shadow_cargo_home(&homes.cargo_home, &exec.root)?;
         let env_cargo_home = shadow_cargo_home.as_deref().unwrap_or(&homes.cargo_home);
+        let jail_target_dir = self.base_policy.jail().join("target");
 
         let env = scrub_env(&ScrubInput {
             child_home: &exec.home,
             child_tmpdir: &exec.tmp,
             cargo_home: env_cargo_home,
             rustup_home: &homes.rustup_home,
-            cargo_target_dir: None,
+            // Persistent jail-level build cache; the env override also
+            // neutralizes any `build.target-dir` an operator config points
+            // outside the jail (write there would only fail closed).
+            cargo_target_dir: Some(&jail_target_dir),
             env_allow: &req.env_allow,
             quarantine: self.profile.quarantine_deps,
             path_value: Some(path_value(&path_dirs)),

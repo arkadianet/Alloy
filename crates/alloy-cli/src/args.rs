@@ -103,6 +103,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_input: bool,
 
+    /// Bounded diagnostics-informed retries after a failed repair run
+    /// (each retry re-checks the edited workspace and seeds the fresh
+    /// errors into the next run; 0 disables).
+    #[arg(long, default_value_t = 2)]
+    pub max_retries: u32,
+
     /// Plan and print the DAG without dispatching it (CL12).
     #[arg(long)]
     pub dry_run: bool,

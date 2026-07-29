@@ -491,7 +491,7 @@ impl TomlModelRouter {
                 } else {
                     ResponseFormat::Text
                 },
-                temperature: None,
+                temperature: routed.endpoint().temperature,
                 max_output_tokens: None,
             };
             let started = tokio::time::Instant::now();
@@ -870,6 +870,52 @@ output_usd_per_mtok = 1.0
             requires_tools: false,
             requires_structured_output: false,
         }
+    }
+
+    /// Issue #53 — the endpoint's configured temperature must reach the
+    /// provider request (previously hardcoded `None`, so the provider
+    /// default applied).
+    #[tokio::test]
+    async fn endpoint_temperature_reaches_provider_request() {
+        let id = ProviderId::new("provider").unwrap();
+        let provider = Arc::new(RecordingModelProvider::new(id));
+        provider.push(Ok(ModelResponse {
+            text: Some("done".into()),
+            structured: None,
+            tool_calls: vec![],
+            usage: Usage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            },
+            provider_request_id: None,
+            finish_reason: Some("stop".into()),
+        }));
+        let mut cfg = config();
+        cfg.providers[0].endpoints[0].temperature = Some(0.25);
+        let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+        let run = RunId::new();
+        let router = TomlModelRouter::from_parts(TomlModelRouterParts::new(
+            cfg,
+            provider.clone(),
+            BudgetPolicy::default(),
+            Some(log),
+            Some(SharedCostMeter::new()),
+            Some(run),
+        ))
+        .unwrap();
+        let routed = router.route(request(run)).await.unwrap();
+        router
+            .complete(
+                &routed,
+                PromptPack {
+                    messages: vec![],
+                    citations: vec![],
+                    domains: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(provider.recorded()[0].1.temperature, Some(0.25));
     }
 
     #[tokio::test]

@@ -6,17 +6,18 @@ Arguments:
   <GOAL>  Natural-language goal text
 
 Options:
-      --session <SESSION>      Reuse an existing session instead of creating one (SQ5)
-      --workspace <WORKSPACE>  Workspace root used to resolve config files and `.alloy` (CL2) [default: .]
-      --max-usd <MAX_USD>      Constraint::MaxUsd; may only lower the profile ceiling (PF11)
-      --profile <PROFILE>      Catalog profile id: default | autonomous | readonly (CL4)
-      --json                   Emit machine-readable JSON on stdout (CL3)
-      --require-cargo-check    Constraint::RequireCargoCheck (implied by the default profile)
-      --quiet                  Suppress progress rendering on stderr (CL7)
-      --yes                    Pre-approve gates non-interactively (refused by readonly, GA4/PF9)
-      --no-input               Never prompt; a gate becomes EX_GATE_REQUIRED (GA5)
-      --verbose                Raise the tracing filter (CL7)
-      --dry-run                Plan and print the DAG without dispatching it (CL12)
-      --template <TEMPLATE>    Template override; dry-run plan inspection only (CL6/CL12)
-      --no-index               Skip the graph bootstrap at session create (IX3)
-  -h, --help                   Print help
+      --session <SESSION>          Reuse an existing session instead of creating one (SQ5)
+      --workspace <WORKSPACE>      Workspace root used to resolve config files and `.alloy` (CL2) [default: .]
+      --max-usd <MAX_USD>          Constraint::MaxUsd; may only lower the profile ceiling (PF11)
+      --profile <PROFILE>          Catalog profile id: default | autonomous | readonly (CL4)
+      --json                       Emit machine-readable JSON on stdout (CL3)
+      --require-cargo-check        Constraint::RequireCargoCheck (implied by the default profile)
+      --quiet                      Suppress progress rendering on stderr (CL7)
+      --yes                        Pre-approve gates non-interactively (refused by readonly, GA4/PF9)
+      --no-input                   Never prompt; a gate becomes EX_GATE_REQUIRED (GA5)
+      --verbose                    Raise the tracing filter (CL7)
+      --max-retries <MAX_RETRIES>  Bounded diagnostics-informed retries after a failed repair run (each retry re-checks the edited workspace and seeds the fresh errors into the next run; 0 disables) [default: 2]
+      --dry-run                    Plan and print the DAG without dispatching it (CL12)
+      --template <TEMPLATE>        Template override; dry-run plan inspection only (CL6/CL12)
+      --no-index                   Skip the graph bootstrap at session create (IX3)
+  -h, --help                       Print help
