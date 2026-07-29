@@ -53,6 +53,7 @@ mod linux {
         DagStore, SessionRows, StorageOpenOptions,
     };
     use alloy_runtime::types::ids::{ArtifactId, DagId, NodeId, ProfileId, RunId, SessionId};
+    use alloy_runtime::SessionProvenance;
     use alloy_runtime::{
         allocate_ids, build_topology, Approval, BudgetPolicy, BuildTopology, CapabilityExecContext,
         CapabilityExecError, CapabilityExecutor, CapabilityOutcome, DagState, GateHumanAdapter,
@@ -322,7 +323,7 @@ mod linux {
             };
             self.storage
                 .sessions()
-                .upsert_session(&session)
+                .upsert_session(&session, &SessionProvenance::unknown())
                 .await
                 .unwrap();
             session.id

@@ -182,10 +182,17 @@ impl SessionService for SessionServiceView {
         };
         let id = session.id;
 
-        self.rows().upsert_session(&session).await.map_err(|e| {
-            warn!(error = %e, "session create failed");
-            store_to_session(e)
-        })?;
+        let provenance = req
+            .provenance
+            .clone()
+            .unwrap_or_else(crate::types::provenance::SessionProvenance::unknown);
+        self.rows()
+            .upsert_session(&session, &provenance)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "session create failed");
+                store_to_session(e)
+            })?;
 
         let payload = json!({
             "workspace_root": req.workspace_root.to_string_lossy(),

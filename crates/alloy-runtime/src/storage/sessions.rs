@@ -34,20 +34,24 @@ pub struct RunRow {
 /// Thin session/run persistence helpers.
 #[async_trait]
 pub trait SessionRows: Send + Sync {
-    /// Upsert a session row.
-    async fn upsert_session(&self, session: &Session) -> Result<(), StoreError>;
+    /// Upsert a session row, persisting `provenance` atomically with it.
+    ///
+    /// Research §7.11 item 4: consent cannot be obtained retroactively, so
+    /// provenance is **required creation input** and **write-once** — on
+    /// conflict the mutable session fields update but `provenance_json` is
+    /// never touched. There is deliberately no post-creation mutation
+    /// surface: consent elevation means a new session.
+    async fn upsert_session(
+        &self,
+        session: &Session,
+        provenance: &crate::types::provenance::SessionProvenance,
+    ) -> Result<(), StoreError>;
     /// Load a session row.
     async fn get_session(&self, id: SessionId) -> Result<Option<Session>, StoreError>;
 
-    /// Write session provenance + consent (research §7.11 item 4).
-    /// Overwrites any prior record; the session row must exist.
-    async fn set_provenance(
-        &self,
-        id: SessionId,
-        provenance: &crate::types::provenance::SessionProvenance,
-    ) -> Result<(), StoreError>;
-    /// Load session provenance. `Ok(None)` = never recorded — read it as
-    /// "no consent, provenance unknown" (fail closed).
+    /// Load session provenance. `Ok(None)` = never recorded (pre-v4 legacy
+    /// rows only) — read it as "no consent, provenance unknown" (fail
+    /// closed).
     async fn get_provenance(
         &self,
         id: SessionId,
@@ -87,10 +91,16 @@ impl SqliteSessionRows {
 
 #[async_trait]
 impl SessionRows for SqliteSessionRows {
-    async fn upsert_session(&self, session: &Session) -> Result<(), StoreError> {
+    async fn upsert_session(
+        &self,
+        session: &Session,
+        provenance: &crate::types::provenance::SessionProvenance,
+    ) -> Result<(), StoreError> {
         let _permit = self.gate.enter()?;
         let db = Arc::clone(&self.db);
         let session = session.clone();
+        let provenance_json =
+            serde_json::to_string(provenance).map_err(|e| StoreError::Internal(e.to_string()))?;
         spawn_db(db, move |handle| {
             handle.with(|conn| {
                 let budget = serde_json::to_string(&session.budget)
@@ -99,11 +109,14 @@ impl SessionRows for SqliteSessionRows {
                     .map_err(|e| StoreError::Internal(e.to_string()))?;
                 let ts_text = ts_to_text(&session.created_at)?;
                 let root = path_to_utf8(&session.workspace_root)?;
+                // One statement = atomic with creation; the conflict arm
+                // deliberately omits provenance_json (write-once).
                 conn.execute(
                     "INSERT INTO sessions (
                         id, workspace_root, profile, budget_json,
-                        language_backends_json, created_at, graph_version
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+                        language_backends_json, created_at, graph_version,
+                        provenance_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
                      ON CONFLICT(id) DO UPDATE SET
                         workspace_root = excluded.workspace_root,
                         profile = excluded.profile,
@@ -116,34 +129,9 @@ impl SessionRows for SqliteSessionRows {
                         budget,
                         langs,
                         ts_text,
+                        provenance_json,
                     ],
                 )?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(|e| self.map_busy(e))
-    }
-
-    async fn set_provenance(
-        &self,
-        id: SessionId,
-        provenance: &crate::types::provenance::SessionProvenance,
-    ) -> Result<(), StoreError> {
-        let _permit = self.gate.enter()?;
-        let db = Arc::clone(&self.db);
-        let id_str = id.to_string();
-        let json =
-            serde_json::to_string(provenance).map_err(|e| StoreError::Internal(e.to_string()))?;
-        spawn_db(db, move |handle| {
-            handle.with(|conn| {
-                let changed = conn.execute(
-                    "UPDATE sessions SET provenance_json = ?1 WHERE id = ?2",
-                    params![json, id_str],
-                )?;
-                if changed == 0 {
-                    return Err(StoreError::NotFound(format!("session {id_str}")));
-                }
                 Ok(())
             })
         })

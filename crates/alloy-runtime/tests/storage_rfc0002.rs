@@ -1,5 +1,6 @@
 //! Unit and integration tests for RFC-0002 storage.
 
+use alloy_runtime::SessionProvenance;
 use std::sync::Arc;
 
 use alloy_runtime::events::{EventSink, NewSessionEvent, RuntimeEvent, SessionEventType};
@@ -452,7 +453,9 @@ async fn session_and_run_rows() {
         language_backends: vec![LanguageId::new("rust").unwrap()],
         created_at: Timestamp::now(),
     };
-    rows.upsert_session(&session).await.unwrap();
+    rows.upsert_session(&session, &SessionProvenance::unknown())
+        .await
+        .unwrap();
     let loaded = rows.get_session(session.id).await.unwrap().unwrap();
     assert_eq!(loaded.id, session.id);
     assert_eq!(loaded.profile.as_str(), "default");
@@ -912,12 +915,13 @@ async fn crash_after_commit_reopen_sees_event() {
     storage.close().await.unwrap();
 }
 
-/// Research §7.11 item 4: provenance and consent round-trip through the v4
-/// column; an unrecorded session reads `None` (fail closed); recording
-/// against a missing session errors instead of silently dropping consent.
+/// Research §7.11 item 4: provenance and consent are required creation
+/// input, persisted atomically with the session row, and write-once — a
+/// later upsert with different provenance updates the mutable session
+/// fields but never the recorded consent, and no mutation API exists.
 #[tokio::test]
-async fn session_provenance_round_trips_and_fails_closed() {
-    use alloy_runtime::{ConsentRecord, SessionProvenance, PROVENANCE_SCHEMA_VERSION};
+async fn session_provenance_is_creation_input_and_immutable() {
+    use alloy_runtime::{ConsentRecord, PROVENANCE_SCHEMA_VERSION};
     let (_dir, storage) = open_temp().await;
     let rows = storage.sessions();
     let session = Session {
@@ -928,12 +932,7 @@ async fn session_provenance_round_trips_and_fails_closed() {
         language_backends: vec![],
         created_at: Timestamp::now(),
     };
-    rows.upsert_session(&session).await.unwrap();
-
-    // Never recorded → None, the fail-closed reading.
-    assert_eq!(rows.get_provenance(session.id).await.unwrap(), None);
-
-    let provenance = SessionProvenance {
+    let granted = SessionProvenance {
         schema_version: PROVENANCE_SCHEMA_VERSION,
         repo: Some("https://github.com/arkadianet/Alloy".into()),
         head_sha: Some("4b8dfd7".into()),
@@ -943,18 +942,44 @@ async fn session_provenance_round_trips_and_fails_closed() {
             share_ok: false,
         },
     };
-    rows.set_provenance(session.id, &provenance).await.unwrap();
-    let got = rows.get_provenance(session.id).await.unwrap().unwrap();
-    assert_eq!(got, provenance);
-
-    // Recording against a session that does not exist is an error.
-    let err = rows
-        .set_provenance(SessionId::new(), &provenance)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, alloy_runtime::StoreError::NotFound(_)),
-        "got {err:?}"
+    rows.upsert_session(&session, &granted).await.unwrap();
+    assert_eq!(
+        rows.get_provenance(session.id).await.unwrap(),
+        Some(granted.clone()),
+        "provenance persists atomically with creation"
     );
+
+    // A later upsert cannot elevate or overwrite consent: the mutable
+    // fields update, the provenance does not.
+    let mut renamed = session.clone();
+    renamed.workspace_root = "/tmp/ws2".into();
+    let mut elevated = granted.clone();
+    elevated.consent.share_ok = true;
+    rows.upsert_session(&renamed, &elevated).await.unwrap();
+    let after = rows.get_provenance(session.id).await.unwrap().unwrap();
+    assert_eq!(after, granted, "consent elevation must be rejected");
+    assert!(!after.consent.share_ok);
+    let reread = rows.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(
+        reread.workspace_root.to_str().unwrap(),
+        "/tmp/ws2",
+        "mutable session fields still update"
+    );
+
+    // Fail-closed default: a session created without explicit consent
+    // records unknown() — nothing consented.
+    let bare = Session {
+        id: SessionId::new(),
+        workspace_root: "/tmp/ws3".into(),
+        profile: ProfileId::new("default").unwrap(),
+        budget: BudgetPolicy::default(),
+        language_backends: vec![],
+        created_at: Timestamp::now(),
+    };
+    rows.upsert_session(&bare, &SessionProvenance::unknown())
+        .await
+        .unwrap();
+    let p = rows.get_provenance(bare.id).await.unwrap().unwrap();
+    assert!(!p.consent.corpus_ok && !p.consent.share_ok);
     storage.close().await.unwrap();
 }

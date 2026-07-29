@@ -139,6 +139,7 @@ mod tests {
                     profile: ProfileId::new("default").unwrap(),
                     budget: BudgetPolicy::default(),
                     language_backends: vec![LanguageId::new("rust").unwrap()],
+                    provenance: None,
                 })
                 .await
                 .unwrap();

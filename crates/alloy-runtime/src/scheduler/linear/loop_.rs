@@ -2321,6 +2321,7 @@ mod tests {
     };
     use crate::types::budget::{BudgetPolicy, Goal, ModelTier, TokenBudget};
     use crate::types::ids::{ArtifactId, CapabilityId, GateId, ProfileId, SessionId, Timestamp};
+    use crate::types::provenance::SessionProvenance;
 
     // ---- test doubles ----
 
@@ -2482,7 +2483,7 @@ mod tests {
             };
             self.storage
                 .sessions()
-                .upsert_session(&session)
+                .upsert_session(&session, &SessionProvenance::unknown())
                 .await
                 .unwrap();
             session.id
