@@ -25,3 +25,20 @@ pub fn init_tracing() {
             .try_init();
     });
 }
+
+/// Initialize a default `tracing` subscriber once, writing to **stderr**.
+///
+/// RFC-0015 OUT1: for the CLI, stdout carries results only; progress and
+/// diagnostics (including tracing) go to stderr so `--json > f.json` stays a
+/// valid document.
+pub fn init_tracing_stderr() {
+    INIT.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}

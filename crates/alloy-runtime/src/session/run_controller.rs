@@ -191,6 +191,40 @@ pub(super) async fn emit_run_finished(
         .map_err(runtime_to_run)
 }
 
+/// True if `(run, gate)` has a durable `ApprovalRequested` (RFC-0015 SQ9:
+/// out-of-band approval from a process holding no waiter).
+async fn has_durable_gate_request(
+    inner: &SessionInner,
+    session: SessionId,
+    run: RunId,
+    gate: GateId,
+) -> Result<bool, RunError> {
+    let events = inner.storage.events();
+    let gate_str = gate.to_string();
+    let mut after = None;
+    loop {
+        let page = events
+            .list_session_events(session, after, crate::session::MAX_EVENTS_PAGE)
+            .await
+            .map_err(store_to_run)?;
+        let Some(last) = page.last() else {
+            return Ok(false);
+        };
+        after = Some(last.seq);
+        let short_page = page.len() < crate::session::MAX_EVENTS_PAGE;
+        if page.iter().any(|ev| {
+            ev.run_id == Some(run)
+                && ev.type_ == SessionEventType::ApprovalRequested
+                && ev.payload.get("gate_id").and_then(|v| v.as_str()) == Some(gate_str.as_str())
+        }) {
+            return Ok(true);
+        }
+        if short_page {
+            return Ok(false);
+        }
+    }
+}
+
 /// True if this run already has a durable `RunCompleted` (retry idempotency).
 pub(super) async fn has_run_completed(
     inner: &SessionInner,
@@ -859,16 +893,25 @@ impl RunController for RunControllerView {
             }
         }
 
-        let sender = self
-            .inner
-            .gates
-            .take(run, gate)
-            .ok_or(RunError::UnknownGate(gate))?;
+        // RFC-0015 SQ9: `approve` is valid from a different process than the
+        // one running the DAG. Waiters are process-local, so a missing waiter
+        // is not `UnknownGate` when the gate's `ApprovalRequested` is durable
+        // — the resolution is persisted and the scheduler's §5.7.2 durable
+        // scan picks it up on (re)dispatch. A gate with neither a waiter nor
+        // a durable request stays `UnknownGate`.
+        let sender = self.inner.gates.take(run, gate);
+        if sender.is_none()
+            && !has_durable_gate_request(&self.inner, row.session_id, run, gate).await?
+        {
+            return Err(RunError::UnknownGate(gate));
+        }
 
         let (_dag_id, generation) = match resolve_dag_generation(&self.inner, &row).await {
             Ok(pair) => pair,
             Err(e) => {
-                self.inner.gates.restore(run, gate, sender);
+                if let Some(sender) = sender {
+                    self.inner.gates.restore(run, gate, sender);
+                }
                 return Err(e);
             }
         };
@@ -881,14 +924,18 @@ impl RunController for RunControllerView {
             // `waiting_approval`, putting the sender back permanently strands Deny waiters
             // (terminal guards block every release path) — drop it so they observe closure.
             if !e.row_committed {
-                self.inner.gates.restore(run, gate, sender);
+                if let Some(sender) = sender {
+                    self.inner.gates.restore(run, gate, sender);
+                }
             }
             return Err(e.err);
         }
 
-        sender
-            .send(decision)
-            .map_err(|_| RunError::Internal("gate waiter dropped".into()))?;
+        if let Some(sender) = sender {
+            sender
+                .send(decision)
+                .map_err(|_| RunError::Internal("gate waiter dropped".into()))?;
+        }
 
         self.inner.metrics.bump_approvals_resolved();
         info!(run_id = %run, gate_id = %gate, decision = ?decision, "approval resolved");

@@ -12,7 +12,7 @@ use super::gate::StorageGate;
 use super::metrics::StorageMetrics;
 use super::open::{spawn_db, DbHandle};
 use crate::session::Session;
-use crate::types::ids::{RunId, SessionId, Timestamp};
+use crate::types::ids::{GraphVersion, RunId, SessionId, Timestamp};
 
 /// Opaque run row for RFC-0003 (state vocabulary owned there).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -63,6 +63,18 @@ pub trait SessionRows: Send + Sync {
     async fn get_run(&self, id: RunId) -> Result<Option<RunRow>, StoreError>;
     /// List runs for a session (created_at ascending).
     async fn list_runs(&self, session: SessionId) -> Result<Vec<RunRow>, StoreError>;
+
+    /// Write `sessions.graph_version` (RFC-0015 §5.6 amendment A3; discharges
+    /// RFC-0011 Appendix E.4 item 2). The column exists since RFC-0002 and
+    /// `upsert_session` writes `NULL`; `alloy index` is the only caller.
+    ///
+    /// Returns [`StoreError::Corrupt`] when the session row is missing so a
+    /// typo'd id is not silently a no-op.
+    async fn set_graph_version(
+        &self,
+        id: SessionId,
+        version: GraphVersion,
+    ) -> Result<(), StoreError>;
 }
 
 /// SQLite implementation of [`SessionRows`].
@@ -318,6 +330,35 @@ impl SessionRows for SqliteSessionRows {
                     });
                 }
                 Ok(out)
+            })
+        })
+        .await
+        .map_err(|e| self.map_busy(e))
+    }
+
+    async fn set_graph_version(
+        &self,
+        id: SessionId,
+        version: GraphVersion,
+    ) -> Result<(), StoreError> {
+        let _permit = self.gate.enter()?;
+        let db = Arc::clone(&self.db);
+        let id_str = id.to_string();
+        spawn_db(db, move |handle| {
+            handle.with(|conn| {
+                let version = i64::try_from(version.0).map_err(|_| {
+                    StoreError::Internal(format!("graph_version {} out of range", version.0))
+                })?;
+                let updated = conn.execute(
+                    "UPDATE sessions SET graph_version = ?2 WHERE id = ?1",
+                    params![id_str, version],
+                )?;
+                if updated == 0 {
+                    return Err(StoreError::Corrupt(format!(
+                        "set_graph_version: session {id_str} not found"
+                    )));
+                }
+                Ok(())
             })
         })
         .await

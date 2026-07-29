@@ -1,15 +1,41 @@
 # profiles/default.toml — Author: arkadianet
-# Skeleton fields parsed by RFC-0001 RuntimeConfig::load (full profile wiring → RFC-0015).
+# Architecture V2 Appendix B baseline. Parsed by RuntimeConfig::load (RFC-0015 §5.6 A1)
+# and, for [sandbox], by alloy-tools load_sandbox_profile. Both readings are cross-checked
+# at assembly (RFC-0015 CR6).
 [profile]
 id = "default"
+description = "Correctness-first Rust profile"
+
+[gates]
+require_cargo_check = true            # MUST stay true in every profile (PF7)
+require_human_on_public_api = true
+require_human_on_new_unsafe = true
+require_human_on_new_dependency = true
+allow_raw_bash = false                # MUST stay false in every profile (PF6)
+
+[sandbox]
+check = "landlock"                    # seatbelt on macOS; "container" acceptable
+test = "container"
+network = "deny"                      # MUST stay deny (PF8)
+quarantine_deps = true                # MUST stay true (PF8)
 
 [budgets]
 max_usd_per_run = 5.0
 max_tokens_per_run = 2_000_000
+max_parallel_nodes = 1                # MUST stay 1 (PF12)
+max_parallel_cargo = 1                # MUST stay 1 (PF12)
+max_parallel_edits = 1                # MUST stay 1 (PF12)
+
+[context]
+total_token_budget = 32_000
+weights = { conversation = 0.20, working_set = 0.55, artifacts = 0.25 }
 
 [observability]
 retain_full_prompts = false
 retain_tool_bodies = false
+
+[limits]
+run_timeout_secs = 1800
 
 # Corpus capture (research §7.11 item 1) — distinct from [observability]:
 # retention is what the log keeps for debugging; capture is what may enter a
@@ -20,12 +46,3 @@ enabled = false
 prompts = false
 tool_bodies = false
 require_consent = true
-
-# Sandbox (RFC-0005). On macOS prefer check = "container" when sandbox-exec
-# deny-default profiles are Unavailable (see docs/security/sandbox-residual-risk.md).
-# Container is an acceptable fallback for both check and test classes.
-[sandbox]
-check = "landlock"
-test = "container"
-network = "deny"
-quarantine_deps = true

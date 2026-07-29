@@ -24,6 +24,7 @@ mod tests;
 pub use goal_record::{RunGoalRecord, TRAJECTORY_SCHEMA_VERSION};
 pub use metrics::SessionMetrics;
 pub use plane::SessionPlane;
+pub use profiles::{validate_mvp_profile, MVP_PROFILES};
 pub use run_state::RunControlState;
 pub use traits::{
     clamp_events_page_limit, ReplanReason, RunController, Session, SessionService, MAX_EVENTS_PAGE,

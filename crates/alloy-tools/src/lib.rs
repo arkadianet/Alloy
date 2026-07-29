@@ -6,6 +6,7 @@
 //! - [`sandbox`] — SandboxBroker, PathPolicy, backends (RFC-0005)
 //! - [`mcp`] — MCP host, in-process builtins, tool disclosure (RFC-0006)
 //! - [`edit`] — GitEditEngine + EditEnginePatchBackend (RFC-0008)
+//! - [`toolchain`] — host `rustc`/`cargo` probe (research §7.11 item 3)
 //! - `authz` — transport-neutral FsRead/FsWrite grant-glob matching (crate-private)
 //! - `redact` — absolute-path redaction for operator/model-visible strings (crate-private)
 //!
@@ -23,6 +24,7 @@ pub mod edit;
 pub mod mcp;
 pub(crate) mod redact;
 pub mod sandbox;
+pub mod toolchain;
 
 pub use sandbox::{
     default_deny_globs, load_sandbox_profile, trusted_exec_path, BackendStatus, DenialReason,

@@ -1,0 +1,37 @@
+# profiles/readonly.toml — Author: arkadianet
+# Inspect and plan only. `alloy run` without --dry-run is refused (PF9); no EditEngine
+# and no test-class exec grant are assembled (PF10).
+[profile]
+id = "readonly"
+description = "Inspect and plan only; no workspace writes"
+
+[gates]
+require_cargo_check = true
+require_human_on_public_api = true
+require_human_on_new_unsafe = true
+require_human_on_new_dependency = true
+allow_raw_bash = false
+
+[sandbox]
+check = "landlock"
+test = "container"
+network = "deny"
+quarantine_deps = true
+
+[budgets]
+max_usd_per_run = 0.0
+max_tokens_per_run = 2_000_000
+max_parallel_nodes = 1
+max_parallel_cargo = 1
+max_parallel_edits = 1
+
+[context]
+total_token_budget = 32_000
+weights = { conversation = 0.20, working_set = 0.55, artifacts = 0.25 }
+
+[observability]
+retain_full_prompts = false
+retain_tool_bodies = false
+
+[limits]
+run_timeout_secs = 900

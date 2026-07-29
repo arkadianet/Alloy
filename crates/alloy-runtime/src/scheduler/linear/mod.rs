@@ -280,6 +280,10 @@ mod tests {
                 run_timeout: Duration::from_secs(30),
                 budget_policy: BudgetPolicy::default(),
                 context_profile: crate::context::ContextProfile::v2_defaults(),
+                profile_id: Some("default".into()),
+                gates: crate::config::GatesConfig::default(),
+                sandbox_echo: None,
+                gate_timeout: None,
                 capture: Default::default(),
             })
             .unwrap();
