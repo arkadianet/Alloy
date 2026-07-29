@@ -64,7 +64,7 @@ pub(crate) fn run(
             &tx,
             node,
             &[GraphEdgeKind::References, GraphEdgeKind::Imports],
-            false,
+            Direction::Incoming,
             version,
             limits,
         )?,
@@ -72,7 +72,7 @@ pub(crate) fn run(
             &tx,
             trait_node,
             &[GraphEdgeKind::Impls],
-            true,
+            Direction::Both,
             version,
             limits,
         )?,
@@ -80,7 +80,7 @@ pub(crate) fn run(
             &tx,
             fn_node,
             &[GraphEdgeKind::Calls],
-            false,
+            Direction::Incoming,
             version,
             limits,
         )?,
@@ -289,11 +289,20 @@ fn fix_from_row(row: &rusqlite::Row<'_>) -> Result<FixEvent, GraphError> {
 /// this type implements"). An unknown anchor returns an empty view with
 /// `truncated = false`: nothing was withheld, and fabricating a row for an
 /// id the graph never minted would violate G7.
+/// Which incident edges a neighbourhood query admits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// Edges pointing at the anchor only (`Refs`, `Callers`).
+    Incoming,
+    /// Either endpoint (`Impls` answers both directions — A-0011-6c).
+    Both,
+}
+
 fn neighbours(
     conn: &Connection,
     anchor: &GraphNodeId,
     kinds: &[alloy_runtime::graph::GraphEdgeKind],
-    both_directions: bool,
+    direction: Direction,
     version: alloy_runtime::GraphVersion,
     limits: &IngestLimits,
 ) -> Result<GraphView, GraphError> {
@@ -315,10 +324,9 @@ fn neighbours(
         .map(|k| format!("'{}'", k.as_str()))
         .collect::<Vec<_>>()
         .join(",");
-    let direction = if both_directions {
-        "(to_id = ?1 OR from_id = ?1)"
-    } else {
-        "to_id = ?1"
+    let direction = match direction {
+        Direction::Both => "(to_id = ?1 OR from_id = ?1)",
+        Direction::Incoming => "to_id = ?1",
     };
     // All incident edges are fetched so truncation happens at the Q8 node
     // ordering boundary in `finish_view` (Q9), mirroring `subgraph`.

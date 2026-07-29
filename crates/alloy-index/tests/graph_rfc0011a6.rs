@@ -604,8 +604,12 @@ async fn high_degree_anchor_stays_under_the_sqlite_variable_limit() {
         })
         .await
         .expect("a high-degree anchor must not blow the SQL variable limit");
-    assert!(view.truncated, "40k callers against the 2k node cap");
-    assert_eq!(view.nodes.len(), 2_000);
+    let cap = IngestLimits::default().max_query_nodes as usize;
+    assert!(
+        view.truncated,
+        "40k callers against the {cap}-node default cap"
+    );
+    assert_eq!(view.nodes.len(), cap);
     g.close().await.unwrap();
 }
 
