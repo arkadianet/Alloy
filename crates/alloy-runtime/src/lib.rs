@@ -62,13 +62,14 @@ pub use adapters::{
 // EditAppliedPayload`) is deliberately not re-exported here: the crate root
 // already exports RFC-0008's session-event payload of the same name.
 pub use capabilities::{
-    system_instruction_digest, Capability, CapabilityContext, CapabilityDescriptor,
-    CapabilityRegistry, CapabilityVersion, EditWorker, PlanningProposalPayload, PlanningWorker,
-    ProcessRunRouterProvider, RegError, RegistryCapabilityExecutor, RepairPlanPayload, RepairStep,
-    RepairWorker, ResolveHints, ReviewFinding, ReviewPayload, ReviewSeverity, ReviewVerdict,
-    ReviewWorker, RunRouterProvider, SessionWorkerPermissions, SideEffectClass, WorkerConfig,
-    WorkerDeps, WorkerPermissions, WorkerToolClass, CAPABILITY_CATALOG, EDIT_SYSTEM,
-    MAX_LLM_CAPABILITIES, PAYLOAD_SCHEMA_VERSION, REPAIR_SYSTEM, REVIEW_SYSTEM,
+    fence_untrusted, system_instruction_digest, Capability, CapabilityContext,
+    CapabilityDescriptor, CapabilityRegistry, CapabilityVersion, EditWorker,
+    PlanningProposalPayload, PlanningWorker, ProcessRunRouterProvider, RegError,
+    RegistryCapabilityExecutor, RepairPlanPayload, RepairStep, RepairWorker, ResolveHints,
+    ReviewFinding, ReviewPayload, ReviewSeverity, ReviewVerdict, ReviewWorker, RunRouterProvider,
+    SessionWorkerPermissions, SideEffectClass, WorkerConfig, WorkerDeps, WorkerPermissions,
+    WorkerToolClass, CAPABILITY_CATALOG, EDIT_SYSTEM, MAX_LLM_CAPABILITIES, PAYLOAD_SCHEMA_VERSION,
+    REPAIR_SYSTEM, REVIEW_SYSTEM,
 };
 pub use config::{default_router_toml, ConfigPaths, GatesConfig, RuntimeConfig, SandboxEcho};
 pub use context::{

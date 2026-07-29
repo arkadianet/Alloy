@@ -49,6 +49,25 @@ The default profile keeps the guard rails on: Landlock/container sandbox,
 `require_cargo_check`, human gate before edits land, $5 / 2M-token budget
 ceilings per run. `--dry-run` shows the plan without dispatching.
 
+## 3b. Review a diff (Alloy on Alloy's own PRs)
+
+`alloy review` runs the `review` capability over a unified diff and prints
+its findings. The CLI spawns nothing — not even `git` — so the diff is piped
+in or named as a file:
+
+```sh
+git diff origin/main... | alloy review --diff -
+alloy review --diff /tmp/pr.diff --json
+```
+
+Findings print as `severity file:line message`, then `summary:` and
+`verdict:`. Exit `0` means `approve`; exit `16` (`EX_REVIEW_CHANGES`) means
+the reviewer asked for changes — a successful run with an opinion, not a
+failure. The planned template (`review_diff`) is a single read-only node: no
+edit, no gate, no cargo. Note that the `readonly` profile's
+`max_usd_per_run = 0` denies the model call, so review under the default
+profile for now.
+
 ## 4. What to record when it misbehaves
 
 File an issue per failure with:

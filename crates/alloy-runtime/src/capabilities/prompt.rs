@@ -58,6 +58,18 @@ pub(crate) fn fence_workspace(path: &str, content: &str) -> String {
     )
 }
 
+/// Wrap host-supplied untrusted text (a diff handed to `alloy review`, say)
+/// in the `<workspace>` fence every capability's system instruction declares
+/// non-instructional (PR12).
+///
+/// The composition root has no other honest way to hand a worker untrusted
+/// bytes: fencing lives in this file and nowhere else (PR1), so hosts call
+/// this rather than assembling the markup themselves.
+#[must_use]
+pub fn fence_untrusted(label: &str, content: &str) -> String {
+    fence_workspace(label, content)
+}
+
 /// Wrap an untrusted tool result in a `<tool>` fence (PR12), truncating to
 /// `max_bytes` on a UTF-8 boundary first (PR6).
 #[must_use]

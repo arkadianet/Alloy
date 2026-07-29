@@ -7,7 +7,7 @@ mod common;
 use predicates::prelude::*;
 
 const SUBCOMMANDS: &[&str] = &[
-    "run", "events", "approve", "cancel", "resume", "index", "host",
+    "run", "review", "events", "approve", "cancel", "resume", "index", "host",
 ];
 
 /// CL10 — top-level and per-subcommand help match snapshots.
