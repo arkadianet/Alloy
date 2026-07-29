@@ -178,11 +178,16 @@ fn sec8_alloy_index_never_writes_dot_env() {
     }
 }
 
-// T14 / IN9: `GraphNodeKind::Item` never appears in an alloy-index insert
-// path — only in seam-mapping match/rank code.
+// T14 / IN9, as amended by RFC-0014 SY3: `Item` nodes are constructed by
+// the `syn` deep pass and nowhere else — outside `src/lang/`,
+// `GraphNodeKind::Item` still appears only in seam-mapping match/rank code.
+// (Item ids stay derived: the G3 grep below covers the whole crate.)
 #[test]
-fn in9_no_item_node_construction_in_ingest() {
+fn in9_item_node_construction_only_in_the_lang_pass() {
     for file in rs_files("crates/alloy-index/src") {
+        if file.components().any(|c| c.as_os_str() == "lang") {
+            continue; // RFC-0014's syn pass — the one legal producer (SY3).
+        }
         let text = read(&file);
         for (i, line) in text.lines().enumerate() {
             if !line.contains("GraphNodeKind::Item") {
