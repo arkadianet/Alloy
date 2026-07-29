@@ -16,6 +16,7 @@
 //!
 //! Author: arkadianet
 
+use crate::dag::{NodeKind, NodeState, TaskDag};
 use crate::edit::engine::EditEngine;
 use crate::edit::types::EditContext;
 use crate::events::{SessionEvent, SessionEventType};
@@ -71,6 +72,30 @@ pub struct RollbackReport {
     pub restored: Vec<TransactionId>,
     /// The refusal that stopped the pass, when there was one.
     pub declined: Option<DeclinedRollback>,
+    /// Succeeded `Edit` nodes the run's DAG records while the journal named
+    /// no transaction at all — edits that are on disk and cannot be undone.
+    ///
+    /// Always `0` when [`Self::found`] is non-zero, or when
+    /// [`rollback_run_edits`] was given no DAG to cross-check against.
+    pub unjournaled_edits: usize,
+}
+
+/// Succeeded `Edit` nodes in `dag`.
+///
+/// A succeeded `Edit` node means `apply_patch` ran with `dry_run: false` and
+/// the tool did not report an error (RFC-0014 EW7, `capabilities::workers::edit`),
+/// so the edit engine committed a transaction for it. Cross-checking that
+/// count against the journal is the only way to notice a *lost* `EditApplied`:
+/// the append happens after the commit point and is deliberately best-effort
+/// (`alloy-tools` `edit::engine`, "EditApplied append failed after commit"),
+/// so a sink failure or a missing `session_id` drops the event while the edit
+/// stays on disk.
+#[must_use]
+fn succeeded_edit_nodes(dag: &TaskDag) -> usize {
+    dag.nodes
+        .values()
+        .filter(|n| n.kind == NodeKind::Edit && n.state == NodeState::Succeeded)
+        .count()
 }
 
 /// Undo every edit `run` applied, newest-first, so a caller can start again
@@ -80,18 +105,30 @@ pub struct RollbackReport {
 /// is rollback-eligible (RFC-0008 §5.11), and undoing it makes its
 /// predecessor the newest in turn.
 ///
+/// Pass `dag` — the run's DAG, as it stands after the failure — to have the
+/// pass notice edits the journal never recorded; see
+/// [`RollbackReport::unjournaled_edits`].
+///
 /// **Never fails.** A refusal — the workspace drifted under the engine, the
 /// transaction is no longer eligible, git is unavailable — stops the pass
-/// and is reported, not raised. The engine has already verified that a
-/// refused rollback left the tree untouched, so the caller's honest move is
-/// to continue against the tree as it stands and say so. Failing the caller
-/// instead would turn "we could not undo an edit" into "your run died",
-/// which is strictly worse for anyone whose editor happened to save a file
-/// mid-run.
+/// and is reported, not raised. Failing the caller instead would turn "we
+/// could not undo an edit" into "your run died", which is strictly worse for
+/// anyone whose editor happened to save a file mid-run.
+///
+/// **The report is not a promise about the tree.** Most refusals are
+/// pre-flight (eligibility, drift, denied paths) and leave the workspace
+/// exactly as they found it, but `EditError::RollbackFailed` and a failed
+/// post-restore digest check (`alloy-tools` `edit::engine::rollback_record`)
+/// are raised *after* the restore was attempted, so the tree may sit between
+/// its pre- and post-edit states. A caller holding stale knowledge of the
+/// workspace — cached diagnostics, a prior probe — must therefore re-derive
+/// it whenever [`RollbackReport::restored`] is non-empty **or**
+/// [`RollbackReport::declined`] is set.
 pub async fn rollback_run_edits(
     engine: &dyn EditEngine,
     events: &[SessionEvent],
     run: RunId,
+    dag: Option<&TaskDag>,
     ctx: &EditContext,
 ) -> RollbackReport {
     let transactions = transactions_of_run(events, run);
@@ -99,6 +136,17 @@ pub async fn rollback_run_edits(
         found: transactions.len(),
         ..RollbackReport::default()
     };
+    if transactions.is_empty() {
+        report.unjournaled_edits = dag.map_or(0, succeeded_edit_nodes);
+        if report.unjournaled_edits > 0 {
+            tracing::warn!(
+                edit_nodes = report.unjournaled_edits,
+                run = %run,
+                "edit node(s) succeeded but the session log named no edit \
+                 transaction; those edits cannot be rolled back"
+            );
+        }
+    }
     for tx in transactions.iter().rev().copied() {
         match engine.rollback(tx, ctx).await {
             Ok(()) => report.restored.push(tx),
@@ -125,12 +173,16 @@ pub async fn rollback_run_edits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dag::{Backoff, RetryPolicy, TaskNode};
     use crate::edit::error::EditError;
     use crate::edit::types::{EditRequest, EditTransaction, EditValidation};
     use crate::events::NewSessionEvent;
+    use crate::types::budget::{ModelTier, TokenBudget};
     use crate::types::ids::ProfileId;
+    use crate::types::ids::{ArtifactId, DagId, NodeId};
     use crate::types::ids::{EventSeq, SessionId, Timestamp};
     use crate::types::permission::PermissionToken;
+    use crate::DagState;
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -295,7 +347,7 @@ mod tests {
         let (a, b) = (TransactionId::new(), TransactionId::new());
         let events = vec![edit(1, Some(run), a), edit(2, Some(run), b)];
         let engine = FakeEngine::new(vec![]);
-        let report = rollback_run_edits(&engine, &events, run, &edit_ctx(run)).await;
+        let report = rollback_run_edits(&engine, &events, run, None, &edit_ctx(run)).await;
         assert_eq!(engine.seen(), vec![b, a], "eligibility is newest-first");
         assert_eq!(report.found, 2);
         assert_eq!(report.restored, vec![b, a]);
@@ -310,7 +362,7 @@ mod tests {
         let (a, b) = (TransactionId::new(), TransactionId::new());
         let events = vec![edit(1, Some(run), a), edit(2, Some(run), b)];
         let engine = FakeEngine::new(vec![b]);
-        let report = rollback_run_edits(&engine, &events, run, &edit_ctx(run)).await;
+        let report = rollback_run_edits(&engine, &events, run, None, &edit_ctx(run)).await;
         assert_eq!(engine.seen(), vec![b], "the older tx must not be attempted");
         assert_eq!(report.found, 2);
         assert!(report.restored.is_empty());
@@ -323,8 +375,101 @@ mod tests {
     async fn a_run_that_edited_nothing_is_a_no_op() {
         let run = RunId::new();
         let engine = FakeEngine::new(vec![]);
-        let report = rollback_run_edits(&engine, &[], run, &edit_ctx(run)).await;
+        let report = rollback_run_edits(&engine, &[], run, None, &edit_ctx(run)).await;
         assert!(engine.seen().is_empty());
         assert_eq!(report, RollbackReport::default());
+    }
+
+    /// The partial case the review asked about: the newest transaction comes
+    /// back, the one under it is refused. Both halves must be on the report —
+    /// a caller that only sees the refusal would think the tree was untouched.
+    #[tokio::test]
+    async fn a_partial_pass_reports_both_halves() {
+        let run = RunId::new();
+        let (a, b) = (TransactionId::new(), TransactionId::new());
+        let events = vec![edit(1, Some(run), a), edit(2, Some(run), b)];
+        let engine = FakeEngine::new(vec![a]);
+        let report = rollback_run_edits(&engine, &events, run, None, &edit_ctx(run)).await;
+        assert_eq!(engine.seen(), vec![b, a]);
+        assert_eq!(report.found, 2);
+        assert_eq!(report.restored, vec![b], "the newest one did come back");
+        assert_eq!(
+            report.declined.map(|d| d.transaction_id),
+            Some(a),
+            "and the one under it did not"
+        );
+    }
+
+    fn dag_with_edit_node(state: NodeState) -> TaskDag {
+        let node = TaskNode {
+            id: NodeId::new(),
+            kind: NodeKind::Edit,
+            capability: None,
+            input_ref: ArtifactId::new(),
+            output_ref: None,
+            state,
+            retry: RetryPolicy {
+                max_attempts: 1,
+                backoff: Backoff::Fixed { delay_ms: 0 },
+                retry_on: vec![],
+                escalate_after: None,
+                escalate_to_tier: None,
+            },
+            cache_key: None,
+            budget: TokenBudget {
+                max_input: 1,
+                max_output: 1,
+            },
+            model_tier: ModelTier::Standard,
+            approval: None,
+            timeout_ms: 1000,
+        };
+        TaskDag {
+            id: DagId::new(),
+            session_id: SessionId::new(),
+            generation: 1,
+            nodes: std::iter::once((node.id, node)).collect(),
+            edges: vec![],
+            state: DagState::Failed,
+        }
+    }
+
+    /// A succeeded `Edit` node means `apply_patch` committed (EW7), so a run
+    /// whose journal names no transaction has lost an `EditApplied` append —
+    /// the edit is on disk and unrollbackable. Say so rather than reporting a
+    /// silent no-op.
+    #[tokio::test]
+    async fn a_succeeded_edit_node_with_an_empty_journal_is_flagged() {
+        let run = RunId::new();
+        let engine = FakeEngine::new(vec![]);
+        let dag = dag_with_edit_node(NodeState::Succeeded);
+        let report = rollback_run_edits(&engine, &[], run, Some(&dag), &edit_ctx(run)).await;
+        assert_eq!(report.found, 0);
+        assert_eq!(report.unjournaled_edits, 1);
+    }
+
+    /// An edit node that did not succeed applied nothing, so an empty journal
+    /// is the truth, not a lost append.
+    #[tokio::test]
+    async fn an_unsucceeded_edit_node_is_not_flagged() {
+        let run = RunId::new();
+        let engine = FakeEngine::new(vec![]);
+        let dag = dag_with_edit_node(NodeState::Failed);
+        let report = rollback_run_edits(&engine, &[], run, Some(&dag), &edit_ctx(run)).await;
+        assert_eq!(report.unjournaled_edits, 0);
+    }
+
+    /// The flag is about a journal that named *nothing*: once a transaction is
+    /// on the report, the rollback path is the honest signal.
+    #[tokio::test]
+    async fn a_journalled_run_is_never_flagged() {
+        let run = RunId::new();
+        let a = TransactionId::new();
+        let events = vec![edit(1, Some(run), a)];
+        let engine = FakeEngine::new(vec![]);
+        let dag = dag_with_edit_node(NodeState::Succeeded);
+        let report = rollback_run_edits(&engine, &events, run, Some(&dag), &edit_ctx(run)).await;
+        assert_eq!(report.restored, vec![a]);
+        assert_eq!(report.unjournaled_edits, 0);
     }
 }

@@ -184,9 +184,9 @@ async fn run_after_assembly(
     let mut attempt: u32 = 0;
     // Set when the post-failure probe's seeded diagnostics still describe
     // the tree the next attempt will start from: the bootstrap check would
-    // re-run cargo for an identical answer (review finding). A successful
-    // rollback invalidates this — the tree changed back — so the flag is
-    // only set when nothing was restored.
+    // re-run cargo for an identical answer (review finding). Any rollback
+    // that touched — or tried to touch — the tree invalidates this; see
+    // `rollback::probe_still_describes_tree`.
     let mut seeded_by_probe = false;
     loop {
         let run = sessions.submit_goal(session, goal.clone()).await?;
@@ -243,8 +243,8 @@ async fn run_after_assembly(
         // iteration's pre-plan probe re-reads whatever tree is left.
         let rolled = rollback::rollback_run(full, ctx, session, run, dag_id).await;
         // The probe's diagnostics describe the pre-rollback tree; they only
-        // stand in for the next bootstrap when nothing was restored.
-        seeded_by_probe = rolled.restored.is_empty();
+        // stand in for the next bootstrap when the pass left that tree alone.
+        seeded_by_probe = rollback::probe_still_describes_tree(&rolled);
         if !ctx.quiet {
             if let Some(line) = rollback::summary(&rolled) {
                 eprintln!("{line}");

@@ -15,19 +15,49 @@
 //! Author: arkadianet
 
 use alloy_runtime::{
-    rollback_run_edits, DagId, DecisionKind, DecisionLog, DecisionRecord, EditContext, NodeExecRef,
-    NodeId, RollbackReport, RunId, SessionId, TransactionId, WorkerToolClass,
+    rollback_run_edits, DagId, DagStore, DecisionKind, DecisionLog, DecisionRecord, EditContext,
+    NodeExecRef, NodeId, RollbackReport, RunId, SessionId, TransactionId, WorkerToolClass,
 };
 use serde_json::json;
 
 use crate::assembly::FullAssembly;
 use crate::resolve::Ctx;
 
+/// Whether the pre-rollback diagnostic probe still describes the tree the
+/// next attempt will start from.
+///
+/// The retry loop skips its pre-plan bootstrap when it does — re-running
+/// cargo for an identical answer costs a compile for nothing. It may only
+/// say so when the pass left the workspace alone. A restore obviously
+/// changes it; a *refusal* is not proof it did not, because
+/// `EditError::RollbackFailed` and the post-restore digest check are raised
+/// after the restore was attempted (see `rollback_run_edits`), which can
+/// leave the tree between its pre- and post-edit states.
+///
+/// `unjournaled_edits` is deliberately not consulted: those edits were never
+/// touched by this pass, so the probe that ran over them still holds.
+#[must_use]
+pub(crate) fn probe_still_describes_tree(report: &RollbackReport) -> bool {
+    report.restored.is_empty() && report.declined.is_none()
+}
+
 /// The operator-facing line for one rollback pass, or `None` when the failed
 /// attempt edited nothing and there is nothing to report.
 #[must_use]
 pub(crate) fn summary(report: &RollbackReport) -> Option<String> {
     if report.found == 0 {
+        // Nothing in the journal is only good news if nothing was edited.
+        // A succeeded edit node says otherwise: the `EditApplied` append is
+        // best-effort after the commit point, so the edit can be on disk with
+        // no transaction id anyone can undo it by.
+        if report.unjournaled_edits > 0 {
+            return Some(format!(
+                "{} edit node(s) of the failed attempt succeeded but named no edit \
+                 transaction in the session log, so nothing could be rolled back; \
+                 the retry starts from the workspace as it stands",
+                report.unjournaled_edits
+            ));
+        }
         return None;
     }
     let mut line = format!(
@@ -99,7 +129,18 @@ pub(crate) async fn rollback_run(
         perms,
     };
 
-    let report = rollback_run_edits(engine.as_ref(), &events, run, &edit_ctx).await;
+    // The DAG is the second witness: it knows an edit node succeeded even
+    // when the `EditApplied` append that would have named the transaction was
+    // lost. Unreadable → no cross-check, never a failure.
+    let dag = match full.base.storage.dags().get(dag_id).await {
+        Ok(dag) => dag,
+        Err(e) => {
+            tracing::warn!(error = %e, "dag unreadable; no unjournaled-edit cross-check");
+            None
+        }
+    };
+
+    let report = rollback_run_edits(engine.as_ref(), &events, run, dag.as_ref(), &edit_ctx).await;
     for tx in &report.restored {
         record_rollback(full, session, run, *tx, None).await;
     }
@@ -166,7 +207,7 @@ mod tests {
         let report = RollbackReport {
             found: 2,
             restored: vec![TransactionId::new(), TransactionId::new()],
-            declined: None,
+            ..RollbackReport::default()
         };
         let line = summary(&report).unwrap();
         assert!(line.contains("rolled back 2/2"), "{line}");
@@ -185,11 +226,82 @@ mod tests {
                 transaction_id: tx,
                 reason: "workspace drifted".into(),
             }),
+            ..RollbackReport::default()
         };
         let line = summary(&report).unwrap();
         assert!(line.contains("rolled back 0/2"), "{line}");
         assert!(line.contains("workspace drifted"), "{line}");
         assert!(line.contains(&tx.to_string()), "{line}");
         assert!(line.contains("as it stands"), "{line}");
+    }
+
+    /// A pass that restored some and was then refused must read as *both*:
+    /// the count says what came back, the clause says what did not.
+    #[test]
+    fn a_partial_rollback_reports_both_halves() {
+        let report = RollbackReport {
+            found: 3,
+            restored: vec![TransactionId::new()],
+            declined: Some(DeclinedRollback {
+                transaction_id: TransactionId::new(),
+                reason: "not newest".into(),
+            }),
+            ..RollbackReport::default()
+        };
+        let line = summary(&report).unwrap();
+        assert!(line.contains("rolled back 1/3"), "{line}");
+        assert!(line.contains("not newest"), "{line}");
+        assert!(line.contains("as it stands"), "{line}");
+    }
+
+    /// The journal named nothing but the DAG says an edit node succeeded:
+    /// silence would be a lie — the edit is on disk and is not coming back.
+    #[test]
+    fn an_unjournaled_edit_is_named_even_though_nothing_was_found() {
+        let report = RollbackReport {
+            found: 0,
+            unjournaled_edits: 1,
+            ..RollbackReport::default()
+        };
+        let line = summary(&report).expect("silence would hide an applied edit");
+        assert!(line.contains("1 edit node"), "{line}");
+        assert!(line.contains("as it stands"), "{line}");
+    }
+
+    /// The retry's stale-probe shortcut may only stand when the pass neither
+    /// restored nor attempted-and-failed a restore. A refusal is not proof the
+    /// tree is untouched: `RollbackFailed` and the post-restore digest check
+    /// are raised *after* the restore ran.
+    #[test]
+    fn only_an_untouched_tree_keeps_the_probes_diagnostics() {
+        assert!(probe_still_describes_tree(&RollbackReport::default()));
+        assert!(probe_still_describes_tree(&RollbackReport {
+            found: 0,
+            unjournaled_edits: 2,
+            ..RollbackReport::default()
+        }));
+        assert!(!probe_still_describes_tree(&RollbackReport {
+            found: 1,
+            restored: vec![TransactionId::new()],
+            ..RollbackReport::default()
+        }));
+        assert!(!probe_still_describes_tree(&RollbackReport {
+            found: 1,
+            restored: vec![],
+            declined: Some(DeclinedRollback {
+                transaction_id: TransactionId::new(),
+                reason: "rollback failed".into(),
+            }),
+            ..RollbackReport::default()
+        }));
+        assert!(!probe_still_describes_tree(&RollbackReport {
+            found: 2,
+            restored: vec![TransactionId::new()],
+            declined: Some(DeclinedRollback {
+                transaction_id: TransactionId::new(),
+                reason: "rollback failed".into(),
+            }),
+            ..RollbackReport::default()
+        }));
     }
 }

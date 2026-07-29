@@ -401,6 +401,51 @@ async fn conversation_excludes_model_and_tool_call_events() {
     }
 }
 
+/// A rolled-back edit must never reach the next attempt's prompt as a bare
+/// `edit_applied`. The CLI's retry loop undoes a failed attempt's edits and
+/// records an `edit_rolled_back` decision; both are admitted conversation
+/// events (D16 admits `EditApplied` and `Decision`), and the window is a tail
+/// ordered by `EventSeq`, so the later rollback can never be dropped while the
+/// apply it undoes is kept.
+#[tokio::test]
+async fn a_rolled_back_edit_is_fenced_next_to_its_rollback() {
+    let fx = Fx::new(GraphMode::Empty);
+    let s = fixed_session();
+    fx.events.push(
+        s,
+        SessionEventType::EditApplied,
+        serde_json::json!({
+            "transaction_id": "ROLLED_TX",
+            "files_touched": ["a.rs"],
+        }),
+    );
+    fx.events.push(
+        s,
+        SessionEventType::Decision,
+        serde_json::json!({
+            "kind": "edit_rolled_back",
+            "metadata": {"transaction_id": "ROLLED_TX", "restored": true},
+        }),
+    );
+    let pack = fx
+        .engine()
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let text = pack_text(&pack);
+    let applied = text
+        .find("edit ROLLED_TX")
+        .expect("the apply is in history");
+    let rolled = text
+        .find("edit_rolled_back")
+        .expect("so is the rollback that undid it");
+    assert!(applied < rolled, "oldest-first (D13):\n{text}");
+    assert!(
+        text[rolled..].contains("ROLLED_TX"),
+        "the rollback names the transaction it undid:\n{text}"
+    );
+}
+
 #[tokio::test]
 async fn conversation_selects_newest_then_renders_oldest_first() {
     let fx = Fx::new(GraphMode::Empty);
