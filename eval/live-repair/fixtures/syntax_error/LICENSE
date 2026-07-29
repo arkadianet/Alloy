@@ -1,0 +1,5 @@
+Alloy-Original fixture material.
+
+This single-error Rust crate is original Alloy live-repair benchmark fixture
+material authored by arkadianet. It is operator benchmark input only and is not
+part of the RFC-0016 offline train/holdout corpus.
