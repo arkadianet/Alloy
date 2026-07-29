@@ -65,6 +65,8 @@ pub struct FullAssembly {
     pub scheduler: Arc<LinearScheduler>,
     /// PF10 — whether a `GitEditEngine` was assembled (false under readonly).
     pub edit_engine_assembled: bool,
+    /// Compile verifier, re-used for the pre-plan diagnostic seed (issue #53).
+    pub verify_compile: Arc<dyn alloy_runtime::Verifier>,
 }
 
 /// Make a path absolute against the process CWD without touching the
@@ -371,7 +373,7 @@ pub async fn assemble_full(
             sessions: storage.sessions() as _,
             session_plane: plane.clone(),
             runs: plane.runs(),
-            verify_compile: verify_compile as _,
+            verify_compile: Arc::clone(&verify_compile) as _,
             verify_test: verify_test as _,
             gate_human: gate_human as _,
             capabilities,
@@ -397,6 +399,7 @@ pub async fn assemble_full(
         plan,
         scheduler: sched,
         edit_engine_assembled,
+        verify_compile: verify_compile as _,
     })
 }
 

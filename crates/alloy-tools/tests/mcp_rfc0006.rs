@@ -343,11 +343,33 @@ async fn cargo_check_fixture_sandboxed() {
     };
 
     let fixtures = copy_fixtures_tree();
-    let jail = fixtures.path().canonicalize().unwrap();
+    // Dogfood regression (round 2): cargo merges config from every jail
+    // *ancestor* and hard-errors on an unreadable one. A token-free
+    // ancestor config (with a jail-escaping target-dir, neutralized by the
+    // forced CARGO_TARGET_DIR) must not fail the sandboxed check.
+    std::fs::create_dir_all(fixtures.path().join(".cargo")).unwrap();
+    std::fs::write(
+        fixtures.path().join(".cargo/config.toml"),
+        format!(
+            "[build]\ntarget-dir = \"{}\"\n",
+            fixtures.path().join("outside-target").display()
+        ),
+    )
+    .unwrap();
+    let root = fixtures.path().canonicalize().unwrap();
+    let jail = root.join("sbx-jail");
+    std::fs::create_dir_all(&jail).unwrap();
+    for entry in std::fs::read_dir(&root).unwrap().flatten() {
+        let name = entry.file_name();
+        if name == *".cargo" || name == *"sbx-jail" {
+            continue;
+        }
+        std::fs::rename(entry.path(), jail.join(&name)).unwrap();
+    }
     let fixture_root = jail.join("sbx_check");
     assert!(fixture_root.join("Cargo.toml").is_file());
 
-    let mut profile = SandboxProfile::default_for_jail(jail).unwrap();
+    let mut profile = SandboxProfile::default_for_jail(jail.clone()).unwrap();
     profile.check_backend = SandboxBackend::Landlock;
     profile.exec_timeout = Duration::from_secs(120);
     let broker = match NativeSandboxBroker::with_operator_homes(profile, homes.clone()).await {
@@ -385,6 +407,16 @@ async fn cargo_check_fixture_sandboxed() {
     );
     assert_eq!(result.content["exit_code"], 0);
     assert_eq!(result.content["backend"], "landlock");
+    // The ancestor config's jail-escaping target-dir must not be honoured:
+    // nothing outside the jail, artifacts under the forced jail target.
+    assert!(
+        !fixtures.path().join("outside-target").exists(),
+        "cargo escaped the jail via the ancestor config target-dir"
+    );
+    assert!(
+        jail.join("target").is_dir(),
+        "forced CARGO_TARGET_DIR must place artifacts under the jail"
+    );
 }
 
 /// A `CARGO_HOME` containing only a copy of the real `cargo`.

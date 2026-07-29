@@ -171,6 +171,7 @@ mod tests {
                 max_context: 1,
                 input_usd_per_mtok: Some(1.0),
                 output_usd_per_mtok: Some(2.0),
+                temperature: None,
             },
             ModelTier::Standard,
             &request,
