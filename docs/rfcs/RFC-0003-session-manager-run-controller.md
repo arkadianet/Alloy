@@ -10,6 +10,7 @@
 | **Related RFCs** | [0004](./RFC-0004-observability-cost-metering.md) budget metering / decision writers · [0009](./RFC-0009-task-dag-templates-planner.md) planner / DAG store · [0010](./RFC-0010-scheduler-runtime-adapters.md) scheduler execution · [0015](./RFC-0015-cli-profiles-config.md) CLI / TTY approval UX |
 | **Product** | Alloy — AI Engineering Runtime |
 | **Supersedes** | Draft outline of this filename (expanded to implementation grade) |
+| **Amended by** | [RFC-0017](./RFC-0017-dynamic-planning.md) §2.7 — **AM-0003-1** additive `RunController::resume_after_replan` (external replan re-arm, `ReplanRequested → Accepted`); **AM-0003-2** §6.3 step 8 generalized to an injected `RunExecutor` seam (`DirectRunExecutor` default is behavior-identical; steps 1–7/9–10 unchanged and observe only the executor's final `DagOutcome`); **AM-0003-3** additive `begin_repair_generation` / `complete_repair_generation` / `control_state` (lease-gated in-run generation transitions; the row stays `Running`, never `ReplanRequested`) |
 
 **Mental model (V2 §5.2 / ADR F-22):** Session owns lifecycle, events, and budgets only. Run control is `RunController`. Session MUST NOT execute tools or mutate DAG topology. Explicit state — if it is not in the session event log (or durable session/run rows), it did not happen.
 

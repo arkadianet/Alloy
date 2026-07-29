@@ -10,6 +10,7 @@
 | **Milestone** | M7 — repair vertical slice |
 | **Effort** | 6–10 person-days |
 | **Crates touched** | `alloy-runtime` (new `capabilities` module), `alloy-tools` (tests only), `alloy-cli` (wiring, RFC-0015) |
+| **Amended by** | [RFC-0017](./RFC-0017-dynamic-planning.md) §2.7 — **AM-0013-1** `PlanningWorker` v2 per PW5 (model branch: `uses_model = true`, `PLANNING_SYSTEM` activated, at most `max_model_turns` calls when driven by `LlmPlanService`; the deterministic branch is retained and PW2 stands verbatim); **AM-0013-2** `PlanningProposalPayload` gains additive `proposal: Option<ProposedDagManifest>`; **AM-0013-3** the `planning` descriptor's `side_effects` is `ReadOnly` on the model branch (`Pure` on the deterministic branch; `SideEffectClass` definitions unchanged, §6 contract table row updated) |
 | **Tests** | Unit, worker integration, cross-subsystem e2e with `ScriptedProvider`, CI greps (§15) |
 
 ---

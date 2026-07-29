@@ -10,6 +10,7 @@
 | **Related RFCs** | [0003](./RFC-0003-session-manager-run-controller.md) `RunGoalRecord.dag_id` / `ReplanReason` / `RunController::request_replan` · [0004](./RFC-0004-observability-cost-metering.md) session event payloads · [0010](./RFC-0010-scheduler-runtime-adapters.md) scheduler execution · [0013](./RFC-0013-capability-registry-workers.md) capability workers · [0015](./RFC-0015-cli-profiles-config.md) `alloy run` |
 | **Product** | Alloy — AI Engineering Runtime |
 | **Supersedes** | Draft outline of this filename (expanded to implementation grade) |
+| **Amended by** | [RFC-0017](./RFC-0017-dynamic-planning.md) §2.7 — **AM-0009-2** a `ReplanReason::FailureIr` replan seeds the new root's input envelope with the sanitized `FromPredecessors` seed (RFC-0017 §5.4; AC 28 below re-scoped accordingly); **AM-0009-3** `PlanProducedPayload` gains optional `source` / `proposal_artifact` / `seeded_root`; **AM-0009-4** `PlanResult` gains `source` / `proposal_artifact`; **AM-0009-5** production wiring selects `TemplatePlanService` vs `LlmPlanService` by profile `[planner] mode` (`DisabledLlmPlanService` retired to a test role); **AM-0009-6** the private persistence machinery is extracted as the shared validated write path `PlanPersistence::persist_validated` (§5.2/§5.3 step lists re-anchored on it; behavior unchanged); **AM-0009-7** `PlanContext` gains `prior_source` / `prior_proposal_artifact` provenance |
 | **Revision** | Post Phase-A engineering review (Opus + GPT) — binding contracts tightened |
 
 **Mental model (V2 §6 / ADR F-03 / F-16):** The Task DAG is explicit, durable, and singly-authored. `dag::types` already exists on `main`; this RFC gives those types **semantics**, **validation**, **persistence**, **templates**, and a **template planner**. RFC-0010 executes the DAG; RFC-0013 populates LLM nodes. The MVP scheduler is linear, but the DAG contract MUST remain correct under a future concurrent scheduler — or that upgrade becomes a breaking change.
@@ -1484,7 +1485,7 @@ Every criterion is independently testable by a named test or mechanical check.
 | 25 | Cross-subsystem persist/reload | §11.7 |
 | 26 | `StorageMetricsSnapshot` fields unchanged | type compile / diff |
 | 27 | Scheduler write contract documented (`put_if_generation`) | §6.4–6.6 present |
-| 28 | Root/non-root `input_ref` envelopes match §5.3.0 (Goal vs pending preds) | unit |
+| 28 | Root/non-root `input_ref` envelopes match §5.3.0 (Goal vs pending preds). *Re-scoped by RFC-0017 AM-0009-2 to non-replan plans and non-`FailureIr` replans: a `FailureIr` replan's root receives the seeded `FromPredecessors` envelope (RFC-0017 §5.4)* | unit |
 | 29 | Plan-time ArtifactPut labels/session/run attribution | unit |
 | 30 | `ReplanReason: PartialEq` additive derive present | compile |
 | 31 | After successful `plan`, every `input_ref` resolves via `ArtifactStore::get` | unit/integration |
