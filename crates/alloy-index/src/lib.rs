@@ -7,8 +7,9 @@
 //!
 //! Facts come from `Cargo.toml` manifests, a bounded, sorted, symlink-free
 //! filesystem walk, and the RFC-0014 `syn` item/import pass — no subprocess,
-//! no network. The `Callers`/`SimilarFixes`/`Refs`/`Impls` query answers
-//! remain **Stub** surfaces reserved for rust-analyzer passthrough (Q4–Q6).
+//! no network. The `Callers`/`Refs`/`Impls` query answers remain **Stub**
+//! surfaces reserved for rust-analyzer passthrough (Q4, Q5); `SimilarFixes`
+//! reads the recorded fixes back since amendment A-0011-5 (Q6).
 //! [`lang::rust::RustBackend`] implements the `LanguageBackend` seam over
 //! this store (RFC-0014 LC2).
 

@@ -23,7 +23,7 @@ use super::super::parse::is_jail_relative;
 use super::super::payload::{
     clamp_string, RepairPlanPayload, RepairStep, MAX_PAYLOAD_STRING_BYTES, PAYLOAD_SCHEMA_VERSION,
 };
-use super::super::prompt::REPAIR_SYSTEM;
+use super::super::prompt::{fence_tool, REPAIR_SYSTEM};
 use super::super::traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
 use super::{
     diagnostics_from_payloads, finish_attempt, llm_exchange, load_pred_payloads, worker_span,
@@ -32,6 +32,14 @@ use super::{
 
 /// RW2: diagnostics presented to the model are capped at this many.
 const MAX_DIAGNOSTICS: usize = 32;
+/// RW4 (A-0011-5): distinct diagnostic codes the graph is asked about.
+const MAX_FIX_CODES: usize = 4;
+/// RW4 (A-0011-5): rows requested per code — the query's own `limit`.
+const FIXES_PER_CODE: usize = 2;
+/// RW4 (A-0011-5): total past-fix lines shown, across all codes.
+const MAX_SIMILAR_FIXES: usize = 8;
+/// RW2-style byte cap on the assembled past-fix note.
+const MAX_SIMILAR_FIXES_BYTES: usize = 1024;
 /// §8.2: max `target_files` entries.
 const MAX_TARGET_FILES: usize = 16;
 /// §8.2: max bytes of one step rationale.
@@ -184,13 +192,18 @@ impl RepairWorker {
             focus_paths: diag_paths.clone(),
         };
 
+        // RW4 (A-0011-5): what the graph remembers about these codes. Best
+        // effort like every other graph read; the note is advisory prose on
+        // the PR11 User-role seam, never a substitute for the diagnostics.
+        let notes = similar_fix_notes(ctx, &diagnostics).await;
+
         let (proposal, _pack) = llm_exchange(
             ctx,
             attempt,
             &self.config,
             REPAIR_SYSTEM,
             &inputs,
-            &[],
+            &notes,
             |value| {
                 let proposal: RepairProposal =
                     serde_json::from_value(value.clone()).map_err(|e| format!("schema: {e}"))?;
@@ -260,6 +273,72 @@ impl RepairWorker {
             confidence,
         })
     }
+}
+
+/// Ask the graph what has been fixed before for the codes in hand and
+/// render at most one compact fenced note (amendment A-0011-5).
+///
+/// Returns an empty vector when there is nothing to say: no codes, no
+/// rows, or a graph that errored — an empty fence would only spend tokens
+/// claiming ignorance.
+async fn similar_fix_notes(
+    ctx: &CapabilityContext<'_>,
+    diagnostics: &[DiagnosticEvent],
+) -> Vec<String> {
+    let mut codes: Vec<&str> = Vec::new();
+    for d in diagnostics {
+        if let Some(code) = d.code.as_deref() {
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
+            if codes.len() == MAX_FIX_CODES {
+                break;
+            }
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for code in codes {
+        if lines.len() >= MAX_SIMILAR_FIXES {
+            break;
+        }
+        let Ok(view) = ctx
+            .graph
+            .query(GraphQuery::SimilarFixes {
+                diagnostic_code: code.to_owned(),
+                limit: FIXES_PER_CODE,
+            })
+            .await
+        else {
+            continue; // A graph error is "no priors", never a failure (RW4).
+        };
+        for f in view.fixes {
+            if !f.verified || lines.len() >= MAX_SIMILAR_FIXES {
+                continue;
+            }
+            let package = f
+                .crate_id
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |c| c.as_str().to_owned());
+            let patch = f
+                .patch_artifact
+                .map_or_else(|| "-".to_owned(), |a| a.to_string());
+            lines.push(format!(
+                "{code} in {package}: verified on {}, patch {patch}",
+                f.recorded_at.0.date()
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let body = format!(
+        "Past repairs of these diagnostic codes in this workspace that a \
+         later verification accepted. Advisory precedent only — the \
+         patches are not shown and may not apply here.\n{}",
+        lines.join("\n")
+    );
+    vec![fence_tool("similar_fixes", &body, MAX_SIMILAR_FIXES_BYTES)]
 }
 
 fn sort_key(d: &DiagnosticEvent) -> (String, u32, Option<String>) {

@@ -13,15 +13,15 @@ use std::sync::Arc;
 
 use alloy_index::{GraphOpenOptions, SqliteProjectGraph};
 use alloy_runtime::{
-    install_sqlite_event_sink, AlloyRuntime, AlloyStorage, CapabilityExecutor, CapabilityRegistry,
-    ContextEngine, DecisionLog, DefaultContextEngine, EditEngine, EventDecisionLog,
-    GraphViewHandle, LinearScheduler, LinearSchedulerDeps, McpVerifyCompileAdapter,
-    McpVerifyTestAdapter, ModelProvider, OpenAiCompatibleProvider, OpenAiCompatibleSpec,
-    ProcessCostMeterFactory, ProcessRunRouterProvider, ProjectGraph, RegistryCapabilityExecutor,
-    RouterConfig, RuntimeConfig, RuntimeHandle, SchedConfig, SecretString, SessionGateHumanAdapter,
-    SessionId, SessionPlane, SessionVerifyPermissions, SessionWorkerPermissions,
-    TemplatePlanService, ToolCaller, ToolName, ToolSelector, WorkerConfig, WorkerDeps,
-    WorkerPermissions,
+    install_sqlite_event_sink, AlloyRuntime, AlloyStorage, AppliedEditSource, CapabilityExecutor,
+    CapabilityRegistry, ContextEngine, DecisionLog, DefaultContextEngine, EditEngine,
+    EventDecisionLog, EventLogEdits, FixRecordingVerifier, GraphViewHandle, LinearScheduler,
+    LinearSchedulerDeps, McpVerifyCompileAdapter, McpVerifyTestAdapter, ModelProvider,
+    OpenAiCompatibleProvider, OpenAiCompatibleSpec, ProcessCostMeterFactory,
+    ProcessRunRouterProvider, ProjectGraph, RegistryCapabilityExecutor, RouterConfig,
+    RuntimeConfig, RuntimeHandle, SchedConfig, SecretString, SessionGateHumanAdapter, SessionId,
+    SessionPlane, SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService,
+    ToolCaller, ToolName, ToolSelector, Verifier, WorkerConfig, WorkerDeps, WorkerPermissions,
 };
 use alloy_tools::mcp::{McpPlatform, ToolHandle, ToolHandleToolCaller};
 use alloy_tools::{
@@ -293,6 +293,22 @@ pub async fn assemble_full(
         verify_tools,
         verify_perms as _,
         storage.artifacts() as _,
+    ));
+    // RFC-0011 IN1 (amendment A-0011-5): the verify path is the host's fix
+    // ingest seam. The composition root hands it the graph; the CLI itself
+    // never writes one (rule B5) and the scheduler only ever sees a
+    // `Verifier`.
+    let applied_edits: Arc<dyn AppliedEditSource> =
+        Arc::new(EventLogEdits::new(storage.events() as _));
+    let verify_compile: Arc<dyn Verifier> = Arc::new(FixRecordingVerifier::new(
+        verify_compile as Arc<dyn Verifier>,
+        Arc::clone(&graph) as Arc<dyn ProjectGraph>,
+        Arc::clone(&applied_edits),
+    ));
+    let verify_test: Arc<dyn Verifier> = Arc::new(FixRecordingVerifier::new(
+        verify_test as Arc<dyn Verifier>,
+        Arc::clone(&graph) as Arc<dyn ProjectGraph>,
+        applied_edits,
     ));
     let gate_human = Arc::new(SessionGateHumanAdapter::new(plane.clone()));
 
