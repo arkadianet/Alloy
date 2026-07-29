@@ -38,8 +38,10 @@ def main() -> None:
             passed = sum(1 for r in fr if r["exit"] == 0)
             retried = sum(r.get("retries", 0) for r in fr)
             secs = sum(r["secs"] for r in fr) / n
+            lo, hi = wilson(passed, n)
             print(
-                f"  {fixture:24s} {passed:2d}/{n:<3d} retries={retried:<3d} avg={secs:5.1f}s"
+                f"  {fixture:24s} {passed:2d}/{n:<3d} retries={retried:<3d} "
+                f"avg={secs:5.1f}s (95% CI {lo:.0%}–{hi:.0%})"
             )
         n = len(config_rows)
         passed = sum(1 for r in config_rows if r["exit"] == 0)
