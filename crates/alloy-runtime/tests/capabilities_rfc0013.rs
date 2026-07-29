@@ -478,6 +478,39 @@ async fn json_pred(fx: &Fixture, kind: NodeKind, payload: &serde_json::Value) ->
     }
 }
 
+/// A root (goal) input whose diff travels out of band, as an attachment in
+/// the artifact CAS — the shape `alloy review` uses.
+async fn goal_with_diff(fx: &Fixture, diff: &str) -> NodeInputPayload {
+    let id = fx
+        .artifacts
+        .put(ArtifactPut {
+            bytes: diff.as_bytes().to_vec(),
+            kind: ArtifactKind::Patch,
+            content_type: Some("text/x-diff".into()),
+            session_id: None,
+            run_id: None,
+            labels: serde_json::Map::new(),
+        })
+        .await
+        .unwrap();
+    NodeInputPayload::Goal(Goal {
+        text: "Review the attached unified diff.".into(),
+        constraints: vec![],
+        attachments: vec![id],
+    })
+}
+
+/// Every message body of the last recorded model request, concatenated.
+fn prompt_text(fx: &Fixture) -> String {
+    let requests = fx.provider.requests();
+    let last = requests.last().expect("a model request was made");
+    last.messages
+        .iter()
+        .map(|m| m.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn structured(value: serde_json::Value) -> Result<ModelResponse, ProviderError> {
     Ok(ModelResponse {
         text: Some(value.to_string()),
@@ -938,6 +971,74 @@ async fn review_worker_request_changes_is_a_success() {
     let review: ReviewPayload = serde_json::from_value(success(outcome)).unwrap();
     assert_eq!(review.verdict, ReviewVerdict::RequestChanges);
     assert_eq!(review.findings.len(), 1);
+}
+
+/// A whitespace-sensitive diff: a blank context line (one space), a context
+/// line whose trailing spaces are the subject of the change, and a line
+/// beginning with `>>>>>>>`. Every one of these is destroyed by the goal
+/// sanitiser (`trim_end` per line, `">>>"` stripping), so it is the fixture
+/// that proves the diff never rides the goal *text*.
+const WHITESPACE_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,6 +1,6 @@\n fn main() {\n \n-    let x = 1;   \n+    let x = 2;\t\n \n// >>>>>>> theirs\n }\n";
+
+/// VW6: the diff the host attaches to the goal reaches the model byte for
+/// byte. Not through `Goal.text` — that field is sanitised for prompt
+/// injection (`sanitize_untrusted`) and would silently reshape the patch.
+#[tokio::test]
+async fn review_worker_sends_an_attached_diff_verbatim() {
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(json!({
+            "verdict": "approve",
+            "findings": [],
+            "summary": "fine",
+            "confidence": 0.7,
+        }))],
+        ..FixtureSpec::default()
+    });
+    let payload = goal_with_diff(&fx, WHITESPACE_DIFF).await;
+    let ctx = exec_ctx(&fx, "review", NodeKind::Review, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let review: ReviewPayload = serde_json::from_value(success(outcome)).unwrap();
+    assert_eq!(review.verdict, ReviewVerdict::Approve);
+
+    let prompt = prompt_text(&fx);
+    assert!(
+        prompt.contains(WHITESPACE_DIFF),
+        "the diff did not survive verbatim into the prompt:\n{prompt}"
+    );
+}
+
+/// VW6: an attachment larger than the worker's ceiling is cut, and the model
+/// is told so in the prompt — never silently.
+#[tokio::test]
+async fn review_worker_marks_an_oversize_attachment_truncated() {
+    let big = format!(
+        "--- a/src/big.rs\n+++ b/src/big.rs\n@@ -1,1 +1,1 @@\n{}",
+        "+// filler line\n".repeat(30_000)
+    );
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(json!({
+            "verdict": "approve",
+            "findings": [],
+            "summary": "fine",
+            "confidence": 0.7,
+        }))],
+        ..FixtureSpec::default()
+    });
+    let payload = goal_with_diff(&fx, &big).await;
+    let ctx = exec_ctx(&fx, "review", NodeKind::Review, payload);
+    fx.executor.execute(&ctx).await.unwrap();
+
+    let prompt = prompt_text(&fx);
+    let marker = format!(
+        "[alloy: truncated — {} of {} bytes shown]",
+        256 * 1024,
+        big.len()
+    );
+    assert!(
+        prompt.contains(&marker),
+        "no in-prompt truncation marker {marker:?}"
+    );
+    assert!(!prompt.contains(&big), "the whole diff was sent after all");
 }
 
 #[tokio::test]

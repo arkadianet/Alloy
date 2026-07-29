@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_runtime::{
-    fence_untrusted, CreateSession, Goal, LanguageId, PlanContext, PlanService, ProfileId,
-    ReviewPayload, ReviewSeverity, ReviewVerdict, RunId, SessionId, SessionRows, TemplateId,
+    truncation_marker, ArtifactKind, ArtifactPut, ArtifactStore, CreateSession, Goal, LanguageId,
+    PlanContext, PlanService, ProfileId, ReviewPayload, ReviewSeverity, ReviewVerdict, RunId,
+    SessionId, SessionRows, TemplateId,
 };
 use serde_json::json;
 
@@ -26,14 +27,23 @@ use crate::errx::{CliError, Exit};
 use crate::outfmt;
 use crate::resolve::Ctx;
 
-/// Largest diff handed to the model. Larger input is truncated with a note
-/// on stderr rather than silently reshaped by the context engine.
+/// Largest diff handed to the model. A larger diff is cut here, and the cut
+/// is declared in three places that must agree: the prompt (an `[alloy:
+/// truncated …]` marker inside the fenced diff), the human output, and the
+/// `--json` envelope.
 const MAX_DIFF_BYTES: usize = 128 * 1024;
 
-/// The instruction line above the fenced diff. The capability's own system
-/// instruction (`REVIEW_SYSTEM`) owns the schema; this only names the task.
-const GOAL_PREAMBLE: &str =
-    "Review the unified diff below. Report findings against the files and lines it touches.";
+/// The goal text: a short human description of the task, and nothing more.
+///
+/// The diff itself never appears here. Goal text is sanitised on its way
+/// through the context engine (`sanitize_untrusted`: per-line `trim_end`,
+/// fence-marker stripping), which is right for prose and fatal for a
+/// whitespace-sensitive patch — it strips the leading space off blank
+/// context lines and rewrites `>>>>>>>` conflict markers. The diff rides
+/// out of band instead, as a goal attachment in the artifact CAS that the
+/// `review` worker fences verbatim.
+const GOAL_TEXT: &str = "Review the attached unified diff. Report findings against the files \
+and lines it touches.";
 
 pub async fn exec(ctx: Ctx, args: ReviewArgs) -> Result<Exit, CliError> {
     let diff = read_diff(&args.diff)?;
@@ -89,22 +99,48 @@ fn read_diff(path: &Path) -> Result<String, CliError> {
     Ok(raw)
 }
 
-/// Bound the diff on a UTF-8 boundary, reporting the cut on stderr.
-fn bound_diff(diff: &str, quiet: bool) -> String {
-    if diff.len() <= MAX_DIFF_BYTES {
-        return diff.to_owned();
+/// The diff as the model will see it, plus what the caller must be told
+/// about the cut.
+struct BoundedDiff {
+    /// Body sent to the model: the diff, then the truncation marker when it
+    /// was cut. The marker is *inside* the fenced content so the reviewer
+    /// cannot mistake a fragment for the whole change.
+    body: String,
+    /// Bytes of the original diff that survived.
+    kept_bytes: usize,
+    /// Bytes of the diff as supplied.
+    total_bytes: usize,
+}
+
+impl BoundedDiff {
+    fn truncated(&self) -> bool {
+        self.kept_bytes < self.total_bytes
+    }
+}
+
+/// Bound the diff on a UTF-8 boundary, appending the §5.4 truncation marker
+/// when anything was dropped.
+fn bound_diff(diff: &str) -> BoundedDiff {
+    let total_bytes = diff.len();
+    if total_bytes <= MAX_DIFF_BYTES {
+        return BoundedDiff {
+            body: diff.to_owned(),
+            kept_bytes: total_bytes,
+            total_bytes,
+        };
     }
     let mut end = MAX_DIFF_BYTES;
     while !diff.is_char_boundary(end) {
         end -= 1;
     }
-    if !quiet {
-        eprintln!(
-            "warning: diff truncated to {MAX_DIFF_BYTES} bytes of {} for review",
-            diff.len()
-        );
+    let kept = &diff[..end];
+    let marker = truncation_marker(end, total_bytes);
+    let separator = if kept.ends_with('\n') { "" } else { "\n" };
+    BoundedDiff {
+        body: format!("{kept}{separator}{marker}"),
+        kept_bytes: end,
+        total_bytes,
     }
-    diff[..end].to_owned()
 }
 
 async fn review_after_assembly(
@@ -147,15 +183,35 @@ async fn review_after_assembly(
     };
     assembly::write_last_session(&full.base.cfg.data_dir, session);
 
-    // The diff is untrusted input: it rides the `<workspace>` fence every
-    // capability instruction declares non-instructional (RFC-0013 PR12).
+    // The diff travels out of band, as a goal attachment in the artifact
+    // CAS. The `review` worker reads those bytes back and wraps them in the
+    // `<workspace>` fence every capability instruction declares
+    // non-instructional (RFC-0013 PR12) — verbatim, because a reviewer
+    // reading a reshaped patch reviews something the author never wrote.
+    let bounded = bound_diff(diff);
+    if bounded.truncated() && !ctx.quiet {
+        eprintln!(
+            "warning: diff truncated to {} bytes of {} for review",
+            bounded.kept_bytes, bounded.total_bytes
+        );
+    }
+    let diff_artifact = full
+        .base
+        .storage
+        .artifacts()
+        .put(ArtifactPut {
+            bytes: bounded.body.clone().into_bytes(),
+            kind: ArtifactKind::Patch,
+            content_type: Some("text/x-diff".into()),
+            session_id: Some(session),
+            run_id: None,
+            labels: serde_json::Map::from_iter([("purpose".to_owned(), json!("review_diff"))]),
+        })
+        .await?;
     let goal = Goal {
-        text: format!(
-            "{GOAL_PREAMBLE}\n\n{}",
-            fence_untrusted("diff", &bound_diff(diff, ctx.quiet))
-        ),
+        text: GOAL_TEXT.to_owned(),
         constraints: vec![],
-        attachments: vec![],
+        attachments: vec![diff_artifact],
     };
     let run = sessions.submit_goal(session, goal.clone()).await?;
     let dag_id = dag_id_for_run(full, run).await?;
@@ -223,11 +279,15 @@ async fn review_after_assembly(
                 json!({
                     "session": session.to_string(),
                     "run": run.to_string(),
+                    "diff_bytes": bounded.kept_bytes,
+                    "diff_total_bytes": bounded.total_bytes,
+                    "diff_truncated": bounded.truncated(),
                     "cost": cost,
                 }),
             );
             println!("{doc}");
         } else {
+            print_truncation_note(&bounded);
             println!("review run {run} produced no verdict");
         }
         eprintln!("no review verdict: inspect the run with `alloy events --session {session}`");
@@ -235,7 +295,7 @@ async fn review_after_assembly(
     }
 
     let payload = review_payload(full, dag_id).await?;
-    render(ctx, session, run, &payload, cost.as_deref());
+    render(ctx, session, run, &payload, &bounded, cost.as_deref());
     Ok(match payload.verdict {
         ReviewVerdict::Approve => Exit::Ok,
         ReviewVerdict::RequestChanges => Exit::ReviewChanges,
@@ -301,9 +361,30 @@ fn verdict_name(v: ReviewVerdict) -> &'static str {
     }
 }
 
+/// Tell the caller, on stdout, that the reviewer saw only part of the diff.
+///
+/// Not `--quiet`-suppressible and not stderr-only: a verdict over a fragment
+/// is a different claim from a verdict over the change, and the difference
+/// belongs with the verdict.
+fn print_truncation_note(bounded: &BoundedDiff) {
+    if bounded.truncated() {
+        println!(
+            "(diff truncated: {} of {} bytes reviewed)",
+            bounded.kept_bytes, bounded.total_bytes
+        );
+    }
+}
+
 /// OUT3 — one JSON document with `--json`; otherwise one line per finding,
 /// then the summary and the verdict.
-fn render(ctx: &Ctx, session: SessionId, run: RunId, payload: &ReviewPayload, cost: Option<&str>) {
+fn render(
+    ctx: &Ctx,
+    session: SessionId,
+    run: RunId,
+    payload: &ReviewPayload,
+    bounded: &BoundedDiff,
+    cost: Option<&str>,
+) {
     let exit = match payload.verdict {
         ReviewVerdict::Approve => Exit::Ok,
         ReviewVerdict::RequestChanges => Exit::ReviewChanges,
@@ -318,7 +399,12 @@ fn render(ctx: &Ctx, session: SessionId, run: RunId, payload: &ReviewPayload, co
                 "run": run.to_string(),
                 "verdict": verdict_name(payload.verdict),
                 "summary": payload.summary,
-                "truncated": payload.truncated,
+                // Two different truncations, two different names: the
+                // model's findings list, and the diff it was shown.
+                "findings_truncated": payload.truncated,
+                "diff_bytes": bounded.kept_bytes,
+                "diff_total_bytes": bounded.total_bytes,
+                "diff_truncated": bounded.truncated(),
                 "confidence": payload.confidence,
                 "findings": payload.findings.iter().map(|f| json!({
                     "severity": severity_name(f.severity),
@@ -346,6 +432,7 @@ fn render(ctx: &Ctx, session: SessionId, run: RunId, payload: &ReviewPayload, co
     if payload.truncated {
         println!("(findings truncated)");
     }
+    print_truncation_note(bounded);
     println!("summary: {}", payload.summary);
     println!("verdict: {}", verdict_name(payload.verdict));
 }
@@ -372,11 +459,25 @@ mod tests {
     }
 
     #[test]
-    fn diff_is_bounded_on_a_char_boundary() {
+    fn diff_is_bounded_on_a_char_boundary_and_marked() {
         let big = "é".repeat(MAX_DIFF_BYTES);
-        let bounded = bound_diff(&big, true);
-        assert!(bounded.len() <= MAX_DIFF_BYTES);
-        assert!(big.starts_with(&bounded));
-        assert_eq!(bound_diff("small", true), "small");
+        let bounded = bound_diff(&big);
+        assert!(bounded.truncated());
+        assert!(bounded.kept_bytes <= MAX_DIFF_BYTES);
+        assert_eq!(bounded.total_bytes, big.len());
+        let marker = truncation_marker(bounded.kept_bytes, big.len());
+        assert!(bounded.body.ends_with(&marker), "{}", bounded.body);
+        assert!(big.starts_with(&bounded.body[..bounded.kept_bytes]));
+    }
+
+    /// A diff that fits is passed through byte for byte — no marker, no
+    /// reshaping of any kind.
+    #[test]
+    fn a_small_diff_is_passed_through_verbatim() {
+        let diff = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n \n-a   \n+a\t\n";
+        let bounded = bound_diff(diff);
+        assert!(!bounded.truncated());
+        assert_eq!(bounded.body, diff);
+        assert_eq!(bounded.kept_bytes, diff.len());
     }
 }

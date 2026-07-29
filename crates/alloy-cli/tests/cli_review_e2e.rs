@@ -19,6 +19,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -56,11 +57,18 @@ fn approve_json() -> serde_json::Value {
     })
 }
 
+/// Every request body the scripted server saw, in arrival order.
+type Recorded = Arc<Mutex<Vec<String>>>;
+
 /// Serve OpenAI-compatible chat completions on loopback, answering the
 /// review instruction with `body` and anything else with an obvious marker.
-fn start_scripted_server(body: serde_json::Value) -> u16 {
+/// Every request body is recorded so a test can assert on what actually
+/// reached the model.
+fn start_scripted_server(body: serde_json::Value) -> (u16, Recorded) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&recorded);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -68,6 +76,7 @@ fn start_scripted_server(body: serde_json::Value) -> u16 {
             let Some(request) = read_http_request(&mut stream) else {
                 continue;
             };
+            sink.lock().unwrap().push(request.clone());
             let content = if request.contains("You review a diff for correctness and risk") {
                 body.clone()
             } else {
@@ -89,7 +98,7 @@ fn start_scripted_server(body: serde_json::Value) -> u16 {
             let _ = stream.write_all(response.as_bytes());
         }
     });
-    port
+    (port, recorded)
 }
 
 /// Minimal HTTP/1.1 request reader: headers, then `content-length` bytes.
@@ -131,6 +140,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 struct E2e {
     ws: TempDir,
+    recorded: Recorded,
 }
 
 fn router_toml(port: u16) -> String {
@@ -167,7 +177,7 @@ planning = "standard"
 }
 
 fn setup(body: serde_json::Value) -> E2e {
-    let port = start_scripted_server(body);
+    let (port, recorded) = start_scripted_server(body);
     let ws = tempfile::tempdir().unwrap();
     std::fs::write(
         ws.path().join("Cargo.toml"),
@@ -180,10 +190,30 @@ fn setup(body: serde_json::Value) -> E2e {
     std::fs::write(ws.path().join("router.toml"), router_toml(port)).unwrap();
     std::fs::write(ws.path().join("example.env"), "ALLOY_API_KEY=\n").unwrap();
     common::git_init_commit(ws.path());
-    E2e { ws }
+    E2e { ws, recorded }
 }
 
 impl E2e {
+    /// Every message body of the recorded review request, concatenated.
+    /// Decoding the wire JSON is what makes a "verbatim" assertion honest:
+    /// the diff's newlines and tabs are escaped on the wire.
+    fn review_prompt(&self) -> String {
+        let bodies = self.recorded.lock().unwrap().clone();
+        let body = bodies
+            .iter()
+            .find(|b| b.contains("You review a diff for correctness and risk"))
+            .unwrap_or_else(|| panic!("no review request reached the model: {bodies:?}"));
+        let doc: serde_json::Value =
+            serde_json::from_str(body).unwrap_or_else(|e| panic!("request body is not JSON: {e}"));
+        doc["messages"]
+            .as_array()
+            .expect("messages array")
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn alloy(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_alloy"));
         cmd.current_dir(self.ws.path())
@@ -319,6 +349,101 @@ fn approve_exits_ok_and_touches_nothing() {
     assert_eq!(
         std::fs::read_to_string(e2e.path().join("src/main.rs")).unwrap(),
         "fn main() {}\n"
+    );
+}
+
+/// A diff whose meaning lives in its whitespace, plus a line starting with
+/// `>>>>>>>`. Both are mangled by the goal-text sanitiser (per-line
+/// `trim_end`; `">>>"` stripping), so this fixture proves the diff does not
+/// ride the goal text.
+const WHITESPACE_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,7 +1,7 @@\n fn main() {\n \n-    let x = 1;   \n+    let x = 2;\t\n \n //  >>>>>>> theirs\n     println!(\"hi\");\n }\n";
+
+/// The diff must reach the model byte for byte: it is the artefact under
+/// review, and a reviewer reading a reshaped patch reviews something the
+/// author never wrote.
+#[test]
+fn diff_reaches_the_model_verbatim() {
+    let e2e = setup(approve_json());
+    let diff_path = e2e.path().join("ws.diff");
+    std::fs::write(&diff_path, WHITESPACE_DIFF).unwrap();
+
+    let out = e2e
+        .alloy()
+        .args(["review", "--diff", diff_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if is_environment_skip(out.status.code(), &stderr) {
+        return;
+    }
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+
+    let prompt = e2e.review_prompt();
+    assert!(
+        prompt.contains(WHITESPACE_DIFF),
+        "the diff was reshaped on its way to the model:\n---prompt---\n{prompt}"
+    );
+}
+
+/// A diff over the 128 KiB ceiling is cut — but the model is told so in the
+/// prompt, and both output modes say so too. A silent cut makes a reviewer
+/// approve a change it never saw.
+#[test]
+fn oversize_diff_is_marked_truncated_in_prompt_and_output() {
+    let e2e = setup(approve_json());
+    // ~192 KiB of valid hunk body: comfortably over MAX_DIFF_BYTES.
+    let big = format!(
+        "--- a/src/big.rs\n+++ b/src/big.rs\n@@ -1,1 +1,1 @@\n{}",
+        "+// filler filler filler filler\n".repeat(6_000)
+    );
+    let total = big.len();
+    assert!(total > 128 * 1024, "fixture must exceed the ceiling");
+    let diff_path = e2e.path().join("big.diff");
+    std::fs::write(&diff_path, &big).unwrap();
+
+    let out = e2e
+        .alloy()
+        .args(["review", "--diff", diff_path.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if is_environment_skip(out.status.code(), &stderr) {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{stderr}\n{stdout}");
+
+    // The model is told, inside the prompt, that it is reading a fragment.
+    // The exact §5.4 marker, so the assertion cannot pass on the system
+    // frame's description of what such markers mean.
+    let marker = format!("[alloy: truncated — {} of {total} bytes shown]", 128 * 1024);
+    let prompt = e2e.review_prompt();
+    assert!(
+        prompt.contains(&marker),
+        "no in-prompt truncation marker {marker:?}:\n{}",
+        &prompt[..prompt.len().min(1500)]
+    );
+
+    // ... and so is the caller, in JSON.
+    let doc: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("not one JSON doc: {e}\n{stdout}"));
+    assert_eq!(doc["diff_truncated"], true, "{doc}");
+    assert_eq!(doc["diff_total_bytes"], total, "{doc}");
+    assert_eq!(doc["diff_bytes"], 128 * 1024, "{doc}");
+    // The findings cap is a different question and keeps its own name.
+    assert_eq!(doc["findings_truncated"], false, "{doc}");
+
+    // ... and in the human rendering, which `--quiet` must not suppress.
+    let out = e2e
+        .alloy()
+        .args(["review", "--diff", diff_path.to_str().unwrap(), "--quiet"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains("diff truncated"),
+        "human output hid the truncation: {stdout}"
     );
 }
 

@@ -61,18 +61,6 @@ pub(crate) fn fence_workspace(path: &str, content: &str) -> String {
     )
 }
 
-/// Wrap host-supplied untrusted text (a diff handed to `alloy review`, say)
-/// in the `<workspace>` fence every capability's system instruction declares
-/// non-instructional (PR12).
-///
-/// The composition root has no other honest way to hand a worker untrusted
-/// bytes: fencing lives in this file and nowhere else (PR1), so hosts call
-/// this rather than assembling the markup themselves.
-#[must_use]
-pub fn fence_untrusted(label: &str, content: &str) -> String {
-    fence_workspace(label, content)
-}
-
 /// Wrap an untrusted tool result in a `<tool>` fence (PR12), truncating to
 /// `max_bytes` on a UTF-8 boundary first (PR6).
 #[must_use]
@@ -82,6 +70,18 @@ pub(crate) fn fence_tool(name: &str, content: &str, max_bytes: usize) -> String 
         "<tool name=\"{name}\">\n{}\n</tool>",
         escape_fence_terminators(&bounded)
     )
+}
+
+/// `[alloy: truncated — {kept} of {total} bytes shown]` — the §5.4 marker
+/// in its byte-counting form.
+///
+/// The Alloy system frame teaches every model that text marked
+/// `[alloy: truncated …]` is incomplete, so any host or worker that cuts
+/// untrusted content MUST leave this behind rather than let the model read a
+/// short body as a whole one.
+#[must_use]
+pub fn truncation_marker(kept: usize, total: usize) -> String {
+    format!("[alloy: truncated — {kept} of {total} bytes shown]")
 }
 
 /// Prepend the capability's owned system instruction (§6.2).

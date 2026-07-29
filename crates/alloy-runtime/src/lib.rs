@@ -62,7 +62,7 @@ pub use adapters::{
 // EditAppliedPayload`) is deliberately not re-exported here: the crate root
 // already exports RFC-0008's session-event payload of the same name.
 pub use capabilities::{
-    fence_untrusted, system_instruction_digest, Capability, CapabilityContext,
+    system_instruction_digest, truncation_marker, Capability, CapabilityContext,
     CapabilityDescriptor, CapabilityRegistry, CapabilityVersion, EditWorker,
     PlanningProposalPayload, PlanningWorker, ProcessRunRouterProvider, RegError,
     RegistryCapabilityExecutor, RepairPlanPayload, RepairStep, RepairWorker, ResolveHints,

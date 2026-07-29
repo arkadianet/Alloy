@@ -32,7 +32,7 @@ pub use payload::{
 };
 pub use perms::{SessionWorkerPermissions, WorkerPermissions, WorkerToolClass};
 pub use prompt::{
-    fence_untrusted, system_instruction_digest, EDIT_SYSTEM, REPAIR_SYSTEM, REVIEW_SYSTEM,
+    system_instruction_digest, truncation_marker, EDIT_SYSTEM, REPAIR_SYSTEM, REVIEW_SYSTEM,
 };
 pub use registry::{CapabilityRegistry, RegError, ResolveHints};
 pub use traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
