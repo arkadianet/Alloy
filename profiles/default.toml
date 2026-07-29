@@ -36,3 +36,13 @@ retain_tool_bodies = false
 
 [limits]
 run_timeout_secs = 1800
+
+# Corpus capture (research §7.11 item 1) — distinct from [observability]:
+# retention is what the log keeps for debugging; capture is what may enter a
+# training corpus. Defaults are fail-closed: nothing captured, and capture
+# (when enabled) requires per-session consent (corpus_ok).
+[capture]
+enabled = false
+prompts = false
+tool_bodies = false
+require_consent = true

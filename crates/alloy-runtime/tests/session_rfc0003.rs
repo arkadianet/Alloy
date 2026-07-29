@@ -136,6 +136,7 @@ fn create_req(dir: &Path) -> CreateSession {
         profile: ProfileId::new("default").unwrap(),
         budget: BudgetPolicy::default(),
         language_backends: vec![LanguageId::new("rust").unwrap()],
+        provenance: None,
     }
 }
 

@@ -76,6 +76,12 @@ pub struct CreateSession {
     pub budget: BudgetPolicy,
     /// Enabled language backends (MVP: `["rust"]`).
     pub language_backends: Vec<LanguageId>,
+    /// Provenance and consent recorded at creation (research §7.11 item 4).
+    /// `None` persists the fail-closed `SessionProvenance::unknown()` — no
+    /// consent. Consent is write-once per session: granting it later means
+    /// creating a new session, never mutating this one.
+    #[serde(default)]
+    pub provenance: Option<crate::types::provenance::SessionProvenance>,
 }
 
 /// User goal submitted to a session.

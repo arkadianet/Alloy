@@ -9,8 +9,8 @@ mod types;
 mod validate;
 
 pub use cache::{
-    compute_cache_key, goal_content_digest, mvp_compiler_fingerprint_digest,
-    mvp_policy_hash_digest, mvp_tool_versions_digest, CacheKeyMaterials,
+    compiler_fingerprint_digest, compute_cache_key, goal_content_digest, policy_hash_digest,
+    tool_versions_digest, CacheKeyMaterials,
 };
 pub(crate) use io::{encode_json, PendingPredPlaceholder};
 pub use io::{

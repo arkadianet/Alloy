@@ -4,10 +4,18 @@ use alloy_runtime::storage::{
     AlloyStorage, ArtifactStore, DagStore, EventStore, StorageOpenOptions, StoreError,
 };
 use alloy_runtime::{
-    mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest, DagId, Goal,
-    PlanContext, PlanProducedPayload, PlanService, RunId, SessionEventType, SessionId,
-    TemplatePlanService,
+    compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, BudgetPolicy, DagId,
+    Goal, PlanContext, PlanProducedPayload, PlanService, ProfileId, RunId, SessionEventType,
+    SessionId, TemplatePlanService, ToolchainRecord,
 };
+
+fn fixture_toolchain() -> ToolchainRecord {
+    ToolchainRecord {
+        channel: "1.97.1".into(),
+        rustc_version: "rustc 1.97.1 (test)".into(),
+        cargo_version: "cargo 1.97.1 (test)".into(),
+    }
+}
 
 fn plan_ctx(session: SessionId, run: RunId, dag: DagId) -> PlanContext {
     PlanContext {
@@ -20,9 +28,15 @@ fn plan_ctx(session: SessionId, run: RunId, dag: DagId) -> PlanContext {
             attachments: vec![],
         },
         template_override: None,
-        policy_hash: mvp_policy_hash_digest(),
-        tool_versions: mvp_tool_versions_digest(),
-        compiler_fingerprint: mvp_compiler_fingerprint_digest(),
+        policy_hash: policy_hash_digest(
+            &ProfileId::new("default").unwrap(),
+            &BudgetPolicy::default(),
+        ),
+        tool_versions: tool_versions_digest(&fixture_toolchain()),
+        compiler_fingerprint: compiler_fingerprint_digest(
+            &fixture_toolchain(),
+            "x86_64-unknown-linux-gnu",
+        ),
     }
 }
 

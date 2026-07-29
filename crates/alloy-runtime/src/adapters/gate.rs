@@ -108,6 +108,7 @@ mod tests {
                 gates: crate::config::GatesConfig::default(),
                 sandbox_echo: None,
                 gate_timeout: None,
+                capture: Default::default(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();
@@ -143,6 +144,7 @@ mod tests {
                     profile: ProfileId::new("default").unwrap(),
                     budget: BudgetPolicy::default(),
                     language_backends: vec![LanguageId::new("rust").unwrap()],
+                    provenance: None,
                 })
                 .await
                 .unwrap();

@@ -38,11 +38,11 @@ impl PlanService for DisabledLlmPlanService {
 mod tests {
     use super::*;
     use crate::dag::{
-        mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest,
-        TemplateId,
+        compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, TemplateId,
     };
     use crate::types::budget::Goal;
     use crate::types::ids::{DagId, RunId, SessionId};
+    use crate::types::toolchain::ToolchainRecord;
 
     fn ctx() -> PlanContext {
         PlanContext {
@@ -55,9 +55,23 @@ mod tests {
                 attachments: vec![],
             },
             template_override: None,
-            policy_hash: mvp_policy_hash_digest(),
-            tool_versions: mvp_tool_versions_digest(),
-            compiler_fingerprint: mvp_compiler_fingerprint_digest(),
+            policy_hash: policy_hash_digest(
+                &crate::types::ids::ProfileId::new("default").unwrap(),
+                &crate::types::budget::BudgetPolicy::default(),
+            ),
+            tool_versions: tool_versions_digest(&fixture_toolchain()),
+            compiler_fingerprint: compiler_fingerprint_digest(
+                &fixture_toolchain(),
+                "x86_64-unknown-linux-gnu",
+            ),
+        }
+    }
+
+    fn fixture_toolchain() -> ToolchainRecord {
+        ToolchainRecord {
+            channel: "1.97.1".into(),
+            rustc_version: "rustc 1.97.1 (test)".into(),
+            cargo_version: "cargo 1.97.1 (test)".into(),
         }
     }
 

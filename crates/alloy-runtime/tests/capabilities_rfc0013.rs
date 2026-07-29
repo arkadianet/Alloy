@@ -189,8 +189,18 @@ struct NoSessions;
 
 #[async_trait]
 impl SessionRows for NoSessions {
-    async fn upsert_session(&self, _session: &Session) -> Result<(), StoreError> {
+    async fn upsert_session(
+        &self,
+        _session: &Session,
+        _provenance: &alloy_runtime::SessionProvenance,
+    ) -> Result<(), StoreError> {
         Ok(())
+    }
+    async fn get_provenance(
+        &self,
+        _id: SessionId,
+    ) -> Result<Option<alloy_runtime::SessionProvenance>, StoreError> {
+        Ok(None)
     }
     async fn get_session(&self, _id: SessionId) -> Result<Option<Session>, StoreError> {
         Ok(None)

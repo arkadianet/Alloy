@@ -34,7 +34,7 @@ use super::retry::{self, Admission, Escalation};
 use super::LinearScheduler;
 use crate::adapters::{
     CapabilityExecContext, CapabilityExecError, CapabilityOutcome, NodeExecContext, NodeExecRef,
-    VerifyOutcome,
+    Verdict, VerdictOutcome,
 };
 use crate::dag::{DagValidator, NodeKind, NodeOutputEnvelope, NodeState, TaskDag};
 use crate::error::{AdapterError, SchedError};
@@ -1171,14 +1171,14 @@ impl LinearScheduler {
                     use tracing::Instrument;
                     self.deps
                         .verify_compile
-                        .check(&ctx)
+                        .verify(&ctx)
                         .instrument(span.clone())
                         .await
                 };
                 match result {
                     Ok(outcome) => {
                         span.record("diagnostics", outcome.diagnostics.len());
-                        Ok(verify_outcome_to_result(
+                        Ok(verdict_to_result(
                             outcome,
                             ErrorClass::Compile,
                             "cargo check failed",
@@ -1204,14 +1204,14 @@ impl LinearScheduler {
                     use tracing::Instrument;
                     self.deps
                         .verify_test
-                        .test(&ctx)
+                        .verify(&ctx)
                         .instrument(span.clone())
                         .await
                 };
                 match result {
                     Ok(outcome) => {
                         span.record("diagnostics", outcome.diagnostics.len());
-                        Ok(verify_outcome_to_result(
+                        Ok(verdict_to_result(
                             outcome,
                             ErrorClass::Test,
                             "cargo test failed",
@@ -2064,35 +2064,37 @@ enum DispatchResult {
     Failed(FailureIr),
 }
 
-fn verify_outcome_to_result(
-    outcome: VerifyOutcome,
-    class: ErrorClass,
-    notes: &str,
-) -> DispatchResult {
-    if outcome.ok {
-        DispatchResult::Succeeded(serde_json::json!({
+fn verdict_to_result(verdict: Verdict, class: ErrorClass, notes: &str) -> DispatchResult {
+    // RL1-RL5 put the raw log for non-Pass verdicts too, but its id only
+    // survived on the success path (in the output envelope). On the failure
+    // paths nothing durable referenced it, so name it in `notes`, which is
+    // what a failed verify surfaces.
+    let noted = |notes: &str| match &verdict.raw_artifact {
+        Some(id) => format!("{notes} (raw log: {id})"),
+        None => notes.to_string(),
+    };
+    match &verdict.outcome {
+        VerdictOutcome::Pass => DispatchResult::Succeeded(serde_json::json!({
             "ok": true,
-            "diagnostics": outcome.diagnostics,
-            "raw_artifact": outcome.raw_artifact.map(|id| id.to_string()),
-        })) // OU4
-    } else {
-        // RL1-RL5 put the raw log for `ok: false` too, but its id only
-        // survived on the success path (in the output envelope). On this path
-        // nothing durable referenced it, so the artifact existed with no way
-        // back to it from the run's records — exactly when an operator most
-        // wants the compiler output. `FailureIr` has no artifact-id field, so
-        // name it in `notes`, which is what a failed verify surfaces.
-        let notes = match outcome.raw_artifact {
-            Some(id) => format!("{notes} (raw log: {id})"),
-            None => notes.to_string(),
-        };
-        DispatchResult::Failed(FailureIr {
+            "diagnostics": verdict.diagnostics,
+            "raw_artifact": verdict.raw_artifact.map(|id| id.to_string()),
+        })), // OU4
+        VerdictOutcome::Fail => DispatchResult::Failed(FailureIr {
             node: NodeId::new(), // overwritten by the caller (DP4)
             error_class: class,
             retry: RetryDisposition::NonRetryable,
-            diagnostics: outcome.diagnostics, // F2
-            notes,
-        })
+            diagnostics: verdict.diagnostics.clone(), // F2
+            notes: noted(notes),
+        }),
+        // §7.11 item 6: the verifier produced no answer. Tool-class and
+        // retryable — never labelled as the agent's Compile/Test failure.
+        VerdictOutcome::Inconclusive { reason } => DispatchResult::Failed(FailureIr {
+            node: NodeId::new(), // overwritten by the caller (DP4)
+            error_class: ErrorClass::Tool,
+            retry: RetryDisposition::Retryable,
+            diagnostics: verdict.diagnostics.clone(),
+            notes: noted(&format!("verify inconclusive: {reason}")),
+        }),
     }
 }
 
@@ -2303,9 +2305,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use super::*;
-    use crate::adapters::{
-        Approval, CapabilityExecutor, GateHumanAdapter, VerifyCompileAdapter, VerifyTestAdapter,
-    };
+    use crate::adapters::{Approval, CapabilityExecutor, GateHumanAdapter};
     use crate::dag::{
         Backoff, DependencyEdge, EdgeKind, NodeInputEnvelope, NodeInputPayload, PredecessorOutput,
         RetryPolicy, TaskNode,
@@ -2321,6 +2321,7 @@ mod tests {
     };
     use crate::types::budget::{BudgetPolicy, Goal, ModelTier, TokenBudget};
     use crate::types::ids::{ArtifactId, CapabilityId, GateId, ProfileId, SessionId, Timestamp};
+    use crate::types::provenance::SessionProvenance;
 
     // ---- test doubles ----
 
@@ -2349,35 +2350,21 @@ mod tests {
     }
 
     struct StaticVerify {
-        outcomes: StdMutex<VecDeque<Result<VerifyOutcome, AdapterError>>>,
+        outcomes: StdMutex<VecDeque<Result<Verdict, AdapterError>>>,
     }
     impl StaticVerify {
-        fn new(outcomes: Vec<Result<VerifyOutcome, AdapterError>>) -> Arc<Self> {
+        fn new(outcomes: Vec<Result<Verdict, AdapterError>>) -> Arc<Self> {
             Arc::new(Self {
                 outcomes: StdMutex::new(VecDeque::from(outcomes)),
             })
         }
         fn ok_once() -> Arc<Self> {
-            Self::new(vec![Ok(VerifyOutcome {
-                ok: true,
-                diagnostics: vec![],
-                raw_artifact: None,
-            })])
+            Self::new(vec![Ok(Verdict::pass())])
         }
     }
     #[async_trait]
-    impl VerifyCompileAdapter for StaticVerify {
-        async fn check(&self, _ctx: &NodeExecContext) -> Result<VerifyOutcome, AdapterError> {
-            self.outcomes
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(Err(AdapterError::Internal("exhausted".into())))
-        }
-    }
-    #[async_trait]
-    impl VerifyTestAdapter for StaticVerify {
-        async fn test(&self, _ctx: &NodeExecContext) -> Result<VerifyOutcome, AdapterError> {
+    impl crate::adapters::Verifier for StaticVerify {
+        async fn verify(&self, _ctx: &NodeExecContext) -> Result<Verdict, AdapterError> {
             self.outcomes
                 .lock()
                 .unwrap()
@@ -2466,6 +2453,7 @@ mod tests {
                 gates: crate::config::GatesConfig::default(),
                 sandbox_echo: None,
                 gate_timeout: None,
+                capture: Default::default(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();
@@ -2500,7 +2488,7 @@ mod tests {
             };
             self.storage
                 .sessions()
-                .upsert_session(&session)
+                .upsert_session(&session, &SessionProvenance::unknown())
                 .await
                 .unwrap();
             session.id
@@ -2528,6 +2516,8 @@ mod tests {
                     attachments: vec![],
                 },
                 dag_id,
+                trajectory_id: Some(crate::types::ids::TrajectoryId::new()),
+                trajectory_schema: crate::session::TRAJECTORY_SCHEMA_VERSION,
             };
             let row = RunRow {
                 id: run_id,
@@ -2659,8 +2649,8 @@ mod tests {
             &self,
             sched_dir: std::path::PathBuf,
             capabilities: Arc<dyn CapabilityExecutor>,
-            verify_compile: Arc<dyn VerifyCompileAdapter>,
-            verify_test: Arc<dyn VerifyTestAdapter>,
+            verify_compile: Arc<dyn crate::adapters::Verifier>,
+            verify_test: Arc<dyn crate::adapters::Verifier>,
             gate_human: Arc<dyn GateHumanAdapter>,
             budget_policy: BudgetPolicy,
             run_timeout: Duration,
@@ -2687,8 +2677,8 @@ mod tests {
             &self,
             sched_dir: std::path::PathBuf,
             capabilities: Arc<dyn CapabilityExecutor>,
-            verify_compile: Arc<dyn VerifyCompileAdapter>,
-            verify_test: Arc<dyn VerifyTestAdapter>,
+            verify_compile: Arc<dyn crate::adapters::Verifier>,
+            verify_test: Arc<dyn crate::adapters::Verifier>,
             gate_human: Arc<dyn GateHumanAdapter>,
             budget_policy: BudgetPolicy,
             run_timeout: Duration,
@@ -3055,6 +3045,8 @@ mod tests {
                 attachments: vec![],
             },
             dag_id,
+            trajectory_id: Some(crate::types::ids::TrajectoryId::new()),
+            trajectory_schema: crate::session::TRAJECTORY_SCHEMA_VERSION,
         };
         let at = Timestamp(time::OffsetDateTime::from_unix_timestamp(unix_secs).unwrap());
         let row = RunRow {

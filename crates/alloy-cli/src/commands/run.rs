@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_runtime::{
-    mvp_compiler_fingerprint_digest, mvp_policy_hash_digest, mvp_tool_versions_digest, Approval,
-    Constraint, CreateSession, DecisionKind, DecisionLog, DecisionRecord, EventSeq, Goal,
-    LanguageId, PlanContext, PlanService, ProfileId, RunGoalRecord, RunId, SessionEvent,
-    SessionEventType, SessionId, SessionRows, TemplateId,
+    compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, Approval, Constraint,
+    CreateSession, DecisionKind, DecisionLog, DecisionRecord, EventSeq, Goal, LanguageId,
+    PlanContext, PlanService, ProfileId, RunGoalRecord, RunId, SessionEvent, SessionEventType,
+    SessionId, SessionRows, TemplateId,
 };
 use serde_json::json;
 
@@ -21,6 +21,30 @@ use crate::assembly::{self, FullAssembly};
 use crate::errx::{CliError, Exit};
 use crate::outfmt;
 use crate::resolve::Ctx;
+
+/// The three `PlanContext` fingerprints, captured at the composition root
+/// (research §7.11 item 3): the profile's budget policy plus a live
+/// `rustc`/`cargo` probe.
+fn plan_fingerprints(
+    ctx: &Ctx,
+) -> Result<
+    (
+        alloy_runtime::Digest,
+        alloy_runtime::Digest,
+        alloy_runtime::Digest,
+    ),
+    CliError,
+> {
+    let profile = ProfileId::new(ctx.profile.clone())
+        .map_err(|e| CliError::new(Exit::Usage, e.to_string()))?;
+    let toolchain = alloy_tools::toolchain::capture_toolchain();
+    let target = alloy_tools::toolchain::host_triple();
+    Ok((
+        policy_hash_digest(&profile, &ctx.cfg.budget_policy),
+        tool_versions_digest(&toolchain),
+        compiler_fingerprint_digest(&toolchain, &target),
+    ))
+}
 
 pub async fn exec(ctx: Ctx, args: RunArgs) -> Result<Exit, CliError> {
     // PF9 — readonly refuses structurally, before any session row.
@@ -116,6 +140,7 @@ async fn run_after_assembly(
                     budget,
                     language_backends: vec![LanguageId::new("rust")
                         .map_err(|e| CliError::new(Exit::Internal, e.to_string()))?],
+                    provenance: None,
                 })
                 .await?
         }
@@ -148,6 +173,7 @@ async fn run_after_assembly(
     }
 
     // §7.1 step 6 — plan (template selection is the plan service's, SQ1).
+    let (policy_hash, tool_versions, compiler_fingerprint) = plan_fingerprints(ctx)?;
     PlanService::plan(
         &full.plan,
         PlanContext {
@@ -156,9 +182,9 @@ async fn run_after_assembly(
             dag_id,
             goal,
             template_override: None,
-            policy_hash: mvp_policy_hash_digest(),
-            tool_versions: mvp_tool_versions_digest(),
-            compiler_fingerprint: mvp_compiler_fingerprint_digest(),
+            policy_hash,
+            tool_versions,
+            compiler_fingerprint,
         },
     )
     .await?;
@@ -243,6 +269,7 @@ async fn dry_run(ctx: Ctx, args: RunArgs) -> Result<Exit, CliError> {
                     budget: ctx.cfg.budget_policy.clone(),
                     language_backends: vec![LanguageId::new("rust")
                         .map_err(|e| CliError::new(Exit::Internal, e.to_string()))?],
+                    provenance: None,
                 })
                 .await?
         }
@@ -264,6 +291,7 @@ async fn dry_run(ctx: Ctx, args: RunArgs) -> Result<Exit, CliError> {
         .map_err(|e| CliError::new(Exit::Internal, format!("goal record: {e}")))?;
 
     let plan = alloy_runtime::TemplatePlanService::from_storage(&base.storage);
+    let (policy_hash, tool_versions, compiler_fingerprint) = plan_fingerprints(&ctx)?;
     let result = alloy_runtime::PlanService::plan(
         &plan,
         PlanContext {
@@ -272,9 +300,9 @@ async fn dry_run(ctx: Ctx, args: RunArgs) -> Result<Exit, CliError> {
             dag_id: record.dag_id,
             goal,
             template_override,
-            policy_hash: mvp_policy_hash_digest(),
-            tool_versions: mvp_tool_versions_digest(),
-            compiler_fingerprint: mvp_compiler_fingerprint_digest(),
+            policy_hash,
+            tool_versions,
+            compiler_fingerprint,
         },
     )
     .await?;

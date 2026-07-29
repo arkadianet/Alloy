@@ -44,6 +44,68 @@ impl From<&crate::config::RuntimeConfig> for RetentionPolicy {
     }
 }
 
+/// Corpus-capture flags (research §7.11 item 1), deliberately separate from
+/// [`RetentionPolicy`].
+///
+/// What the *log* keeps for debugging and what may be *captured for a
+/// training corpus* are different questions with different consent
+/// obligations; overloading `retain_full_prompts` for both would make every
+/// operator's SQLite a liability. This type only states policy — no capture
+/// pipeline exists yet, which is exactly why the split must exist now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapturePolicy {
+    /// Master switch. `false` (the default) = no corpus capture of any kind.
+    pub enabled: bool,
+    /// Capture rendered prompts/completions for the corpus.
+    pub prompts: bool,
+    /// Capture tool argument/result bodies for the corpus.
+    pub tool_bodies: bool,
+    /// Require `SessionProvenance.consent.corpus_ok` before any capture
+    /// (default `true`; setting it `false` is an explicit operator act).
+    pub require_consent: bool,
+}
+
+impl CapturePolicy {
+    /// Fail-closed default: nothing captured, consent required.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            prompts: false,
+            tool_bodies: false,
+            require_consent: true,
+        }
+    }
+
+    /// Whether capture of `scope` is permitted for a session with the
+    /// given `corpus_ok` consent. Fail closed on every axis: the master
+    /// switch, the per-scope flag, and consent must all authorise it —
+    /// `enabled` alone never grants anything.
+    #[must_use]
+    pub fn permits_capture(&self, scope: CaptureScope, corpus_ok: bool) -> bool {
+        let scope_on = match scope {
+            CaptureScope::Prompts => self.prompts,
+            CaptureScope::ToolBodies => self.tool_bodies,
+        };
+        self.enabled && scope_on && (corpus_ok || !self.require_consent)
+    }
+}
+
+/// What kind of content a capture decision is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureScope {
+    /// Rendered prompts / completions.
+    Prompts,
+    /// Tool argument/result bodies.
+    ToolBodies,
+}
+
+impl Default for CapturePolicy {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 /// Outcome of applying retention to a prompt or tool body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RetentionOutcome {
@@ -482,6 +544,54 @@ fn find_ci(hay: &str, needle: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §7.11 item 1: capture is fail-closed on every axis and never implied
+    /// by log retention.
+    #[test]
+    fn capture_policy_defaults_are_fail_closed() {
+        let p = CapturePolicy::default();
+        assert!(!p.enabled && !p.prompts && !p.tool_bodies);
+        assert!(p.require_consent);
+        assert!(
+            !p.permits_capture(CaptureScope::Prompts, true),
+            "disabled beats consent"
+        );
+
+        // enabled alone grants nothing: the scope flag must be on too.
+        let enabled_no_scope = CapturePolicy {
+            enabled: true,
+            ..CapturePolicy::disabled()
+        };
+        for scope in [CaptureScope::Prompts, CaptureScope::ToolBodies] {
+            assert!(
+                !enabled_no_scope.permits_capture(scope, true),
+                "{scope:?}: no scope flag, no capture"
+            );
+        }
+
+        let prompts_on = CapturePolicy {
+            enabled: true,
+            prompts: true,
+            ..CapturePolicy::disabled()
+        };
+        assert!(prompts_on.permits_capture(CaptureScope::Prompts, true));
+        assert!(
+            !prompts_on.permits_capture(CaptureScope::ToolBodies, true),
+            "prompt scope must not authorise tool bodies"
+        );
+        assert!(
+            !prompts_on.permits_capture(CaptureScope::Prompts, false),
+            "no consent, no capture"
+        );
+
+        let no_consent_needed = CapturePolicy {
+            enabled: true,
+            prompts: true,
+            require_consent: false,
+            ..CapturePolicy::disabled()
+        };
+        assert!(no_consent_needed.permits_capture(CaptureScope::Prompts, false));
+    }
     use serde_json::json;
 
     #[test]

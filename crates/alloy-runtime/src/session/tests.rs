@@ -153,6 +153,7 @@ impl Harness {
             gates: crate::config::GatesConfig::default(),
             sandbox_echo: None,
             gate_timeout: None,
+            capture: Default::default(),
         })
         .unwrap();
         let handle = rt.start().await.unwrap();
@@ -190,6 +191,7 @@ impl Harness {
                 profile: ProfileId::new("default").unwrap(),
                 budget: BudgetPolicy::default(),
                 language_backends: vec![LanguageId::new("rust").unwrap()],
+                provenance: None,
             })
             .await
             .unwrap()
@@ -354,6 +356,7 @@ async fn session_reject_unknown_profile() {
             profile: ProfileId::new("wat").unwrap(),
             budget: BudgetPolicy::default(),
             language_backends: vec![LanguageId::new("rust").unwrap()],
+            provenance: None,
         })
         .await
         .unwrap_err();
@@ -369,6 +372,7 @@ async fn session_create_rejects_relative_root_and_empty_backends() {
         profile: ProfileId::new("default").unwrap(),
         budget: BudgetPolicy::default(),
         language_backends: vec![LanguageId::new("rust").unwrap()],
+        provenance: None,
     };
 
     let relative = CreateSession {

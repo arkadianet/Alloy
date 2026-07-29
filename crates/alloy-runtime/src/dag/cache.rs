@@ -6,6 +6,7 @@
 
 use crate::dag::types::{CacheKey, NodeKind};
 use crate::types::ids::{CapabilityId, Digest};
+use crate::types::toolchain::ToolchainRecord;
 
 /// Materials for [`compute_cache_key`].
 #[derive(Debug, Clone)]
@@ -59,22 +60,61 @@ pub fn compute_cache_key(m: CacheKeyMaterials<'_>) -> CacheKey {
     CacheKey(Digest::sha256(&bytes))
 }
 
-/// MVP tool-versions fingerprint.
+/// Tool-versions fingerprint derived from a captured [`ToolchainRecord`]
+/// (research §7.11 item 3 — a real digest over real inputs, replacing the
+/// former `mvp_tool_versions_digest()` constant).
 #[must_use]
-pub fn mvp_tool_versions_digest() -> Digest {
-    Digest::sha256(b"alloy.mvp.tool_versions.v0")
+pub fn tool_versions_digest(toolchain: &ToolchainRecord) -> Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"alloy.tool_versions.v1");
+    for field in [
+        &toolchain.channel,
+        &toolchain.rustc_version,
+        &toolchain.cargo_version,
+    ] {
+        push_framed(&mut bytes, field);
+    }
+    Digest::sha256(&bytes)
 }
 
-/// MVP compiler fingerprint.
-#[must_use]
-pub fn mvp_compiler_fingerprint_digest() -> Digest {
-    Digest::sha256(b"alloy.mvp.compiler_fingerprint.v0")
+/// Unambiguous field framing: u64-LE length prefix, then the bytes. A
+/// separator-based framing would collide on inputs containing the
+/// separator; a length prefix cannot.
+fn push_framed(out: &mut Vec<u8>, field: &str) {
+    out.extend_from_slice(&(field.len() as u64).to_le_bytes());
+    out.extend_from_slice(field.as_bytes());
 }
 
-/// MVP policy hash.
+/// Compiler fingerprint: the exact `rustc` plus the target triple it
+/// compiles for. Two runs whose compile-pass labels came from different
+/// compilers or targets must never share a cache row.
 #[must_use]
-pub fn mvp_policy_hash_digest() -> Digest {
-    Digest::sha256(b"alloy.mvp.policy_hash.v0")
+pub fn compiler_fingerprint_digest(toolchain: &ToolchainRecord, target_triple: &str) -> Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"alloy.compiler_fingerprint.v1");
+    push_framed(&mut bytes, &toolchain.rustc_version);
+    push_framed(&mut bytes, target_triple);
+    Digest::sha256(&bytes)
+}
+
+/// Policy hash over the effective profile identity and budget policy —
+/// the knobs that change what a run was *allowed* to do, and therefore what
+/// its outcome label means.
+///
+/// `BudgetPolicy` is plain serde data; serialization cannot fail for valid
+/// values.
+#[must_use]
+pub fn policy_hash_digest(
+    profile: &crate::types::ids::ProfileId,
+    policy: &crate::types::budget::BudgetPolicy,
+) -> Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"alloy.policy_hash.v1");
+    push_framed(&mut bytes, profile.as_str());
+    let policy_json = serde_json::to_vec(policy).expect("BudgetPolicy JSON serialization");
+    bytes.extend_from_slice(&(policy_json.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&policy_json);
+    Digest::sha256(&bytes)
 }
 
 /// Content digest for a root [`crate::types::budget::Goal`] (JSON of the Goal only).
@@ -89,8 +129,16 @@ pub fn goal_content_digest(goal: &crate::types::budget::Goal) -> Digest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::budget::Goal;
-    use crate::types::ids::CapabilityId;
+    use crate::types::budget::{BudgetPolicy, Goal};
+    use crate::types::ids::{CapabilityId, ProfileId};
+
+    fn toolchain() -> ToolchainRecord {
+        ToolchainRecord {
+            channel: "1.97.1".into(),
+            rustc_version: "rustc 1.97.1 (abcdef 2026-06-01)".into(),
+            cargo_version: "cargo 1.97.1 (123456 2026-06-01)".into(),
+        }
+    }
 
     /// Fixed Goal fixture — digests pinned offline for AC 20 / §5.8.
     const GOLDEN_GOAL_CONTENT: &str =
@@ -107,9 +155,11 @@ mod tests {
         };
         let content = goal_content_digest(&goal);
         assert_eq!(content.as_hex(), GOLDEN_GOAL_CONTENT);
-        let policy = mvp_policy_hash_digest();
-        let tools = mvp_tool_versions_digest();
-        let compiler = mvp_compiler_fingerprint_digest();
+        // Arbitrary fixed digests (the former mvp_* constants, inlined): the
+        // golden pins the *key formula*, not any fingerprint derivation.
+        let policy = Digest::sha256(b"alloy.mvp.policy_hash.v0");
+        let tools = Digest::sha256(b"alloy.mvp.tool_versions.v0");
+        let compiler = Digest::sha256(b"alloy.mvp.compiler_fingerprint.v0");
         let cap = CapabilityId::new("repair").unwrap();
         let key = compute_cache_key(CacheKeyMaterials {
             kind: NodeKind::Analyze,
@@ -148,5 +198,65 @@ mod tests {
             let expected = format!("\"{}\"", kind_serde_snake_case(kind));
             assert_eq!(s, expected, "mismatch for {kind:?}");
         }
+    }
+
+    /// §7.11 item 3: fingerprints are content-derived — same inputs agree,
+    /// any changed input disagrees.
+    #[test]
+    fn fingerprints_are_real_and_input_sensitive() {
+        let tc = toolchain();
+        assert_eq!(tool_versions_digest(&tc), tool_versions_digest(&tc));
+        let mut newer = tc.clone();
+        newer.rustc_version = "rustc 1.98.0 (fedcba 2026-09-01)".into();
+        assert_ne!(tool_versions_digest(&tc), tool_versions_digest(&newer));
+
+        let a = compiler_fingerprint_digest(&tc, "x86_64-unknown-linux-gnu");
+        let b = compiler_fingerprint_digest(&tc, "aarch64-apple-darwin");
+        assert_ne!(a, b, "target triple is part of the compiler identity");
+        assert_ne!(
+            compiler_fingerprint_digest(&newer, "x86_64-unknown-linux-gnu"),
+            a
+        );
+
+        let default_profile = ProfileId::new("default").unwrap();
+        let autonomous = ProfileId::new("autonomous").unwrap();
+        let policy = BudgetPolicy::default();
+        assert_eq!(
+            policy_hash_digest(&default_profile, &policy),
+            policy_hash_digest(&default_profile, &policy)
+        );
+        assert_ne!(
+            policy_hash_digest(&default_profile, &policy),
+            policy_hash_digest(&autonomous, &policy)
+        );
+    }
+
+    /// Field framing is length-prefixed, so shifting bytes across a field
+    /// boundary (which a separator-based framing would conflate) changes
+    /// the digest.
+    #[test]
+    fn fingerprint_framing_is_unambiguous_across_field_boundaries() {
+        let a = ToolchainRecord {
+            channel: "1.97.1\u{0}x".into(),
+            rustc_version: "r".into(),
+            cargo_version: "c".into(),
+        };
+        let b = ToolchainRecord {
+            channel: "1.97.1".into(),
+            rustc_version: "\u{0}x\u{0}r".into(),
+            cargo_version: "c".into(),
+        };
+        assert_ne!(tool_versions_digest(&a), tool_versions_digest(&b));
+
+        let tc = toolchain();
+        assert_ne!(
+            compiler_fingerprint_digest(&tc, "a\u{0}b"),
+            {
+                let mut moved = tc.clone();
+                moved.rustc_version = format!("{}\u{0}a", moved.rustc_version);
+                compiler_fingerprint_digest(&moved, "b")
+            },
+            "bytes moved across the field boundary must not collide"
+        );
     }
 }

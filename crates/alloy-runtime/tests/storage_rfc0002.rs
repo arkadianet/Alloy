@@ -1,5 +1,6 @@
 //! Unit and integration tests for RFC-0002 storage.
 
+use alloy_runtime::SessionProvenance;
 use std::sync::Arc;
 
 use alloy_runtime::events::{EventSink, NewSessionEvent, RuntimeEvent, SessionEventType};
@@ -86,7 +87,7 @@ async fn open_creates_layout() {
     assert!(dir.path().join("alloy.sqlite").is_file());
     assert!(dir.path().join("artifacts").is_dir());
     assert!(dir.path().join("graph").is_dir());
-    assert_eq!(storage.schema_version(), 3);
+    assert_eq!(storage.schema_version(), 4);
     storage.close().await.unwrap();
 }
 
@@ -102,7 +103,7 @@ async fn migrate_idempotent_and_refuse_newer() {
     let storage = AlloyStorage::open(StorageOpenOptions::for_data_dir(dir.path()))
         .await
         .unwrap();
-    assert_eq!(storage.schema_version(), 3);
+    assert_eq!(storage.schema_version(), 4);
     storage.close().await.unwrap();
     drop(storage);
 
@@ -452,7 +453,9 @@ async fn session_and_run_rows() {
         language_backends: vec![LanguageId::new("rust").unwrap()],
         created_at: Timestamp::now(),
     };
-    rows.upsert_session(&session).await.unwrap();
+    rows.upsert_session(&session, &SessionProvenance::unknown())
+        .await
+        .unwrap();
     let loaded = rows.get_session(session.id).await.unwrap().unwrap();
     assert_eq!(loaded.id, session.id);
     assert_eq!(loaded.profile.as_str(), "default");
@@ -927,12 +930,16 @@ async fn set_graph_version_writes_and_survives_upsert() {
         language_backends: vec![LanguageId::new("rust").unwrap()],
         created_at: Timestamp::now(),
     };
-    rows.upsert_session(&session).await.unwrap();
+    rows.upsert_session(&session, &SessionProvenance::unknown())
+        .await
+        .unwrap();
     rows.set_graph_version(session.id, alloy_runtime::GraphVersion(7))
         .await
         .unwrap();
     // The upsert conflict clause does not overwrite graph_version.
-    rows.upsert_session(&session).await.unwrap();
+    rows.upsert_session(&session, &SessionProvenance::unknown())
+        .await
+        .unwrap();
     rows.set_graph_version(session.id, alloy_runtime::GraphVersion(8))
         .await
         .unwrap();
@@ -941,5 +948,74 @@ async fn set_graph_version_writes_and_survives_upsert() {
         .set_graph_version(SessionId::new(), alloy_runtime::GraphVersion(1))
         .await;
     assert!(matches!(missing, Err(StoreError::Corrupt(_))));
+    storage.close().await.unwrap();
+}
+
+/// Research §7.11 item 4: provenance and consent are required creation
+/// input, persisted atomically with the session row, and write-once — a
+/// later upsert with different provenance updates the mutable session
+/// fields but never the recorded consent, and no mutation API exists.
+#[tokio::test]
+async fn session_provenance_is_creation_input_and_immutable() {
+    use alloy_runtime::{ConsentRecord, PROVENANCE_SCHEMA_VERSION};
+    let (_dir, storage) = open_temp().await;
+    let rows = storage.sessions();
+    let session = Session {
+        id: SessionId::new(),
+        workspace_root: "/tmp/ws".into(),
+        profile: ProfileId::new("default").unwrap(),
+        budget: BudgetPolicy::default(),
+        language_backends: vec![],
+        created_at: Timestamp::now(),
+    };
+    let granted = SessionProvenance {
+        schema_version: PROVENANCE_SCHEMA_VERSION,
+        repo: Some("https://github.com/arkadianet/Alloy".into()),
+        head_sha: Some("4b8dfd7".into()),
+        spdx: vec!["MIT OR Apache-2.0".into()],
+        consent: ConsentRecord {
+            corpus_ok: true,
+            share_ok: false,
+        },
+    };
+    rows.upsert_session(&session, &granted).await.unwrap();
+    assert_eq!(
+        rows.get_provenance(session.id).await.unwrap(),
+        Some(granted.clone()),
+        "provenance persists atomically with creation"
+    );
+
+    // A later upsert cannot elevate or overwrite consent: the mutable
+    // fields update, the provenance does not.
+    let mut renamed = session.clone();
+    renamed.workspace_root = "/tmp/ws2".into();
+    let mut elevated = granted.clone();
+    elevated.consent.share_ok = true;
+    rows.upsert_session(&renamed, &elevated).await.unwrap();
+    let after = rows.get_provenance(session.id).await.unwrap().unwrap();
+    assert_eq!(after, granted, "consent elevation must be rejected");
+    assert!(!after.consent.share_ok);
+    let reread = rows.get_session(session.id).await.unwrap().unwrap();
+    assert_eq!(
+        reread.workspace_root.to_str().unwrap(),
+        "/tmp/ws2",
+        "mutable session fields still update"
+    );
+
+    // Fail-closed default: a session created without explicit consent
+    // records unknown() — nothing consented.
+    let bare = Session {
+        id: SessionId::new(),
+        workspace_root: "/tmp/ws3".into(),
+        profile: ProfileId::new("default").unwrap(),
+        budget: BudgetPolicy::default(),
+        language_backends: vec![],
+        created_at: Timestamp::now(),
+    };
+    rows.upsert_session(&bare, &SessionProvenance::unknown())
+        .await
+        .unwrap();
+    let p = rows.get_provenance(bare.id).await.unwrap().unwrap();
+    assert!(!p.consent.corpus_ok && !p.consent.share_ok);
     storage.close().await.unwrap();
 }
