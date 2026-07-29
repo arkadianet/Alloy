@@ -889,7 +889,14 @@ impl RunController for RunControllerView {
             | RunControlState::Accepted
             | RunControlState::Running
             | RunControlState::ReplanRequested => {
-                return Err(RunError::InvalidPhase("not waiting approval".into()));
+                // The scheduler persists `DagState::WaitingApproval` before
+                // the run row flips (dogfood CI race, 2026-07-29). A durable
+                // `ApprovalRequested` proves the gate is genuinely open, so
+                // the resolution below is safe: it is persisted first and the
+                // §5.7.2 durable scan applies it regardless of phase timing.
+                if !has_durable_gate_request(&self.inner, row.session_id, run, gate).await? {
+                    return Err(RunError::InvalidPhase("not waiting approval".into()));
+                }
             }
         }
 

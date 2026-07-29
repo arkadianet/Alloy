@@ -1712,6 +1712,51 @@ async fn run_approve_deny_emits_run_finished_after_redispatch() {
     h.close().await;
 }
 
+/// Dogfood CI race (2026-07-29): the scheduler persists
+/// `DagState::WaitingApproval` before the run row flips to
+/// `waiting_approval`, so an approver acting on the published DAG state
+/// could land in the gap and be rejected — even though the durable
+/// `ApprovalRequested` already exists and SQ9 resolution would be picked
+/// up by the scheduler's durable scan. A durable gate request now
+/// satisfies the phase guard for a non-terminal run.
+#[tokio::test]
+async fn run_approve_accepts_durable_gate_request_before_state_flip() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+    let gate = GateId::new();
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run),
+            type_: SessionEventType::ApprovalRequested,
+            payload: json!({ "gate_id": gate.to_string() }),
+        })
+        .await
+        .unwrap();
+    h.set_run_state(run, RunControlState::Running).await;
+    h.runs().approve(run, gate, Approval::Allow).await.unwrap();
+    // Same guard on the deny side.
+    let run2 = h.submit(session).await;
+    h.seed_dag(run2).await;
+    let gate2 = GateId::new();
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run2),
+            type_: SessionEventType::ApprovalRequested,
+            payload: json!({ "gate_id": gate2.to_string() }),
+        })
+        .await
+        .unwrap();
+    h.set_run_state(run2, RunControlState::Running).await;
+    h.runs().approve(run2, gate2, Approval::Deny).await.unwrap();
+    h.close().await;
+}
+
 #[tokio::test]
 async fn run_approve_requires_waiting_approval() {
     let h = Harness::new().await;

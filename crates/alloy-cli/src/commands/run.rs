@@ -152,7 +152,7 @@ async fn run_after_assembly(
         bootstrap_index(full, ctx, session).await;
     }
 
-    // §7.1 step 4 — submit the goal.
+    // §7.1 step 4 — the goal, shared by every attempt.
     let mut constraints = Vec::new();
     if let Some(v) = args.max_usd {
         constraints.push(Constraint::MaxUsd(v));
@@ -165,37 +165,6 @@ async fn run_after_assembly(
         constraints,
         attachments: vec![],
     };
-    let run = sessions.submit_goal(session, goal.clone()).await?;
-    let dag_id = dag_id_for_run(full, run).await?;
-
-    if !ctx.quiet {
-        eprintln!("session {session}  run {run}");
-    }
-
-    // Issue #53 — one verify pass before planning, so the repair worker's
-    // generation-1 prompt carries the real rustc diagnostics instead of
-    // guessing from the goal text. Best-effort: a missing toolchain or
-    // sandbox must never fail a run before it starts.
-    bootstrap_diagnostics(full, ctx, session, run, dag_id).await;
-
-    // §7.1 step 6 — plan (template selection is the plan service's, SQ1).
-    let (policy_hash, tool_versions, compiler_fingerprint) = plan_fingerprints(ctx)?;
-    PlanService::plan(
-        &full.plan,
-        PlanContext {
-            session_id: session,
-            run_id: run,
-            dag_id,
-            goal,
-            template_override: None,
-            policy_hash,
-            tool_versions,
-            compiler_fingerprint,
-        },
-    )
-    .await?;
-
-    // §7.1 steps 7–10 — dispatch + render + gates + terminal exit.
     let mode = if args.yes {
         GateMode::AutoAllow
     } else if args.no_input {
@@ -203,7 +172,104 @@ async fn run_after_assembly(
     } else {
         GateMode::Interactive
     };
-    execute_and_render(full, ctx, "run", session, run, mode).await
+
+    // Bounded diagnostics-informed retry loop (issue #53 follow-through).
+    // Each attempt is a fully audited run in the same session: submit →
+    // pre-plan diagnostic seed (re-checks the *edited* workspace, so a
+    // retry's generation-1 prompt sees exactly what the previous patch
+    // broke) → plan → dispatch. Only a RunFailed exit with error-level
+    // diagnostics still present retries; gate denials, cancellations,
+    // budget stops and clean exits return immediately.
+    let mut attempt: u32 = 0;
+    loop {
+        let run = sessions.submit_goal(session, goal.clone()).await?;
+        let dag_id = dag_id_for_run(full, run).await?;
+
+        if !ctx.quiet {
+            eprintln!("session {session}  run {run}");
+        }
+
+        // Issue #53 — one verify pass before planning, so the repair
+        // worker's generation-1 prompt carries the real rustc diagnostics
+        // instead of guessing from the goal text. Best-effort: a missing
+        // toolchain or sandbox must never fail a run before it starts.
+        bootstrap_diagnostics(full, ctx, session, run, dag_id).await;
+
+        // §7.1 step 6 — plan (template selection is the plan service's, SQ1).
+        let (policy_hash, tool_versions, compiler_fingerprint) = plan_fingerprints(ctx)?;
+        PlanService::plan(
+            &full.plan,
+            PlanContext {
+                session_id: session,
+                run_id: run,
+                dag_id,
+                goal: goal.clone(),
+                template_override: None,
+                policy_hash,
+                tool_versions,
+                compiler_fingerprint,
+            },
+        )
+        .await?;
+
+        // §7.1 steps 7–10 — dispatch + render + gates + terminal exit.
+        let exit = execute_and_render(full, ctx, "run", session, run, mode).await?;
+        if exit != Exit::RunFailed || attempt >= args.max_retries {
+            return Ok(exit);
+        }
+        // Post-failure probe: the same verifier + graph seed. Fresh
+        // error-level diagnostics are both the retry signal and the next
+        // attempt's model input; anything else (run failed for a
+        // non-compile reason) returns the honest failure now.
+        let errors = post_failure_errors(full, ctx, session, run, dag_id).await;
+        if errors == 0 {
+            return Ok(exit);
+        }
+        attempt += 1;
+        if !ctx.quiet {
+            eprintln!(
+                "run failed with {errors} compile error(s) still present; \
+                 retrying with fresh diagnostics ({attempt}/{})",
+                args.max_retries
+            );
+        }
+    }
+}
+
+/// Post-failure diagnostic probe for the retry loop: one sandboxed verify
+/// over the edited workspace, seeded into the graph. Returns the
+/// error-level count, `0` on any probe failure (fail-safe: no retry).
+async fn post_failure_errors(
+    full: &FullAssembly,
+    ctx: &Ctx,
+    session: SessionId,
+    run: RunId,
+    dag_id: alloy_runtime::DagId,
+) -> usize {
+    let exec_ctx = alloy_runtime::NodeExecContext {
+        meta: alloy_runtime::NodeExecRef {
+            session_id: session,
+            run_id: run,
+            dag_id,
+            node_id: alloy_runtime::NodeId::new(),
+            workspace_root: ctx.workspace_abs.clone(),
+            attempt: 1,
+        },
+        cancellation: full.base.handle.cancellation().child_token(),
+    };
+    match alloy_runtime::seed_graph_diagnostics(
+        full.verify_compile.as_ref(),
+        full.graph.as_ref(),
+        &exec_ctx,
+    )
+    .await
+    {
+        Ok(report) => report.errors,
+        Err(e) => {
+            tracing::warn!(error = %e, "post-failure diagnostic probe failed; not retrying");
+            0
+        }
+    }
 }
 
 /// Issue #53 — pre-plan diagnostic seed; a failure is a warning, never
@@ -234,9 +300,9 @@ async fn bootstrap_diagnostics(
     )
     .await
     {
-        Ok(n) => {
-            if !ctx.quiet && n > 0 {
-                eprintln!("seeded {n} diagnostic(s) from cargo check");
+        Ok(report) => {
+            if !ctx.quiet && report.recorded > 0 {
+                eprintln!("seeded {} diagnostic(s) from cargo check", report.recorded);
             }
         }
         Err(e) => {

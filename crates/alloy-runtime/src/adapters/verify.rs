@@ -912,6 +912,12 @@ mod seed_tests {
             self.0.lock().unwrap().push(d);
             Ok(())
         }
+        async fn clear_diagnostics(&self) -> Result<u64, GraphError> {
+            let mut v = self.0.lock().unwrap();
+            let n = v.len() as u64;
+            v.clear();
+            Ok(n)
+        }
         async fn record_fix(&self, _f: crate::graph::FixEvent) -> Result<(), GraphError> {
             Ok(())
         }
@@ -962,13 +968,36 @@ mod seed_tests {
             raw_artifact: None,
         }))));
         let graph = RecordingGraph::default();
-        let n = seed_graph_diagnostics(&verifier, &graph, &ctx())
+        let report = seed_graph_diagnostics(&verifier, &graph, &ctx())
             .await
             .unwrap();
-        assert_eq!(n, 2);
+        assert_eq!(report.recorded, 2);
+        assert_eq!(report.errors, 2);
         let recorded = graph.0.lock().unwrap();
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].code.as_deref(), Some("E0308"));
+    }
+
+    /// Dogfood finding (2026-07-29, retry round): each seed pass is a
+    /// full check of the current workspace, so its diagnostics supersede
+    /// everything previously recorded — without clearing, retries fed the
+    /// model a growing pile of already-fixed errors (5.9k-token prompts).
+    #[tokio::test]
+    async fn reseeding_clears_superseded_diagnostics_first() {
+        let verifier = StubVerifier(Mutex::new(Some(Ok(Verdict {
+            outcome: VerdictOutcome::Fail,
+            diagnostics: vec![diag("E0277")],
+            raw_artifact: None,
+        }))));
+        let graph = RecordingGraph::default();
+        graph.0.lock().unwrap().push(diag("E0308")); // stale, from a prior seed
+        let report = seed_graph_diagnostics(&verifier, &graph, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(report.recorded, 1);
+        let recorded = graph.0.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "stale diagnostics must be cleared");
+        assert_eq!(recorded[0].code.as_deref(), Some("E0277"));
     }
 
     /// A verifier error propagates (the CLI warns and continues); nothing

@@ -193,11 +193,14 @@ fn hermetic_cargo_home(root: &Path) -> Option<()> {
 }
 
 fn setup() -> Option<E2e> {
+    setup_with(start_scripted_server())
+}
+
+fn setup_with(port: u16) -> Option<E2e> {
     if which_cargo().is_none() {
         eprintln!("skip: cargo not found");
         return None;
     }
-    let port = start_scripted_server();
     let ws = tempfile::tempdir().unwrap();
     common::copy_dir_all(&common::fixture_crate_source(), ws.path()).unwrap();
     common::write_profiles(ws.path());
@@ -485,4 +488,87 @@ fn yes_auto_approves_and_completes() {
     assert!(stdout.contains("succeeded"), "stdout: {stdout}");
     let main_rs = std::fs::read_to_string(e2e.ws.path().join("src/main.rs")).unwrap();
     assert!(main_rs.contains("let x: i32 = 42;"));
+}
+
+/// A server whose *first* edit response is a wrong fix (it introduces a
+/// fresh type error); every later edit response patches that wrong state
+/// correctly. Analyze responses are shared.
+fn start_wrong_first_server() -> u16 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let edits = AtomicUsize::new(0);
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+            let Some(body) = read_http_request(&mut stream) else {
+                continue;
+            };
+            let content = if body.contains("You analyse Rust compiler diagnostics") {
+                repair_response_json()
+            } else if body.contains("You produce a minimal unified diff") {
+                let n = edits.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    serde_json::json!({
+                        "patch": WRONG_DIFF,
+                        "summary": "replace the string literal with true",
+                        "confidence": 0.4,
+                    })
+                } else {
+                    serde_json::json!({
+                        "patch": SECOND_FIX_DIFF,
+                        "summary": "replace the bool literal with 42",
+                        "confidence": 0.9,
+                    })
+                }
+            } else {
+                serde_json::json!({"unexpected": true})
+            };
+            let doc = serde_json::json!({
+                "id": "scripted-1",
+                "choices": [{
+                    "message": { "content": content.to_string() },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 200, "completion_tokens": 60 },
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{doc}",
+                doc.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
+const WRONG_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = \"not a number\";\n+    let x: i32 = true;\n     println!(\"{}\", x);\n }\n";
+const SECOND_FIX_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = true;\n+    let x: i32 = 42;\n     println!(\"{}\", x);\n }\n";
+
+/// The bounded retry loop: a wrong first patch fails verify, the driver
+/// re-checks the edited workspace, seeds the *new* diagnostics, and the
+/// second run fixes what the first one actually broke. Exit 0 overall.
+#[test]
+fn retry_recovers_from_a_wrong_first_patch() {
+    let Some(e2e) = setup_with(start_wrong_first_server()) else {
+        return;
+    };
+    let out = e2e
+        .alloy()
+        .args(["run", "fix the compile error in src/main.rs", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if is_environment_skip(out.status.code(), &stderr) {
+        return;
+    }
+    assert_eq!(out.status.code(), Some(0), "retry run failed: {stderr}");
+    assert!(
+        stderr.contains("retrying"),
+        "retry marker missing: {stderr}"
+    );
+    let main_rs = std::fs::read_to_string(e2e.ws.path().join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("let x: i32 = 42;"), "{main_rs}");
 }

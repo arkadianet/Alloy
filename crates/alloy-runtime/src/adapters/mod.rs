@@ -17,7 +17,7 @@ pub use capability::{
 pub use diagnostics::{diagnostic_fingerprint, parse_rustc_diagnostics};
 pub use gate::SessionGateHumanAdapter;
 pub use perms::{SessionVerifyPermissions, VerifyClass, VerifyPermissions};
-pub use seed::seed_graph_diagnostics;
+pub use seed::{seed_graph_diagnostics, SeedReport};
 pub use tool_caller::{ToolCaller, ToolCallerError};
 pub use verify::{McpVerifyCompileAdapter, McpVerifyTestAdapter};
 
