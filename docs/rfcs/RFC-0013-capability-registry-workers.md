@@ -173,6 +173,17 @@ Each amendment is **additive** and named so a reviewer can accept or reject it i
 
 **Explicitly not amended:** `CapabilityExecutor`, `CapabilityExecContext`, `CapabilityOutcome`, `CapabilityExecError`, `NodeExecRef`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `FailureIr`, `WorkerMetrics`, `ToolCaller`, `ToolCall`, `ToolResult`, `PermissionToken`, `GraphViewHandle`, `ModelRouter`, `RoutingRequest`, `PromptPack`, `EditRequest`, `PatchSet`. RFC-0013 consumes all of these as-merged.
 
+### 2.3a Amendment AM-0013-1 — line-ops edit response (post-merge)
+
+Motivated by dogfooding: the dominant small-model failure is malformed or misanchored unified diffs — hunk-count mistakes, stale anchors, re-emitted patches — while the edit prompt already shows the model the CURRENT file with 1-based line numbers in the working-set gutter. Addressing those visible numbers is drastically easier than authoring hunk headers. Additive; every rule below leaves EW1–EW11 in force.
+
+| # | Amendment | Rule amended | Statement |
+| --- | --- | --- | --- |
+| **AM-0013-1a** | EW3 | The model MAY answer with `{"ops": [op], "summary", "confidence"}` instead of `{"patch", ...}` — **exactly one** of `patch` / `ops`, never both, never neither (either violation is PS6). Op forms (each a `deny_unknown_fields` schema selected by an `"op"` tag): `replace_lines {path, start, end, expect: [string], new: [string]}`, `insert_lines {path, after_line, new: [string]}` (`after_line` 0 = top of file), `delete_lines {path, start, end, expect: [string]}`. `start`/`end` are 1-based inclusive line numbers into the CURRENT file — the same numbers the working-set excerpt gutter shows. `EDIT_SYSTEM` documents both forms and recommends ops; diffs remain the only way to create or delete a file. |
+| **AM-0013-1b** | EW4 | Ops are screened statically (jail-relative paths, well-formed ranges, `expect` sized to its range, no embedded newline/NUL) then compiled **locally** by pure `ops_to_patchset(ops, files)` into the existing `PatchSet`/`Hunk` shape, after reading each **distinct** path once via `fs_read`. Everything downstream — EW5 size bound, EW6 dry-run + repair turn, EW7 apply, EW9 artifact, RFC-0008 validation/rollback — is unchanged: an ops response and a diff response producing the same edit reach `apply_patch` with byte-identical arguments. |
+| **AM-0013-1c** | EW4 (honesty guard) | `expect` MUST repeat the current content of every replaced/deleted line verbatim; compilation verifies it against the file just read and rejects on mismatch with model-repairable feedback ("stale op ..."), the equivalent of a diff's deleted/context lines. Also rejected with feedback: out-of-range lines, overlapping ops, unreadable paths, and files whose `fs_read` came back truncated (the feedback redirects to the diff form). One repair turn (mirroring EW6), then `Failed` / `Model` / `Retryable`. |
+| **AM-0013-1d** | EW4 caps | Bounds mirroring the existing caps, enforced before any file read: ≤ 256 ops per response (`MAX_OPS_PER_RESPONSE`, = `MAX_HUNKS_PER_FILE` — one op compiles to one hunk), ≤ 64 distinct paths (`MAX_PATCH_FILES`), ≤ 10 000 total `expect`/`new` lines (mirrors the backend's `MAX_LINES_PER_HUNK`), ≤ 64 KiB total line bytes (mirrors EW5). The compiled `PatchSet` is still re-checked against the real EW5 bound. |
+
 ### 2.4 Crate placement (normative)
 
 | Component | Crate | Why |
