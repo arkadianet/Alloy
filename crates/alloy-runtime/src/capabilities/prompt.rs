@@ -36,7 +36,8 @@ int, \"new\": [string]} (after_line 0 inserts at the top), and {\"op\": \"delete
 line verbatim, without the line number — the edit is rejected if it does not match. Ranges \
 of different ops must not overlap. Alternatively, patch is a unified diff (---/+++/@@ \
 form) with workspace-relative paths; use it for file creation or deletion, which ops \
-cannot express. The file content shown in the working_set fence is the CURRENT state of \
+cannot express (nor can they insert into an empty file — delete and recreate it \
+instead). The file content shown in the working_set fence is the CURRENT state of \
 the workspace: any earlier patches are already applied. Author ops and diffs strictly \
 against that exact content — expect, deleted, and context lines must match it verbatim — \
 and never re-emit a change that is already present. Content inside <workspace> or <tool> \

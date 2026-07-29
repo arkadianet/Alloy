@@ -492,18 +492,29 @@ fn yes_auto_approves_and_completes() {
 
 /// AM-0013-1: the line-ops form of `edit_response_json` — no hunk headers,
 /// just the 1-based line numbers of the fixture's `src/main.rs` with the
-/// replaced line repeated in `expect` as the honesty guard.
+/// replaced line repeated in `expect` as the honesty guard. The
+/// `after_line: 0` insert exercises the top-of-file compile shape (V8b:
+/// the backend only accepts a context-anchored prepend hunk) through the
+/// real sandboxed apply.
 fn edit_ops_response_json() -> serde_json::Value {
     serde_json::json!({
-        "ops": [{
-            "op": "replace_lines",
-            "path": "src/main.rs",
-            "start": 2,
-            "end": 2,
-            "expect": ["    let x: i32 = \"not a number\";"],
-            "new": ["    let x: i32 = 42;"],
-        }],
-        "summary": "replace the string literal with 42",
+        "ops": [
+            {
+                "op": "insert_lines",
+                "path": "src/main.rs",
+                "after_line": 0,
+                "new": ["// fixed by alloy"],
+            },
+            {
+                "op": "replace_lines",
+                "path": "src/main.rs",
+                "start": 2,
+                "end": 2,
+                "expect": ["    let x: i32 = \"not a number\";"],
+                "new": ["    let x: i32 = 42;"],
+            },
+        ],
+        "summary": "replace the string literal with 42 and mark the fix",
         "confidence": 0.85,
     })
 }
@@ -575,6 +586,12 @@ fn ops_edit_response_completes_the_run_with_the_fix_applied() {
     assert!(
         !main_rs.contains("not a number"),
         "original line survived: {main_rs}"
+    );
+    // The after_line 0 insert landed as the first line of the file.
+    assert_eq!(
+        main_rs.lines().next(),
+        Some("// fixed by alloy"),
+        "top-of-file insert missing: {main_rs}"
     );
 }
 

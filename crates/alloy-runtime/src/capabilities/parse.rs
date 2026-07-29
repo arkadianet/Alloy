@@ -646,24 +646,63 @@ fn compile_file_ops(path: &str, content: &str, ops: &[&LineOp]) -> Result<Vec<Hu
                         op.after_line.saturating_add(1)
                     ));
                 }
-                cursor = op.after_line;
-                last_insert_boundary = Some(op.after_line);
-                let new_start = i64::from(op.after_line) + delta + 1;
-                delta += i64::try_from(op.new.len()).unwrap_or(i64::MAX);
-                Hunk {
-                    old_start: op.after_line,
-                    old_lines: 0,
-                    new_start: u32::try_from(new_start)
-                        .map_err(|_| format!("op positions overflow in {path}"))?,
-                    new_lines: u32::try_from(op.new.len())
-                        .map_err(|_| format!("too many lines in one op on {path}"))?,
-                    lines: op.new.iter().map(|l| format!("+{l}")).collect(),
-                    eof_newline: if op.after_line == total {
-                        eof_newline
-                    } else {
-                        true
-                    },
-                    old_eof_no_newline: op.after_line == total && !eof_newline,
+                if op.after_line == 0 {
+                    // The backend reserves `old_start == 0` for Create (its
+                    // V8b rule), so a pure zero-length-range prepend hunk is
+                    // unrepresentable. A top-of-file insert instead takes
+                    // git's default prepend shape and anchors on line 1 as
+                    // trailing context: `@@ -1,1 +1,N+1 @@`, `+new` lines
+                    // first, then ` line1`. An empty file has no line to
+                    // anchor on (and the backend rejects every Modify shape
+                    // for it), so that case is repairable feedback.
+                    let Some(first) = lines.first() else {
+                        return Err(format!(
+                            "insert_lines after_line 0: {path} is empty and the edit \
+                             backend cannot line-edit an empty file; delete it and \
+                             recreate it with the full content via a unified diff patch"
+                        ));
+                    };
+                    cursor = 1;
+                    last_insert_boundary = Some(0);
+                    let new_start = 1 + delta;
+                    let new_count = op.new.len().saturating_add(1);
+                    delta += i64::try_from(op.new.len()).unwrap_or(i64::MAX);
+                    let mut body: Vec<String> = op.new.iter().map(|l| format!("+{l}")).collect();
+                    body.push(format!(" {first}"));
+                    Hunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: u32::try_from(new_start)
+                            .map_err(|_| format!("op positions overflow in {path}"))?,
+                        new_lines: u32::try_from(new_count)
+                            .map_err(|_| format!("too many lines in one op on {path}"))?,
+                        lines: body,
+                        // The context anchor is the last old line iff the
+                        // file has exactly one line, and it stays last on
+                        // the new side, carrying the eof property with it.
+                        eof_newline: if total == 1 { eof_newline } else { true },
+                        old_eof_no_newline: total == 1 && !eof_newline,
+                    }
+                } else {
+                    cursor = op.after_line;
+                    last_insert_boundary = Some(op.after_line);
+                    let new_start = i64::from(op.after_line) + delta + 1;
+                    delta += i64::try_from(op.new.len()).unwrap_or(i64::MAX);
+                    Hunk {
+                        old_start: op.after_line,
+                        old_lines: 0,
+                        new_start: u32::try_from(new_start)
+                            .map_err(|_| format!("op positions overflow in {path}"))?,
+                        new_lines: u32::try_from(op.new.len())
+                            .map_err(|_| format!("too many lines in one op on {path}"))?,
+                        lines: op.new.iter().map(|l| format!("+{l}")).collect(),
+                        eof_newline: if op.after_line == total {
+                            eof_newline
+                        } else {
+                            true
+                        },
+                        old_eof_no_newline: op.after_line == total && !eof_newline,
+                    }
                 }
             }
             LineOp::Replace(_) | LineOp::Delete(_) => {
@@ -1136,10 +1175,23 @@ mod tests {
         let FilePatch::Modify { hunks, .. } = &set.files[0] else {
             panic!("expected Modify");
         };
-        assert_eq!((hunks[0].old_start, hunks[0].old_lines), (0, 0));
-        assert_eq!((hunks[0].new_start, hunks[0].new_lines), (1, 1));
-        assert_eq!(hunks[0].lines, vec!["+zero"]);
-        // Backend delta rule: new_start = after_line + delta + 1.
+        // V8b reserves `old_start == 0` for Create, so a top-of-file insert
+        // must be the context-anchored git prepend shape: consume line 1 as
+        // trailing context (`@@ -1,1 +1,2 @@` / `+zero` / ` one`).
+        assert_eq!(
+            hunks[0],
+            Hunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 2,
+                lines: vec!["+zero".into(), " one".into()],
+                eof_newline: true,
+                old_eof_no_newline: false,
+            }
+        );
+        // Backend delta rule: new_start = after_line + delta + 1, where the
+        // top-insert contributed delta = new_lines - old_lines = 1.
         assert_eq!((hunks[1].old_start, hunks[1].old_lines), (3, 0));
         assert_eq!((hunks[1].new_start, hunks[1].new_lines), (5, 1));
 
@@ -1166,6 +1218,96 @@ mod tests {
                 old_eof_no_newline: false,
             }
         );
+    }
+
+    /// A top-of-file insert into a one-line file consumes that line as its
+    /// context anchor, so it inherits the file's eof-newline properties.
+    #[test]
+    fn ops_compile_top_insert_anchors_on_line_one_and_keeps_eof_flags() {
+        let files = one_file("a.txt", "only");
+        let set = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.txt", "after_line": 0, "new": ["first"],
+            }))],
+            &files,
+        )
+        .unwrap();
+        let FilePatch::Modify { hunks, .. } = &set.files[0] else {
+            panic!("expected Modify");
+        };
+        assert_eq!(
+            hunks[0],
+            Hunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 2,
+                lines: vec!["+first".into(), " only".into()],
+                eof_newline: false,
+                old_eof_no_newline: true,
+            }
+        );
+    }
+
+    /// The backend's Modify grammar cannot express an insertion into an
+    /// empty file (V8b bans `old_start == 0` outside Create, and there is no
+    /// line to anchor context on), so the compile must fail with
+    /// model-repairable feedback rather than emit a hunk the dry run rejects.
+    #[test]
+    fn ops_compile_rejects_insert_into_empty_file() {
+        let files = one_file("a.txt", "");
+        let err = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.txt", "after_line": 0, "new": ["first"],
+            }))],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        assert!(err.contains("a.txt"), "{err}");
+    }
+
+    /// The top-insert consumes line 1 as its anchor, so a second op that
+    /// also touches line 1 is an overlap (the backend would reject the pair
+    /// as overlapping hunks anyway).
+    #[test]
+    fn ops_compile_top_insert_conflicts_with_an_op_on_line_one() {
+        let files = one_file("a.rs", "one\ntwo\n");
+        let err = ops_to_patchset(
+            &[
+                op(serde_json::json!({
+                    "op": "insert_lines", "path": "a.rs", "after_line": 0, "new": ["zero"],
+                })),
+                op(serde_json::json!({
+                    "op": "replace_lines", "path": "a.rs", "start": 1, "end": 1,
+                    "expect": ["one"], "new": ["ONE"],
+                })),
+            ],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("overlap"), "{err}");
+        // Line 2 onward stays available after a top insert.
+        let set = ops_to_patchset(
+            &[
+                op(serde_json::json!({
+                    "op": "insert_lines", "path": "a.rs", "after_line": 0, "new": ["zero"],
+                })),
+                op(serde_json::json!({
+                    "op": "replace_lines", "path": "a.rs", "start": 2, "end": 2,
+                    "expect": ["two"], "new": ["TWO"],
+                })),
+            ],
+            &files,
+        )
+        .unwrap();
+        let FilePatch::Modify { hunks, .. } = &set.files[0] else {
+            panic!("expected Modify");
+        };
+        assert_eq!(hunks.len(), 2);
+        // delta after the top insert is +1: replace of old line 2 lands at
+        // new line 3.
+        assert_eq!((hunks[1].old_start, hunks[1].new_start), (2, 3));
     }
 
     #[test]
