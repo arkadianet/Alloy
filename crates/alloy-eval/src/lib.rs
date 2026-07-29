@@ -56,10 +56,10 @@ pub use harness::{EvalHarness, EvalHarnessConfig, LoadedFixture, EVAL_MAX_CONCUR
 pub use live_repair::{
     parse_observations_jsonl, render_router_toml, wilson_interval, LiveRepairCorpus,
     LiveRepairEndpoint, LiveRepairExpectedOutcome, LiveRepairFixture, LiveRepairFixtureReport,
-    LiveRepairGateApplicability, LiveRepairManifest, LiveRepairObservation, LiveRepairPassRate,
-    LiveRepairReport, WilsonInterval, LIVE_REPAIR_GOAL_MAX_BYTES, LIVE_REPAIR_MANIFEST_FILE,
-    LIVE_REPAIR_MANIFEST_VERSION, LIVE_REPAIR_MAX_TAGS, LIVE_REPAIR_REPORT_VERSION,
-    LIVE_REPAIR_REQUEST_TIMEOUT_MS, WILSON_Z_95,
+    LiveRepairGateApplicability, LiveRepairManifest, LiveRepairObservation, LiveRepairOutcome,
+    LiveRepairPassRate, LiveRepairReport, WilsonInterval, LIVE_REPAIR_GOAL_MAX_BYTES,
+    LIVE_REPAIR_MANIFEST_FILE, LIVE_REPAIR_MANIFEST_VERSION, LIVE_REPAIR_MAX_TAGS,
+    LIVE_REPAIR_REPORT_VERSION, LIVE_REPAIR_REQUEST_TIMEOUT_MS, WILSON_Z_95,
 };
 pub use manifest::{
     CargoRecordingRefs, EndpointPrices, ExpectedDiagnostic, FixtureDriverKind, FixtureId,

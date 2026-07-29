@@ -18,10 +18,36 @@ use crate::metrics::{MetricField, UnmeasuredReason};
 use crate::report::FixtureStatus;
 
 /// Report schema version for the live-repair benchmark.
-pub const LIVE_REPAIR_REPORT_VERSION: u32 = 1;
+///
+/// `2` splits the old catch-all `errors` column into `timeouts` (which stay in
+/// the pass-rate denominator) and `harness_errors` (which do not), and requires
+/// every observation to carry the endpoint identity it was produced against.
+pub const LIVE_REPAIR_REPORT_VERSION: u32 = 2;
 
 /// Exit code produced by `timeout(1)` when the per-run budget is exceeded.
 const TIMEOUT_EXIT_CODE: i32 = 124;
+
+/// Exit codes the shell reports when a command was found but could not be
+/// executed (`126`) or could not be found at all (`127`).
+const UNEXECUTABLE_EXIT_CODES: [i32; 2] = [126, 127];
+
+/// What one live repetition actually did.
+///
+/// This is finer-grained than the offline [`FixtureStatus`] on purpose: a
+/// timeout and a harness failure are both "not a pass", but only the harness
+/// failure means the measurement never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveRepairOutcome {
+    /// `alloy` exited `0`: the fixture was repaired.
+    Pass,
+    /// `alloy` exited non-zero: the fixture was not repaired.
+    Fail,
+    /// `timeout(1)` killed the run before it finished.
+    Timeout,
+    /// The benchmark could not execute `alloy` at all.
+    HarnessError,
+}
 
 /// Whether RFC-0016 holdout gates apply to this report.
 ///
@@ -60,23 +86,55 @@ pub struct LiveRepairObservation {
     pub retries: u32,
     /// Observed wall time in milliseconds.
     pub wall_ms: u64,
+    /// Wire model id this repetition was executed against.
+    pub model: String,
+    /// Sampling temperature this repetition was executed with.
+    pub temperature: f64,
+    /// OpenAI-compatible base URL this repetition was executed against.
+    pub base_url: String,
 }
 
 impl LiveRepairObservation {
-    /// Classify this observation using the offline `Pass | Fail | Error`
+    /// Classify this observation.
+    ///
+    /// Exit `0` is a pass, `124` is a `timeout(1)` kill, `126`/`127` mean the
+    /// shell could not execute the binary, and every other non-zero code is a
+    /// plain failure.
+    #[must_use]
+    pub fn outcome(&self) -> LiveRepairOutcome {
+        match self.exit_code {
+            0 => LiveRepairOutcome::Pass,
+            TIMEOUT_EXIT_CODE => LiveRepairOutcome::Timeout,
+            code if UNEXECUTABLE_EXIT_CODES.contains(&code) => LiveRepairOutcome::HarnessError,
+            _ => LiveRepairOutcome::Fail,
+        }
+    }
+
+    /// Project [`Self::outcome`] onto the offline `Pass | Fail | Error`
     /// vocabulary.
     ///
-    /// Exit `0` is a pass. A `timeout(1)` kill (`124`) or a shell
-    /// could-not-execute code (`126`, `127`) is harness infrastructure
-    /// failure, so it is [`FixtureStatus::Error`] and is excluded from the
-    /// pass-rate denominator exactly like an offline `Error` fixture. Every
-    /// other non-zero code is a genuine [`FixtureStatus::Fail`].
+    /// A **timeout is a [`FixtureStatus::Fail`]**: the run did not fix the
+    /// code, so counting it as infrastructure and dropping it from the
+    /// denominator would let "1 pass + 9 timeouts" render as a 100% pass rate.
+    /// Only a could-not-execute code is [`FixtureStatus::Error`], because then
+    /// no measurement happened at all — and the scorer refuses to treat such a
+    /// run as a result (see [`LiveRepairReport::has_harness_errors`]).
     #[must_use]
     pub fn status(&self) -> FixtureStatus {
-        match self.exit_code {
-            0 => FixtureStatus::Pass,
-            TIMEOUT_EXIT_CODE | 126 | 127 => FixtureStatus::Error,
-            _ => FixtureStatus::Fail,
+        match self.outcome() {
+            LiveRepairOutcome::Pass => FixtureStatus::Pass,
+            LiveRepairOutcome::Fail | LiveRepairOutcome::Timeout => FixtureStatus::Fail,
+            LiveRepairOutcome::HarnessError => FixtureStatus::Error,
+        }
+    }
+
+    /// The endpoint identity this observation was produced against.
+    #[must_use]
+    pub fn endpoint(&self) -> LiveRepairEndpoint {
+        LiveRepairEndpoint {
+            model: self.model.clone(),
+            temperature: self.temperature,
+            base_url: self.base_url.clone(),
         }
     }
 }
@@ -85,15 +143,21 @@ impl LiveRepairObservation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiveRepairPassRate {
-    /// Non-error attempts, i.e. the pass-rate denominator.
+    /// Attempts that produced a measurement, i.e. the pass-rate denominator:
+    /// `passes + failures + timeouts`.
     pub attempts: u32,
     /// Passing attempts.
     pub passes: u32,
-    /// Failing attempts.
+    /// Attempts that ran to completion without repairing the fixture.
     pub failures: u32,
-    /// Attempts excluded from the denominator as infrastructure errors.
-    pub errors: u32,
-    /// Pass rate over non-error attempts.
+    /// Attempts killed by the per-run timeout. Counted as failures for the
+    /// pass rate and reported here in their own column.
+    pub timeouts: u32,
+    /// Attempts where `alloy` could not be executed at all. These never
+    /// happened as measurements, so they are excluded from the denominator —
+    /// and they make the whole run untrustworthy rather than a result.
+    pub harness_errors: u32,
+    /// Pass rate over `attempts`.
     pub rate: MetricField<f64>,
     /// Wilson 95% interval for `rate`.
     pub wilson95: MetricField<WilsonInterval>,
@@ -103,21 +167,24 @@ impl LiveRepairPassRate {
     fn from_observations(observations: &[&LiveRepairObservation]) -> Self {
         let mut passes = 0_u32;
         let mut failures = 0_u32;
-        let mut errors = 0_u32;
+        let mut timeouts = 0_u32;
+        let mut harness_errors = 0_u32;
         for observation in observations {
-            match observation.status() {
-                FixtureStatus::Pass => passes += 1,
-                FixtureStatus::Fail => failures += 1,
-                FixtureStatus::Error => errors += 1,
+            match observation.outcome() {
+                LiveRepairOutcome::Pass => passes += 1,
+                LiveRepairOutcome::Fail => failures += 1,
+                LiveRepairOutcome::Timeout => timeouts += 1,
+                LiveRepairOutcome::HarnessError => harness_errors += 1,
             }
         }
-        let attempts = passes + failures;
+        let attempts = passes + failures + timeouts;
         if attempts == 0 {
             return Self {
                 attempts,
                 passes,
                 failures,
-                errors,
+                timeouts,
+                harness_errors,
                 rate: MetricField::Unmeasured {
                     reason: UnmeasuredReason::EmptySample,
                 },
@@ -130,7 +197,8 @@ impl LiveRepairPassRate {
             attempts,
             passes,
             failures,
-            errors,
+            timeouts,
+            harness_errors,
             rate: MetricField::Measured(f64::from(passes) / f64::from(attempts)),
             wilson95: MetricField::Measured(wilson_interval(passes, attempts, WILSON_Z_95)),
         }
@@ -182,17 +250,26 @@ pub struct LiveRepairReport {
 impl LiveRepairReport {
     /// Aggregate raw observations against a loaded corpus.
     ///
+    /// `expected_reps` is the repetition count the sweep was configured with.
+    /// When it is `Some(n)`, every fixture in `corpus` must contribute exactly
+    /// repetitions `1..=n`; when it is `None`, each *observed* fixture must
+    /// still contribute a gap-free `1..=k`.
+    ///
     /// Ownership: borrows `corpus` and `endpoint`, consumes `observations`.
     ///
     /// # Errors
     ///
     /// [`EvalError::Manifest`] when an observation names a fixture that is not
-    /// in `corpus`; the benchmark must never silently score an unknown id.
+    /// in `corpus`, when it was produced against a different endpoint than
+    /// `endpoint`, when a `(fixture, repetition)` pair is duplicated, or when
+    /// the repetition sequence has a gap or is short of `expected_reps`. A
+    /// silently-truncated or double-counted sweep is not a result.
     pub fn assemble(
         run_id: impl Into<String>,
         endpoint: LiveRepairEndpoint,
         corpus: &LiveRepairCorpus,
         observations: Vec<LiveRepairObservation>,
+        expected_reps: Option<u32>,
     ) -> Result<Self, EvalError> {
         let mut grouped: BTreeMap<&str, Vec<&LiveRepairObservation>> = BTreeMap::new();
         for observation in &observations {
@@ -202,11 +279,27 @@ impl LiveRepairReport {
                     observation.fixture_id
                 )));
             }
+            if observation.endpoint() != endpoint {
+                return Err(EvalError::Manifest(format!(
+                    "observation {}#{} was produced against model={} temperature={} base_url={}, \
+                     but this report is for model={} temperature={} base_url={}; \
+                     runs from different endpoints must not be pooled",
+                    observation.fixture_id,
+                    observation.repetition,
+                    observation.model,
+                    observation.temperature,
+                    observation.base_url,
+                    endpoint.model,
+                    endpoint.temperature,
+                    endpoint.base_url,
+                )));
+            }
             grouped
                 .entry(observation.fixture_id.as_str())
                 .or_default()
                 .push(observation);
         }
+        validate_repetitions(corpus, &grouped, expected_reps)?;
 
         let mut fixtures = Vec::with_capacity(corpus.fixtures().len());
         for fixture in corpus.fixtures() {
@@ -241,6 +334,16 @@ impl LiveRepairReport {
         })
     }
 
+    /// Whether any repetition failed to execute `alloy` at all.
+    ///
+    /// A run with harness errors is a broken sweep, not a measurement: callers
+    /// (the CLI, `run.sh`) must surface it as a failure rather than publish the
+    /// pass rate of whatever did run.
+    #[must_use]
+    pub fn has_harness_errors(&self) -> bool {
+        self.overall.harness_errors > 0
+    }
+
     /// Total retry lines observed across the whole run.
     #[must_use]
     pub fn retries_total(&self) -> u32 {
@@ -273,8 +376,15 @@ impl LiveRepairReport {
                 self.endpoint.model, self.endpoint.temperature
             ),
             format!(
-                "overall pass={} fail={} error={}",
-                self.overall.passes, self.overall.failures, self.overall.errors
+                "overall pass={} fail={} timeout={} harness_error={}",
+                self.overall.passes,
+                self.overall.failures,
+                self.overall.timeouts,
+                self.overall.harness_errors
+            ),
+            format!(
+                "denominator attempts={} (timeouts included, harness errors excluded)",
+                self.overall.attempts
             ),
             format!("pass_rate={}", render_rate(&self.overall.rate)),
             format!("wilson95={}", render_wilson(&self.overall.wilson95)),
@@ -296,11 +406,12 @@ impl LiveRepairReport {
             .iter()
             .map(|fixture| {
                 format!(
-                    "fixture {} pass={}/{} error={} retries={} wilson95={} tags={}",
+                    "fixture {} pass={}/{} timeout={} harness_error={} retries={} wilson95={} tags={}",
                     fixture.fixture_id,
                     fixture.pass_rate.passes,
                     fixture.pass_rate.attempts,
-                    fixture.pass_rate.errors,
+                    fixture.pass_rate.timeouts,
+                    fixture.pass_rate.harness_errors,
                     fixture.retries_total,
                     render_wilson(&fixture.pass_rate.wilson95),
                     fixture.tags.join(",")
@@ -340,6 +451,58 @@ pub fn parse_observations_jsonl(src: &str) -> Result<Vec<LiveRepairObservation>,
         observations.push(observation);
     }
     Ok(observations)
+}
+
+/// Reject duplicate, missing, and out-of-range `(fixture, repetition)` pairs.
+///
+/// Repetitions are 1-based and dense: a sweep of `n` reps must produce exactly
+/// `1..=n` for every fixture. Anything else means rows were lost, replayed, or
+/// concatenated from another run, and the pass rate would be quietly wrong.
+fn validate_repetitions(
+    corpus: &LiveRepairCorpus,
+    grouped: &BTreeMap<&str, Vec<&LiveRepairObservation>>,
+    expected_reps: Option<u32>,
+) -> Result<(), EvalError> {
+    for (id, observed) in grouped {
+        let mut seen: Vec<u32> = observed.iter().map(|o| o.repetition).collect();
+        seen.sort_unstable();
+        let expected = expected_reps.unwrap_or(seen.len() as u32);
+        for (index, repetition) in seen.iter().enumerate() {
+            let position = index as u32 + 1;
+            if *repetition == position {
+                continue;
+            }
+            if index > 0 && *repetition == seen[index - 1] {
+                return Err(EvalError::Manifest(format!(
+                    "duplicate observation for live-repair fixture {id} repetition {repetition}"
+                )));
+            }
+            return Err(EvalError::Manifest(format!(
+                "live-repair fixture {id} is missing repetition {position} \
+                 (repetitions must be the dense 1..={expected} sequence)"
+            )));
+        }
+        if let Some(expected) = expected_reps {
+            if seen.len() as u32 != expected {
+                return Err(EvalError::Manifest(format!(
+                    "live-repair fixture {id} is missing repetition {} of {expected}",
+                    seen.len() as u32 + 1
+                )));
+            }
+        }
+    }
+    if let Some(expected) = expected_reps {
+        for fixture in corpus.fixtures() {
+            let id = fixture.manifest().id.as_str();
+            if !grouped.contains_key(id) {
+                return Err(EvalError::Manifest(format!(
+                    "live-repair fixture {id} has no observations, but the sweep declared \
+                     {expected} repetition(s) per fixture"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn mean_wall_ms(observations: &[&LiveRepairObservation]) -> MetricField<f64> {
@@ -431,6 +594,9 @@ package = "{id}"
             exit_code: exit,
             retries,
             wall_ms,
+            model: "stub-model".to_owned(),
+            temperature: 0.6,
+            base_url: "http://127.0.0.1:11434/v1/".to_owned(),
         }
     }
 
@@ -442,18 +608,212 @@ package = "{id}"
         }
     }
 
+    fn assemble(
+        corpus: &LiveRepairCorpus,
+        observations: Vec<LiveRepairObservation>,
+    ) -> Result<LiveRepairReport, EvalError> {
+        LiveRepairReport::assemble(
+            "00000000-0000-4000-8000-000000000000",
+            endpoint(),
+            corpus,
+            observations,
+            None,
+        )
+    }
+
     #[test]
-    fn observation_status_vocabulary() {
-        assert_eq!(observation("aaa", 1, 0, 0, 1).status(), FixtureStatus::Pass);
-        assert_eq!(observation("aaa", 1, 1, 0, 1).status(), FixtureStatus::Fail);
-        assert_eq!(observation("aaa", 1, 2, 0, 1).status(), FixtureStatus::Fail);
-        for infra in [124, 126, 127] {
+    fn observation_outcome_vocabulary() {
+        assert_eq!(
+            observation("aaa", 1, 0, 0, 1).outcome(),
+            LiveRepairOutcome::Pass
+        );
+        assert_eq!(
+            observation("aaa", 1, 1, 0, 1).outcome(),
+            LiveRepairOutcome::Fail
+        );
+        assert_eq!(
+            observation("aaa", 1, 124, 0, 1).outcome(),
+            LiveRepairOutcome::Timeout
+        );
+        for broken in [126, 127] {
             assert_eq!(
-                observation("aaa", 1, infra, 0, 1).status(),
-                FixtureStatus::Error,
-                "exit {infra} must be infrastructure error"
+                observation("aaa", 1, broken, 0, 1).outcome(),
+                LiveRepairOutcome::HarnessError,
+                "exit {broken} must be a harness error"
             );
         }
+    }
+
+    #[test]
+    fn timeout_is_a_failure_not_an_excluded_error() {
+        // A run that timed out did not fix the code. Excluding it from the
+        // denominator would turn "1 pass + 9 timeouts" into a 100% pass rate.
+        assert_eq!(
+            observation("aaa", 1, 124, 0, 1).status(),
+            FixtureStatus::Fail
+        );
+        let (_dir, corpus) = corpus();
+        let mut observations = vec![observation("aaa", 1, 0, 0, 10)];
+        for rep in 2..=10 {
+            observations.push(observation("aaa", rep, 124, 0, 600_000));
+        }
+        let report = assemble(&corpus, observations).unwrap();
+        let aaa = &report.fixtures[0];
+        assert_eq!(
+            aaa.pass_rate.attempts, 10,
+            "timeouts stay in the denominator"
+        );
+        assert_eq!(aaa.pass_rate.passes, 1);
+        assert_eq!(aaa.pass_rate.timeouts, 9, "timeouts get their own column");
+        assert_eq!(
+            aaa.pass_rate.failures, 0,
+            "a timeout is not a plain failure"
+        );
+        assert_eq!(aaa.pass_rate.harness_errors, 0);
+        assert_eq!(aaa.pass_rate.rate, MetricField::Measured(0.1));
+        assert_eq!(report.overall.rate, MetricField::Measured(0.1));
+        let lines = report.render_fixture_lines();
+        assert!(lines.contains("timeout=9"), "{lines}");
+        assert!(report.render_summary().contains("timeout=9"));
+    }
+
+    #[test]
+    fn harness_errors_stay_out_of_the_denominator_and_are_reported() {
+        let (_dir, corpus) = corpus();
+        let report = assemble(
+            &corpus,
+            vec![
+                observation("aaa", 1, 0, 0, 10),
+                observation("aaa", 2, 127, 0, 1),
+            ],
+        )
+        .unwrap();
+        let aaa = &report.fixtures[0];
+        assert_eq!(aaa.pass_rate.attempts, 1);
+        assert_eq!(aaa.pass_rate.harness_errors, 1);
+        assert!(report.has_harness_errors());
+        assert!(report.render_summary().contains("harness_error=1"));
+    }
+
+    #[test]
+    fn assemble_rejects_duplicate_fixture_repetition_pairs() {
+        let (_dir, corpus) = corpus();
+        let err = assemble(
+            &corpus,
+            vec![
+                observation("aaa", 1, 0, 0, 10),
+                observation("aaa", 1, 1, 0, 10),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, EvalError::Manifest(message) if message.contains("duplicate")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn assemble_rejects_a_gap_in_the_repetition_sequence() {
+        let (_dir, corpus) = corpus();
+        let err = assemble(
+            &corpus,
+            vec![
+                observation("aaa", 1, 0, 0, 10),
+                observation("aaa", 3, 0, 0, 10),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, EvalError::Manifest(message) if message.contains("missing")),
+            "{err}"
+        );
+        assert!(matches!(
+            assemble(&corpus, vec![observation("aaa", 0, 0, 0, 10)]),
+            Err(EvalError::Manifest(_))
+        ));
+    }
+
+    #[test]
+    fn assemble_rejects_a_short_or_absent_fixture_when_reps_are_declared() {
+        let (_dir, corpus) = corpus();
+        let short = LiveRepairReport::assemble(
+            "00000000-0000-4000-8000-000000000000",
+            endpoint(),
+            &corpus,
+            vec![
+                observation("aaa", 1, 0, 0, 10),
+                observation("aaa", 2, 0, 0, 10),
+                observation("bbb", 1, 0, 0, 10),
+                observation("bbb", 2, 0, 0, 10),
+            ],
+            Some(3),
+        );
+        assert!(
+            matches!(&short, Err(EvalError::Manifest(message)) if message.contains("missing")),
+            "{short:?}"
+        );
+
+        let absent = LiveRepairReport::assemble(
+            "00000000-0000-4000-8000-000000000000",
+            endpoint(),
+            &corpus,
+            vec![observation("aaa", 1, 0, 0, 10)],
+            Some(1),
+        );
+        assert!(
+            matches!(&absent, Err(EvalError::Manifest(message)) if message.contains("bbb")),
+            "{absent:?}"
+        );
+
+        let complete = LiveRepairReport::assemble(
+            "00000000-0000-4000-8000-000000000000",
+            endpoint(),
+            &corpus,
+            vec![
+                observation("aaa", 1, 0, 0, 10),
+                observation("bbb", 1, 0, 0, 10),
+            ],
+            Some(1),
+        );
+        assert!(complete.is_ok(), "{complete:?}");
+    }
+
+    #[test]
+    fn assemble_rejects_observations_from_a_different_endpoint() {
+        let (_dir, corpus) = corpus();
+        let mut foreign_model = observation("aaa", 1, 0, 0, 10);
+        foreign_model.model = "other-model".to_owned();
+        assert!(
+            matches!(
+                assemble(&corpus, vec![foreign_model]),
+                Err(EvalError::Manifest(_))
+            ),
+            "a row from another model must not be pooled into this report"
+        );
+
+        let mut foreign_temperature = observation("aaa", 1, 0, 0, 10);
+        foreign_temperature.temperature = 0.9;
+        assert!(matches!(
+            assemble(&corpus, vec![foreign_temperature]),
+            Err(EvalError::Manifest(_))
+        ));
+
+        let mut foreign_endpoint = observation("aaa", 1, 0, 0, 10);
+        foreign_endpoint.base_url = "http://example.invalid/v1/".to_owned();
+        assert!(matches!(
+            assemble(&corpus, vec![foreign_endpoint]),
+            Err(EvalError::Manifest(_))
+        ));
+    }
+
+    #[test]
+    fn observations_without_endpoint_identity_are_rejected() {
+        let anonymous =
+            "{\"fixture_id\":\"aaa\",\"repetition\":1,\"exit_code\":0,\"retries\":0,\"wall_ms\":1}";
+        assert!(
+            matches!(parse_observations_jsonl(anonymous), Err(EvalError::Json(_))),
+            "an observation must carry the endpoint it was produced against"
+        );
     }
 
     #[test]
@@ -463,16 +823,10 @@ package = "{id}"
             observation("aaa", 1, 0, 0, 1_000),
             observation("aaa", 2, 0, 2, 3_000),
             observation("aaa", 3, 101, 1, 2_000),
-            observation("bbb", 1, 124, 0, 600_000),
+            observation("bbb", 1, 127, 0, 600_000),
             observation("bbb", 2, 0, 0, 500),
         ];
-        let report = LiveRepairReport::assemble(
-            "00000000-0000-4000-8000-000000000000",
-            endpoint(),
-            &corpus,
-            observations,
-        )
-        .unwrap();
+        let report = assemble(&corpus, observations).unwrap();
 
         assert_eq!(report.schema_version, LIVE_REPAIR_REPORT_VERSION);
         assert!(!report.offline);
@@ -487,7 +841,8 @@ package = "{id}"
         assert_eq!(aaa.pass_rate.attempts, 3);
         assert_eq!(aaa.pass_rate.passes, 2);
         assert_eq!(aaa.pass_rate.failures, 1);
-        assert_eq!(aaa.pass_rate.errors, 0);
+        assert_eq!(aaa.pass_rate.timeouts, 0);
+        assert_eq!(aaa.pass_rate.harness_errors, 0);
         assert_eq!(aaa.retries_total, 3);
         assert_eq!(aaa.passes_via_retry, 1);
         assert_eq!(aaa.mean_wall_ms, MetricField::Measured(2_000.0));
@@ -495,13 +850,13 @@ package = "{id}"
         let bbb = &report.fixtures[1];
         assert_eq!(bbb.pass_rate.attempts, 1);
         assert_eq!(bbb.pass_rate.passes, 1);
-        assert_eq!(bbb.pass_rate.errors, 1);
+        assert_eq!(bbb.pass_rate.harness_errors, 1);
         assert_eq!(bbb.mean_wall_ms, MetricField::Measured(500.0));
 
         assert_eq!(report.overall.attempts, 4);
         assert_eq!(report.overall.passes, 3);
         assert_eq!(report.overall.failures, 1);
-        assert_eq!(report.overall.errors, 1);
+        assert_eq!(report.overall.harness_errors, 1);
         assert_eq!(report.overall.rate, MetricField::Measured(0.75));
         assert_eq!(
             report.overall.wilson95,
@@ -514,13 +869,7 @@ package = "{id}"
     #[test]
     fn assemble_reports_unmeasured_for_fixture_without_observations() {
         let (_dir, corpus) = corpus();
-        let report = LiveRepairReport::assemble(
-            "00000000-0000-4000-8000-000000000000",
-            endpoint(),
-            &corpus,
-            vec![observation("aaa", 1, 0, 0, 10)],
-        )
-        .unwrap();
+        let report = assemble(&corpus, vec![observation("aaa", 1, 0, 0, 10)]).unwrap();
         let bbb = &report.fixtures[1];
         assert_eq!(bbb.pass_rate.attempts, 0);
         assert_eq!(
@@ -541,12 +890,7 @@ package = "{id}"
     fn assemble_rejects_unknown_fixture_id() {
         let (_dir, corpus) = corpus();
         assert!(matches!(
-            LiveRepairReport::assemble(
-                "00000000-0000-4000-8000-000000000000",
-                endpoint(),
-                &corpus,
-                vec![observation("zzz", 1, 0, 0, 10)],
-            ),
+            assemble(&corpus, vec![observation("zzz", 1, 0, 0, 10)]),
             Err(EvalError::Manifest(_))
         ));
     }
@@ -554,9 +898,7 @@ package = "{id}"
     #[test]
     fn summary_is_unmistakably_not_an_offline_gate_report() {
         let (_dir, corpus) = corpus();
-        let report = LiveRepairReport::assemble(
-            "00000000-0000-4000-8000-000000000000",
-            endpoint(),
+        let report = assemble(
             &corpus,
             vec![
                 observation("aaa", 1, 0, 1, 10),
@@ -568,7 +910,8 @@ package = "{id}"
 offline=false\n\
 holdout_gate=not_applicable\n\
 endpoint model=stub-model temperature=0.600000\n\
-overall pass=1 fail=1 error=0\n\
+overall pass=1 fail=1 timeout=0 harness_error=0\n\
+denominator attempts=2 (timeouts included, harness errors excluded)\n\
 pass_rate=0.500000\n\
 wilson95=[0.094529,0.905471]\n\
 retries_total=1 passes_via_retry=1\n\
@@ -583,13 +926,7 @@ cost_disclaimer=internal-only";
     #[test]
     fn fixture_lines_render_tags_and_intervals() {
         let (_dir, corpus) = corpus();
-        let report = LiveRepairReport::assemble(
-            "00000000-0000-4000-8000-000000000000",
-            endpoint(),
-            &corpus,
-            vec![observation("bbb", 1, 0, 0, 20)],
-        )
-        .unwrap();
+        let report = assemble(&corpus, vec![observation("bbb", 1, 0, 0, 20)]).unwrap();
         let lines = report.render_fixture_lines();
         assert!(lines.contains("fixture aaa pass=0/0"));
         assert!(lines.contains("wilson95=unmeasured:empty_sample"));
@@ -599,8 +936,8 @@ cost_disclaimer=internal-only";
 
     #[test]
     fn observations_jsonl_round_trip_and_errors() {
-        let src = "\n{\"fixture_id\":\"aaa\",\"repetition\":1,\"exit_code\":0,\"retries\":2,\"wall_ms\":1500}\n\n\
-{\"fixture_id\":\"bbb\",\"repetition\":1,\"exit_code\":124,\"retries\":0,\"wall_ms\":600000}\n";
+        let src = "\n{\"fixture_id\":\"aaa\",\"repetition\":1,\"exit_code\":0,\"retries\":2,\"wall_ms\":1500,\"model\":\"stub-model\",\"temperature\":0.6,\"base_url\":\"http://127.0.0.1:11434/v1/\"}\n\n\
+{\"fixture_id\":\"bbb\",\"repetition\":1,\"exit_code\":124,\"retries\":0,\"wall_ms\":600000,\"model\":\"stub-model\",\"temperature\":0.6,\"base_url\":\"http://127.0.0.1:11434/v1/\"}\n";
         let parsed = parse_observations_jsonl(src).unwrap();
         assert_eq!(
             parsed,
@@ -612,9 +949,9 @@ cost_disclaimer=internal-only";
 
         for bad in [
             "{\"fixture_id\":\"aaa\"}",
-            "{\"fixture_id\":\"aaa\",\"repetition\":1,\"exit_code\":0,\"retries\":0,\"wall_ms\":1,\"extra\":1}",
+            "{\"fixture_id\":\"aaa\",\"repetition\":1,\"exit_code\":0,\"retries\":0,\"wall_ms\":1,\"model\":\"stub-model\",\"temperature\":0.6,\"base_url\":\"http://127.0.0.1:11434/v1/\",\"extra\":1}",
             "not json",
-            "{\"fixture_id\":\"BAD ID\",\"repetition\":1,\"exit_code\":0,\"retries\":0,\"wall_ms\":1}",
+            "{\"fixture_id\":\"BAD ID\",\"repetition\":1,\"exit_code\":0,\"retries\":0,\"wall_ms\":1,\"model\":\"stub-model\",\"temperature\":0.6,\"base_url\":\"http://127.0.0.1:11434/v1/\"}",
         ] {
             assert!(
                 matches!(parse_observations_jsonl(bad), Err(EvalError::Json(_))),
@@ -626,9 +963,7 @@ cost_disclaimer=internal-only";
     #[test]
     fn report_serde_round_trip() {
         let (_dir, corpus) = corpus();
-        let report = LiveRepairReport::assemble(
-            "00000000-0000-4000-8000-000000000000",
-            endpoint(),
+        let report = assemble(
             &corpus,
             vec![
                 observation("aaa", 1, 0, 0, 10),
@@ -667,13 +1002,7 @@ cost_disclaimer=internal-only";
     #[test]
     fn report_rejects_unknown_json_fields() {
         let (_dir, corpus) = corpus();
-        let report = LiveRepairReport::assemble(
-            "00000000-0000-4000-8000-000000000000",
-            endpoint(),
-            &corpus,
-            vec![observation("aaa", 1, 0, 0, 10)],
-        )
-        .unwrap();
+        let report = assemble(&corpus, vec![observation("aaa", 1, 0, 0, 10)]).unwrap();
         let mut value: serde_json::Value = serde_json::to_value(&report).unwrap();
         value["unexpected"] = serde_json::Value::Bool(true);
         assert!(serde_json::from_value::<LiveRepairReport>(value).is_err());

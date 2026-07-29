@@ -15,7 +15,7 @@
 //! alloy-eval-live-repair render-router --model <m> --temperature <t> --base-url <u>
 //! alloy-eval-live-repair score --fixtures <dir> --observations <jsonl>
 //!                              --model <m> --temperature <t> --base-url <u>
-//!                              [--out <report.json>]
+//!                              [--reps <n>] [--out <report.json>]
 //! ```
 
 #![forbid(unsafe_code)]
@@ -37,13 +37,22 @@ USAGE:
   alloy-eval-live-repair plan --fixtures <dir>
   alloy-eval-live-repair render-router --model <m> --temperature <t> --base-url <u>
   alloy-eval-live-repair score --fixtures <dir> --observations <jsonl>
-                               --model <m> --temperature <t> --base-url <u> [--out <json>]";
+                               --model <m> --temperature <t> --base-url <u>
+                               [--reps <n>] [--out <json>]
+
+EXIT: 0 scored, 2 bad invocation or invalid observations, 3 the sweep could not
+execute the alloy binary (broken harness, not a result)";
+
+/// Exit code for a run whose repetitions could not execute `alloy` at all.
+/// Distinct from `2` (bad invocation) and from `0` (a scored result, however
+/// bad the pass rate): the sweep itself is broken and must not be published.
+const EXIT_HARNESS_BROKEN: u8 = 3;
 
 fn main() -> ExitCode {
     match run() {
-        Ok(output) => {
-            print!("{output}");
-            ExitCode::SUCCESS
+        Ok(Output { text, exit }) => {
+            print!("{text}");
+            exit
         }
         Err(message) => {
             eprintln!("alloy-eval-live-repair: {message}");
@@ -52,16 +61,31 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<String, String> {
+/// Command output plus the process exit code it implies.
+struct Output {
+    text: String,
+    exit: ExitCode,
+}
+
+impl From<String> for Output {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            exit: ExitCode::SUCCESS,
+        }
+    }
+}
+
+fn run() -> Result<Output, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = args.split_first().ok_or_else(|| USAGE.to_owned())?;
     let options = parse_options(rest)?;
 
     match command.as_str() {
-        "plan" => plan(&options),
-        "render-router" => render_router(&options),
+        "plan" => plan(&options).map(Output::from),
+        "render-router" => render_router(&options).map(Output::from),
         "score" => score(&options),
-        "-h" | "--help" | "help" => Ok(format!("{USAGE}\n")),
+        "-h" | "--help" | "help" => Ok(Output::from(format!("{USAGE}\n"))),
         other => Err(format!("unknown command {other}\n{USAGE}")),
     }
 }
@@ -129,16 +153,25 @@ fn render_router(options: &BTreeMap<String, String>) -> Result<String, String> {
     render_router_toml(&endpoint(options)?).map_err(|err| err.to_string())
 }
 
-fn score(options: &BTreeMap<String, String>) -> Result<String, String> {
+fn score(options: &BTreeMap<String, String>) -> Result<Output, String> {
     let corpus = corpus(options)?;
     let endpoint = endpoint(options)?;
+    let expected_reps = match options.get("reps") {
+        Some(raw) => Some(
+            raw.parse::<u32>()
+                .ok()
+                .filter(|reps| *reps >= 1)
+                .ok_or_else(|| "--reps must be a positive integer".to_owned())?,
+        ),
+        None => None,
+    };
     let observations_path = PathBuf::from(required(options, "observations")?);
     let raw = std::fs::read_to_string(&observations_path)
         .map_err(|err| format!("read {}: {err}", observations_path.display()))?;
     let observations = parse_observations_jsonl(&raw).map_err(|err| err.to_string())?;
 
     let run_id = uuid::Uuid::new_v4().to_string();
-    let report = LiveRepairReport::assemble(run_id, endpoint, &corpus, observations)
+    let report = LiveRepairReport::assemble(run_id, endpoint, &corpus, observations, expected_reps)
         .map_err(|err| err.to_string())?;
 
     if let Some(out) = options.get("out") {
@@ -147,9 +180,26 @@ fn score(options: &BTreeMap<String, String>) -> Result<String, String> {
         std::fs::write(out, format!("{json}\n")).map_err(|err| format!("write {out}: {err}"))?;
     }
 
-    Ok(format!(
-        "{}\n{}\n",
-        report.render_fixture_lines(),
-        report.render_summary()
-    ))
+    // The report is still written and printed — an operator needs to see what
+    // happened — but a run that could not execute `alloy` is not a result, so
+    // the process exits non-zero rather than blessing the pass rate.
+    let exit = if report.has_harness_errors() {
+        eprintln!(
+            "alloy-eval-live-repair: {} repetition(s) could not execute the alloy binary; \
+             this sweep is broken and its pass rate must not be published",
+            report.overall.harness_errors
+        );
+        ExitCode::from(EXIT_HARNESS_BROKEN)
+    } else {
+        ExitCode::SUCCESS
+    };
+
+    Ok(Output {
+        text: format!(
+            "{}\n{}\n",
+            report.render_fixture_lines(),
+            report.render_summary()
+        ),
+        exit,
+    })
 }

@@ -94,6 +94,7 @@ case "$pkg" in
   pass_fixture) echo "{retry_line}" >&2; exit 0;;
   fail_fixture) exit 1;;
   timeout_fixture) exit 124;;
+  unexecutable_fixture) exit 127;;
 esac
 exit 95
 "#
@@ -136,11 +137,15 @@ fn bench(ids: &[&str]) -> Bench {
 }
 
 fn run_bench(bench: &Bench, reps: &str) -> std::process::Output {
+    run_bench_with(bench, reps, &bench.alloy.clone())
+}
+
+fn run_bench_with(bench: &Bench, reps: &str, alloy: &Path) -> std::process::Output {
     Command::new("bash")
         .arg(run_script())
         .arg(&bench.out)
         .env("FIXTURES", &bench.fixtures)
-        .env("ALLOY", &bench.alloy)
+        .env("ALLOY", alloy)
         .env("SCORER", SCORER)
         .env("REPS", reps)
         .env("MODEL", "stub-model")
@@ -149,6 +154,28 @@ fn run_bench(bench: &Bench, reps: &str) -> std::process::Output {
         .env("TIMEOUT", "60")
         .output()
         .expect("run.sh")
+}
+
+/// Score `bench.out` directly, optionally declaring the repetition count.
+fn score(bench: &Bench, reps: Option<&str>) -> std::process::Output {
+    let mut command = Command::new(SCORER);
+    command
+        .args(["score", "--fixtures"])
+        .arg(&bench.fixtures)
+        .arg("--observations")
+        .arg(&bench.out)
+        .args([
+            "--model",
+            "stub-model",
+            "--temperature",
+            "0.6",
+            "--base-url",
+            "http://127.0.0.1:11434/v1/",
+        ]);
+    if let Some(reps) = reps {
+        command.args(["--reps", reps]);
+    }
+    command.output().expect("scorer")
 }
 
 #[test]
@@ -188,6 +215,151 @@ fn runner_executes_every_fixture_and_records_structured_observations() {
         assert_eq!(observation.exit_code, 1);
         assert_eq!(observation.retries, 0);
     }
+
+    // Every row names the endpoint it was produced against.
+    for observation in &observations {
+        assert_eq!(observation.model, "stub-model");
+        assert!((observation.temperature - 0.6).abs() < f64::EPSILON);
+        assert_eq!(observation.base_url, "http://127.0.0.1:11434/v1/");
+    }
+}
+
+#[test]
+fn runner_refuses_to_start_without_a_usable_alloy_binary() {
+    let bench = bench(&["pass_fixture"]);
+    let missing = bench.fixtures.parent().unwrap().join("no-such-alloy");
+    let output = run_bench_with(&bench, "1", &missing);
+    assert!(
+        !output.status.success(),
+        "a missing alloy binary must fail the sweep, not score exit-127 rows"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("alloy binary not found"), "{stderr}");
+    assert!(
+        !bench.out.exists() || fs::read_to_string(&bench.out).unwrap().is_empty(),
+        "no observation may be written by a sweep that never ran"
+    );
+}
+
+#[test]
+fn runner_rejects_a_repetition_count_that_is_not_a_positive_integer() {
+    let bench = bench(&["pass_fixture"]);
+    // An unset/empty REPS falls back to the documented default; anything set
+    // to a non-count must stop the sweep.
+    for reps in ["abc", "0", "-1", "2.5", " 2"] {
+        let output = run_bench(&bench, reps);
+        assert!(
+            !output.status.success(),
+            "REPS={reps} must fail loudly instead of running zero repetitions"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("REPS"),
+            "REPS={reps}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn runner_and_scorer_fail_when_a_repetition_could_not_execute_alloy() {
+    let bench = bench(&["pass_fixture", "unexecutable_fixture"]);
+    let output = run_bench(&bench, "1");
+    assert!(
+        !output.status.success(),
+        "a could-not-execute row means the sweep is broken, not that the model failed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not execute"),
+        "{stderr}\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("harness_error=1"), "{stdout}");
+    // The one measured attempt is still reported, it is simply not blessed.
+    assert!(
+        stdout.contains("overall pass=1 fail=0 timeout=0"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn scorer_rejects_duplicate_and_missing_repetitions() {
+    let bench = bench(&["pass_fixture"]);
+    let row = |rep: u32| {
+        format!(
+            "{{\"fixture_id\":\"pass_fixture\",\"repetition\":{rep},\"exit_code\":0,\
+             \"retries\":0,\"wall_ms\":1,\"model\":\"stub-model\",\"temperature\":0.6,\
+             \"base_url\":\"http://127.0.0.1:11434/v1/\"}}\n"
+        )
+    };
+
+    fs::write(&bench.out, format!("{}{}", row(1), row(1))).unwrap();
+    let duplicate = score(&bench, Some("2"));
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("duplicate"),
+        "{}",
+        String::from_utf8_lossy(&duplicate.stderr)
+    );
+
+    fs::write(&bench.out, format!("{}{}", row(1), row(3))).unwrap();
+    let gap = score(&bench, None);
+    assert!(!gap.status.success());
+    assert!(
+        String::from_utf8_lossy(&gap.stderr).contains("missing repetition"),
+        "{}",
+        String::from_utf8_lossy(&gap.stderr)
+    );
+
+    fs::write(&bench.out, row(1)).unwrap();
+    let short = score(&bench, Some("2"));
+    assert!(!short.status.success());
+    assert!(
+        String::from_utf8_lossy(&short.stderr).contains("missing repetition"),
+        "{}",
+        String::from_utf8_lossy(&short.stderr)
+    );
+
+    fs::write(&bench.out, format!("{}{}", row(1), row(2))).unwrap();
+    assert!(score(&bench, Some("2")).status.success());
+}
+
+#[test]
+fn scorer_rejects_rows_from_another_endpoint() {
+    let bench = bench(&["pass_fixture"]);
+    fs::write(
+        &bench.out,
+        "{\"fixture_id\":\"pass_fixture\",\"repetition\":1,\"exit_code\":0,\"retries\":0,\
+         \"wall_ms\":1,\"model\":\"other-model\",\"temperature\":0.6,\
+         \"base_url\":\"http://127.0.0.1:11434/v1/\"}\n",
+    )
+    .unwrap();
+    let output = score(&bench, Some("1"));
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("different endpoints"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn scorer_prints_a_wilson_interval_for_every_fixture() {
+    let bench = bench(&["pass_fixture", "fail_fixture"]);
+    let output = run_bench(&bench, "2");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for fixture in ["pass_fixture", "fail_fixture"] {
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("fixture {fixture} ")))
+            .unwrap_or_else(|| panic!("no line for {fixture} in {stdout}"));
+        assert!(
+            line.contains("wilson95=[") && !line.contains("wilson95=unmeasured"),
+            "{fixture} must carry its own CI: {line}"
+        );
+    }
 }
 
 #[test]
@@ -203,8 +375,13 @@ fn runner_writes_a_structured_report_using_the_eval_report_vocabulary() {
     );
     assert!(stdout.contains("offline=false"), "{stdout}");
     assert!(stdout.contains("holdout_gate=not_applicable"), "{stdout}");
-    assert!(stdout.contains("overall pass=1 fail=1 error=1"), "{stdout}");
-    assert!(stdout.contains("pass_rate=0.500000"), "{stdout}");
+    // The timed-out repetition is a failure, not an excluded infrastructure
+    // error: 1 pass out of 3 attempts, never 1/2.
+    assert!(
+        stdout.contains("overall pass=1 fail=1 timeout=1 harness_error=0"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("pass_rate=0.333333"), "{stdout}");
     assert!(
         stdout.contains("retries_total=1 passes_via_retry=1"),
         "{stdout}"
@@ -221,8 +398,12 @@ fn runner_writes_a_structured_report_using_the_eval_report_vocabulary() {
     assert_eq!(report.schema_version, LIVE_REPAIR_REPORT_VERSION);
     assert!(!report.offline);
     assert_eq!(report.fixtures.len(), 3);
-    assert_eq!(report.overall.attempts, 2);
-    assert_eq!(report.overall.errors, 1);
+    assert_eq!(
+        report.overall.attempts, 3,
+        "timeouts stay in the denominator"
+    );
+    assert_eq!(report.overall.timeouts, 1);
+    assert_eq!(report.overall.harness_errors, 0);
     assert_eq!(report.observations.len(), 3);
     assert!(report
         .fixtures
@@ -248,7 +429,8 @@ fn scorer_rejects_observations_for_an_unknown_fixture() {
     let bench = bench(&["pass_fixture"]);
     fs::write(
         &bench.out,
-        "{\"fixture_id\":\"ghost\",\"repetition\":1,\"exit_code\":0,\"retries\":0,\"wall_ms\":1}\n",
+        "{\"fixture_id\":\"ghost\",\"repetition\":1,\"exit_code\":0,\"retries\":0,\"wall_ms\":1,\
+\"model\":\"stub-model\",\"temperature\":0.6,\"base_url\":\"http://127.0.0.1:11434/v1/\"}\n",
     )
     .unwrap();
     let output = Command::new(SCORER)

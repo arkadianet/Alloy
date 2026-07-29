@@ -64,6 +64,17 @@ alloy --workspace <tmp> run "<goal from the manifest>" --yes
 Exit code `0` is a pass. Wall time and the retry-line count scraped from the
 run log are recorded alongside it. Nothing is written inside the repository.
 
+Before the first repetition, `run.sh` preflights itself: the scorer and the
+`alloy` binary must exist and be executable (and must not answer a probe with
+`126`/`127`), and `REPS`, `TIMEOUT`, `TEMP`, `MODEL` and `BASEURL` must parse.
+Its exit codes distinguish the two kinds of bad news:
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | The sweep ran and was scored. Fixtures may have failed — that is a result. |
+| `2` | The sweep is broken before it started (bad config, unusable binary) or the observations are invalid. |
+| `3` | The sweep ran but at least one repetition could not execute `alloy`; do not publish it. |
+
 ### Environment
 
 | Var | Default | Meaning |
@@ -84,19 +95,25 @@ run log are recorded alongside it. Nothing is written inside the repository.
 `run.sh` appends one JSON object per repetition to the results file:
 
 ```json
-{"fixture_id":"missing_mut","repetition":1,"exit_code":0,"retries":1,"wall_ms":18422}
+{"fixture_id":"missing_mut","repetition":1,"exit_code":0,"retries":1,"wall_ms":18422,"model":"qwen2.5-coder:32b","temperature":0.6,"base_url":"http://127.0.0.1:11434/v1/"}
 ```
+
+Every row carries the endpoint identity it was produced against, and the scorer
+refuses to pool rows whose `model` / `temperature` / `base_url` disagree with
+the report's endpoint: two sweeps concatenated by mistake are an error, not an
+average.
 
 and then writes `<results>.report.json`, a `LiveRepairReport`:
 
 ```text
-fixture missing_mut pass=9/10 error=0 retries=3 wilson95=[0.595758,0.982431] tags=e0384,mutability
+fixture missing_mut pass=9/10 timeout=0 harness_error=0 retries=3 wilson95=[0.595758,0.982431] tags=e0384,mutability
 ...
 alloy-eval-live-repair run_id=<uuid v4>
 offline=false
 holdout_gate=not_applicable
 endpoint model=qwen2.5-coder:32b temperature=0.600000
-overall pass=87 fail=13 error=0
+overall pass=87 fail=13 timeout=0 harness_error=0
+denominator attempts=100 (timeouts included, harness errors excluded)
 pass_rate=0.870000
 wilson95=[0.789338,0.923136]
 retries_total=21 passes_via_retry=14
@@ -112,17 +129,27 @@ target/debug/alloy-eval-live-repair score \
   --observations /tmp/live-repair.jsonl \
   --model qwen2.5-coder:32b --temperature 0.6 \
   --base-url http://127.0.0.1:11434/v1/ \
+  --reps 10 \
   --out /tmp/live-repair.report.json
 ```
 
 ### Scoring semantics
 
-* Exit `0` → `Pass`; exit `124` / `126` / `127` (timeout, or the binary could
-  not be executed) → `Error`; any other non-zero code → `Fail`. This reuses the
-  offline `Pass | Fail | Error` vocabulary.
-* `Error` attempts are **excluded** from the pass-rate denominator, exactly as
-  RFC-0016 excludes `Error` fixtures from `success_rate`. The retired
-  `score.py` counted every attempt; that is the one deliberate divergence.
+* Exit `0` → `Pass`; exit `124` (killed by `timeout(1)`) → `Timeout`; exit
+  `126` / `127` (the binary could not be executed) → `HarnessError`; any other
+  non-zero code → `Fail`.
+* **A timeout is a failure.** It stays in the pass-rate denominator and is
+  reported in its own `timeout=` column. Excluding it would let a run of
+  1 pass + 9 timeouts render as a 100% pass rate, which is the opposite of what
+  happened: the code was not fixed.
+* Only `HarnessError` attempts are excluded from the denominator, because no
+  measurement happened at all — and such a run is not published: the scorer
+  exits `3` and `run.sh` exits `3` after reporting what it saw.
+* Observations are validated before scoring: an unknown fixture id, a duplicate
+  `(fixture, repetition)` pair, a gap in the `1..=REPS` sequence, a fixture with
+  no rows when `--reps` is declared, or a row from a different endpoint is a
+  hard error rather than a quietly smaller sample.
+* Every fixture line carries its own Wilson 95% interval, not just `OVERALL`.
 * Wilson 95% intervals are ported verbatim from `score.py::wilson`, including
   its `n == 0` degenerate case, and the port is pinned by unit tests against
   the Python reference values.

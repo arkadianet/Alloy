@@ -35,8 +35,8 @@ pub use manifest::{
 };
 pub use report::{
     parse_observations_jsonl, LiveRepairEndpoint, LiveRepairFixtureReport,
-    LiveRepairGateApplicability, LiveRepairObservation, LiveRepairPassRate, LiveRepairReport,
-    LIVE_REPAIR_REPORT_VERSION,
+    LiveRepairGateApplicability, LiveRepairObservation, LiveRepairOutcome, LiveRepairPassRate,
+    LiveRepairReport, LIVE_REPAIR_REPORT_VERSION,
 };
 pub use router::{render_router_toml, LIVE_REPAIR_REQUEST_TIMEOUT_MS};
 pub use score::{wilson_interval, WilsonInterval, WILSON_Z_95};
