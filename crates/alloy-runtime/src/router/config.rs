@@ -92,6 +92,10 @@ pub struct EndpointConfig {
     pub supports_tools: bool,
     /// Whether JSON-object output may select this endpoint.
     pub supports_structured_output: bool,
+    /// Whether completions may carry a full JSON Schema `response_format`
+    /// (schema-constrained decoding). Defaults to `false`; endpoints that
+    /// did not opt in receive plain `json_object` instead.
+    pub supports_json_schema: bool,
     /// Advisory context-window size.
     pub max_context: u32,
     /// Operator price per million input tokens.
@@ -157,6 +161,8 @@ struct EndpointFile {
     supports_tools: bool,
     #[serde(default)]
     supports_structured_output: bool,
+    #[serde(default)]
+    supports_json_schema: bool,
     max_context: u32,
     input_usd_per_mtok: Option<f64>,
     output_usd_per_mtok: Option<f64>,
@@ -329,6 +335,7 @@ impl TryFrom<EndpointFile> for EndpointConfig {
             tiers: file.tiers,
             supports_tools: file.supports_tools,
             supports_structured_output: file.supports_structured_output,
+            supports_json_schema: file.supports_json_schema,
             max_context: file.max_context,
             input_usd_per_mtok: file.input_usd_per_mtok,
             output_usd_per_mtok: file.output_usd_per_mtok,
@@ -347,6 +354,7 @@ impl EndpointConfig {
             tiers: self.tiers.clone(),
             supports_tools: self.supports_tools,
             supports_structured_output: self.supports_structured_output,
+            supports_json_schema: self.supports_json_schema,
             max_context: self.max_context,
             input_usd_per_mtok: self.input_usd_per_mtok,
             output_usd_per_mtok: self.output_usd_per_mtok,

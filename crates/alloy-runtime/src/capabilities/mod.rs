@@ -32,6 +32,7 @@ pub use payload::{
 };
 pub use perms::{SessionWorkerPermissions, WorkerPermissions, WorkerToolClass};
 pub use prompt::{
+    edit_response_schema, repair_response_schema, review_response_schema,
     system_instruction_digest, truncation_marker, EDIT_SYSTEM, REPAIR_SYSTEM, REVIEW_SYSTEM,
 };
 pub use registry::{CapabilityRegistry, RegError, ResolveHints};

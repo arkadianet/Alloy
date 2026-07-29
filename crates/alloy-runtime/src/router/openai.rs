@@ -155,7 +155,7 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<WireResponseFormat>,
+    response_format: Option<WireResponseFormat<'a>>,
 }
 
 impl<'a> WireRequest<'a> {
@@ -166,18 +166,37 @@ impl<'a> WireRequest<'a> {
             stream: false,
             temperature: request.temperature,
             max_tokens: request.max_output_tokens,
-            response_format: matches!(request.response_format, ResponseFormat::JsonObject)
-                .then_some(WireResponseFormat {
-                    kind: "json_object",
-                }),
+            response_format: match &request.response_format {
+                ResponseFormat::Text => None,
+                ResponseFormat::JsonObject => Some(WireResponseFormat::JsonObject),
+                ResponseFormat::JsonSchema { name, schema } => {
+                    Some(WireResponseFormat::JsonSchema {
+                        json_schema: WireJsonSchema { name, schema },
+                    })
+                }
+            },
         }
     }
 }
 
+/// OpenAI `response_format` wire shape. The `json_schema` arm matches the
+/// schema-constrained decoding contract that vLLM, Ollama's OpenAI endpoint
+/// (≥ 0.5), and llama.cpp all accept:
+/// `{"type":"json_schema","json_schema":{"name":...,"schema":{...}}}`.
+/// `strict` is deliberately omitted: local servers ignore it and constrain
+/// by grammar anyway, while OpenAI's strict mode would reject schemas whose
+/// `required` list is narrower than `properties`.
 #[derive(Serialize)]
-struct WireResponseFormat {
-    #[serde(rename = "type")]
-    kind: &'static str,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireResponseFormat<'a> {
+    JsonObject,
+    JsonSchema { json_schema: WireJsonSchema<'a> },
+}
+
+#[derive(Serialize)]
+struct WireJsonSchema<'a> {
+    name: &'a str,
+    schema: &'a Value,
 }
 
 #[derive(Deserialize)]
@@ -410,7 +429,10 @@ fn map_success(
             .as_deref()
             .map(|value| scrub_redact_and_truncate(value, api_key, 128))
     };
-    let structured = if matches!(format, ResponseFormat::JsonObject) {
+    let structured = if matches!(
+        format,
+        ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. }
+    ) {
         text.as_deref()
             .and_then(|content| serde_json::from_str::<Value>(content).ok())
             .filter(Value::is_object)
@@ -606,6 +628,83 @@ mod tests {
         let response = map_success(body.as_bytes(), &ResponseFormat::Text, key).unwrap();
         assert!(!response.provider_request_id.unwrap().contains(key));
         assert!(!response.finish_reason.unwrap().contains(key));
+    }
+
+    #[test]
+    fn wire_request_carries_json_schema_response_format() {
+        use crate::router::ToolChoice;
+        use crate::types::budget::ModelTier;
+        use crate::types::ids::EndpointId;
+
+        let endpoint = ModelEndpoint {
+            id: EndpointId::new("endpoint").unwrap(),
+            provider: ProviderId::new("provider").unwrap(),
+            display_name: "Endpoint".into(),
+            model: "configured-model".into(),
+            tiers: vec![ModelTier::Standard],
+            supports_tools: false,
+            supports_structured_output: true,
+            supports_json_schema: true,
+            max_context: 1,
+            input_usd_per_mtok: None,
+            output_usd_per_mtok: None,
+            temperature: None,
+        };
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "summary": { "type": "string" } },
+            "required": ["summary"],
+            "additionalProperties": false,
+        });
+        let request = CompletionRequest {
+            messages: vec![],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            response_format: ResponseFormat::JsonSchema {
+                name: "repair_plan".into(),
+                schema: schema.clone(),
+            },
+            temperature: None,
+            max_output_tokens: None,
+        };
+        let body = serde_json::to_value(WireRequest::new(&endpoint, &request)).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "repair_plan"
+        );
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+        // `strict` stays off the wire (see WireResponseFormat docs).
+        assert!(body["response_format"]["json_schema"]
+            .as_object()
+            .unwrap()
+            .get("strict")
+            .is_none());
+
+        // The pre-amendment shapes are unchanged.
+        let plain = CompletionRequest {
+            response_format: ResponseFormat::JsonObject,
+            ..request
+        };
+        let body = serde_json::to_value(WireRequest::new(&endpoint, &plain)).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_object");
+        let text = CompletionRequest {
+            response_format: ResponseFormat::Text,
+            ..plain
+        };
+        let body = serde_json::to_value(WireRequest::new(&endpoint, &text)).unwrap();
+        assert!(body.as_object().unwrap().get("response_format").is_none());
+    }
+
+    #[test]
+    fn json_schema_format_parses_structured_object() {
+        let body =
+            br#"{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}"#;
+        let format = ResponseFormat::JsonSchema {
+            name: "s".into(),
+            schema: serde_json::json!({"type":"object"}),
+        };
+        assert!(map_success(body, &format, "").unwrap().structured.is_some());
     }
 
     #[test]

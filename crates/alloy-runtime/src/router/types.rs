@@ -33,6 +33,13 @@ pub struct ModelEndpoint {
     pub supports_tools: bool,
     /// Whether the endpoint can request JSON-object output.
     pub supports_structured_output: bool,
+    /// Whether the endpoint accepts a full JSON Schema as its
+    /// `response_format` constraint (OpenAI `json_schema` wire shape,
+    /// honoured by vLLM, Ollama ≥ 0.5, and llama.cpp `--jinja` servers).
+    ///
+    /// Defaults to `false`: servers that reject the shape degrade honestly
+    /// to plain `json_object` unless the operator opts the endpoint in.
+    pub supports_json_schema: bool,
     /// Advisory context-window size.
     pub max_context: u32,
     /// Operator price per one million input tokens.
@@ -123,6 +130,28 @@ pub enum ResponseFormat {
     Text,
     /// Request a JSON object while preserving the original text.
     JsonObject,
+    /// Request output constrained to a named JSON Schema (schema-constrained
+    /// decoding). Only sent to endpoints with `supports_json_schema = true`;
+    /// the router degrades to [`ResponseFormat::JsonObject`] everywhere else.
+    JsonSchema {
+        /// Stable schema name carried on the wire (OpenAI `json_schema.name`).
+        name: String,
+        /// The JSON Schema document itself.
+        schema: serde_json::Value,
+    },
+}
+
+/// A named JSON Schema constraining a structured completion.
+///
+/// Carried on [`RoutingRequest::response_schema`] (serde-default, so older
+/// payloads keep deserializing) and applied by the router only when the
+/// selected endpoint declares `supports_json_schema = true`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JsonSchemaSpec {
+    /// Stable schema name carried on the wire.
+    pub name: String,
+    /// The JSON Schema document.
+    pub schema: serde_json::Value,
 }
 
 /// Provider-neutral completion request.
@@ -205,6 +234,14 @@ pub struct RoutingRequest {
     pub requires_tools: bool,
     /// Require an endpoint that supports structured output.
     pub requires_structured_output: bool,
+    /// Optional JSON Schema constraining the structured response.
+    ///
+    /// Best-effort: it never filters endpoint selection. When the selected
+    /// endpoint lacks `supports_json_schema`, completion degrades to plain
+    /// [`ResponseFormat::JsonObject`]. `None` (the serde default, so older
+    /// payloads keep deserializing) is the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<JsonSchemaSpec>,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +276,7 @@ pub struct RoutedModel {
     capability: CapabilityId,
     capability_mapped: bool,
     requires_structured_output: bool,
+    response_schema: Option<JsonSchemaSpec>,
     route_event_seq: Option<EventSeq>,
     router_instance_id: u64,
     complete_ticket: CompleteTicket,
@@ -281,6 +319,13 @@ impl RoutedModel {
         self.requires_structured_output
     }
 
+    /// Caller-requested response schema, if any (best-effort: applied only
+    /// when the selected endpoint supports it).
+    #[must_use]
+    pub fn response_schema(&self) -> Option<&JsonSchemaSpec> {
+        self.response_schema.as_ref()
+    }
+
     /// Sequence of the successfully recorded route decision, if any.
     #[must_use]
     pub fn route_event_seq(&self) -> Option<EventSeq> {
@@ -304,6 +349,7 @@ impl RoutedModel {
             capability: req.capability.clone(),
             capability_mapped,
             requires_structured_output: req.requires_structured_output,
+            response_schema: req.response_schema.clone(),
             route_event_seq,
             router_instance_id,
             complete_ticket: CompleteTicket::new(),
@@ -338,6 +384,7 @@ impl Clone for RoutedModel {
             capability: self.capability.clone(),
             capability_mapped: self.capability_mapped,
             requires_structured_output: self.requires_structured_output,
+            response_schema: self.response_schema.clone(),
             route_event_seq: self.route_event_seq,
             router_instance_id: self.router_instance_id,
             complete_ticket: self.complete_ticket.clone(),
@@ -394,6 +441,7 @@ mod tests {
             tiers: vec![ModelTier::Standard],
             supports_tools: false,
             supports_structured_output: true,
+            supports_json_schema: false,
             max_context: 1,
             input_usd_per_mtok: Some(0.0),
             output_usd_per_mtok: Some(0.0),
@@ -416,6 +464,7 @@ mod tests {
             },
             requires_tools: false,
             requires_structured_output: true,
+            response_schema: None,
         }
     }
 

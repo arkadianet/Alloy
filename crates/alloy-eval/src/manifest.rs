@@ -724,6 +724,7 @@ fn build_fixture_endpoint(manifest: &FixtureManifest) -> Result<ModelEndpoint, E
         tiers: vec![ModelTier::Standard],
         supports_tools: false,
         supports_structured_output: false,
+        supports_json_schema: false,
         max_context: 8192,
         input_usd_per_mtok: manifest
             .endpoint_prices

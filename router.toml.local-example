@@ -26,6 +26,12 @@ model = "qwen2.5-coder:14b"
 tiers = ["standard", "economy"]
 supports_tools = true
 supports_structured_output = true
+# Schema-constrained decoding (RFC-0007 A-0007-2): Ollama >= 0.5 maps the
+# OpenAI response_format = {type = "json_schema", ...} shape onto its native
+# grammar-constrained `format`, so local models stop burning repair turns on
+# malformed JSON. Set false if your server rejects the shape; Alloy then
+# degrades that endpoint to plain json_object.
+supports_json_schema = true
 max_context = 32768
 # Optional sampling temperature (0.0..=2.0); omit for the provider default.
 # Moderate values suit repair with the retry loop: low temp re-samples the

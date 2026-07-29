@@ -316,7 +316,7 @@ impl WorkerPermissions for StaticPerms {
 
 // --- fixture ------------------------------------------------------------
 
-fn router_toml(supports_structured: bool) -> String {
+fn router_toml(supports_structured: bool, supports_json_schema: bool) -> String {
     format!(
         r#"
 [policy]
@@ -336,6 +336,7 @@ display_name = "Endpoint"
 model = "operator-configured"
 tiers = ["standard", "economy"]
 supports_structured_output = {supports_structured}
+supports_json_schema = {supports_json_schema}
 max_context = 65536
 input_usd_per_mtok = 2.0
 output_usd_per_mtok = 4.0
@@ -349,6 +350,7 @@ display_name = "Premium"
 model = "operator-premium"
 tiers = ["premium"]
 supports_structured_output = {supports_structured}
+supports_json_schema = {supports_json_schema}
 max_context = 65536
 input_usd_per_mtok = 8.0
 output_usd_per_mtok = 16.0
@@ -377,6 +379,7 @@ struct FixtureSpec {
     responses: Vec<Result<ModelResponse, ProviderError>>,
     tool_results: Vec<ToolResult>,
     supports_structured: bool,
+    supports_json_schema: bool,
     budget_policy: BudgetPolicy,
     config: WorkerConfig,
     /// Read-only graph behind the worker handle; `None` ⇒ the null graph.
@@ -389,6 +392,7 @@ impl Default for FixtureSpec {
             responses: vec![],
             tool_results: vec![],
             supports_structured: true,
+            supports_json_schema: false,
             budget_policy: BudgetPolicy::default(),
             config: WorkerConfig::default(),
             graph: None,
@@ -405,8 +409,11 @@ fn fixture(spec: FixtureSpec) -> Fixture {
     ));
     let perms = Arc::new(StaticPerms::new());
     let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
-    let config = RouterConfig::from_str("rfc0013 tests", &router_toml(spec.supports_structured))
-        .expect("valid router config");
+    let config = RouterConfig::from_str(
+        "rfc0013 tests",
+        &router_toml(spec.supports_structured, spec.supports_json_schema),
+    )
+    .expect("valid router config");
     let routers = Arc::new(ProcessRunRouterProvider::new(
         config,
         Arc::clone(&provider) as Arc<dyn ModelProvider>,
@@ -1355,6 +1362,54 @@ async fn structured_fallback_on_no_endpoint_is_recorded() {
         .find(|d| d.kind == DecisionKind::Custom("worker_attempt".into()))
         .expect("worker_attempt record");
     assert_eq!(attempt.metadata["structured_fallback"], json!(true));
+}
+
+#[tokio::test]
+async fn worker_attaches_response_schema_when_endpoint_supports_it() {
+    // A-0007-2: repair declares its response schema next to REPAIR_SYSTEM,
+    // and an opted-in endpoint receives it on the completion request.
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        supports_json_schema: true,
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, goal());
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _plan: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+
+    let requests = fx.provider.requests();
+    assert_eq!(requests.len(), 1);
+    let expected = alloy_runtime::capabilities::repair_response_schema();
+    let alloy_runtime::ResponseFormat::JsonSchema { name, schema } = &requests[0].response_format
+    else {
+        panic!(
+            "expected JsonSchema response format, got {:?}",
+            requests[0].response_format
+        );
+    };
+    assert_eq!(name, &expected.name);
+    assert_eq!(schema, &expected.schema);
+}
+
+#[tokio::test]
+async fn worker_schema_falls_back_to_json_object_when_unsupported() {
+    // A-0007-2 honest degrade: the endpoint never opted in, so the schema
+    // stays off the wire and the request is plain JSON-object.
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        supports_json_schema: false,
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, goal());
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _plan: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+
+    let requests = fx.provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].response_format,
+        alloy_runtime::ResponseFormat::JsonObject
+    );
 }
 
 #[tokio::test]

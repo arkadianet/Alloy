@@ -32,6 +32,7 @@ mod tests {
             tiers: vec![ModelTier::Standard],
             supports_tools: false,
             supports_structured_output: false,
+            supports_json_schema: false,
             max_context: 1,
             input_usd_per_mtok: Some(2.0),
             output_usd_per_mtok: Some(4.0),

@@ -28,7 +28,7 @@ use super::super::payload::{
     clamp_string, EditAppliedPayload, MAX_PAYLOAD_STRING_BYTES, PAYLOAD_SCHEMA_VERSION,
 };
 use super::super::perms::WorkerToolClass;
-use super::super::prompt::{fence_tool, EDIT_SYSTEM};
+use super::super::prompt::{edit_response_schema, fence_tool, EDIT_SYSTEM};
 use super::super::traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
 use super::{
     call_tool, finish_attempt, llm_exchange, load_pred_payloads, map_tool_result_error,
@@ -318,6 +318,7 @@ impl EditWorker {
             attempt,
             &self.config,
             EDIT_SYSTEM,
+            Some(&edit_response_schema()),
             inputs,
             feedback,
             |value| {
