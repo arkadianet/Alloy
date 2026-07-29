@@ -143,6 +143,10 @@ impl CargoJsonRecording {
         Ok(alloy_runtime::cargo_exit_verdict(
             Some(i64::from(self.exit_code)),
             has_errors,
+            // Recordings are cargo-check JSON: a genuine compile failure
+            // always carries error diagnostics, so a bare 101 is cargo's
+            // own failure — Inconclusive, same as the runtime adapter.
+            true,
         ))
     }
 }
