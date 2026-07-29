@@ -64,6 +64,8 @@ mod tests {
                 &fixture_toolchain(),
                 "x86_64-unknown-linux-gnu",
             ),
+            prior_source: None,
+            prior_proposal_artifact: None,
         }
     }
 

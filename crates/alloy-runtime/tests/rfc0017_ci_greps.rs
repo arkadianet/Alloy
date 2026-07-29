@@ -61,3 +61,48 @@ fn ac31_scheduler_never_names_max_repair_generations() {
         }
     }
 }
+
+fn crate_src_files(rel: &str) -> Vec<PathBuf> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let mut files = Vec::new();
+    if dir.exists() {
+        walk_rs_files(&dir, &mut files);
+    }
+    files
+}
+
+/// AC 46 (PS1): `DagStore::{put, put_if_generation, replace_for_replan}` is
+/// called from `planner/persist.rs` only — no other planner (or driver)
+/// module names a DAG write. Test modules are excluded: fixtures may arrange
+/// store states directly; PS1 constrains production plan writes.
+#[test]
+fn ac46_plan_writes_only_through_plan_persistence() {
+    let mut files = crate_src_files("src/planner");
+    files.extend(crate_src_files("src/driver"));
+    assert!(!files.is_empty(), "no planner sources found — walk broken");
+    let write_calls = [".put_if_generation(", ".replace_for_replan(", "dags.put("];
+    for file in files {
+        if file.ends_with("persist.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let mut in_tests = false;
+        for (idx, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("mod tests") {
+                in_tests = true;
+            }
+            if in_tests || is_comment_line(line) {
+                continue;
+            }
+            for needle in write_calls {
+                assert!(
+                    !line.contains(needle),
+                    "AC 46 violated: {}:{} calls {needle} outside planner/persist.rs",
+                    file.display(),
+                    idx + 1
+                );
+            }
+        }
+    }
+}

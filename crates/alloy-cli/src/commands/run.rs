@@ -219,6 +219,8 @@ async fn run_after_assembly(
                 policy_hash,
                 tool_versions,
                 compiler_fingerprint,
+                prior_source: None,
+                prior_proposal_artifact: None,
             },
         )
         .await?;
@@ -436,6 +438,8 @@ async fn dry_run(ctx: Ctx, args: RunArgs) -> Result<Exit, CliError> {
             policy_hash,
             tool_versions,
             compiler_fingerprint,
+            prior_source: None,
+            prior_proposal_artifact: None,
         },
     )
     .await?;

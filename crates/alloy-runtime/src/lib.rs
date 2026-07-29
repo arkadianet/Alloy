@@ -119,7 +119,7 @@ pub use obs::{
 };
 pub use planner::{
     DisabledLlmPlanService, PlanContext, PlanError, PlanProducedPayload, PlanResult, PlanService,
-    TemplatePlanService,
+    PlanSource, TemplatePlanService,
 };
 pub use router::{
     classify_provider_error, classify_router_error, ChatMessage, ChatRole, Citation,

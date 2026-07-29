@@ -37,6 +37,8 @@ fn plan_ctx(session: SessionId, run: RunId, dag: DagId) -> PlanContext {
             &fixture_toolchain(),
             "x86_64-unknown-linux-gnu",
         ),
+        prior_source: None,
+        prior_proposal_artifact: None,
     }
 }
 
