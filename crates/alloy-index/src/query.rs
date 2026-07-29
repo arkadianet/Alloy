@@ -38,7 +38,11 @@ pub(crate) fn run(
     // Q11: version read in the same transaction as the rows.
     let tx = conn.unchecked_transaction().map_err(from_rusqlite)?;
     let version = read_version(&tx)?;
-    let view = match q {
+    // RS4/A-0014-4: fidelity is computed from graph_meta.model_version by
+    // the one seam function, for every query kind including the Stubs.
+    let fidelity =
+        crate::migrate::fidelity_for_model_version(crate::migrate::read_model_version(&tx)?);
+    let mut view = match q {
         GraphQuery::Symbol { path } => symbol(&tx, path, version, limits)?,
         GraphQuery::Diagnostics { crate_id, since } => {
             diagnostics(&tx, crate_id.as_ref(), since.as_ref(), version, limits)?
@@ -54,6 +58,7 @@ pub(crate) fn run(
             view
         }
     };
+    view.fidelity = fidelity;
     // Read-only: the transaction rolls back on drop having written nothing.
     drop(tx);
     Ok(view)
@@ -174,7 +179,9 @@ fn diagnostics(
     Ok(view)
 }
 
-/// Q7: BFS over `Defines` edges in both directions, radius clamped.
+/// Q7: BFS over `Defines` **and** `Imports` edges in both directions,
+/// radius clamped. Imports participate since the RFC-0014 deep pass — the
+/// Appendix B projection reaches an imported node across one hop.
 fn subgraph(
     conn: &Connection,
     seeds: &[GraphNodeId],
@@ -184,20 +191,21 @@ fn subgraph(
 ) -> Result<GraphView, GraphError> {
     let radius = radius.min(MAX_SUBGRAPH_RADIUS);
 
-    // Load the (small, thin) Defines adjacency once.
+    // Load the (small) adjacency once, ordered for deterministic BFS (Q8).
     let mut adjacency: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut edge_rows: Vec<(String, String)> = Vec::new();
+    let mut edge_rows: Vec<(String, String, String)> = Vec::new();
     {
         let mut stmt = conn
-            .prepare("SELECT from_id, to_id FROM graph_edges WHERE kind = 'defines'")
+            .prepare("SELECT from_id, to_id, kind FROM graph_edges ORDER BY from_id, to_id, kind")
             .map_err(from_rusqlite)?;
         let mut rows = stmt.query([]).map_err(from_rusqlite)?;
         while let Some(row) = rows.next().map_err(from_rusqlite)? {
             let from: String = row.get(0).map_err(from_rusqlite)?;
             let to: String = row.get(1).map_err(from_rusqlite)?;
+            let kind: String = row.get(2).map_err(from_rusqlite)?;
             adjacency.entry(from.clone()).or_default().push(to.clone());
             adjacency.entry(to.clone()).or_default().push(from.clone());
-            edge_rows.push((from, to));
+            edge_rows.push((from, to, kind));
         }
     }
 
@@ -254,14 +262,14 @@ fn subgraph(
     // Edges with both endpoints in the view (post-truncation, in finish_view).
     let edges = edge_rows
         .into_iter()
-        .filter(|(f, t)| visited.contains(f) && visited.contains(t))
-        .map(|(f, t)| -> Result<GraphEdge, GraphError> {
+        .filter(|(f, t, _)| visited.contains(f) && visited.contains(t))
+        .map(|(f, t, k)| -> Result<GraphEdge, GraphError> {
             Ok(GraphEdge {
                 from: GraphNodeId::parse(&f)
                     .map_err(|e| GraphError::Corrupt(format!("edge from {f:?}: {e}")))?,
                 to: GraphNodeId::parse(&t)
                     .map_err(|e| GraphError::Corrupt(format!("edge to {t:?}: {e}")))?,
-                kind: parse_edge_kind("defines")?,
+                kind: parse_edge_kind(&k)?,
                 confidence: 1.0,
             })
         })

@@ -5,16 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use alloy_runtime::graph::{
-    FileChange, FileChangeKind, FixEvent, GraphError, GraphFidelity, GraphQuery, GraphView,
-    IngestReport, ProjectGraph,
+    FileChange, FixEvent, GraphError, GraphQuery, GraphView, IngestReport, ProjectGraph,
 };
 use alloy_runtime::types::diagnostic::DiagnosticEvent;
-use alloy_runtime::types::ids::{Digest, GraphSnapshotId, GraphVersion, Timestamp};
+use alloy_runtime::types::ids::{GraphSnapshotId, GraphVersion, Timestamp};
 use async_trait::async_trait;
 use rusqlite::Connection;
 
 use crate::db::{acquire_instance_lock, from_rusqlite, open_connection, spawn_graph_db, GraphDb};
-use crate::ingest::{self, hash_file, scan_workspace, ScanOutput};
+use crate::ingest::{self, scan_workspace, ScanOutput};
 use crate::layout::{GraphLayout, GraphOpenOptions, IngestLimits};
 use crate::metrics::{GraphMetrics, GraphMetricsSnapshot};
 use crate::migrate::{self, GRAPH_MODEL_VERSION};
@@ -57,6 +56,13 @@ impl SqliteProjectGraph {
     }
 
     fn open_sync(opts: &GraphOpenOptions, metrics: &Arc<GraphMetrics>) -> Result<Self, GraphError> {
+        if opts.limits.max_items == 0 {
+            // SY15: a zero item cap would let the store claim SynDeep while
+            // emitting nothing — rejected before any file is touched.
+            return Err(GraphError::LimitExceeded(
+                "max_items = 0 is rejected at open (SY15)".into(),
+            ));
+        }
         opts.layout.ensure_dirs()?;
         let lock = acquire_instance_lock(&opts.layout.root)?;
 
@@ -305,10 +311,14 @@ fn commit_scan(conn: &mut Connection, scan: &ScanOutput) -> Result<IngestReport,
         unchanged,
         crates: scan.crates,
         modules: scan.modules,
+        items: scan.items,
+        imports: scan.imports,
         files: scan.files.len() as u32,
         skipped: scan.skipped,
         warnings: scan.warnings.clone(),
-        source: GraphFidelity::Manifest,
+        // RS4/A-0014-4: fidelity is decided by the one seam function over
+        // the model version this pass ingested under, never by a literal.
+        source: migrate::fidelity_for_model_version(GRAPH_MODEL_VERSION),
     })
 }
 
@@ -322,96 +332,6 @@ pub(crate) fn read_version(conn: &Connection) -> Result<GraphVersion, GraphError
         )
         .map_err(from_rusqlite)?;
     Ok(GraphVersion(v as u64))
-}
-
-/// Recompute the §4.6 content digest from the stored rows and bump the
-/// version iff it changed (shared by the incremental path).
-fn recompute_and_bump(conn: &Connection) -> Result<(GraphVersion, bool), GraphError> {
-    let digest = digest_from_rows(conn)?;
-    let (stored_version, stored_digest): (i64, String) = conn
-        .query_row(
-            "SELECT graph_version, content_digest FROM graph_meta WHERE id = 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(from_rusqlite)?;
-    if stored_digest == digest.as_hex() {
-        return Ok((GraphVersion(stored_version as u64), false));
-    }
-    let next = stored_version + 1;
-    conn.execute(
-        "UPDATE graph_meta SET graph_version = ?1, content_digest = ?2, updated_at = ?3
-         WHERE id = 1",
-        rusqlite::params![next, digest.as_hex(), now_rfc3339()?],
-    )
-    .map_err(from_rusqlite)?;
-    Ok((GraphVersion(next as u64), true))
-}
-
-/// §4.6 canonical rendering over the stored rows.
-fn digest_from_rows(conn: &Connection) -> Result<Digest, GraphError> {
-    use alloy_runtime::types::ids::DigestHasher;
-    let mut hasher = DigestHasher::new();
-    let mut stmt = conn
-        .prepare(
-            "SELECT kind, path, crate_id, file, digest FROM graph_nodes
-             ORDER BY CASE kind
-                        WHEN 'workspace' THEN 0 WHEN 'crate' THEN 1
-                        WHEN 'module' THEN 2 ELSE 3 END, path",
-        )
-        .map_err(from_rusqlite)?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-            ))
-        })
-        .map_err(from_rusqlite)?;
-    for row in rows {
-        let (kind, path, crate_id, file, digest) = row.map_err(from_rusqlite)?;
-        hasher.update(kind.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(path.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(crate_id.as_deref().unwrap_or("").as_bytes());
-        hasher.update(b"\0");
-        hasher.update(file.as_deref().unwrap_or("").as_bytes());
-        hasher.update(b"\0");
-        hasher.update(digest.as_deref().unwrap_or("").as_bytes());
-        hasher.update(b"\n");
-    }
-    let mut stmt = conn
-        .prepare(
-            "SELECT nf.path, nt.path, e.kind
-               FROM graph_edges e
-               JOIN graph_nodes nf ON nf.id = e.from_id
-               JOIN graph_nodes nt ON nt.id = e.to_id
-              ORDER BY nf.path, nt.path, e.kind",
-        )
-        .map_err(from_rusqlite)?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(from_rusqlite)?;
-    for row in rows {
-        let (from_path, to_path, kind) = row.map_err(from_rusqlite)?;
-        hasher.update(from_path.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(to_path.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(kind.as_bytes());
-        hasher.update(b"\n");
-    }
-    Ok(hasher.finish())
 }
 
 #[async_trait]
@@ -433,111 +353,30 @@ impl ProjectGraph for SqliteProjectGraph {
         }
         let root = self.remembered_root()?;
 
-        // Classify: any structural change (manifest, created/deleted .rs)
-        // re-derives from the tree — a conservative superset of §6.6's
-        // per-subtree table that IN10's rebuild-equivalence sanctions.
-        let structural = changes.iter().any(|c| {
-            c.path == "Cargo.toml"
-                || c.path.ends_with("/Cargo.toml")
-                || (c.path.ends_with(".rs")
-                    && matches!(c.kind, FileChangeKind::Created | FileChangeKind::Deleted))
+        // RFC-0014 OQ6 (Beta default): any manifest or `.rs` change —
+        // including a plain modification — re-derives from the tree. Item
+        // and import facts come from the parse, so a per-file digest patch
+        // cannot keep IN10's incremental ≡ rebuild equivalence; per-file
+        // item invalidation waits on T14's digest-equality proof. Non-`.rs`,
+        // non-manifest paths are ignored and counted (§6.6).
+        let relevant = changes.iter().any(|c| {
+            c.path == "Cargo.toml" || c.path.ends_with("/Cargo.toml") || c.path.ends_with(".rs")
         });
-
-        if structural {
-            let limits = self.limits;
-            let root2 = root.clone();
-            let scan = tokio::task::spawn_blocking(move || scan_workspace(&root2, &limits))
-                .await
-                .map_err(|e| GraphError::Internal(format!("spawn_blocking join: {e}")))??;
+        if !relevant {
+            GraphMetrics::add(&self.metrics.files_skipped, changes.len() as u64);
             let db = Arc::clone(&self.db);
-            let report =
-                spawn_graph_db(db, move |db| db.with_mut(|conn| commit_scan(conn, &scan))).await?;
-            GraphMetrics::add(&self.metrics.files_skipped, u64::from(report.skipped));
-            return Ok(report.version);
+            return spawn_graph_db(db, |db| db.with(read_version)).await;
         }
 
-        // Modified-only path: re-hash tracked module files; untracked or
-        // non-.rs paths are ignored and counted (§6.6). Filesystem work runs
-        // on the blocking pool (X3's posture), and the same symlink/escape
-        // rules as the scan walk apply (IN4/SEC7): a symlinked file, or a
-        // path whose resolution leaves the workspace root, is skipped.
         let limits = self.limits;
-        let change_paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
-        let hash_root = root.clone();
-        let (updates, skipped) = tokio::task::spawn_blocking(
-            move || -> Result<(Vec<(String, Digest, u64)>, u64), GraphError> {
-                let canonical_root = hash_root
-                    .canonicalize()
-                    .map_err(|e| GraphError::Workspace(format!("canonicalize root: {e}")))?;
-                let mut updates: Vec<(String, Digest, u64)> = Vec::new();
-                let mut skipped = 0u64;
-                for path in change_paths {
-                    if !path.ends_with(".rs") {
-                        skipped += 1;
-                        continue;
-                    }
-                    let abs = hash_root.join(&path);
-                    // IN4/SEC7: never hash through a symlink...
-                    let is_symlink = std::fs::symlink_metadata(&abs)
-                        .map(|m| m.file_type().is_symlink())
-                        .unwrap_or(false);
-                    if is_symlink || !abs.is_file() {
-                        skipped += 1;
-                        continue;
-                    }
-                    // ...and never a path that resolves outside the root
-                    // (a symlinked intermediate directory).
-                    match abs.canonicalize() {
-                        Ok(resolved) if resolved.starts_with(&canonical_root) => {}
-                        _ => {
-                            skipped += 1;
-                            continue;
-                        }
-                    }
-                    let (digest, byte_len, oversized) = hash_file(&abs, &limits)?;
-                    if oversized {
-                        skipped += 1;
-                    }
-                    updates.push((path, digest, byte_len));
-                }
-                Ok((updates, skipped))
-            },
-        )
-        .await
-        .map_err(|e| GraphError::Internal(format!("spawn_blocking join: {e}")))??;
-        GraphMetrics::add(&self.metrics.files_skipped, skipped);
-
+        let scan = tokio::task::spawn_blocking(move || scan_workspace(&root, &limits))
+            .await
+            .map_err(|e| GraphError::Internal(format!("spawn_blocking join: {e}")))??;
         let db = Arc::clone(&self.db);
-        spawn_graph_db(db, move |db| {
-            db.with_mut(|conn| {
-                let tx = conn.unchecked_transaction().map_err(from_rusqlite)?;
-                {
-                    let mut files_stmt = tx
-                        .prepare_cached(
-                            "UPDATE graph_files SET digest = ?1, byte_len = ?2 WHERE path = ?3",
-                        )
-                        .map_err(from_rusqlite)?;
-                    let mut nodes_stmt = tx
-                        .prepare_cached("UPDATE graph_nodes SET digest = ?1 WHERE file = ?2")
-                        .map_err(from_rusqlite)?;
-                    for (path, digest, byte_len) in &updates {
-                        let changed = files_stmt
-                            .execute(rusqlite::params![digest.as_hex(), *byte_len as i64, path])
-                            .map_err(from_rusqlite)?;
-                        if changed == 0 {
-                            continue; // not a tracked module file — ignored (§6.6).
-                        }
-                        nodes_stmt
-                            .execute(rusqlite::params![digest.as_hex(), path])
-                            .map_err(from_rusqlite)?;
-                    }
-                }
-                let (version, _bumped) = recompute_and_bump(&tx)?;
-                tx.commit().map_err(from_rusqlite)?;
-                Ok(version)
-            })
-        })
-        .await
+        let report =
+            spawn_graph_db(db, move |db| db.with_mut(|conn| commit_scan(conn, &scan))).await?;
+        GraphMetrics::add(&self.metrics.files_skipped, u64::from(report.skipped));
+        Ok(report.version)
     }
 
     #[tracing::instrument(skip_all, name = "index.query")]
