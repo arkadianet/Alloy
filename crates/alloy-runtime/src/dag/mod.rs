@@ -22,6 +22,8 @@ pub use templates::{
     TemplateEdgeSpec, TemplateId, TemplateIdMap, TemplateManifest, TemplateNodeSpec,
 };
 pub use types::*;
+/// Kind ↔ capability-id map shared with the RFC-0013 registry (rule RG3).
+pub(crate) use validate::expected_capability;
 /// Shared predecessor-satisfaction rule (RFC-0009 §5.3.1), reused by
 /// `scheduler::linear::ready::promotable_nodes` (RFC-0010 §3.13) so the
 /// scheduler does not reimplement the readiness predicate.

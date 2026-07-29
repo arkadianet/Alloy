@@ -22,6 +22,7 @@
 //! - [`dag`] — TaskDag types, validation, templates, cache, I/O envelopes (RFC-0009)
 //! - [`planner`] — [`PlanService`] / [`TemplatePlanService`] (RFC-0009)
 //! - [`edit`] — EditEngine trait + TextPatch / SemanticOps IR (RFC-0008)
+//! - [`lang`] — [`LanguageBackend`] seam, toolchain runner, registry (RFC-0014)
 //! - [`config`] — TOML + env load (never writes `.env`)
 //!
 //! Author: arkadianet
@@ -30,12 +31,15 @@
 #![forbid(unsafe_code)]
 
 pub mod adapters;
+pub mod capabilities;
 pub mod config;
+pub mod context;
 pub mod dag;
 pub mod edit;
 pub mod error;
 pub mod events;
 pub mod graph;
+pub mod lang;
 pub mod logging;
 pub mod obs;
 pub mod planner;
@@ -54,7 +58,25 @@ pub use adapters::{
     UnavailableCapabilityExecutor, UnavailableGateHuman, UnavailableVerifyCompile,
     UnavailableVerifyTest, Verdict, VerdictOutcome, Verifier, VerifyClass, VerifyPermissions,
 };
+// RFC-0013 exports. The `edit` capability payload (`capabilities::
+// EditAppliedPayload`) is deliberately not re-exported here: the crate root
+// already exports RFC-0008's session-event payload of the same name.
+pub use capabilities::{
+    system_instruction_digest, Capability, CapabilityContext, CapabilityDescriptor,
+    CapabilityRegistry, CapabilityVersion, EditWorker, PlanningProposalPayload, PlanningWorker,
+    ProcessRunRouterProvider, RegError, RegistryCapabilityExecutor, RepairPlanPayload, RepairStep,
+    RepairWorker, ResolveHints, ReviewFinding, ReviewPayload, ReviewSeverity, ReviewVerdict,
+    ReviewWorker, RunRouterProvider, SessionWorkerPermissions, SideEffectClass, WorkerConfig,
+    WorkerDeps, WorkerPermissions, WorkerToolClass, CAPABILITY_CATALOG, EDIT_SYSTEM,
+    MAX_LLM_CAPABILITIES, PAYLOAD_SCHEMA_VERSION, REPAIR_SYSTEM, REVIEW_SYSTEM,
+};
 pub use config::{default_router_toml, ConfigPaths, RuntimeConfig};
+pub use context::{
+    AssembleInputs, AssembleRequest, BytesPerTokenEstimator, CompactStrategy, ContextEngine,
+    ContextError, ContextHandle, ContextMetricsSnapshot, ContextProfile, DefaultContextEngine,
+    Degradation, DegradationReason, DomainId, DomainWeights, EvictPolicy, EvictReport, FileExcerpt,
+    GraphProjection, NullContextEngine, StaleReason, TokenEstimator, WorkingSet,
+};
 pub use dag::{
     allocate_ids, build_topology, compiler_fingerprint_digest, compute_cache_key,
     goal_content_digest, policy_hash_digest, tool_versions_digest, ApprovalSpec, Backoff,
@@ -78,6 +100,10 @@ pub use graph::{
     derive_node_id, FileChange, FileChangeKind, FixEvent, GraphEdge, GraphEdgeKind, GraphError,
     GraphFidelity, GraphNode, GraphNodeKind, GraphQuery, GraphView, GraphViewHandle, IngestReport,
     NullProjectGraph, ProjectGraph,
+};
+pub use lang::{
+    scope_package, selector_args, LangError, LanguageBackend, LanguageManifest, LanguageRegistry,
+    McpToolchainRunner, RustToolchain, Scope, TestReport, TestSelector, TextEdit, ToolchainRunner,
 };
 pub use obs::{
     apply_prompt_retention, apply_tool_retention, hash_content, hash_prompt, hash_tool_body,
@@ -127,8 +153,8 @@ pub use types::diagnostic::{
 pub use types::ids::{
     ArtifactId, CapabilityId, CheckpointId, CrateId, DagId, DiagnosticId, Digest, DigestError,
     DigestHasher, EndpointId, EventSeq, GateId, GraphNodeId, GraphSnapshotId, GraphVersion,
-    IdError, LanguageId, NodeId, ProfileId, ProviderId, RunId, ServerId, SessionId, Timestamp,
-    TrajectoryId, TransactionId,
+    IdError, LanguageId, NodeId, ProfileId, ProviderId, RunId, ServerId, SessionId, SummaryId,
+    Timestamp, TrajectoryId, TransactionId,
 };
 pub use types::metrics::{RuntimeMetrics, WorkerMetrics};
 pub use types::permission::{ExecAllow, Glob, Grant, HostAllow, PermissionToken};

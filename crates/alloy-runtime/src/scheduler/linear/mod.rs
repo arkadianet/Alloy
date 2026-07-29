@@ -279,6 +279,7 @@ mod tests {
                 retain_tool_bodies: false,
                 run_timeout: Duration::from_secs(30),
                 budget_policy: BudgetPolicy::default(),
+                context_profile: crate::context::ContextProfile::v2_defaults(),
                 capture: Default::default(),
             })
             .unwrap();

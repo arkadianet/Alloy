@@ -5,7 +5,9 @@ mod diagnostics;
 mod gate;
 mod perms;
 mod tool_caller;
-mod verify;
+// `pub(crate)` so `lang::runner` can reuse the single cargo argv path and
+// exit-code classification (RFC-0014 LB9) without a second implementation.
+pub(crate) mod verify;
 
 pub use capability::{
     CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityOutcome,

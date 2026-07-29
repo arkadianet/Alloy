@@ -23,7 +23,9 @@ fn write(path: &Path, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
-/// Build Appendix B.1's tree under `root`.
+/// Build the toy workspace under `root` — RFC-0011 Appendix B.1's tree with
+/// the bodies RFC-0014 Appendix B adds for the Beta deep pass (module
+/// declarations, five items, three in-workspace imports).
 fn build_toy_workspace(root: &Path) {
     write(
         &root.join("Cargo.toml"),
@@ -33,18 +35,31 @@ fn build_toy_workspace(root: &Path) {
         &root.join("crates/toy-core/Cargo.toml"),
         "[package]\nname = \"toy-core\"\n",
     );
-    write(&root.join("crates/toy-core/src/lib.rs"), "// lib\n");
-    write(&root.join("crates/toy-core/src/io.rs"), "// io\n");
+    write(
+        &root.join("crates/toy-core/src/lib.rs"),
+        "pub mod io;\npub mod util;\npub struct Config { pub verbose: bool }\n",
+    );
+    write(
+        &root.join("crates/toy-core/src/io.rs"),
+        "mod reader;\npub use reader::Reader;\nuse crate::Config;\nuse std::io::Read;\n\
+         pub fn open(cfg: &Config) -> Reader { let _ = cfg; Reader {} }\n",
+    );
     write(
         &root.join("crates/toy-core/src/io/reader.rs"),
-        "// reader\n",
+        "pub struct Reader {}\n",
     );
-    write(&root.join("crates/toy-core/src/util/mod.rs"), "// util\n");
+    write(
+        &root.join("crates/toy-core/src/util/mod.rs"),
+        "pub const LIMIT: usize = 8;\n",
+    );
     write(
         &root.join("crates/toy-cli/Cargo.toml"),
         "[package]\nname = \"toy-cli\"\n",
     );
-    write(&root.join("crates/toy-cli/src/main.rs"), "fn main() {}\n");
+    write(
+        &root.join("crates/toy-cli/src/main.rs"),
+        "use toy_core::io;\nfn main() { let _ = io::open; }\n",
+    );
     write(&root.join("target/debug/junk.rs"), "// build output\n");
     write(&root.join("README.md"), "# toy\n");
 }
@@ -263,7 +278,8 @@ async fn edges_always_have_confidence_one() {
 // T3 — ingest
 // ---------------------------------------------------------------------
 
-// T3a: Appendix B golden node/edge set.
+// T3a: Appendix B golden node/edge set — the RFC-0014 Beta totals
+// (13 nodes, 12 Defines, 3 Imports).
 #[tokio::test]
 async fn rebuild_toy_workspace_golden_nodes_and_edges() {
     let fx = Fx::new();
@@ -272,6 +288,8 @@ async fn rebuild_toy_workspace_golden_nodes_and_edges() {
     assert_eq!(report.version, GraphVersion(1));
     assert_eq!(report.crates, 2);
     assert_eq!(report.modules, 5);
+    assert_eq!(report.items, 5);
+    assert_eq!(report.imports, 3);
     g.close().await.unwrap();
 
     let conn = rusqlite::Connection::open(fx.data.join("graph/graph.sqlite")).unwrap();
@@ -295,6 +313,36 @@ async fn rebuild_toy_workspace_golden_nodes_and_edges() {
             "toy-core",
             Some("toy-core"),
             Some("crates/toy-core/Cargo.toml"),
+        ),
+        (
+            "item",
+            "toy_cli::main::main",
+            Some("toy-cli"),
+            Some("crates/toy-cli/src/main.rs"),
+        ),
+        (
+            "item",
+            "toy_core::Config",
+            Some("toy-core"),
+            Some("crates/toy-core/src/lib.rs"),
+        ),
+        (
+            "item",
+            "toy_core::io::open",
+            Some("toy-core"),
+            Some("crates/toy-core/src/io.rs"),
+        ),
+        (
+            "item",
+            "toy_core::io::reader::Reader",
+            Some("toy-core"),
+            Some("crates/toy-core/src/io/reader.rs"),
+        ),
+        (
+            "item",
+            "toy_core::util::LIMIT",
+            Some("toy-core"),
+            Some("crates/toy-core/src/util/mod.rs"),
         ),
         (
             "module",
@@ -332,7 +380,7 @@ async fn rebuild_toy_workspace_golden_nodes_and_edges() {
         .iter()
         .map(|(k, p, c, f)| (k.as_str(), p.as_str(), c.as_deref(), f.as_deref()))
         .collect();
-    assert_eq!(got, expect, "B.2 node table");
+    assert_eq!(got, expect, "B.2 node table at Beta");
 
     let mut stmt = conn
         .prepare(
@@ -352,15 +400,20 @@ async fn rebuild_toy_workspace_golden_nodes_and_edges() {
         (".", "toy-core"),
         ("toy-cli", "toy_cli::main"),
         ("toy-core", "toy_core"),
+        ("toy_cli::main", "toy_cli::main::main"),
+        ("toy_core", "toy_core::Config"),
         ("toy_core", "toy_core::io"),
         ("toy_core", "toy_core::util"),
+        ("toy_core::io", "toy_core::io::open"),
         ("toy_core::io", "toy_core::io::reader"),
+        ("toy_core::io::reader", "toy_core::io::reader::Reader"),
+        ("toy_core::util", "toy_core::util::LIMIT"),
     ];
     let got: Vec<(&str, &str)> = edges
         .iter()
         .map(|(f, t)| (f.as_str(), t.as_str()))
         .collect();
-    assert_eq!(got, expect_edges, "B.3 edge table");
+    assert_eq!(got, expect_edges, "B.3 edge table at Beta");
 }
 
 // T3b: IN6 — a second rebuild over an unchanged tree does not bump.
@@ -611,9 +664,10 @@ async fn exceeding_max_files_leaves_previous_version_intact() {
     assert!(count(&fx.data, "SELECT COUNT(*) FROM graph_nodes") > 0);
 }
 
-// T3m: IN8/IN9 — zero Item nodes, zero Imports edges.
+// T3m (superseded by RFC-0014 SY3/SY11): the deep pass fills the reserved
+// `item`/`imports` seams — the v1 CHECK lists admit them with no DDL (SY2).
 #[tokio::test]
-async fn no_item_nodes_and_no_imports_edges_are_written() {
+async fn deep_pass_writes_item_nodes_and_imports_edges() {
     let fx = Fx::new();
     let g = fx.open().await;
     g.rebuild(&fx.ws).await.unwrap();
@@ -623,14 +677,14 @@ async fn no_item_nodes_and_no_imports_edges_are_written() {
             &fx.data,
             "SELECT COUNT(*) FROM graph_nodes WHERE kind = 'item'"
         ),
-        0
+        5
     );
     assert_eq!(
         count(
             &fx.data,
             "SELECT COUNT(*) FROM graph_edges WHERE kind = 'imports'"
         ),
-        0
+        3
     );
 }
 
@@ -727,7 +781,9 @@ async fn modified_file_with_new_digest_updates_digest_and_bumps_version() {
     assert_eq!(file_digest, Digest::sha256(b"// io v2\n").as_hex());
 }
 
-// T4c: Created module file adds the node and its Defines edge.
+// T4c: Created module file adds the node and its Defines edge. Module
+// inference is declaration-driven at Beta (RFC-0014 A-0014-2), so the new
+// file arrives together with its `mod writer;` declaration.
 #[tokio::test]
 async fn created_module_file_adds_node_and_defines_edge() {
     let fx = Fx::new();
@@ -735,13 +791,24 @@ async fn created_module_file_adds_node_and_defines_edge() {
     let v1 = g.rebuild(&fx.ws).await.unwrap();
     write(
         &fx.ws.join("crates/toy-core/src/io/writer.rs"),
-        "// writer\n",
+        "pub struct Writer {}\n",
+    );
+    write(
+        &fx.ws.join("crates/toy-core/src/io.rs"),
+        "mod reader;\nmod writer;\npub use reader::Reader;\nuse crate::Config;\n\
+         pub fn open(cfg: &Config) -> Reader { let _ = cfg; Reader {} }\n",
     );
     let v2 = g
-        .apply_incremental(&[FileChange {
-            path: "crates/toy-core/src/io/writer.rs".into(),
-            kind: FileChangeKind::Created,
-        }])
+        .apply_incremental(&[
+            FileChange {
+                path: "crates/toy-core/src/io/writer.rs".into(),
+                kind: FileChangeKind::Created,
+            },
+            FileChange {
+                path: "crates/toy-core/src/io.rs".into(),
+                kind: FileChangeKind::Modified,
+            },
+        ])
         .await
         .unwrap();
     assert!(v2 > v1);
@@ -1002,7 +1069,9 @@ async fn subgraph_bfs_honours_radius_directions_and_unknown_seeds() {
         .unwrap();
     assert_eq!(view.nodes.len(), 1);
 
-    // radius 1 → both directions (B.4's example).
+    // radius 1 → both directions over Defines *and* Imports (RFC-0014
+    // Appendix B's projection: items and the imported node are one hop out,
+    // and the importing bin module is reachable in reverse).
     let view = g
         .query(GraphQuery::Subgraph {
             seeds: vec![io],
@@ -1013,9 +1082,17 @@ async fn subgraph_bfs_honours_radius_directions_and_unknown_seeds() {
     let paths: Vec<&str> = view.nodes.iter().map(|n| n.path.as_str()).collect();
     assert_eq!(
         paths,
-        vec!["toy_core", "toy_core::io", "toy_core::io::reader"]
+        vec![
+            "toy_cli::main",
+            "toy_core",
+            "toy_core::io",
+            "toy_core::io::reader",
+            "toy_core::Config",
+            "toy_core::io::open",
+            "toy_core::io::reader::Reader",
+        ]
     );
-    assert_eq!(view.edges.len(), 2);
+    assert_eq!(view.edges.len(), 8);
 
     // radius clamps at 3 — same result as an absurd radius.
     let a = g
@@ -1203,8 +1280,8 @@ async fn snapshot_records_version_and_counts() {
         )
         .unwrap();
     assert_eq!(version, 1);
-    assert_eq!(nodes, 8);
-    assert_eq!(edges, 7);
+    assert_eq!(nodes, 13, "RFC-0014 Appendix B: 13 nodes at Beta");
+    assert_eq!(edges, 15, "RFC-0014 Appendix B: 12 Defines + 3 Imports");
 }
 
 // SEC6: a diagnostic span with an absolute path outside the workspace stores

@@ -30,6 +30,9 @@ tempfile = { workspace = true }
 landlock = { workspace = true }
 
 [dev-dependencies]
+# RFC-0013 T20: the scheduler e2e drives the real capability registry with
+# alloy-eval's ScriptedProvider (rule C2: dev-dependency only, no cycle).
+alloy-eval = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
