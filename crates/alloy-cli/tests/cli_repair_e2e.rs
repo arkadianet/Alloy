@@ -432,6 +432,19 @@ fn run_sigterm_drains_and_exits_cancelled() {
         eprintln!("skip: run reached the gate before SIGTERM");
         return;
     }
+    if out.status.code().is_none() {
+        // Killed by the raw signal: it landed during assembly, before the
+        // CR14 handler was armed (slow CI). Default disposition applies
+        // there by design — nothing was running yet.
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            out.status.signal(),
+            Some(rustix::process::Signal::Term as i32),
+            "{stderr}"
+        );
+        eprintln!("skip: SIGTERM landed before the handler was armed");
+        return;
+    }
     assert_eq!(
         out.status.code(),
         Some(6),
