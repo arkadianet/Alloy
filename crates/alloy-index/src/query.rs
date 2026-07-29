@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
-use alloy_runtime::graph::{FixEvent, GraphEdge, GraphError, GraphNode, GraphQuery, GraphView};
+use alloy_runtime::graph::{
+    FixEvent, GraphEdge, GraphEdgeKind, GraphError, GraphNode, GraphQuery, GraphView,
+};
 use alloy_runtime::types::diagnostic::DiagnosticEvent;
 use alloy_runtime::types::ids::{
     ArtifactId, CrateId, DiagnosticId, Digest, GraphNodeId, Timestamp, TransactionId,
@@ -41,7 +43,7 @@ pub(crate) fn run(
     let tx = conn.unchecked_transaction().map_err(from_rusqlite)?;
     let version = read_version(&tx)?;
     // RS4/A-0014-4: fidelity is computed from graph_meta.model_version by
-    // the one seam function, for every query kind including the Stubs.
+    // the one seam function, for every query kind.
     let fidelity =
         crate::migrate::fidelity_for_model_version(crate::migrate::read_model_version(&tx)?);
     let mut view = match q {
@@ -55,12 +57,33 @@ pub(crate) fn run(
             diagnostic_code,
             limit,
         } => similar_fixes(&tx, diagnostic_code, *limit, version, limits)?,
-        // Q4/Q5 Stubs: empty views, truncated, never an error.
-        GraphQuery::Refs { .. } | GraphQuery::Impls { .. } | GraphQuery::Callers { .. } => {
-            let mut view = GraphView::empty(version);
-            view.truncated = true;
-            view
-        }
+        // Q4/Q5 as amended by A-0011-6: anchored edge lookups over the
+        // semantic edges the deep pass records. Never an error; an unknown
+        // anchor is an honest empty view.
+        GraphQuery::Refs { node } => neighbours(
+            &tx,
+            node,
+            &[GraphEdgeKind::References, GraphEdgeKind::Imports],
+            Direction::Incoming,
+            version,
+            limits,
+        )?,
+        GraphQuery::Impls { trait_node } => neighbours(
+            &tx,
+            trait_node,
+            &[GraphEdgeKind::Impls],
+            Direction::Both,
+            version,
+            limits,
+        )?,
+        GraphQuery::Callers { fn_node } => neighbours(
+            &tx,
+            fn_node,
+            &[GraphEdgeKind::Calls],
+            Direction::Incoming,
+            version,
+            limits,
+        )?,
     };
     view.fidelity = fidelity;
     // Read-only: the transaction rolls back on drop having written nothing.
@@ -260,9 +283,113 @@ fn fix_from_row(row: &rusqlite::Row<'_>) -> Result<FixEvent, GraphError> {
     })
 }
 
-/// Q7: BFS over `Defines` **and** `Imports` edges in both directions,
-/// radius clamped. Imports participate since the RFC-0014 deep pass — the
-/// Appendix B projection reaches an imported node across one hop.
+/// Q4/Q5 as amended by A-0011-6: the anchor node plus the edges of `kinds`
+/// touching it — incoming only (`Refs`, `Callers`) or both directions
+/// (`Impls`, so one query answers "implementers of this trait" and "traits
+/// this type implements"). An unknown anchor returns an empty view with
+/// `truncated = false`: nothing was withheld, and fabricating a row for an
+/// id the graph never minted would violate G7.
+/// Which incident edges a neighbourhood query admits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// Edges pointing at the anchor only (`Refs`, `Callers`).
+    Incoming,
+    /// Either endpoint (`Impls` answers both directions — A-0011-6c).
+    Both,
+}
+
+fn neighbours(
+    conn: &Connection,
+    anchor: &GraphNodeId,
+    kinds: &[alloy_runtime::graph::GraphEdgeKind],
+    direction: Direction,
+    version: alloy_runtime::GraphVersion,
+    limits: &IngestLimits,
+) -> Result<GraphView, GraphError> {
+    let id = anchor.to_string();
+    let known: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM graph_nodes WHERE id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .map_err(from_rusqlite)?;
+    if known == 0 {
+        return Ok(GraphView::empty(version));
+    }
+
+    // `kinds` are compile-time wire tags, never caller input.
+    let kind_list = kinds
+        .iter()
+        .map(|k| format!("'{}'", k.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let direction = match direction {
+        Direction::Both => "(to_id = ?1 OR from_id = ?1)",
+        Direction::Incoming => "to_id = ?1",
+    };
+    // All incident edges are fetched so truncation happens at the Q8 node
+    // ordering boundary in `finish_view` (Q9), mirroring `subgraph`.
+    let sql = format!(
+        "SELECT from_id, to_id, kind FROM graph_edges
+          WHERE kind IN ({kind_list}) AND {direction}
+          ORDER BY from_id, to_id, kind"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(from_rusqlite)?;
+    let mut rows = stmt.query([&id]).map_err(from_rusqlite)?;
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    ids.insert(id.clone());
+    let mut edges: Vec<GraphEdge> = Vec::new();
+    while let Some(row) = rows.next().map_err(from_rusqlite)? {
+        let from: String = row.get(0).map_err(from_rusqlite)?;
+        let to: String = row.get(1).map_err(from_rusqlite)?;
+        let kind: String = row.get(2).map_err(from_rusqlite)?;
+        ids.insert(from.clone());
+        ids.insert(to.clone());
+        edges.push(GraphEdge {
+            from: GraphNodeId::parse(&from)
+                .map_err(|e| GraphError::Corrupt(format!("edge from {from:?}: {e}")))?,
+            to: GraphNodeId::parse(&to)
+                .map_err(|e| GraphError::Corrupt(format!("edge to {to:?}: {e}")))?,
+            kind: parse_edge_kind(&kind)?,
+            confidence: 1.0,
+        });
+    }
+
+    let id_params: Vec<String> = ids.into_iter().collect();
+    let nodes = query_nodes_by_ids(conn, &id_params)?;
+    finish_view(nodes, edges, version, limits)
+}
+
+/// Fetch nodes by id in bounded chunks: a high-degree anchor can put tens
+/// of thousands of ids in play, and one placeholder per id would exceed
+/// SQLite's variable limit (32766 for the bundled build). Chunk order does
+/// not matter — `finish_view` sorts (Q8).
+fn query_nodes_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<GraphNode>, GraphError> {
+    const CHUNK: usize = 512;
+    let mut nodes = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT {NODE_COLS} FROM graph_nodes WHERE id IN ({placeholders})");
+        nodes.extend(query_nodes(
+            conn,
+            &sql,
+            rusqlite::params_from_iter(chunk.iter()),
+        )?);
+    }
+    Ok(nodes)
+}
+
+/// Q7 as amended by A-0011-6f: BFS over the **structural** edges —
+/// `Defines` and `Imports` — in both directions, radius clamped. Imports
+/// participate since the RFC-0014 deep pass (its Appendix B projection
+/// reaches an imported node across one hop). The semantic kinds
+/// (`References`/`Calls`/`Impls`) are never traversed — a call graph is
+/// asked for via `Callers`/`Refs`/`Impls`, not pulled into a neighbourhood
+/// — but semantic edges whose endpoints both land in the view are returned
+/// (the §5 edge-inclusion rule).
 fn subgraph(
     conn: &Connection,
     seeds: &[GraphNodeId],
@@ -284,16 +411,20 @@ fn subgraph(
             let from: String = row.get(0).map_err(from_rusqlite)?;
             let to: String = row.get(1).map_err(from_rusqlite)?;
             let kind: String = row.get(2).map_err(from_rusqlite)?;
-            adjacency.entry(from.clone()).or_default().push(to.clone());
-            adjacency.entry(to.clone()).or_default().push(from.clone());
+            // Only structural kinds enter the adjacency (Q7 / A-0011-6f);
+            // every kind stays in `edge_rows` for in-view inclusion.
+            if kind == GraphEdgeKind::Defines.as_str() || kind == GraphEdgeKind::Imports.as_str() {
+                adjacency.entry(from.clone()).or_default().push(to.clone());
+                adjacency.entry(to.clone()).or_default().push(from.clone());
+            }
             edge_rows.push((from, to, kind));
         }
     }
 
     // Unknown seeds are ignored (Q7). The visited set is capped at
     // `max_query_nodes + 1`: one over the cap is enough to detect Q9
-    // truncation, and it bounds both memory and the SQL `IN` placeholder
-    // count well under SQLite's variable limit. BFS order over sorted
+    // truncation, and it bounds memory (the node fetch is chunked, so the
+    // SQL variable limit is safe at any cap). BFS order over sorted
     // adjacency is deterministic, so the capped set is too (Q8).
     let visit_cap = limits.max_query_nodes as usize + 1;
     let mut visited: BTreeSet<String> = BTreeSet::new();
@@ -333,12 +464,8 @@ fn subgraph(
     if visited.is_empty() {
         return Ok(GraphView::empty(version));
     }
-    let placeholders = std::iter::repeat_n("?", visited.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!("SELECT {NODE_COLS} FROM graph_nodes WHERE id IN ({placeholders})");
     let ids: Vec<String> = visited.iter().cloned().collect();
-    let nodes = query_nodes(conn, &sql, rusqlite::params_from_iter(ids.iter()))?;
+    let nodes = query_nodes_by_ids(conn, &ids)?;
 
     // Edges with both endpoints in the view (post-truncation, in finish_view).
     let edges = edge_rows

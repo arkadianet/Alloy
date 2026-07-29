@@ -151,14 +151,14 @@ fn sample_fix(code: &str) -> FixEvent {
 async fn migrate_fresh_and_idempotent() {
     let fx = Fx::new();
     let g = fx.open().await;
-    assert_eq!(g.schema_version(), 1);
+    assert_eq!(g.schema_version(), 2);
     g.close().await.unwrap();
     drop(g); // release the X1 instance lock before reopening
     let g = fx.open().await;
-    assert_eq!(g.schema_version(), 1);
+    assert_eq!(g.schema_version(), 2);
     assert_eq!(
         count(&fx.data, "SELECT COUNT(*) FROM graph_schema_migrations"),
-        1
+        2
     );
     g.close().await.unwrap();
 }
@@ -994,24 +994,40 @@ async fn symbol_resolves_exactly_and_never_prefix_matches() {
     g.close().await.unwrap();
 }
 
-// T6d/T6f: the three remaining Stub kinds return empty truncated views
-// (Q4, Q5). `SimilarFixes` left the Stub set with amendment A-0011-5.
+// T6d/T6f as amended by A-0011-6: the former Stub kinds answer from the
+// semantic edges; empty answers are honest (`truncated = false`), and no
+// answer is ever an error.
 #[tokio::test]
-async fn stub_queries_return_empty_truncated_views() {
+async fn former_stub_queries_answer_from_semantic_edges() {
     let fx = Fx::new();
     let g = built(&fx).await;
-    let node = derive_node_id(GraphNodeKind::Module, "toy-core\0toy_core");
-    let queries = vec![
-        GraphQuery::Callers { fn_node: node },
-        GraphQuery::Refs { node },
-        GraphQuery::Impls { trait_node: node },
-    ];
-    for q in queries {
-        let view = g.query(q.clone()).await.unwrap();
-        assert!(view.is_empty(), "{q:?} must be empty");
-        assert!(view.truncated, "{q:?} must set truncated");
-    }
-    assert!(g.metrics().queries_stub >= 3);
+    // Refs: `open`'s signature references Config; `io` imports it.
+    let config = derive_node_id(GraphNodeKind::Item, "toy-core\0toy_core::Config");
+    let view = g.query(GraphQuery::Refs { node: config }).await.unwrap();
+    let paths: Vec<&str> = view.nodes.iter().map(|n| n.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["toy_core::io", "toy_core::Config", "toy_core::io::open"]
+    );
+    assert_eq!(view.edges.len(), 2, "one references + one imports edge");
+    assert!(!view.truncated);
+    // Callers: nothing calls `open` in the toy tree — anchor only.
+    let open = derive_node_id(GraphNodeKind::Item, "toy-core\0toy_core::io::open");
+    let view = g
+        .query(GraphQuery::Callers { fn_node: open })
+        .await
+        .unwrap();
+    assert_eq!(view.nodes.len(), 1, "anchor only, never an error");
+    assert!(view.edges.is_empty());
+    assert!(!view.truncated, "nothing was withheld");
+    // Impls: no trait impls exist in the toy tree.
+    let view = g
+        .query(GraphQuery::Impls { trait_node: config })
+        .await
+        .unwrap();
+    assert_eq!(view.nodes.len(), 1);
+    assert!(view.edges.is_empty());
+    assert!(!view.truncated);
     g.close().await.unwrap();
 }
 
@@ -1088,7 +1104,9 @@ async fn subgraph_bfs_honours_radius_directions_and_unknown_seeds() {
             "toy_core::io::reader::Reader",
         ]
     );
-    assert_eq!(view.edges.len(), 8);
+    // Ten edges among these seven nodes since A-0011-6: eight Defines/
+    // Imports plus open's two References (Config, Reader).
+    assert_eq!(view.edges.len(), 10);
 
     // radius clamps at 3 — same result as an absurd radius.
     let a = g
@@ -1365,7 +1383,7 @@ async fn snapshot_records_version_and_counts() {
         .unwrap();
     assert_eq!(version, 1);
     assert_eq!(nodes, 13, "RFC-0014 Appendix B: 13 nodes at Beta");
-    assert_eq!(edges, 15, "RFC-0014 Appendix B: 12 Defines + 3 Imports");
+    assert_eq!(edges, 18, "A-0011-6: 12 Defines + 3 Imports + 3 References");
 }
 
 // SEC6: a diagnostic span with an absolute path outside the workspace stores

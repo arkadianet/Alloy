@@ -1,12 +1,26 @@
-//! The `syn` item/import deep pass (RFC-0014 §5, `model_version = 2`).
+//! The `syn` item/import/reference deep pass (RFC-0014 §5, RFC-0011
+//! amendment A-0011-6 — `model_version = 3`).
 //!
 //! Module inference is **declaration-driven** (amendment A-0014-2): roots
 //! come from the manifest (IN7a/IN7b), then `mod foo;` / `mod foo { … }`
 //! declarations decide children; `#[path]` is honoured; `cfg` is never
 //! evaluated (SY7). IN7f survives verbatim — a missing node is acceptable,
-//! an invented one is not (G7). The visitor walks items and nested `mod`
-//! blocks only; it never descends into function bodies, expressions, or
-//! macro invocations (SY10, SC3).
+//! an invented one is not (G7).
+//!
+//! Since amendment A-0011-6 the pass also records **semantic edges**
+//! between the item nodes it already emits: `References` (type usages and
+//! multi-segment path expressions), `Calls` (fn calls whose callee resolves
+//! to a workspace `fn` item), and `Impls` (`impl Trait for Type` blocks).
+//! Resolution is **syntactic and best-effort** — `syn` performs no name
+//! resolution, so the pass resolves only through the scopes it can see:
+//! `crate`/`self`/`super` prefixes, the module's own `use` bindings, the
+//! module's declared children, workspace crate idents, and unambiguous glob
+//! imports. Everything else — `std`/registry paths, method calls (no type
+//! inference), locals, generic parameters, macro-generated code — records
+//! **nothing**. A missing edge is acceptable; an invented one is not (G7).
+//! Known accepted imprecision, documented in RFC-0011 §2.3b: a body-local
+//! binding that shadows an in-scope single-segment fn name can attribute a
+//! call to the workspace item, and `#[cfg]` variants are all recorded.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -39,6 +53,54 @@ pub(crate) struct UseRecord {
     glob: bool,
     /// `use ::a::b` — extern-prelude only; relative resolution is skipped.
     leading_colon: bool,
+    /// Name the leaf binds in the importing module (`c` for `use a::b as
+    /// c`), feeding the A-0011-6 alias table. `None` for globs.
+    alias: Option<String>,
+}
+
+/// A raw, unresolved path as it appeared in source (A-0011-6).
+#[derive(Debug, Clone)]
+pub(crate) struct RawPath {
+    segments: Vec<String>,
+    leading_colon: bool,
+}
+
+fn raw_of(path: &syn::Path) -> RawPath {
+    RawPath {
+        segments: path.segments.iter().map(|s| s.ident.to_string()).collect(),
+        leading_colon: path.leading_colon.is_some(),
+    }
+}
+
+/// Where a pending reference originates.
+#[derive(Debug)]
+enum RefOrigin {
+    /// A module-level item node already emitted.
+    Node { id: GraphNodeId, path: String },
+    /// The self type of an `impl` block — impl-block bodies have no node of
+    /// their own, so their references attribute to the self-type item once
+    /// it resolves (A-0011-6).
+    SelfType(RawPath),
+}
+
+/// One reference or call awaiting workspace-wide resolution (A-0011-6).
+#[derive(Debug)]
+struct PendingRef {
+    crate_ident: String,
+    module_path: String,
+    origin: RefOrigin,
+    target: RawPath,
+    /// `true` when the path was a call expression's callee.
+    is_call: bool,
+}
+
+/// One `impl Trait for Type` block awaiting resolution (A-0011-6).
+#[derive(Debug)]
+struct ImplRecord {
+    crate_ident: String,
+    module_path: String,
+    self_ty: RawPath,
+    trait_ty: RawPath,
 }
 
 /// Cross-crate state of one deep pass.
@@ -52,6 +114,13 @@ pub(crate) struct DeepPass {
     /// by two module trees (lib and bin) keeps its first module.
     seen_files: BTreeSet<String>,
     uses: Vec<UseRecord>,
+    /// Full rust paths of emitted module-level `fn` items — the only
+    /// admissible `Calls` targets (A-0011-6).
+    fn_items: BTreeSet<String>,
+    /// References/calls collected during the walk, resolved at the end.
+    refs: Vec<PendingRef>,
+    /// Trait impl blocks collected during the walk.
+    impls: Vec<ImplRecord>,
     /// Idents of every workspace member (SY13 leading-segment resolution).
     workspace_idents: BTreeSet<String>,
 }
@@ -64,6 +133,9 @@ impl DeepPass {
             seen_paths: BTreeSet::new(),
             seen_files: BTreeSet::new(),
             uses: Vec::new(),
+            fn_items: BTreeSet::new(),
+            refs: Vec::new(),
+            impls: Vec::new(),
             workspace_idents: members.iter().map(|m| crate_ident(&m.package)).collect(),
         }
     }
@@ -364,8 +436,11 @@ struct ModScope<'a> {
     depth: u32,
 }
 
-/// SY3/SY5/SY10: module-level items and nested `mod`s only; `impl` blocks,
-/// macros and bodies are never entered.
+/// SY3/SY10: module-level items and nested `mod`s only; macros are never
+/// entered. Since A-0011-6, item bodies and signatures are walked for
+/// reference/call collection, and `impl` blocks yield `Impls` edges plus
+/// references attributed to their self type — but still no item nodes of
+/// their own (SY5).
 fn walk_items(
     items: &[syn::Item],
     scope: &ModScope<'_>,
@@ -375,32 +450,50 @@ fn walk_items(
 ) -> Result<(), GraphError> {
     for item in items {
         match item {
-            syn::Item::Fn(i) => emit_item(&i.sig.ident, scope, ctx, pass, out)?,
-            syn::Item::Struct(i) => emit_item(&i.ident, scope, ctx, pass, out)?,
-            syn::Item::Enum(i) => emit_item(&i.ident, scope, ctx, pass, out)?,
-            syn::Item::Union(i) => emit_item(&i.ident, scope, ctx, pass, out)?,
-            syn::Item::Trait(i) => emit_item(&i.ident, scope, ctx, pass, out)?,
-            syn::Item::Type(i) => emit_item(&i.ident, scope, ctx, pass, out)?,
-            syn::Item::Const(i) => emit_item(&i.ident, scope, ctx, pass, out)?,
-            syn::Item::Static(i) => emit_item(&i.ident, scope, ctx, pass, out)?,
+            syn::Item::Fn(i) => {
+                if let Some((id, path)) = emit_item(&i.sig.ident, scope, ctx, pass, out)? {
+                    pass.fn_items.insert(path.clone());
+                    collect_refs(item, Some(&i.sig.generics), id, path, scope, ctx, pass);
+                }
+            }
+            syn::Item::Struct(i) => {
+                emit_with_refs(item, &i.ident, Some(&i.generics), scope, ctx, pass, out)?
+            }
+            syn::Item::Enum(i) => {
+                emit_with_refs(item, &i.ident, Some(&i.generics), scope, ctx, pass, out)?
+            }
+            syn::Item::Union(i) => {
+                emit_with_refs(item, &i.ident, Some(&i.generics), scope, ctx, pass, out)?
+            }
+            syn::Item::Trait(i) => {
+                emit_with_refs(item, &i.ident, Some(&i.generics), scope, ctx, pass, out)?
+            }
+            syn::Item::Type(i) => {
+                emit_with_refs(item, &i.ident, Some(&i.generics), scope, ctx, pass, out)?
+            }
+            syn::Item::Const(i) => {
+                emit_with_refs(item, &i.ident, Some(&i.generics), scope, ctx, pass, out)?
+            }
+            syn::Item::Static(i) => emit_with_refs(item, &i.ident, None, scope, ctx, pass, out)?,
             syn::Item::Mod(m) => walk_mod(m, scope, ctx, pass, out)?,
             syn::Item::Use(u) => collect_use(u, scope, ctx, pass),
-            // SY5: impl blocks and associated items are deferred; macros,
-            // extern blocks and the rest are never entered (SY10).
+            syn::Item::Impl(i) => collect_impl(i, scope, ctx, pass),
+            // Macros, extern blocks and the rest are never entered (SY10).
             _ => {}
         }
     }
     Ok(())
 }
 
-/// One item node plus its `Defines` edge (SY3, SY4, SY6).
+/// One item node plus its `Defines` edge (SY3, SY4, SY6). `Ok(None)` when a
+/// colliding path kept its first claimant (SY8).
 fn emit_item(
     ident: &syn::Ident,
     scope: &ModScope<'_>,
     ctx: &mut CrateCtx<'_>,
     pass: &mut DeepPass,
     out: &mut ScanOutput,
-) -> Result<(), GraphError> {
+) -> Result<Option<(GraphNodeId, String)>, GraphError> {
     let path = format!("{}::{ident}", scope.module_path);
     if !pass
         .seen_paths
@@ -411,7 +504,7 @@ fn emit_item(
         out.warnings.push(format!(
             "colliding item path {path:?}; keeping the first in traversal order (SY8)"
         ));
-        return Ok(());
+        return Ok(None);
     }
     pass.item_budget += 1;
     if pass.item_budget > ctx.limits.max_items {
@@ -434,10 +527,243 @@ fn emit_item(
         from: scope.module_id,
         to: id,
         from_path: scope.module_path.to_string(),
-        to_path: path,
+        to_path: path.clone(),
         kind: GraphEdgeKind::Defines,
     });
+    Ok(Some((id, path)))
+}
+
+/// Emit one item node, then collect its references (A-0011-6).
+fn emit_with_refs(
+    item: &syn::Item,
+    ident: &syn::Ident,
+    generics: Option<&syn::Generics>,
+    scope: &ModScope<'_>,
+    ctx: &mut CrateCtx<'_>,
+    pass: &mut DeepPass,
+    out: &mut ScanOutput,
+) -> Result<(), GraphError> {
+    if let Some((id, path)) = emit_item(ident, scope, ctx, pass, out)? {
+        collect_refs(item, generics, id, path, scope, ctx, pass);
+    }
     Ok(())
+}
+
+/// Declared type-parameter names of an item — single-segment type paths
+/// matching one are generic parameters, never workspace items (A-0011-6).
+fn generic_names(generics: Option<&syn::Generics>) -> BTreeSet<String> {
+    generics
+        .map(|g| g.type_params().map(|p| p.ident.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Syntactic reference/call collector (A-0011-6). Records only shapes whose
+/// resolution has a chance of being confident:
+///
+/// - type paths (signatures, fields, aliases);
+/// - trait bounds (`T: Codec`, supertraits);
+/// - struct-literal paths;
+/// - multi-segment value paths (`io::open`) — single-segment value paths
+///   are overwhelmingly locals and are skipped;
+/// - call-expression callees, single-segment included (same-module helper
+///   calls), marked as calls.
+///
+/// Every collected path passes the [`RefCollector::push_path`] gate, which
+/// drops any path whose head segment is `Self` or a generic parameter in
+/// scope (`T::helper()` resolves through the generic, whatever else shares
+/// its name — A-0011-6b).
+///
+/// Never entered: attributes, macro invocations (tokens are unparsed),
+/// `use` declarations (handled by [`collect_use`]), method-call receivers'
+/// method names (no type inference), patterns, and items nested inside
+/// bodies.
+struct RefCollector<'p> {
+    generics: BTreeSet<String>,
+    out: &'p mut Vec<(RawPath, bool)>,
+}
+
+impl RefCollector<'_> {
+    /// The single gate every collected path passes through: a path whose
+    /// head segment is `Self` or a generic parameter in scope resolves
+    /// through the generic (which shadows aliases, crate idents and module
+    /// children alike), so recording it risks an invented edge (G7). This
+    /// applies uniformly — calls, value paths, struct literals, type paths
+    /// and trait bounds — single- and multi-segment.
+    fn push_path(&mut self, path: &syn::Path, is_call: bool) {
+        if let Some(head) = path.segments.first() {
+            let head = head.ident.to_string();
+            if head == "Self" || self.generics.contains(&head) {
+                return;
+            }
+        }
+        self.out.push((raw_of(path), is_call));
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for RefCollector<'_> {
+    fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
+    fn visit_macro(&mut self, _: &'ast syn::Macro) {}
+    // Items declared inside bodies live in their own scope; attributing
+    // their contents to the enclosing item risks invented edges (G7).
+    // Root entry bypasses this via the free-function walk in
+    // [`collect_refs`], so only *nested* items (which syn routes through
+    // this trait method) are suppressed — `use`, `mod`, `impl` included.
+    fn visit_item(&mut self, _: &'ast syn::Item) {}
+
+    // Nested generic scopes (an impl's or trait's method `fn m<U>(…)`)
+    // add their type parameters before their bounds/signature/body are
+    // visited — syn walks a signature's generics before its inputs and a
+    // fn's signature before its block. Names accumulate for the rest of
+    // the item; over-suppression is acceptable, invention is not (G7).
+    fn visit_generics(&mut self, node: &'ast syn::Generics) {
+        for p in node.type_params() {
+            self.generics.insert(p.ident.to_string());
+        }
+        syn::visit::visit_generics(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(p) = &*node.func {
+            if p.qself.is_none() {
+                self.push_path(&p.path, true);
+            }
+            // The callee path is consumed as a call; only arguments recurse
+            // (a turbofish's type arguments are consumed with it).
+        } else {
+            self.visit_expr(&node.func);
+        }
+        for arg in &node.args {
+            self.visit_expr(arg);
+        }
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        // Single-segment value paths are overwhelmingly locals; the honesty
+        // rule skips them rather than risk a shadowed false edge.
+        if node.qself.is_none() && node.path.segments.len() >= 2 {
+            self.push_path(&node.path, false);
+        }
+        syn::visit::visit_expr_path(self, node);
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        // A struct literal's path names a type even when single-segment.
+        if node.qself.is_none() {
+            self.push_path(&node.path, false);
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+
+    fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+        if node.qself.is_none() {
+            self.push_path(&node.path, false);
+        }
+        // Recurse for generic arguments (`Vec<Config>` reaches `Config`).
+        syn::visit::visit_type_path(self, node);
+    }
+
+    fn visit_trait_bound(&mut self, node: &'ast syn::TraitBound) {
+        // `T: Codec`, supertraits, `impl<T: Codec>` — bounds are trait
+        // paths, not `TypePath`s, so they need their own hook.
+        self.push_path(&node.path, false);
+        syn::visit::visit_trait_bound(self, node);
+    }
+}
+
+/// Run the collector over one AST node and queue the pending references.
+fn push_refs<F>(
+    generics: BTreeSet<String>,
+    origin_for: F,
+    visit: impl FnOnce(&mut RefCollector<'_>),
+    scope: &ModScope<'_>,
+    ctx: &CrateCtx<'_>,
+    pass: &mut DeepPass,
+) where
+    F: Fn() -> RefOrigin,
+{
+    let mut raws = Vec::new();
+    visit(&mut RefCollector {
+        generics,
+        out: &mut raws,
+    });
+    for (target, is_call) in raws {
+        pass.refs.push(PendingRef {
+            crate_ident: crate_ident(ctx.package),
+            module_path: scope.module_path.to_string(),
+            origin: origin_for(),
+            target,
+            is_call,
+        });
+    }
+}
+
+/// Collect references from one emitted module-level item (A-0011-6).
+fn collect_refs(
+    item: &syn::Item,
+    generics: Option<&syn::Generics>,
+    id: alloy_runtime::GraphNodeId,
+    path: String,
+    scope: &ModScope<'_>,
+    ctx: &CrateCtx<'_>,
+    pass: &mut DeepPass,
+) {
+    push_refs(
+        generic_names(generics),
+        move || RefOrigin::Node {
+            id,
+            path: path.clone(),
+        },
+        // Free-function walk: dispatches to the per-kind visitors without
+        // the `visit_item` override, which exists to blank *nested* items.
+        |c| syn::visit::visit_item(c, item),
+        scope,
+        ctx,
+        pass,
+    );
+}
+
+/// One `impl` block (A-0011-6): an `Impls` edge for `impl Trait for Type`
+/// when both sides can resolve, plus references from the block's associated
+/// items attributed to the self type. Impl blocks and their methods still
+/// get no nodes of their own (SY5).
+fn collect_impl(i: &syn::ItemImpl, scope: &ModScope<'_>, ctx: &CrateCtx<'_>, pass: &mut DeepPass) {
+    let syn::Type::Path(self_ty) = &*i.self_ty else {
+        return; // `impl Trait for [T; N]` etc.: no item to anchor on.
+    };
+    if self_ty.qself.is_some() {
+        return;
+    }
+    let impl_generics = generic_names(Some(&i.generics));
+    let self_raw = raw_of(&self_ty.path);
+    // `impl<T> Trait for T`: the self "type" is a generic parameter.
+    if self_raw.segments.len() == 1 && impl_generics.contains(&self_raw.segments[0]) {
+        return;
+    }
+    if let Some((bang, trait_path, _)) = &i.trait_ {
+        // Negative impls assert absence; recording one as an Impls edge
+        // would invert its meaning.
+        if bang.is_none() {
+            pass.impls.push(ImplRecord {
+                crate_ident: crate_ident(ctx.package),
+                module_path: scope.module_path.to_string(),
+                self_ty: self_raw.clone(),
+                trait_ty: raw_of(trait_path),
+            });
+        }
+    }
+    let origin_raw = self_raw;
+    push_refs(
+        impl_generics,
+        move || RefOrigin::SelfType(origin_raw.clone()),
+        |c| {
+            for item in &i.items {
+                syn::visit::Visit::visit_impl_item(c, item);
+            }
+        },
+        scope,
+        ctx,
+        pass,
+    );
 }
 
 /// `#[path = "…"]` value, when present.
@@ -607,11 +933,8 @@ fn walk_mod(
 /// Flatten one `use` declaration into leaves (SY12). `cfg` is not
 /// evaluated: gated imports are collected like any other.
 fn collect_use(u: &syn::ItemUse, scope: &ModScope<'_>, ctx: &CrateCtx<'_>, pass: &mut DeepPass) {
-    fn flatten(
-        tree: &syn::UseTree,
-        prefix: &mut Vec<String>,
-        leaves: &mut Vec<(Vec<String>, bool)>,
-    ) {
+    type Leaf = (Vec<String>, bool, Option<String>);
+    fn flatten(tree: &syn::UseTree, prefix: &mut Vec<String>, leaves: &mut Vec<Leaf>) {
         match tree {
             syn::UseTree::Path(p) => {
                 prefix.push(p.ident.to_string());
@@ -625,18 +948,21 @@ fn collect_use(u: &syn::ItemUse, scope: &ModScope<'_>, ctx: &CrateCtx<'_>, pass:
                 if ident != "self" || segs.is_empty() {
                     segs.push(ident);
                 }
-                leaves.push((segs, false));
+                // The bound name is the effective final segment.
+                let alias = segs.last().cloned();
+                leaves.push((segs, false, alias));
             }
             syn::UseTree::Rename(r) => {
-                // `use a::b as c` targets `b` (SY12); the rename is dropped.
+                // `use a::b as c` targets `b` (SY12); the rename binds `c`
+                // in the importing module (A-0011-6 alias table).
                 let mut segs = prefix.clone();
                 let ident = r.ident.to_string();
                 if ident != "self" || segs.is_empty() {
                     segs.push(ident);
                 }
-                leaves.push((segs, false));
+                leaves.push((segs, false, Some(r.rename.to_string())));
             }
-            syn::UseTree::Glob(_) => leaves.push((prefix.clone(), true)),
+            syn::UseTree::Glob(_) => leaves.push((prefix.clone(), true, None)),
             syn::UseTree::Group(g) => {
                 for item in &g.items {
                     flatten(item, prefix, leaves);
@@ -646,7 +972,7 @@ fn collect_use(u: &syn::ItemUse, scope: &ModScope<'_>, ctx: &CrateCtx<'_>, pass:
     }
     let mut leaves = Vec::new();
     flatten(&u.tree, &mut Vec::new(), &mut leaves);
-    for (segments, glob) in leaves {
+    for (segments, glob, alias) in leaves {
         if segments.is_empty() {
             continue;
         }
@@ -657,15 +983,17 @@ fn collect_use(u: &syn::ItemUse, scope: &ModScope<'_>, ctx: &CrateCtx<'_>, pass:
             segments,
             glob,
             leading_colon: u.leading_colon.is_some(),
+            alias,
         });
     }
 }
 
-/// SY11–SY13: syntactic resolution of the collected `use` leaves against
-/// the module/item trees just built. Anything unresolved produces nothing —
-/// cross-workspace targets (`std::`, registry crates) get no edge and no
-/// node (G7).
-pub(crate) fn resolve_imports(pass: &DeepPass, out: &mut ScanOutput) {
+/// SY11–SY13 plus A-0011-6: syntactic resolution of the collected `use`
+/// leaves, references, calls and impl blocks against the module/item trees
+/// just built. Anything unresolved produces nothing — cross-workspace
+/// targets (`std::`, registry crates), locals, and ambiguous glob hits get
+/// no edge and no node (G7).
+pub(crate) fn resolve_semantics(pass: &DeepPass, out: &mut ScanOutput) {
     let mut modules: BTreeMap<&str, GraphNodeId> = BTreeMap::new();
     let mut items: BTreeMap<&str, GraphNodeId> = BTreeMap::new();
     for n in &out.nodes {
@@ -682,16 +1010,31 @@ pub(crate) fn resolve_imports(pass: &DeepPass, out: &mut ScanOutput) {
         }
     }
 
-    // SY12: duplicate (from, to, imports) rows collapse.
-    let mut seen: BTreeSet<(GraphNodeId, GraphNodeId)> = BTreeSet::new();
+    // Pass 1 — `use` leaves: Imports edges (SY12: duplicate rows collapse)
+    // plus the per-module alias and glob tables the value resolver reads.
+    let mut aliases: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut globs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut seen: BTreeSet<(GraphNodeId, GraphNodeId, GraphEdgeKind)> = BTreeSet::new();
     for record in &pass.uses {
         let Some((to_id, to_path)) = resolve_use(record, pass, &modules, &items) else {
             continue;
         };
+        if record.glob {
+            globs
+                .entry(record.module_path.clone())
+                .or_default()
+                .push(to_path.clone());
+        } else if let Some(alias) = &record.alias {
+            aliases
+                .entry(record.module_path.clone())
+                .or_default()
+                .entry(alias.clone())
+                .or_insert_with(|| to_path.clone());
+        }
         if to_id == record.module_id {
             continue; // a module never imports itself.
         }
-        if !seen.insert((record.module_id, to_id)) {
+        if !seen.insert((record.module_id, to_id, GraphEdgeKind::Imports)) {
             continue;
         }
         out.imports += 1;
@@ -702,6 +1045,169 @@ pub(crate) fn resolve_imports(pass: &DeepPass, out: &mut ScanOutput) {
             to_path,
             kind: GraphEdgeKind::Imports,
         });
+    }
+
+    let scope = ValueScope {
+        pass,
+        modules: &modules,
+        items: &items,
+        aliases: &aliases,
+        globs: &globs,
+    };
+
+    // Pass 2 — references and calls (A-0011-6). A call whose target is a
+    // workspace `fn` item is a Calls edge; a call resolving to any other
+    // item (tuple-struct constructor, …) is honest as a References edge.
+    for r in &pass.refs {
+        let Some((from_id, from_path)) = (match &r.origin {
+            RefOrigin::Node { id, path } => Some((*id, path.clone())),
+            RefOrigin::SelfType(raw) => scope.resolve_item(raw, &r.module_path, &r.crate_ident),
+        }) else {
+            continue;
+        };
+        let Some((to_id, to_path)) = scope.resolve_item(&r.target, &r.module_path, &r.crate_ident)
+        else {
+            continue;
+        };
+        if to_id == from_id {
+            continue; // self-references carry no information.
+        }
+        let kind = if r.is_call && pass.fn_items.contains(&to_path) {
+            GraphEdgeKind::Calls
+        } else {
+            GraphEdgeKind::References
+        };
+        if !seen.insert((from_id, to_id, kind)) {
+            continue;
+        }
+        match kind {
+            GraphEdgeKind::Calls => out.calls += 1,
+            _ => out.references += 1,
+        }
+        out.edges.push(EdgeRow {
+            from: from_id,
+            to: to_id,
+            from_path: from_path.clone(),
+            to_path,
+            kind,
+        });
+    }
+
+    // Pass 3 — impl blocks (A-0011-6): self-type item → trait item.
+    for imp in &pass.impls {
+        let Some((from_id, from_path)) =
+            scope.resolve_item(&imp.self_ty, &imp.module_path, &imp.crate_ident)
+        else {
+            continue;
+        };
+        let Some((to_id, to_path)) =
+            scope.resolve_item(&imp.trait_ty, &imp.module_path, &imp.crate_ident)
+        else {
+            continue;
+        };
+        if to_id == from_id || !seen.insert((from_id, to_id, GraphEdgeKind::Impls)) {
+            continue;
+        }
+        out.impls += 1;
+        out.edges.push(EdgeRow {
+            from: from_id,
+            to: to_id,
+            from_path,
+            to_path,
+            kind: GraphEdgeKind::Impls,
+        });
+    }
+}
+
+/// Read-only lookup context for value/type path resolution (A-0011-6).
+struct ValueScope<'a> {
+    pass: &'a DeepPass,
+    modules: &'a BTreeMap<&'a str, GraphNodeId>,
+    items: &'a BTreeMap<&'a str, GraphNodeId>,
+    aliases: &'a BTreeMap<String, BTreeMap<String, String>>,
+    globs: &'a BTreeMap<String, Vec<String>>,
+}
+
+impl ValueScope<'_> {
+    fn known(&self, path: &str) -> bool {
+        self.modules.contains_key(path) || self.items.contains_key(path)
+    }
+
+    /// Resolve a raw path from `module_path`'s scope to a workspace **item**
+    /// node. Leading-segment order (documented in RFC-0011 §2.3b):
+    /// `crate`/`self`/`super`/`::` prefixes, then the module's `use`
+    /// bindings, then workspace crate idents, then the module's own
+    /// children, then unambiguous glob imports. `Self`, locals-shaped
+    /// single segments (filtered at collection) and everything unresolved
+    /// yield `None` — no edge (G7).
+    fn resolve_item(
+        &self,
+        raw: &RawPath,
+        module_path: &str,
+        crate_ident: &str,
+    ) -> Option<(GraphNodeId, String)> {
+        let segs = &raw.segments;
+        let head = segs.first()?.as_str();
+        let mut rest = &segs[1..];
+        let base: String;
+        if raw.leading_colon {
+            // `::a::…` — extern prelude only: a workspace crate or nothing.
+            if !self.pass.workspace_idents.contains(head) {
+                return None;
+            }
+            base = head.to_string();
+        } else {
+            match head {
+                "crate" => base = crate_ident.to_string(),
+                "self" => base = module_path.to_string(),
+                "Self" => return None,
+                "super" => {
+                    let mut b = module_path.to_string();
+                    let (parent, _) = b.rsplit_once("::")?;
+                    b = parent.to_string();
+                    while rest.first().is_some_and(|s| s == "super") {
+                        let (parent, _) = b.rsplit_once("::")?;
+                        b = parent.to_string();
+                        rest = &rest[1..];
+                    }
+                    base = b;
+                }
+                _ => {
+                    if let Some(target) = self.aliases.get(module_path).and_then(|m| m.get(head)) {
+                        base = target.clone();
+                    } else if self.pass.workspace_idents.contains(head) {
+                        base = head.to_string();
+                    } else {
+                        let child = format!("{module_path}::{head}");
+                        if self.known(&child) {
+                            base = child;
+                        } else {
+                            // Glob fallback: exactly one glob-imported
+                            // module may provide the name; ambiguity
+                            // resolves to nothing (G7).
+                            let hits: BTreeSet<String> = self
+                                .globs
+                                .get(module_path)
+                                .into_iter()
+                                .flatten()
+                                .map(|g| format!("{g}::{head}"))
+                                .filter(|c| self.known(c))
+                                .collect();
+                            if hits.len() != 1 {
+                                return None;
+                            }
+                            base = hits.into_iter().next()?;
+                        }
+                    }
+                }
+            }
+        }
+        let full = if rest.is_empty() {
+            base
+        } else {
+            format!("{base}::{}", rest.join("::"))
+        };
+        self.items.get(full.as_str()).map(|id| (*id, full))
     }
 }
 
