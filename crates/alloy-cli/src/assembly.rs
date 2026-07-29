@@ -15,15 +15,16 @@ use alloy_index::{GraphOpenOptions, SqliteProjectGraph};
 use alloy_runtime::{
     compiler_fingerprint_digest, install_sqlite_event_sink, policy_hash_digest,
     tool_versions_digest, AlloyRuntime, AlloyStorage, AppliedEditSource, CapabilityExecutor,
-    CapabilityRegistry, ContextEngine, DecisionLog, DefaultContextEngine, EditEngine,
-    EventDecisionLog, EventLogEdits, FixRecordingVerifier, GenerationDriver, GenerationDriverDeps,
-    GenerationPolicy, GraphViewHandle, LinearScheduler, LinearSchedulerDeps,
-    McpVerifyCompileAdapter, McpVerifyTestAdapter, ModelProvider, OpenAiCompatibleProvider,
-    OpenAiCompatibleSpec, PlanFingerprints, ProcessCostMeterFactory, ProcessRunRouterProvider,
-    ProfileId, ProjectGraph, RegistryCapabilityExecutor, RouterConfig, RuntimeConfig,
-    RuntimeHandle, SchedConfig, SecretString, SessionGateHumanAdapter, SessionId, SessionPlane,
-    SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService, ToolCaller, ToolName,
-    ToolSelector, Verifier, WorkerConfig, WorkerDeps, WorkerPermissions,
+    CapabilityPlanProposer, CapabilityRegistry, ContextEngine, DecisionLog, DefaultContextEngine,
+    EditEngine, EventDecisionLog, EventLogEdits, FixRecordingVerifier, GenerationDriver,
+    GenerationDriverDeps, GenerationPolicy, GraphViewHandle, LinearScheduler, LinearSchedulerDeps,
+    LlmPlanService, McpVerifyCompileAdapter, McpVerifyTestAdapter, ModelProvider,
+    OpenAiCompatibleProvider, OpenAiCompatibleSpec, PlanFingerprints, PlanService, PlannerMode,
+    ProcessCostMeterFactory, ProcessRunRouterProvider, ProfileId, ProjectGraph, ProposerDeps,
+    RegistryCapabilityExecutor, RouterConfig, RuntimeConfig, RuntimeHandle, SchedConfig,
+    SecretString, SessionGateHumanAdapter, SessionId, SessionPlane, SessionVerifyPermissions,
+    SessionWorkerPermissions, TemplatePlanService, ToolCaller, ToolName, ToolSelector, Verifier,
+    WorkerConfig, WorkerDeps, WorkerPermissions,
 };
 use alloy_tools::mcp::{McpPlatform, ToolHandle, ToolHandleToolCaller};
 use alloy_tools::{
@@ -61,8 +62,10 @@ pub struct FullAssembly {
     pub cost_meters: Arc<ProcessCostMeterFactory>,
     /// Run-scoped router provider (CR20 — per-run routers, one provider).
     pub routers: Arc<ProcessRunRouterProvider>,
-    /// Plan service (RFC-0009).
-    pub plan: TemplatePlanService,
+    /// Plan service (RFC-0009 / RFC-0017 AM-0009-5): `TemplatePlanService`
+    /// when `planner.mode = "template"` (default), `LlmPlanService` when
+    /// `"llm"`.
+    pub plan: Arc<dyn PlanService>,
     /// The installed scheduler (kept for wiring assertions).
     pub scheduler: Arc<LinearScheduler>,
     /// PF10 — the assembled `GitEditEngine`, or `None` under readonly (where
@@ -385,17 +388,31 @@ pub async fn assemble_full_with(
         Some("**".into()),
         if readonly { None } else { Some("**".into()) },
     ));
-    let registry = CapabilityRegistry::mvp(WorkerDeps {
-        routers: Arc::clone(&routers) as _,
-        context,
-        tools: worker_tools,
-        perms: Arc::clone(&worker_perms),
-        graph: GraphViewHandle::new(Arc::clone(&graph) as Arc<dyn ProjectGraph>),
-        artifacts: storage.artifacts() as _,
-        decisions: Arc::clone(&decisions) as _,
-        sessions: storage.sessions() as _,
-        config: WorkerConfig::default(),
-    })
+    // RFC-0017 AM-0013-1: the planning worker's model branch is registered
+    // iff the profile opts into LLM planning.
+    let llm_planning = cfg.planner.mode == PlannerMode::Llm;
+    if readonly && llm_planning {
+        // Defense in depth: RuntimeConfig::load already rejects the shipped
+        // readonly profile; a custom read-only assembly fails closed too.
+        return Err(CliError::new(
+            Exit::Config,
+            "planner.mode = \"llm\" is forbidden for a read-only assembly (RFC-0017 §7.1)",
+        ));
+    }
+    let registry = CapabilityRegistry::mvp_with(
+        WorkerDeps {
+            routers: Arc::clone(&routers) as _,
+            context,
+            tools: worker_tools,
+            perms: Arc::clone(&worker_perms),
+            graph: GraphViewHandle::new(Arc::clone(&graph) as Arc<dyn ProjectGraph>),
+            artifacts: storage.artifacts() as _,
+            decisions: Arc::clone(&decisions) as _,
+            sessions: storage.sessions() as _,
+            config: WorkerConfig::default(),
+        },
+        llm_planning,
+    )
     .map_err(|e| CliError::new(Exit::Internal, format!("capability registry: {e}")))?;
     let capabilities: Arc<dyn CapabilityExecutor> =
         Arc::new(RegistryCapabilityExecutor::new(Arc::new(registry)));
@@ -414,7 +431,7 @@ pub async fn assemble_full_with(
             verify_compile: Arc::clone(&verify_compile) as _,
             verify_test: verify_test as _,
             gate_human: gate_human as _,
-            capabilities,
+            capabilities: Arc::clone(&capabilities),
             decisions: Arc::clone(&decisions) as _,
             cost_meters: Arc::clone(&cost_meters) as _,
             runtime_cancel: handle.cancellation(),
@@ -430,7 +447,35 @@ pub async fn assemble_full_with(
     );
     handle.set_scheduler(Arc::clone(&sched) as _)?;
 
-    let plan = TemplatePlanService::from_storage(&storage);
+    // RFC-0017 AM-0009-5 — the plan service is selected by `planner.mode`:
+    // `LlmPlanService` wraps the template service fail-closed, driving the
+    // planning capability through the production executor with the run's
+    // meter source (PP4) and the runtime cancellation token.
+    let build_plan_service = || -> Arc<dyn PlanService> {
+        let template = TemplatePlanService::from_storage(&storage);
+        if llm_planning {
+            let proposer = CapabilityPlanProposer::new(
+                Arc::clone(&capabilities),
+                ProposerDeps {
+                    workspace_root: workspace_root.to_path_buf(),
+                    cancellation: handle.cancellation(),
+                    cost_meters: Arc::clone(&cost_meters) as _,
+                    budget_policy: cfg.budget_policy.clone(),
+                },
+                cfg.planner.clone(),
+            );
+            Arc::new(LlmPlanService::new(
+                template,
+                Arc::new(proposer),
+                storage.artifacts() as _,
+                Arc::clone(&decisions) as _,
+                cfg.planner.clone(),
+            ))
+        } else {
+            Arc::new(template)
+        }
+    };
+    let plan = build_plan_service();
 
     // RFC-0017 MG1 — construct the `GenerationDriver` and inject it as the
     // §6.3 step-8 executor (AM-0003-2). Construct-and-inject only: the CLI
@@ -443,7 +488,7 @@ pub async fn assemble_full_with(
     let target = alloy_tools::toolchain::host_triple();
     let driver = GenerationDriver::new(GenerationDriverDeps {
         handle: handle.clone(),
-        plans: Arc::new(TemplatePlanService::from_storage(&storage)),
+        plans: Arc::clone(&plan),
         runs: plane.runs(),
         dags: storage.dags() as _,
         sessions: storage.sessions() as _,

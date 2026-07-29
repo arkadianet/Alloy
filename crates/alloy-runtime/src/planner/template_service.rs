@@ -234,9 +234,22 @@ impl TemplatePlanService {
         )
     }
 
-    fn select(ctx: &PlanContext) -> TemplateId {
+    /// Day-1 selector (RFC-0009 MVP rule), shared with `LlmPlanService`'s
+    /// fallback-identity computation (RFC-0017 LP5).
+    pub(crate) fn select(ctx: &PlanContext) -> TemplateId {
         ctx.template_override
             .unwrap_or(TemplateId::RepairLocalDiagnostic)
+    }
+
+    /// The single validated write path, shared with `LlmPlanService` (LP2 —
+    /// both services persist through the same `PlanPersistence`).
+    pub(crate) fn persistence(&self) -> &PlanPersistence {
+        &self.persist
+    }
+
+    /// Read-only DAG store handle for the replan probe (never a write path).
+    pub(crate) fn dag_store(&self) -> Arc<dyn DagStore> {
+        Arc::clone(&self.dags)
     }
 
     /// Thin caller of [`PlanPersistence::persist_validated`] (AM-0009-6):

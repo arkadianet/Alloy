@@ -381,6 +381,8 @@ struct FixtureSpec {
     config: WorkerConfig,
     /// Read-only graph behind the worker handle; `None` ⇒ the null graph.
     graph: Option<Arc<FixesGraph>>,
+    /// RFC-0017 AM-0013-1: register the planning worker's model branch.
+    planning_model: bool,
 }
 
 impl Default for FixtureSpec {
@@ -392,6 +394,7 @@ impl Default for FixtureSpec {
             budget_policy: BudgetPolicy::default(),
             config: WorkerConfig::default(),
             graph: None,
+            planning_model: false,
         }
     }
 }
@@ -429,7 +432,7 @@ fn fixture(spec: FixtureSpec) -> Fixture {
         sessions: Arc::new(NoSessions),
         config: spec.config,
     };
-    let registry = CapabilityRegistry::mvp(deps).expect("mvp registry");
+    let registry = CapabilityRegistry::mvp_with(deps, spec.planning_model).expect("mvp registry");
     Fixture {
         provider,
         tools,
@@ -1282,6 +1285,80 @@ async fn planning_worker_makes_no_model_call_and_no_tool_call() {
     assert!(fx.tools.calls().is_empty());
     assert_eq!(fx.meter.snapshot().model_calls, 0);
     assert_eq!(fx.perms.mints.load(Ordering::SeqCst), 0);
+}
+
+/// RFC-0017 AC 49 (AM-0013-3): the `planning` descriptor reports
+/// `ReadOnly`/`uses_model = true` on the model branch and `Pure`/false on
+/// the deterministic branch; `required_tools()` stays `[]` on both.
+#[test]
+fn ac49_planning_descriptor_reports_branch_truthfully() {
+    use alloy_runtime::{Capability, PlanningWorker, SideEffectClass};
+    let det = PlanningWorker::new(WorkerConfig::default());
+    let d = det.describe();
+    assert!(!d.uses_model);
+    assert_eq!(d.side_effects, SideEffectClass::Pure);
+    assert!(det.required_tools().is_empty());
+
+    let model = PlanningWorker::new_model(WorkerConfig::default());
+    let d = model.describe();
+    assert!(d.uses_model);
+    assert_eq!(d.side_effects, SideEffectClass::ReadOnly);
+    assert!(model.required_tools().is_empty());
+    // Advisory tier unchanged (AM-0013-1).
+    assert_eq!(model.preferred_tier(), ModelTier::Economy);
+}
+
+/// RFC-0017 AC 13 (PW-B/PW-D): the model branch emits the proposal in its
+/// payload from one structured turn — no tools, no clamping of the chain.
+#[tokio::test]
+async fn ac13_planning_model_branch_emits_proposal_payload() {
+    let reply = json!({
+        "schema_version": 1,
+        "nodes": [
+            { "name": "analyze", "kind": "analyze", "approval_reason": null },
+            { "name": "edit", "kind": "edit", "approval_reason": null },
+            { "name": "verify", "kind": "verify_compile", "approval_reason": null },
+            { "name": "gate", "kind": "gate_human", "approval_reason": "Approve fix" }
+        ],
+        "rationale": "repair chain",
+        "confidence": 0.8
+    });
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(reply)],
+        planning_model: true,
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "planning", NodeKind::Plan, goal());
+    let payload = success(fx.executor.execute(&ctx).await.unwrap());
+    assert_eq!(payload["capability"], "planning");
+    assert_eq!(payload["template_id"], "repair_local_diagnostic");
+    assert_eq!(payload["replan_requested"], false);
+    let proposal = &payload["proposal"];
+    assert_eq!(proposal["schema_version"], 1);
+    assert_eq!(proposal["nodes"].as_array().unwrap().len(), 4);
+    assert_eq!(proposal["nodes"][3]["kind"], "gate_human");
+    assert_eq!(fx.provider.requests().len(), 1);
+    assert!(fx.tools.calls().is_empty(), "PW-C: no tools");
+}
+
+/// RFC-0017 AC 13 (PW-B): the model branch is bounded by `max_model_turns`
+/// with at most one repair turn — two invalid replies end the attempt.
+#[tokio::test]
+async fn ac13_planning_model_branch_bounded_by_one_repair_turn() {
+    let bad = json!({ "unexpected": "shape" });
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(bad.clone()), structured(bad)],
+        planning_model: true,
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "planning", NodeKind::Plan, goal());
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let CapabilityOutcome::Failed { failure } = outcome else {
+        panic!("two invalid replies must fail the attempt");
+    };
+    assert_eq!(failure.error_class, ErrorClass::Model);
+    // One original turn + exactly one repair turn (max_model_turns = 2).
+    assert_eq!(fx.provider.requests().len(), 2);
 }
 
 #[tokio::test]

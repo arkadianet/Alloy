@@ -209,7 +209,7 @@ async fn run_after_assembly(
         // §7.1 step 6 — plan (template selection is the plan service's, SQ1).
         let (policy_hash, tool_versions, compiler_fingerprint) = plan_fingerprints(ctx)?;
         PlanService::plan(
-            &full.plan,
+            &*full.plan,
             PlanContext {
                 session_id: session,
                 run_id: run,

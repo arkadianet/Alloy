@@ -6,13 +6,17 @@
 //! AM-0009-1 / rule PW2: topology has exactly one writer).
 
 mod config;
+mod llm_service;
 mod llm_stub;
 pub(crate) mod persist;
+mod proposer;
 pub(crate) mod seed;
 mod template_service;
 
 pub use config::{PlannerConfig, PlannerMode};
+pub use llm_service::{LlmPlanService, PlannerMetrics};
 pub use llm_stub::DisabledLlmPlanService;
+pub use proposer::{CapabilityPlanProposer, PlanProposer, ProposeError, ProposerDeps};
 pub use template_service::{
     PlanContext, PlanError, PlanProducedPayload, PlanResult, PlanService, PlanSource,
     TemplatePlanService,

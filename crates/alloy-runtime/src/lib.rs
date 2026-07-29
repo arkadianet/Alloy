@@ -127,8 +127,9 @@ pub use obs::{
     RetentionPolicy, SharedCostMeter, TierCost, ToolCallRecord,
 };
 pub use planner::{
-    DisabledLlmPlanService, PlanContext, PlanError, PlanProducedPayload, PlanResult, PlanService,
-    PlanSource, PlannerConfig, PlannerMode, TemplatePlanService,
+    CapabilityPlanProposer, DisabledLlmPlanService, LlmPlanService, PlanContext, PlanError,
+    PlanProducedPayload, PlanProposer, PlanResult, PlanService, PlanSource, PlannerConfig,
+    PlannerMetrics, PlannerMode, ProposeError, ProposerDeps, TemplatePlanService,
 };
 pub use router::{
     classify_provider_error, classify_router_error, ChatMessage, ChatRole, Citation,

@@ -18,6 +18,7 @@ pub use io::{
     NodeInputEnvelope, NodeInputPayload, NodeOutputEnvelope, PredecessorOutput,
     ENVELOPE_SCHEMA_VERSION,
 };
+pub(crate) use proposal::resolve_proposal;
 pub use proposal::{
     allocate_proposal_ids, compile_proposal, CompileArgs, ProposalRejection, ProposedDagManifest,
     ProposedNodeSpec, PROPOSAL_SCHEMA_VERSION,

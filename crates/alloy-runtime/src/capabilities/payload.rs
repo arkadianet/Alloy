@@ -182,6 +182,12 @@ pub struct PlanningProposalPayload {
     pub rationale: String,
     /// Always `false` in MVP: a worker never requests topology change (PW2).
     pub replan_requested: bool,
+    /// Model-proposed chain when the worker ran its model branch (RFC-0017
+    /// AM-0013-2). Absent ⇒ deterministic template selection — the pre-0017
+    /// wire shape decodes unchanged. The worker performs **no clamping**;
+    /// containment is the proposal compiler's (SEC5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<crate::dag::ProposedDagManifest>,
     /// OC7 truncation marker.
     pub truncated: bool,
     /// Always `1.0` — deterministic selection.
@@ -336,6 +342,7 @@ mod tests {
             citations: vec![],
             artifacts: vec![],
             metrics: metrics(),
+            proposal: None,
         };
         let json = serde_json::to_value(&planning).unwrap();
         assert_eq!(

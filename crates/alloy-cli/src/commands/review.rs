@@ -227,7 +227,7 @@ async fn review_after_assembly(
     let toolchain = alloy_tools::toolchain::capture_toolchain();
     let target = alloy_tools::toolchain::host_triple();
     PlanService::plan(
-        &full.plan,
+        &*full.plan,
         PlanContext {
             session_id: session,
             run_id: run,
