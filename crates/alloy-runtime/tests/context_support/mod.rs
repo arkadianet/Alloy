@@ -334,6 +334,11 @@ pub struct ScriptedGraph {
     pub diagnostics: Mutex<Vec<DiagnosticEvent>>,
     /// When set, every served view reports `truncated = true` (Q9).
     pub truncated: Mutex<bool>,
+    /// When set, `Callers`/`Refs` on `toy_core::io` serve populated views
+    /// (A-0012-1); unset mirrors the M7 store, whose stubs return empty.
+    pub impact: Mutex<bool>,
+    /// When set, every `Callers`/`Refs` query fails with `Io`.
+    pub fail_impact: Mutex<bool>,
 }
 
 impl ScriptedGraph {
@@ -345,7 +350,36 @@ impl ScriptedGraph {
             busy_burned: Mutex::new(false),
             diagnostics: Mutex::new(Vec::new()),
             truncated: Mutex::new(false),
+            impact: Mutex::new(false),
+            fail_impact: Mutex::new(false),
         })
+    }
+
+    /// Enable populated `Callers`/`Refs` views (the post-Beta store shape).
+    pub fn set_impact(&self, on: bool) {
+        *self.impact.lock().unwrap() = on;
+    }
+
+    /// Make every `Callers`/`Refs` query fail with `GraphError::Io`.
+    pub fn set_fail_impact(&self, on: bool) {
+        *self.fail_impact.lock().unwrap() = on;
+    }
+
+    /// The deterministic id of the `toy_core::io` module node.
+    pub fn io_node_id() -> alloy_runtime::types::ids::GraphNodeId {
+        derive_node_id(GraphNodeKind::Module, "toy-core\0toy_core::io")
+    }
+
+    /// The out-of-crate caller node served for `Callers(toy_core::io)`.
+    pub fn caller_node() -> GraphNode {
+        GraphNode {
+            id: derive_node_id(GraphNodeKind::Item, "toy-cli\0toy_cli::main"),
+            kind: GraphNodeKind::Item,
+            path: "toy_cli::main".to_owned(),
+            crate_id: Some(alloy_runtime::CrateId::new("toy-cli").unwrap()),
+            file: Some("crates/toy-cli/src/main.rs".to_owned()),
+            digest: None,
+        }
     }
 
     pub fn handle(self: &Arc<Self>) -> GraphViewHandle {
@@ -413,6 +447,18 @@ impl ScriptedGraph {
             GraphQuery::Diagnostics { .. } => {
                 view.diagnostics = self.diagnostics.lock().unwrap().clone();
             }
+            GraphQuery::Callers { fn_node }
+                if *self.impact.lock().unwrap() && *fn_node == Self::io_node_id() =>
+            {
+                view.nodes = vec![Self::caller_node()];
+            }
+            GraphQuery::Refs { node }
+                if *self.impact.lock().unwrap() && *node == Self::io_node_id() =>
+            {
+                // A node already present in the subgraph: exercises the
+                // "relation line only, no duplicate node line" path.
+                view.nodes = vec![nodes[2].clone()];
+            }
             _ => {}
         }
         view
@@ -431,6 +477,11 @@ impl ProjectGraph for ScriptedGraph {
 
     async fn query(&self, q: GraphQuery) -> Result<GraphView, GraphError> {
         self.queries.lock().unwrap().push(q.clone());
+        if *self.fail_impact.lock().unwrap()
+            && matches!(q, GraphQuery::Callers { .. } | GraphQuery::Refs { .. })
+        {
+            return Err(GraphError::Io("impact backend down".into()));
+        }
         let mode = *self.mode.lock().unwrap();
         match mode {
             GraphMode::Toy | GraphMode::VersionFails => Ok(self.toy_view(&q)),

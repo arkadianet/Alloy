@@ -38,7 +38,7 @@ use super::render::{
 use super::types::{
     AssembleInputs, AssembleRequest, CompactStrategy, ContextHandle, Degradation,
     DegradationReason, DomainId, EvictPolicy, EvictReport, FileExcerpt, GraphProjection,
-    StaleReason, WorkingSet,
+    ImpactEntry, StaleReason, WorkingSet,
 };
 use super::working_set::{
     fetch_diagnostics_fallback, fetch_graph, order_diagnostics, order_files, primary_span_path,
@@ -539,6 +539,10 @@ struct WsState {
     /// Kept flags over the projection's edges.
     edges_kept: Vec<bool>,
     graph_omitted: usize,
+    /// Kept flags over the projection's impact entries (A-0012-1).
+    impact_kept: Vec<bool>,
+    /// Impact entries dropped by the budget or the backstop (B7).
+    impact_omitted: usize,
     /// Kept flags over `WsRaw.diagnostics`.
     diags_kept: Vec<bool>,
     diags_omitted: usize,
@@ -885,7 +889,9 @@ impl DefaultContextEngine {
                 seed_paths.insert(p);
             }
         }
-        // A13 bound: at most `must_include.len() + max_files` Symbol queries.
+        // A13 bound (as amended by A-0012-1a): at most `must_include.len() +
+        // max_files` Symbol queries, one Subgraph, one Diagnostics fallback,
+        // and `2 × max_impact_seeds` Callers/Refs impact reads.
         while seed_paths.len() > self.profile.max_files {
             let last = seed_paths.iter().next_back().cloned();
             if let Some(last) = last {
@@ -973,6 +979,8 @@ impl DefaultContextEngine {
                 &pinned_nodes,
                 &seed_paths,
                 self.profile.graph_radius,
+                self.profile.max_impact_seeds,
+                self.profile.max_impact_nodes,
             )
             .await;
             ws.queried += fetch.queried;
@@ -1299,6 +1307,16 @@ impl DefaultContextEngine {
         }
     }
 
+    /// `calls {node} -> {seed}` / `refs {node} -> {seed}` (A-0012-1b).
+    fn impact_relation_line(entry: &ImpactEntry) -> String {
+        format!(
+            "{} {} -> {}",
+            entry.relation.label(),
+            sanitize_line(&entry.node.path),
+            sanitize_line(&entry.seed_path)
+        )
+    }
+
     fn node_line(node: &GraphNode) -> String {
         let kind = node.kind.as_str();
         let path = sanitize_line(&node.path);
@@ -1353,6 +1371,31 @@ impl DefaultContextEngine {
                 sanitize_line(from),
                 sanitize_line(to)
             ));
+        }
+        // Impact entries (A-0012-1b): a node line for out-of-view nodes,
+        // then the relation line, in D5 order.
+        let mut impact_ids = kept_ids.clone();
+        for (i, entry) in projection.impact.iter().enumerate() {
+            if !state.impact_kept.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            if impact_ids.insert(entry.node.id) {
+                let line = Self::node_line(&entry.node);
+                citations.push(SectionCitation {
+                    source: format!(
+                        "alloy://working_set/graph/{}/{}",
+                        projection.version.0,
+                        sanitize_line(&entry.node.path)
+                    ),
+                    bytes: Some(line.clone()),
+                });
+                lines.push(line);
+            }
+            lines.push(Self::impact_relation_line(entry));
+        }
+        let impact_omitted = projection.impact_omitted + state.impact_omitted;
+        if impact_omitted > 0 {
+            lines.push(omitted_marker(impact_omitted, "impact items"));
         }
         if projection.truncated {
             lines.push(graph_truncated_marker().to_owned());
@@ -1456,6 +1499,7 @@ impl DefaultContextEngine {
             .iter()
             .chain(projection.neighbourhood.iter())
             .map(Self::node_line)
+            .chain(projection.impact.iter().map(Self::impact_relation_line))
             .collect();
         self.est(&lines.join("\n"))
     }
@@ -1632,6 +1676,33 @@ impl DefaultContextEngine {
                     state.graph_omitted += 1;
                 }
             }
+            // Impact entries last (A-0012-1b): each costs its relation line
+            // plus a node line when the node is not already rendered.
+            state.impact_kept = vec![false; projection.impact.len()];
+            let mut rendered_ids: BTreeSet<crate::types::ids::GraphNodeId> = merged
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| state.nodes_kept.get(*i).copied().unwrap_or(false))
+                .map(|(_, n)| n.id)
+                .collect();
+            for (i, entry) in projection.impact.iter().enumerate() {
+                let relation_cost = self
+                    .est(&Self::impact_relation_line(entry))
+                    .saturating_add(1);
+                let node_cost = if rendered_ids.contains(&entry.node.id) {
+                    0
+                } else {
+                    self.est(&Self::node_line(&entry.node)).saturating_add(1)
+                };
+                let cost = relation_cost + node_cost;
+                if used + cost <= remaining {
+                    used += cost;
+                    state.impact_kept[i] = true;
+                    rendered_ids.insert(entry.node.id);
+                } else {
+                    state.impact_omitted += 1;
+                }
+            }
             if state.nodes_kept.iter().any(|&k| k) {
                 remaining = remaining.saturating_sub(used);
             }
@@ -1752,8 +1823,8 @@ impl DefaultContextEngine {
     }
 
     /// B10 within the WorkingSet: reverse inclusion order — diagnostics,
-    /// then graph edges, then graph nodes, then files. Pinned items (B11)
-    /// are never droppable.
+    /// then impact entries (A-0012-1), then graph edges, then graph nodes,
+    /// then files. Pinned items (B11) are never droppable.
     fn drop_one_working_set(ws_raw: &WsRaw, ws: &mut WsState) -> bool {
         let diag_victim = ws
             .diags_kept
@@ -1765,6 +1836,13 @@ impl DefaultContextEngine {
         if let Some(i) = diag_victim {
             ws.diags_kept[i] = false;
             ws.diags_omitted += 1;
+            return true;
+        }
+        // Impact entries drop before the neighbourhood they annotate
+        // (A-0012-1b: last included, first dropped).
+        if let Some(i) = ws.impact_kept.iter().rposition(|&k| k) {
+            ws.impact_kept[i] = false;
+            ws.impact_omitted += 1;
             return true;
         }
         if let Some(i) = ws.edges_kept.iter().rposition(|&k| k) {
@@ -1890,7 +1968,10 @@ impl DefaultContextEngine {
             (DomainId::Conversation, conv_state.omitted),
             (
                 DomainId::WorkingSet,
-                ws_state.files_omitted + ws_state.graph_omitted + ws_state.diags_omitted,
+                ws_state.files_omitted
+                    + ws_state.graph_omitted
+                    + ws_state.impact_omitted
+                    + ws_state.diags_omitted,
             ),
             (DomainId::Artifacts, art_state.omitted),
         ];
@@ -2068,6 +2149,9 @@ impl DefaultContextEngine {
         // Counters (A11): items, truncated, omitted per live domain.
         let kept_nodes = ws_state.nodes_kept.iter().filter(|&&k| k).count();
         let kept_edges = ws_state.edges_kept.iter().filter(|&&k| k).count();
+        let kept_impact = ws_state.impact_kept.iter().filter(|&&k| k).count();
+        let impact_omitted =
+            ws_state.impact_omitted + ws.graph.as_ref().map_or(0, |p| p.impact_omitted);
         let kept_diags = ws_state.diags_kept.iter().filter(|&&k| k).count();
         let graph_truncated = ws
             .graph
@@ -2081,13 +2165,14 @@ impl DefaultContextEngine {
                 omitted: conv_state.omitted + conv.skipped_malformed,
             },
             DomainStats {
-                items: ws_state.files.len() + kept_nodes + kept_edges + kept_diags,
+                items: ws_state.files.len() + kept_nodes + kept_edges + kept_impact + kept_diags,
                 tokens_est: ws_tokens,
                 truncated: ws_state.files.iter().filter(|f| f.truncated).count()
                     + usize::from(graph_truncated),
                 omitted: ws_state.files_omitted
                     + ws.file_cap_omitted
                     + ws_state.graph_omitted
+                    + impact_omitted
                     + ws_state.diags_omitted
                     + ws.diag_cap_omitted,
             },

@@ -12,11 +12,14 @@ use std::time::Duration;
 
 use alloy_runtime::adapters::{NodeExecRef, ToolCaller, ToolCallerError};
 use alloy_runtime::capabilities::EditAppliedPayload;
-use alloy_runtime::graph::{FileChange, FixEvent, GraphError, GraphQuery, GraphView, ProjectGraph};
+use alloy_runtime::graph::{
+    derive_node_id, FileChange, FixEvent, GraphError, GraphNode, GraphNodeKind, GraphQuery,
+    GraphView, ProjectGraph,
+};
 use alloy_runtime::storage::{
     ArtifactBlob, ArtifactMeta, ArtifactPut, ArtifactStore, SessionRows, StoreError,
 };
-use alloy_runtime::types::ids::{GraphSnapshotId, GraphVersion};
+use alloy_runtime::types::ids::{GraphNodeId, GraphSnapshotId, GraphVersion};
 use alloy_runtime::{
     AdapterError, ArtifactId, ArtifactKind, BudgetPolicy, CapabilityExecContext,
     CapabilityExecError, CapabilityExecutor, CapabilityId, CapabilityRegistry, ChatRole,
@@ -124,12 +127,16 @@ impl ToolCaller for QueueToolCaller {
     }
 }
 
-/// Read-only `ProjectGraph` double: answers `SimilarFixes` from a canned
-/// table and records the queries it saw. Every write is `Disabled`, so a
-/// worker that tried to write would fail loudly (SEC4).
+/// Read-only `ProjectGraph` double: answers `SimilarFixes`, `Symbol` and
+/// `Callers` from canned tables and records the queries it saw. Every write
+/// is `Disabled`, so a worker that tried to write would fail loudly (SEC4).
 #[derive(Default)]
 struct FixesGraph {
     fixes: HashMap<String, Vec<FixEvent>>,
+    /// Nodes served by `Symbol` (matched on `path` or `file`).
+    symbols: Vec<GraphNode>,
+    /// Caller nodes served by `Callers`, keyed by the callee node id.
+    callers: HashMap<GraphNodeId, Vec<GraphNode>>,
     seen: Mutex<Vec<GraphQuery>>,
 }
 
@@ -137,7 +144,18 @@ impl FixesGraph {
     fn with(fixes: HashMap<String, Vec<FixEvent>>) -> Self {
         Self {
             fixes,
-            seen: Mutex::new(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    fn with_callers(
+        symbols: Vec<GraphNode>,
+        callers: HashMap<GraphNodeId, Vec<GraphNode>>,
+    ) -> Self {
+        Self {
+            symbols,
+            callers,
+            ..Self::default()
         }
     }
 
@@ -157,14 +175,27 @@ impl ProjectGraph for FixesGraph {
     async fn query(&self, q: GraphQuery) -> Result<GraphView, GraphError> {
         self.seen.lock().unwrap().push(q.clone());
         let mut view = GraphView::empty(GraphVersion(1));
-        if let GraphQuery::SimilarFixes {
-            diagnostic_code,
-            limit,
-        } = &q
-        {
-            if let Some(rows) = self.fixes.get(diagnostic_code) {
-                view.fixes = rows.iter().take(*limit).cloned().collect();
+        match &q {
+            GraphQuery::SimilarFixes {
+                diagnostic_code,
+                limit,
+            } => {
+                if let Some(rows) = self.fixes.get(diagnostic_code) {
+                    view.fixes = rows.iter().take(*limit).cloned().collect();
+                }
             }
+            GraphQuery::Symbol { path } => {
+                view.nodes = self
+                    .symbols
+                    .iter()
+                    .filter(|n| n.path == *path || n.file.as_deref() == Some(path.as_str()))
+                    .cloned()
+                    .collect();
+            }
+            GraphQuery::Callers { fn_node } => {
+                view.nodes = self.callers.get(fn_node).cloned().unwrap_or_default();
+            }
+            _ => {}
         }
         Ok(view)
     }
@@ -864,6 +895,123 @@ async fn repair_worker_omits_the_similar_fixes_note_when_the_graph_has_none() {
             .messages
             .iter()
             .any(|m| m.content.contains("similar_fixes")),
+        "no fence when there is nothing to show"
+    );
+}
+
+/// The canned graph shape for the caller-hint tests: `src/main.rs` resolves
+/// to one node whose recorded caller lives in `src/startup.rs`.
+fn callers_graph() -> Arc<FixesGraph> {
+    let callee = GraphNode {
+        id: derive_node_id(GraphNodeKind::Item, "app\0app::main"),
+        kind: GraphNodeKind::Item,
+        path: "app::main".into(),
+        crate_id: alloy_runtime::CrateId::new("app").ok(),
+        file: Some("src/main.rs".into()),
+        digest: None,
+    };
+    let caller = GraphNode {
+        id: derive_node_id(GraphNodeKind::Item, "app\0app::startup"),
+        kind: GraphNodeKind::Item,
+        path: "app::startup".into(),
+        crate_id: alloy_runtime::CrateId::new("app").ok(),
+        file: Some("src/startup.rs".into()),
+        digest: None,
+    };
+    let mut callers = HashMap::new();
+    callers.insert(callee.id, vec![caller]);
+    Arc::new(FixesGraph::with_callers(vec![callee], callers))
+}
+
+#[tokio::test]
+async fn repair_worker_asks_for_callers_and_fences_them_into_the_prompt() {
+    // A-0012-1 (worker side, mirroring A-0011-5c): the diagnosed paths
+    // drive bounded Symbol + Callers reads, and what comes back rides one
+    // compact User-role fence naming who calls into the change.
+    let graph = callers_graph();
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+
+    // Bounded reads: one Symbol per distinct diagnosed path, one Callers
+    // per resolved item.
+    let symbols = graph
+        .seen()
+        .iter()
+        .filter(|q| matches!(q, GraphQuery::Symbol { .. }))
+        .count();
+    let callers = graph
+        .seen()
+        .iter()
+        .filter(|q| matches!(q, GraphQuery::Callers { .. }))
+        .count();
+    assert_eq!(symbols, 1, "one Symbol read for the one diagnosed path");
+    assert_eq!(callers, 1, "one Callers read for the one resolved item");
+
+    // The fence reaches the model as User content, compact and honest.
+    let requests = fx.provider.requests();
+    assert_eq!(requests.len(), 1);
+    let note = requests[0]
+        .messages
+        .iter()
+        .find(|m| m.role == ChatRole::User && m.content.contains("<tool name=\"callers\">"))
+        .expect("callers note present");
+    assert!(note.content.contains("app::startup"));
+    assert!(note.content.contains("src/startup.rs"), "target-file hint");
+    assert!(
+        note.content.len() < 2048,
+        "the note stays compact: {} bytes",
+        note.content.len()
+    );
+}
+
+#[tokio::test]
+async fn repair_worker_accepts_caller_files_as_targets() {
+    // A caller-named file is a legitimate impact target (RW6 widened by the
+    // graph observation): the plan may point at src/startup.rs even though
+    // no diagnostic and no goal names it.
+    let graph = callers_graph();
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(
+            &["src/main.rs", "src/startup.rs"],
+            false,
+        ))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let plan: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+    assert_eq!(plan.target_files, vec!["src/main.rs", "src/startup.rs"]);
+}
+
+#[tokio::test]
+async fn repair_worker_omits_the_callers_note_when_the_graph_has_none() {
+    // The M7 store: Callers is a stub returning empty. Honest absence — no
+    // fence, no error (the empty-store degradation contract).
+    let graph = Arc::new(FixesGraph::default());
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+    let requests = fx.provider.requests();
+    assert!(
+        !requests[0]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("<tool name=\"callers\">")),
         "no fence when there is nothing to show"
     );
 }

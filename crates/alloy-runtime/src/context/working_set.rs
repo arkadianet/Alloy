@@ -9,7 +9,9 @@ use crate::types::diagnostic::{DiagnosticEvent, DiagnosticLevel};
 use crate::types::ids::CrateId;
 
 use super::render::{bound_bytes, is_safe_rel_path, relativize, sanitize_line, sanitize_untrusted};
-use super::types::{Degradation, DegradationReason, DomainId, GraphProjection};
+use super::types::{
+    Degradation, DegradationReason, DomainId, GraphProjection, ImpactEntry, ImpactRelation,
+};
 
 // ---------------------------------------------------------------------
 // Files (§4.3a)
@@ -131,14 +133,17 @@ pub(super) async fn query_once_retry_busy(
     .await
 }
 
-/// Build the graph slice: `Symbol` per seed path, then one `Subgraph` for
-/// all seeds (D10). Only `Symbol` / `Subgraph` / `Diagnostics` query kinds
-/// exist in this module (D14).
+/// Build the graph slice: `Symbol` per seed path, one `Subgraph` for all
+/// seeds (D10), then bounded `Callers`/`Refs` impact reads per seed
+/// (A-0012-1a). Only these query kinds plus `Diagnostics` exist in this
+/// module (D14 as amended).
 pub(super) async fn fetch_graph(
     handle: &GraphViewHandle,
     pinned_seed_nodes: &[GraphNode],
     seed_paths: &BTreeSet<String>,
     radius: u8,
+    max_impact_seeds: usize,
+    max_impact_nodes: usize,
 ) -> GraphFetch {
     let mut fetch = GraphFetch::default();
     let mut seeds: Vec<GraphNode> = pinned_seed_nodes.to_vec();
@@ -180,13 +185,24 @@ pub(super) async fn fetch_graph(
                     .into_iter()
                     .filter(|n| !seed_id_set.contains(&n.id))
                     .collect();
+                // A-0012-1: bounded impact reads after the neighbourhood.
+                let impact = fetch_impact(
+                    handle,
+                    &mut fetch,
+                    &seeds,
+                    max_impact_seeds,
+                    max_impact_nodes,
+                )
+                .await;
                 fetch.projection = Some(GraphProjection {
                     version: view.version,
                     fidelity: view.fidelity,
                     seeds: seeds.clone(),
                     neighbourhood,
                     edges: view.edges,
-                    truncated: view.truncated,
+                    truncated: view.truncated || impact.truncated,
+                    impact: impact.entries,
+                    impact_omitted: impact.omitted,
                 });
             }
             Err(e) => {
@@ -205,6 +221,93 @@ pub(super) async fn fetch_graph(
     }
 
     fetch
+}
+
+/// Outcome of the bounded impact fetch (A-0012-1).
+#[derive(Debug, Default)]
+struct ImpactFetch {
+    /// D5-ordered, deduplicated, capped entries.
+    entries: Vec<ImpactEntry>,
+    /// Entries dropped by the `max_impact_nodes` cap (B7/B8).
+    omitted: usize,
+    /// A non-empty impact view was capped by the index (RFC-0011 Q9).
+    truncated: bool,
+}
+
+/// Issue at most `2 × max_impact_seeds` `Callers`/`Refs` queries over the
+/// leading seeds (A-0012-1a). An error records a degradation and stops the
+/// impact fetch — never the projection (E2). Empty views are honest
+/// absence: no entry, no degradation, no marker (A-0012-1c).
+async fn fetch_impact(
+    handle: &GraphViewHandle,
+    fetch: &mut GraphFetch,
+    seeds: &[GraphNode],
+    max_impact_seeds: usize,
+    max_impact_nodes: usize,
+) -> ImpactFetch {
+    let mut out = ImpactFetch::default();
+    if max_impact_seeds == 0 || max_impact_nodes == 0 {
+        return out;
+    }
+    'seeds: for seed in seeds.iter().take(max_impact_seeds) {
+        for (relation, query) in [
+            (
+                ImpactRelation::Caller,
+                GraphQuery::Callers { fn_node: seed.id },
+            ),
+            (
+                ImpactRelation::Reference,
+                GraphQuery::Refs { node: seed.id },
+            ),
+        ] {
+            fetch.queried += 1;
+            match query_once_retry_busy(handle, query).await {
+                Ok(view) => {
+                    if !view.nodes.is_empty() && view.truncated {
+                        out.truncated = true;
+                    }
+                    for node in view.nodes {
+                        if node.id == seed.id {
+                            continue; // a self-row is noise, not impact
+                        }
+                        out.entries.push(ImpactEntry {
+                            seed_path: seed.path.clone(),
+                            relation,
+                            node,
+                        });
+                    }
+                }
+                Err(e) => {
+                    fetch.degraded_queries += 1;
+                    push_degradation(
+                        &mut fetch.degradations,
+                        map_graph_error(&e),
+                        &format!("impact query failed: {e}"),
+                    );
+                    break 'seeds;
+                }
+            }
+        }
+    }
+    // D5 total order, then dedup and the cap (A-0012-1b).
+    out.entries.sort_by(|a, b| {
+        let key = |e: &ImpactEntry| {
+            (
+                e.seed_path.clone(),
+                e.relation,
+                e.node.kind,
+                e.node.path.clone(),
+                e.node.id,
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    out.entries.dedup_by(|a, b| {
+        a.seed_path == b.seed_path && a.relation == b.relation && a.node.id == b.node.id
+    });
+    out.omitted = out.entries.len().saturating_sub(max_impact_nodes);
+    out.entries.truncate(max_impact_nodes);
+    out
 }
 
 /// The `Diagnostics` fallback query, issued **only** when the caller

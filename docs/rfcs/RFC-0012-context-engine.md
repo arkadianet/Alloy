@@ -65,7 +65,7 @@ Each deferral names the seam that already exists to carry it, so nothing has to 
 | Retrieval ranking / relevance scoring | Item order is a **total order derived from facts** (recency, severity, path), not a learned score (§4.1 D5) | Deferred; needs an eval signal that does not exist |
 | Summarization / "aggressive economy" compaction | `ContextEngine::compact` exists and is a **Stub** no-op (§3.3, A12) | Deferred (V2 §8.1 Deferred), measured in Eval |
 | Long-term memory / External Memory auto-retrieve | `DomainId::LongTerm` returns empty; no store is opened | Deferred (V2 §8.1, ADR F-23) |
-| Graph `Callers` / `SimilarFixes` / `Refs` / `Impls` in the WorkingSet | RFC-0011 `GraphQuery` variants exist and return empty | RFC-0011 Beta; this RFC never issues them (D14) |
+| Graph `SimilarFixes` / `Impls` in the WorkingSet | RFC-0011 `GraphQuery` variants exist and return empty | RFC-0011 Beta; this RFC never issues them (D14). `Callers` / `Refs` are no longer deferred: amendment **A-0012-1** issues them, bounded, and degrades to honest absence while the store's stubs return empty |
 | `syn`-deep symbol bodies in the projection | `GraphView.fidelity` labels the projection; `GraphFidelity::SynDeep` reserved | RFC-0011 Beta / RFC-0014 |
 | Real tokenizer counts | `TokenEstimator` is a trait with one impl (§6.2) | Deferred until a provider disagrees measurably |
 | Prompt caching / prefix reuse | `PromptPack` shape is frozen by V2 §8.1 Evolution "keep PromptPack shape stable for cache discipline" | Post-Beta |
@@ -81,7 +81,7 @@ Each deferral names the seam that already exists to carry it, so nothing has to 
 5. `assemble` MUST return a `PromptPack` whose `citations` is non-empty whenever any section rendered content, and every `Citation.digest` MUST be `Some` (rule **CIT1**, §7.11 item 9).
 6. The WorkingSet graph projection MAY be empty. An empty, failing, disabled or busy graph MUST degrade the domain and MUST NOT fail `assemble` (rules **E1**, **E2**; RFC-0011 Appendix C rule E1: *a graph failure MUST NEVER fail a DAG node*).
 7. The Context Engine MUST hold a `GraphViewHandle` and MUST NOT name, store, or construct an `Arc<dyn ProjectGraph>` (rule **SEC1**, CI-grepped by T-CI3; RFC-0011 E.1.1).
-8. Only `GraphQuery::Symbol`, `GraphQuery::Diagnostics` and `GraphQuery::Subgraph` may be issued (rule **D14**; RFC-0011 E.1 — the other four return empty Stubs).
+8. Only `GraphQuery::Symbol`, `GraphQuery::Diagnostics` and `GraphQuery::Subgraph` may be issued (rule **D14**; RFC-0011 E.1 — the other four return empty Stubs). *(Amended by **A-0012-1a**, §2.3a: bounded `Callers` / `Refs` impact reads are additionally permitted; `Impls` / `SimilarFixes` stay forbidden.)*
 9. `GraphView.fidelity` MUST be rendered as a **citation label** and MUST NOT be described to the model as call-graph knowledge (rule **CIT6**; RFC-0011 E.1.2).
 10. Every string derived from the repository, the graph, or a tool MUST pass `obs::redact::redact_secrets` and MUST be fenced as untrusted content before entering a message (rules **SEC2**, **SEC3**).
 11. No absolute host path may appear anywhere in a `PromptPack` — messages, citations or `domains` (rule **SEC4**; aligns with RFC-0011 G12/SEC6).
@@ -171,6 +171,19 @@ Two **additive** amendments are authorised here. Each is a new item; neither res
 | **A2** | New module `alloy-runtime::context` + crate-root re-exports | `alloy-runtime` | The subsystem itself. Purely additive; no existing module changes. Re-export list in §3.10. |
 
 RFC-0004 conventions this RFC mirrors: `redact_secrets` for secret scrubbing, atomic-counter metrics snapshots rather than a metrics registry, and the strict separation between **assembly-time redaction** (what the model sees — this RFC) and **logging retention** (`apply_prompt_retention`, what the event log stores — RFC-0004's, unchanged). Rule **SEC5** makes that separation explicit.
+
+### 2.3a Amendment A-0012-1 — cross-file impact enters the WorkingSet (post-merge)
+
+Mirrors the RFC-0011 §2.3a convention: each item is additive, changes population and bounded reads only, and reshapes no merged public field outside the explicitly named `#[non_exhaustive]` types.
+
+| # | Amendment | Amends | Normative statement |
+| --- | --- | --- | --- |
+| **A-0012-1a** | Bounded impact reads are permitted | **D14**, **A13**, T-CI6 | `context/**` MAY additionally construct `GraphQuery::Callers` and `GraphQuery::Refs`, and only as follows: after the D10 `Subgraph` succeeds, at most `2 × max_impact_seeds` such queries are issued — `Callers` then `Refs` per seed, over the leading seeds in D9 order. `Impls` and `SimilarFixes` remain forbidden in `context/**`; T-CI6 greps for exactly those two. A13's bound becomes `must_include.len() + max_files + 2 + 2 × max_impact_seeds` queries per call. |
+| **A-0012-1b** | The projection carries impact | §3.4 `GraphProjection` | `GraphProjection` (already `#[non_exhaustive]`) gains `impact: Vec<ImpactEntry>` and `impact_omitted: usize`; new public types `ImpactEntry { seed_path, relation, node }` and `ImpactRelation { Caller, Reference }`. Ordering is a D5 total order: `(seed_path ASC, relation [Caller < Reference], node.kind, node.path, node.id)`, deduplicated by `(seed_path, relation, node.id)`, then capped at `max_impact_nodes` with the surplus recorded in `impact_omitted`. Rendering rides the **existing `working_set:graph` fence**: an out-of-view impact node renders one standard node line with the standard `alloy://working_set/graph/{version}/{node_path}` citation; every entry renders one relation line `calls {node} -> {seed}` / `refs {node} -> {seed}`; an in-view node gets no duplicate node line. Impact participates fully in the B rules: it is clamped inside the WorkingSet allowance (B6), dropped **first** in the WorkingSet's B10 reverse-inclusion order (inclusion order is nodes → edges → impact), and every drop leaves `[alloy: omitted — {n} more impact items not shown]` mirrored by the manifest's `omitted` counter (B7/B8). A non-empty impact view capped by the index sets the projection's `truncated` flag (Q9 marker). |
+| **A-0012-1c** | Empty impact is honest absence | **E2** posture | An empty `Callers`/`Refs` view — the M7 store's stub answer — contributes no entry, no marker, and **no degradation**: a populated projection with empty impact is complete, not degraded. A failing impact query maps per E2 (`Busy` retried once per E4), records one degradation, and stops further impact reads for that call — it never discards the projection and never fails assembly (E1 unchanged). The empty-store path is byte-for-byte the pre-amendment behaviour: no graph fence, `graph_empty`, `Ok`. |
+| **A-0012-1d** | Two profile knobs | §3.5, §4.6 | `ContextProfile` gains `max_impact_seeds` (default `4`; `0` disables impact reads) and `max_impact_nodes` (default `8`), parsed from `[context]` like every other cap. D19 is untouched: `weights` still names exactly the three live domains. |
+
+Worker-side counterpart (recorded here for traceability, owned by RFC-0013 RW4 / RFC-0011 A-0011-5c's posture): `RepairWorker` MAY resolve the diagnosed paths via `Symbol` and issue one `Callers` query per resolved item (≤ 4 paths, ≤ 8 rendered lines, ≤ 1 KiB), rendering the result as one bounded, fenced, User-role advisory note; graph-recorded caller files additionally widen the RW6 target set, since a recorded caller is a workspace observation of impact. Read-only through `GraphViewHandle`; RFC-0011 SEC4 unchanged.
 
 ### 2.4 Module placement decision (normative)
 
@@ -797,7 +810,7 @@ pub struct ContextMetricsSnapshot {
 | **D11** | Diagnostic order: `(level DESC [Error > Warning > Note > Help], code ASC, primary path ASC, DiagnosticId ASC)`. The primary path is the D9 primary span's path; diagnostics without spans sort after those with one. |
 | **D12** | Artifact order: `(created_at DESC, ArtifactId ASC)`, filtered to `ArtifactKind` in {`Patch`, `Log`, `Decision`, `Blob`}; `ArtifactKind::PromptPack` **and** `ArtifactKind::Other(_)` artifacts are **excluded** (no prompt-in-prompt recursion; no unclassified bodies). This exclusion outranks B11: a pinned `PromptPack`- or `Other`-kind artifact is `MustIncludeNotFound`, never embedded. |
 | **D13** | Conversation order: ascending `EventSeq`, after selecting the most recent `max_conversation_events` window. Rendering is oldest-first; selection is newest-first. |
-| **D14** | Only `GraphQuery::Symbol`, `GraphQuery::Diagnostics` and `GraphQuery::Subgraph` may be constructed in `context/**` (RFC-0011 E.1; CI grep T-CI6). |
+| **D14** | Only `GraphQuery::Symbol`, `GraphQuery::Diagnostics` and `GraphQuery::Subgraph` may be constructed in `context/**` (RFC-0011 E.1; CI grep T-CI6). *(Amended by **A-0012-1a**, §2.3a: bounded `Callers` / `Refs` impact reads are additionally permitted; `Impls` / `SimilarFixes` remain forbidden and T-CI6 greps for exactly those two.)* |
 | **D15** | A domain that produces no content MUST still appear in the manifest with `"items": 0` and its degradations. Absence is reported, never implied. |
 | **D16** | The Conversation domain MUST exclude `ModelCall`, `ToolCall`, `NodeState`, `PlanProduced`, `SessionCreated`, `ReplanRequested` and `RunCompleted` events (§4.2). |
 | **D17** | `DiagnosticEvent.raw_json` is never rendered; `children` are flattened to at most three lines each (§4.3c). |
@@ -836,11 +849,12 @@ This is V2 §8.1's own parenthetical: *"WorkingSet (files + graph projection + d
 
 Deduplicate, clamp to `max_files`, read from `workspace_root.join(path)` with the RFC-0011 SEC7 posture (no symlink traversal, no escape above the root; a rejected path is a `Degradation`, not an error). Each file is rendered up to `max_file_lines`; when a diagnostic points into the file, the retained window is centred on the diagnostic span. Order by D8.
 
-**(b) Graph projection.** Exactly three query kinds, all through `GraphViewHandle` (SEC1):
+**(b) Graph projection.** Exactly three query kinds *(plus the A-0012-1a impact reads, item 4)*, all through `GraphViewHandle` (SEC1):
 
 1. `GraphQuery::Symbol { path }` per seed handle (bounded by `must_include.len() + max_files`).
 2. `GraphQuery::Subgraph { seeds, radius }` — one call (D10).
 3. `GraphQuery::Diagnostics { crate_id, since }` — issued **only** when `AssembleInputs.diagnostics` is empty, so the recorded log is a fallback rather than a duplicate.
+4. *(A-0012-1a)* `GraphQuery::Callers { fn_node }` and `GraphQuery::Refs { node }` — after a successful Subgraph, over the leading `max_impact_seeds` seeds; results populate `GraphProjection.impact` per §2.3a and render inside the `working_set:graph` fence.
 
 `GraphView.version` becomes `GraphProjection.version` and the memo key (K1). `GraphView.fidelity` becomes `GraphProjection.fidelity` and is rendered **only** as a provenance label in the fence header (CIT6). `GraphView.truncated` propagates to `GraphProjection.truncated` and emits a marker.
 
@@ -885,6 +899,9 @@ max_artifacts = 8
 max_conversation_events = 200
 graph_radius = 1
 cache_capacity = 32
+# A-0012-1d impact caps (0 disables the Callers/Refs impact reads):
+max_impact_seeds = 4
+max_impact_nodes = 8
 ```
 
 The first two settings are V2 Appendix B verbatim. RFC-0015 owns the file, the layering and the CLI surface; this RFC owns `ContextProfile::from_toml_table` and its validation (D2, D19).
@@ -909,7 +926,7 @@ The first two settings are V2 Appendix B verbatim. RFC-0015 owns the file, the l
 | **A10** | `must_include` items are resolved and allocated **before** any weighted allowance (B11) and are additionally listed in a final addendum section so the model cannot miss them. |
 | **A11** | The `domains` manifest is written last, from the counters accumulated during rendering — never re-derived by a second pass, which could disagree. |
 | **A12** | **Stub:** `compact(domain, _)` on a live domain drops the memoized projection for that domain and returns `Ok(())`; it performs **no summarization**. On a reserved domain it returns `ContextError::DomainNotLive`. |
-| **A13** | Assembly is `async` but performs no unbounded concurrency: at most `max_files` sequential file reads and at most `must_include.len() + max_files + 2` graph queries per call. |
+| **A13** | Assembly is `async` but performs no unbounded concurrency: at most `max_files` sequential file reads and at most `must_include.len() + max_files + 2` graph queries per call. *(Amended by **A-0012-1a**, §2.3a: the bound is `must_include.len() + max_files + 2 + 2 × max_impact_seeds`.)* |
 | **A14** | Assembly MUST NOT write to the workspace, the artifact store, or the event log. It is a pure read + render (T-CI9). |
 | **A15** | A pack whose messages contain no `User` content MUST NOT be returned; `ContextError::EmptyPrompt` is raised instead (E8). |
 
@@ -1299,7 +1316,7 @@ Implemented as ordinary `#[test]`s using the existing `rfc0010_ci_greps.rs` / `r
 | **T-CI3** | `sec1_context_never_names_project_graph_directly` | SEC1 — `context/**` contains no `dyn ProjectGraph`, `SqliteProjectGraph`, `rebuild(`, `record_diagnostic`, `record_fix`, `apply_incremental` |
 | **T-CI4** | `d1_reserved_domains_appear_only_in_the_enum_and_the_empty_arm` | D1 — the five reserved variants occur in `context/**` only in the enum declaration, `ALL`, `is_live`, `label`, and the manifest loop |
 | **T-CI5** | `sec7_no_embedding_index_identifiers` | SEC7 — no `embed`, `embedding`, `vector_store`, `cosine`, `ann_index`, `faiss`, `hnsw` |
-| **T-CI6** | `d14_only_three_graph_query_kinds_are_constructed` | D14 — `GraphQuery::Callers` / `Refs` / `Impls` / `SimilarFixes` absent from `context/**` |
+| **T-CI6** | `d14_only_the_amended_graph_query_kinds_are_constructed` *(renamed by A-0012-1a)* | D14 as amended — `GraphQuery::Impls` / `SimilarFixes` absent from `context/**`; `Callers` / `Refs` are permitted, bounded per A-0012-1a |
 | **T-CI7** | `c3_router_does_not_depend_on_context` | C3 — `router/**` contains no `crate::context` / `super::context` |
 | **T-CI8** | `e1_no_from_graph_error_or_store_error_for_context_error` | E1 — no `impl From<GraphError> for ContextError`, none for `StoreError` |
 | **T-CI9** | `a14_context_never_writes` | A14/SEC9 — `context/**` contains no `fs::write`, `create_dir`, `File::create`, `OpenOptions`, `remove_file`, `.put(` |
@@ -1331,7 +1348,7 @@ T5i serialises two packs assembled from the same fixture and compares bytes. T8h
 | Real tokenizer counts | `TokenEstimator` trait | When a provider disagreement is measured |
 | Prompt-cache prefix discipline | Stable `PromptPack` shape (V2 §8.1 Evolution) | Post-Beta |
 | Cross-session conversation recall | `DomainId::LongTerm` | Deferred |
-| `Callers` / `SimilarFixes` in the WorkingSet | RFC-0011 query variants return empty | After RFC-0011 Beta + precision measurement |
+| `SimilarFixes` in the WorkingSet | RFC-0011 query variant returns empty | After RFC-0011 Beta + precision measurement. (`Callers` / `Refs`: shipped by A-0012-1, §2.3a) |
 | Versioned redaction passes over captured packs | RFC-0004 retention + `redactor_version` (§7.11 item 12) | RFC-0018 scope, not this RFC |
 
 Rule **C5** restated as the deepening contract: **Beta changes population, never shape.** If a Beta change requires editing any signature in §3, it is out of scope and needs its own RFC.
@@ -1363,7 +1380,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 19. `DiagnosticEvent.raw_json` is never rendered (**D17**, T3g).
 - [ ] 20. `ArtifactKind::PromptPack` artifacts are never embedded in a pack (**D12**, T3i).
 - [ ] 21. Non-UTF-8 or NUL-bearing inputs are excluded as `NotTextual` (**D7**, T3j).
-- [ ] 22. Only `Symbol`, `Diagnostics` and `Subgraph` graph queries are constructed (**D14**, T4e, T-CI6).
+- [ ] 22. Only `Symbol`, `Diagnostics` and `Subgraph` graph queries are constructed (**D14**, T4e, T-CI6). *(Amended by A-0012-1a: plus bounded `Callers` / `Refs`; `Impls` / `SimilarFixes` still absent — T4e is renamed `only_the_read_path_query_kinds_are_queried`.)*
 - [ ] 23. The neighbourhood is one `Subgraph` query for all seeds (**D10**, T4f).
 - [ ] 24. Graph seeds are deduplicated and sorted (**D9**, T4i).
 - [ ] 25. The engine holds a `GraphViewHandle`; `dyn ProjectGraph` and the write methods appear nowhere in `context/**` (**SEC1**, T-CI3).

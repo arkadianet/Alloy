@@ -40,6 +40,12 @@ const FIXES_PER_CODE: usize = 2;
 const MAX_SIMILAR_FIXES: usize = 8;
 /// RW2-style byte cap on the assembled past-fix note.
 const MAX_SIMILAR_FIXES_BYTES: usize = 1024;
+/// A-0012-1: distinct diagnosed paths resolved for caller impact.
+const MAX_CALLER_PATHS: usize = 4;
+/// A-0012-1: total caller lines shown, across all diagnosed paths.
+const MAX_CALLER_LINES: usize = 8;
+/// RW2-style byte cap on the assembled callers note.
+const MAX_CALLERS_BYTES: usize = 1024;
 /// §8.2: max `target_files` entries.
 const MAX_TARGET_FILES: usize = 16;
 /// §8.2: max bytes of one step rationale.
@@ -195,7 +201,14 @@ impl RepairWorker {
         // RW4 (A-0011-5): what the graph remembers about these codes. Best
         // effort like every other graph read; the note is advisory prose on
         // the PR11 User-role seam, never a substitute for the diagnostics.
-        let notes = similar_fix_notes(ctx, &diagnostics).await;
+        let mut notes = similar_fix_notes(ctx, &diagnostics).await;
+
+        // A-0012-1 (mirroring A-0011-5c): who calls into the diagnosed
+        // items. Same posture — bounded, read-only, best effort; caller
+        // files additionally widen the RW6 target set, since a caller is a
+        // workspace observation of impact.
+        let (caller_notes, caller_paths) = caller_hints(ctx, &diagnostics).await;
+        notes.extend(caller_notes);
 
         let (proposal, _pack) = llm_exchange(
             ctx,
@@ -207,7 +220,7 @@ impl RepairWorker {
             |value| {
                 let proposal: RepairProposal =
                     serde_json::from_value(value.clone()).map_err(|e| format!("schema: {e}"))?;
-                validate_proposal(&proposal, &diag_paths, &goal_text)?;
+                validate_proposal(&proposal, &diag_paths, &caller_paths, &goal_text)?;
                 Ok(proposal)
             },
         )
@@ -341,6 +354,91 @@ async fn similar_fix_notes(
     vec![fence_tool("similar_fixes", &body, MAX_SIMILAR_FIXES_BYTES)]
 }
 
+/// Ask the graph who calls into the diagnosed items and render at most one
+/// compact fenced note plus the caller-file target hints (A-0012-1,
+/// mirroring A-0011-5c's posture).
+///
+/// Bounded like every other graph read: at most [`MAX_CALLER_PATHS`]
+/// `Symbol` resolutions, one `Callers` query per resolved item, and
+/// [`MAX_CALLER_LINES`] rendered lines. A graph error or an empty view —
+/// today's store, whose `Callers` stub returns empty — is "no known
+/// callers": no fence, no error, never a failure (RW4). Read-only via the
+/// `GraphViewHandle`; PW/SEC posture unchanged.
+async fn caller_hints(
+    ctx: &CapabilityContext<'_>,
+    diagnostics: &[DiagnosticEvent],
+) -> (Vec<String>, Vec<String>) {
+    let mut paths: Vec<&str> = Vec::new();
+    for d in diagnostics {
+        if let Some(span) = d.spans.first() {
+            let path = span.path.as_str();
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+            if paths.len() == MAX_CALLER_PATHS {
+                break;
+            }
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut caller_paths: Vec<String> = Vec::new();
+    'outer: for path in paths {
+        let Ok(view) = ctx
+            .graph
+            .query(GraphQuery::Symbol {
+                path: path.to_owned(),
+            })
+            .await
+        else {
+            continue; // A graph error is "no callers known", never a failure.
+        };
+        let Some(node) = view.nodes.first() else {
+            continue;
+        };
+        let Ok(callers) = ctx
+            .graph
+            .query(GraphQuery::Callers { fn_node: node.id })
+            .await
+        else {
+            continue;
+        };
+        for caller in callers.nodes {
+            if lines.len() >= MAX_CALLER_LINES {
+                break 'outer;
+            }
+            if caller.id == node.id {
+                continue;
+            }
+            let file = caller.file.as_deref().unwrap_or("-");
+            let line = format!("{} ({file}) calls into {path}", caller.path);
+            if lines.contains(&line) {
+                continue;
+            }
+            lines.push(line);
+            if let Some(f) = caller.file {
+                if is_jail_relative(&f) && !caller_paths.contains(&f) {
+                    caller_paths.push(f);
+                }
+            }
+        }
+    }
+    if lines.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let body = format!(
+        "Known callers of the diagnosed items, from the project graph. \
+         These files consume what you are changing: treat them as \
+         additional target-file hints and keep their call sites \
+         compiling.\n{}",
+        lines.join("\n")
+    );
+    (
+        vec![fence_tool("callers", &body, MAX_CALLERS_BYTES)],
+        caller_paths,
+    )
+}
+
 fn sort_key(d: &DiagnosticEvent) -> (String, u32, Option<String>) {
     let (path, line) = d
         .spans
@@ -349,10 +447,13 @@ fn sort_key(d: &DiagnosticEvent) -> (String, u32, Option<String>) {
     (path, line, d.code.clone())
 }
 
-/// PS5 + RW5 + RW6 semantic validation.
+/// PS5 + RW5 + RW6 semantic validation. `caller_paths` are graph-observed
+/// caller files (A-0012-1): legitimate impact targets alongside the
+/// diagnostic- and goal-named ones.
 fn validate_proposal(
     proposal: &RepairProposal,
     diag_paths: &[String],
+    caller_paths: &[String],
     goal_text: &str,
 ) -> Result<(), String> {
     // RW5: prose only — a unified-diff header anywhere is a violation.
@@ -375,11 +476,15 @@ fn validate_proposal(
             return Err(format!("target path is not jail-relative: {path:.120}"));
         }
         // RW6: a target must trace to a workspace observation — a
-        // diagnostic span — or be named by the goal (a Create target).
-        let known = diag_paths.iter().any(|p| p == path) || goal_text.contains(path.as_str());
+        // diagnostic span or a graph-recorded caller (A-0012-1) — or be
+        // named by the goal (a Create target).
+        let known = diag_paths.iter().any(|p| p == path)
+            || caller_paths.iter().any(|p| p == path)
+            || goal_text.contains(path.as_str());
         if !known {
             return Err(format!(
-                "target file named by neither a diagnostic nor the goal: {path:.120}"
+                "target file named by neither a diagnostic, a recorded caller, \
+                 nor the goal: {path:.120}"
             ));
         }
     }
@@ -421,28 +526,40 @@ mod tests {
     fn repair_worker_rejects_diff_in_rationale() {
         // RW5.
         let p = proposal(vec!["src/lib.rs"], "@@ -1 +1 @@ change this", false);
-        assert!(validate_proposal(&p, &["src/lib.rs".into()], "").is_err());
+        assert!(validate_proposal(&p, &["src/lib.rs".into()], &[], "").is_err());
         let ok = proposal(vec!["src/lib.rs"], "clone before the borrow", false);
-        assert!(validate_proposal(&ok, &["src/lib.rs".into()], "").is_ok());
+        assert!(validate_proposal(&ok, &["src/lib.rs".into()], &[], "").is_ok());
     }
 
     #[test]
     fn repair_worker_requires_target_files_unless_needs_replan() {
         // RW6.
-        assert!(validate_proposal(&proposal(vec![], "x", false), &[], "").is_err());
-        assert!(validate_proposal(&proposal(vec![], "x", true), &[], "").is_ok());
+        assert!(validate_proposal(&proposal(vec![], "x", false), &[], &[], "").is_err());
+        assert!(validate_proposal(&proposal(vec![], "x", true), &[], &[], "").is_ok());
     }
 
     #[test]
     fn repair_worker_rejects_unknown_and_escaping_targets() {
         // RW6 + PS5.
-        assert!(validate_proposal(&proposal(vec!["../x.rs"], "x", false), &[], "").is_err());
-        assert!(validate_proposal(&proposal(vec!["src/other.rs"], "x", false), &[], "").is_err());
+        assert!(validate_proposal(&proposal(vec!["../x.rs"], "x", false), &[], &[], "").is_err());
+        assert!(
+            validate_proposal(&proposal(vec!["src/other.rs"], "x", false), &[], &[], "").is_err()
+        );
         // Named by the goal ⇒ acceptable Create target.
         assert!(validate_proposal(
             &proposal(vec!["src/other.rs"], "x", false),
             &[],
+            &[],
             "create src/other.rs"
+        )
+        .is_ok());
+        // A graph-recorded caller file is a workspace observation too
+        // (A-0012-1): a legitimate impact target.
+        assert!(validate_proposal(
+            &proposal(vec!["src/other.rs"], "x", false),
+            &[],
+            &["src/other.rs".into()],
+            ""
         )
         .is_ok());
     }
