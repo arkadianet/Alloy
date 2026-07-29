@@ -780,6 +780,7 @@ async fn unescalated_effective_tier_routes_at_the_capability_tier() {
     assert_eq!(route.metadata["tier"], "standard");
     assert_eq!(route.metadata["tier_source"], "capability_map");
     assert_eq!(route.metadata["escalation_unserved"], false);
+}
 
 fn past_fix(code: &str, hours_ago: i64) -> FixEvent {
     FixEvent {
