@@ -2,8 +2,10 @@
 
 mod capability;
 mod diagnostics;
+mod fixes;
 mod gate;
 mod perms;
+mod seed;
 mod tool_caller;
 // `pub(crate)` so `lang::runner` can reuse the single cargo argv path and
 // exit-code classification (RFC-0014 LB9) without a second implementation.
@@ -14,8 +16,12 @@ pub use capability::{
     UnavailableCapabilityExecutor,
 };
 pub use diagnostics::{diagnostic_fingerprint, parse_rustc_diagnostics};
+pub use fixes::{
+    AppliedEdit, AppliedEditSource, EventLogEdits, FixRecordingVerifier, MAX_PENDING_RUNS,
+};
 pub use gate::SessionGateHumanAdapter;
 pub use perms::{SessionVerifyPermissions, VerifyClass, VerifyPermissions};
+pub use seed::{seed_graph_diagnostics, SeedReport};
 pub use tool_caller::{ToolCaller, ToolCallerError};
 pub use verify::{McpVerifyCompileAdapter, McpVerifyTestAdapter};
 

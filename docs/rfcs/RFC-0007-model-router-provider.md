@@ -935,6 +935,18 @@ OUTPUT: (tier, tier_source)
 
 `[policy].scoring` is parsed into `ScoringWeights` (all fields optional `f64`) and MUST NOT be read by `select`.
 
+#### 5.2.1 Escalation override (amendment — PR #58)
+
+`RoutingRequest.tier_override: Option<ModelTier>` (serde `default`, omitted when `None`, so existing payloads are unaffected) carries RFC-0010 §5.11.4's `CapabilityExecContext.effective_tier` into tier resolution. Without it §5.2's output is a pure function of `capability`, which made RFC-0010 escalation and RFC-0013 MR2 unobservable in routing: an escalated retry re-selected the endpoint that had just failed. Rules:
+
+| id | Rule |
+| --- | --- |
+| **TO1** | The override is a **floor**, never a ceiling: it applies iff it is strictly more capable than the §5.2 tier, ranked `local < economy < standard < premium`. A value at or below the resolved tier is inert. Nothing downgrades a configured tier. |
+| **TO2** | When applied, `tier_source = "escalation"`. `capability_mapped` keeps describing the §5.2 lookup that produced the tier being raised, and `requested_tier` records the requested value on every route where the caller sent one (applied or not). |
+| **TO3** | If no endpoint serves the overridden tier (§5.3 filters), selection retries **once** at the §5.2 tier, increments `routes_escalation_unserved`, logs a warning, and records `escalation_unserved = true`. An operator who serves no `premium` endpoint therefore keeps the retry they would have had, minus the escalation. |
+| **TO4** | TO3 is the *only* fallback. The §5.2-resolved tier still never fails over (§5.3): if it has no endpoint either, `NoEndpoint` is returned naming that tier. |
+| **TO5** | The override is a routing input only. It does not touch `[capability_tiers]`, `TaskNode.model_tier` (RFC-0010 ES3), or budget enforcement (§5.4 step 6 stands: tier is never changed to satisfy budget). |
+
 ### 5.3 Endpoint selection
 
 Among `config` endpoints where:

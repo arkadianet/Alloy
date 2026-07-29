@@ -862,3 +862,154 @@ mod tests {
         .to_string()
     }
 }
+
+#[cfg(test)]
+mod seed_tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::adapters::{
+        seed_graph_diagnostics, NodeExecContext, NodeExecRef, Verdict, VerdictOutcome, Verifier,
+    };
+    use crate::error::AdapterError;
+    use crate::graph::{GraphError, GraphQuery, GraphView, ProjectGraph};
+    use crate::types::diagnostic::{DiagnosticEvent, DiagnosticLevel};
+    use crate::types::ids::GraphVersion;
+    use crate::types::ids::{DagId, NodeId, RunId, SessionId};
+
+    struct StubVerifier(Mutex<Option<Result<Verdict, AdapterError>>>);
+
+    #[async_trait]
+    impl Verifier for StubVerifier {
+        async fn verify(&self, _ctx: &NodeExecContext) -> Result<Verdict, AdapterError> {
+            self.0.lock().unwrap().take().expect("one verify call")
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingGraph(Mutex<Vec<DiagnosticEvent>>);
+
+    #[async_trait]
+    impl ProjectGraph for RecordingGraph {
+        async fn rebuild(&self, _root: &std::path::Path) -> Result<GraphVersion, GraphError> {
+            Ok(GraphVersion(0))
+        }
+        async fn apply_incremental(
+            &self,
+            _changes: &[crate::graph::FileChange],
+        ) -> Result<GraphVersion, GraphError> {
+            Ok(GraphVersion(0))
+        }
+        async fn snapshot(&self) -> Result<crate::types::ids::GraphSnapshotId, GraphError> {
+            Err(GraphError::Disabled)
+        }
+        async fn query(&self, _q: GraphQuery) -> Result<GraphView, GraphError> {
+            Ok(GraphView::empty(GraphVersion(0)))
+        }
+        async fn record_diagnostic(&self, d: DiagnosticEvent) -> Result<(), GraphError> {
+            self.0.lock().unwrap().push(d);
+            Ok(())
+        }
+        async fn clear_diagnostics(&self) -> Result<u64, GraphError> {
+            let mut v = self.0.lock().unwrap();
+            let n = v.len() as u64;
+            v.clear();
+            Ok(n)
+        }
+        async fn record_fix(&self, _f: crate::graph::FixEvent) -> Result<(), GraphError> {
+            Ok(())
+        }
+    }
+
+    fn ctx() -> NodeExecContext {
+        NodeExecContext {
+            meta: NodeExecRef {
+                session_id: SessionId::new(),
+                run_id: RunId::new(),
+                dag_id: DagId::new(),
+                node_id: NodeId::new(),
+                workspace_root: "/tmp/ws".into(),
+                attempt: 1,
+            },
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    fn diag(code: &str) -> DiagnosticEvent {
+        let message = "mismatched types".to_owned();
+        let fingerprint = crate::adapters::diagnostic_fingerprint(
+            Some(code),
+            DiagnosticLevel::Error,
+            &message,
+            None,
+        );
+        DiagnosticEvent {
+            id: crate::types::ids::DiagnosticId::new(),
+            code: Some(code.to_owned()),
+            level: DiagnosticLevel::Error,
+            message,
+            spans: vec![],
+            children: vec![],
+            package: None,
+            fingerprint,
+            raw_json: None,
+        }
+    }
+
+    /// Issue #53 — a pre-plan verify pass seeds the graph so the repair
+    /// worker's generation-1 prompt carries the real rustc error.
+    #[tokio::test]
+    async fn seeds_every_parsed_diagnostic_into_the_graph() {
+        let verifier = StubVerifier(Mutex::new(Some(Ok(Verdict {
+            outcome: VerdictOutcome::Fail,
+            diagnostics: vec![diag("E0308"), diag("E0277")],
+            raw_artifact: None,
+        }))));
+        let graph = RecordingGraph::default();
+        let report = seed_graph_diagnostics(&verifier, &graph, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(report.recorded, 2);
+        assert_eq!(report.errors, 2);
+        let recorded = graph.0.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].code.as_deref(), Some("E0308"));
+    }
+
+    /// Dogfood finding (2026-07-29, retry round): each seed pass is a
+    /// full check of the current workspace, so its diagnostics supersede
+    /// everything previously recorded — without clearing, retries fed the
+    /// model a growing pile of already-fixed errors (5.9k-token prompts).
+    #[tokio::test]
+    async fn reseeding_clears_superseded_diagnostics_first() {
+        let verifier = StubVerifier(Mutex::new(Some(Ok(Verdict {
+            outcome: VerdictOutcome::Fail,
+            diagnostics: vec![diag("E0277")],
+            raw_artifact: None,
+        }))));
+        let graph = RecordingGraph::default();
+        graph.0.lock().unwrap().push(diag("E0308")); // stale, from a prior seed
+        let report = seed_graph_diagnostics(&verifier, &graph, &ctx())
+            .await
+            .unwrap();
+        assert_eq!(report.recorded, 1);
+        let recorded = graph.0.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "stale diagnostics must be cleared");
+        assert_eq!(recorded[0].code.as_deref(), Some("E0277"));
+    }
+
+    /// A verifier error propagates (the CLI warns and continues); nothing
+    /// is recorded.
+    #[tokio::test]
+    async fn verifier_error_propagates_and_records_nothing() {
+        let verifier = StubVerifier(Mutex::new(Some(Err(AdapterError::Tool(
+            "cargo missing".into(),
+        )))));
+        let graph = RecordingGraph::default();
+        let err = seed_graph_diagnostics(&verifier, &graph, &ctx()).await;
+        assert!(err.is_err());
+        assert!(graph.0.lock().unwrap().is_empty());
+    }
+}

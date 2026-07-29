@@ -367,6 +367,48 @@ mod tests {
         );
     }
 
+    /// The shipped `repair_local_diagnostic` manifest is the only day-1
+    /// producer of escalation policy, so pin what the scheduler will actually
+    /// decide for its model-backed nodes: base tier on attempt 1, Premium on
+    /// the single retry. `es1_escalation_applies_to_capability_context_after_
+    /// threshold` in `loop_.rs` proves the same decision reaches
+    /// `CapabilityExecContext.effective_tier` (ES3), and
+    /// `escalated_effective_tier_routes_to_the_premium_endpoint` in
+    /// `tests/capabilities_rfc0013.rs` proves that tier reaches the routed
+    /// endpoint.
+    #[test]
+    fn repair_template_llm_nodes_escalate_on_their_retry() {
+        use crate::dag::{NodeKind, TemplateCatalog, TemplateId};
+
+        let manifest = TemplateCatalog::get(TemplateId::RepairLocalDiagnostic);
+        let llm: Vec<_> = manifest
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Analyze | NodeKind::Edit))
+            .collect();
+        assert_eq!(llm.len(), 2, "analyze + edit are the model-backed nodes");
+        for node in llm {
+            assert_eq!(escalation_for_attempt(&node.retry, 1), Escalation::None);
+            assert_eq!(
+                escalation_for_attempt(&node.retry, 2),
+                Escalation::To(ModelTier::Premium),
+                "{} must escalate on its retry",
+                node.name
+            );
+            // The escalated attempt must be reachable: A3 admits `attempt <
+            // max_attempts`, so escalate_after + 1 <= max_attempts.
+            assert!(node.retry.escalate_after.unwrap() < node.retry.max_attempts);
+        }
+        // ES5: adapter nodes carry no escalation at all (V9 forbids it).
+        for node in manifest
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::VerifyCompile | NodeKind::GateHuman))
+        {
+            assert_eq!(escalation_for_attempt(&node.retry, 99), Escalation::None);
+        }
+    }
+
     #[test]
     fn reject_reason_as_str_is_stable_snake_case() {
         assert_eq!(

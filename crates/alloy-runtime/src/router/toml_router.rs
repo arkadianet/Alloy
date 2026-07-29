@@ -21,6 +21,7 @@ use crate::types::ids::{EventSeq, RunId};
 use super::config::RouterConfig;
 use super::decision_bridge::{
     budget_decision_for_complete, budget_decision_for_route, route_decision, BudgetCounters,
+    RouteTier,
 };
 use super::error::{normalize_provider_error, ProviderError, RouterError};
 use super::meter_bridge::{build_cancelled_model_call_record, build_model_call_record};
@@ -30,7 +31,8 @@ use super::openai::{OpenAiCompatibleProvider, OpenAiCompatibleSpec};
 #[cfg(feature = "http-provider")]
 use super::secret::SecretString;
 use super::select::{
-    apply_usd_ceiling_overlay, check_budget_snapshot, resolve_tier, select_endpoint, TierSource,
+    apply_tier_override, apply_usd_ceiling_overlay, check_budget_snapshot, resolve_tier,
+    select_endpoint, TierSource,
 };
 use super::traits::{ModelProvider, ModelRouter};
 use super::types::{
@@ -362,24 +364,55 @@ impl TomlModelRouter {
             return Err(RouterError::Config("run mismatch".into()));
         }
 
-        let (tier, tier_source) = resolve_tier(&self.config, &request.capability);
-        span.record("tier", super::decision_bridge::tier_name(tier));
+        let configured = resolve_tier(&self.config, &request.capability);
+        let (tier, tier_source) = apply_tier_override(configured, request.tier_override);
         if tier_source == TierSource::Default {
             self.metrics
                 .routes_default_tier
                 .fetch_add(1, Ordering::Relaxed);
         }
         let in_flight = self.metrics.in_flight.load(Ordering::SeqCst);
-        let Some(endpoint) = select_endpoint(
-            &self.config,
+        let select = |tier| {
+            select_endpoint(
+                &self.config,
+                tier,
+                request.requires_tools,
+                request.requires_structured_output,
+            )
+        };
+        // §5.2.1: an escalation the operator does not serve degrades to the
+        // configured tier — the retry runs where it would have run without
+        // escalation instead of dying on `NoEndpoint`. The *configured* tier
+        // never fails over (RFC-0007 §5.3).
+        let (tier, tier_source, endpoint, escalation_unserved) = match select(tier) {
+            Some(endpoint) => (tier, tier_source, Some(endpoint), false),
+            None if tier_source == TierSource::Escalation => {
+                let (base_tier, base_source) = configured;
+                tracing::warn!(
+                    requested_tier = super::decision_bridge::tier_name(tier),
+                    tier = super::decision_bridge::tier_name(base_tier),
+                    capability = %request.capability,
+                    "no endpoint serves the escalated tier; routing at the configured tier"
+                );
+                self.metrics
+                    .routes_escalation_unserved
+                    .fetch_add(1, Ordering::Relaxed);
+                (base_tier, base_source, select(base_tier), true)
+            }
+            None => (tier, tier_source, None, false),
+        };
+        span.record("tier", super::decision_bridge::tier_name(tier));
+        let route_meta = RouteTier {
             tier,
-            request.requires_tools,
-            request.requires_structured_output,
-        ) else {
+            source: tier_source,
+            base_source: configured.1,
+            requested: request.tier_override,
+            escalation_unserved,
+        };
+        let Some(endpoint) = endpoint else {
             let decision = route_decision(
                 &request,
-                tier,
-                tier_source,
+                route_meta,
                 &self
                     .config
                     .providers
@@ -410,8 +443,7 @@ impl TomlModelRouter {
             );
             let decision = budget_decision_for_route(
                 &request,
-                tier,
-                tier_source,
+                route_meta,
                 check,
                 counters,
                 budget_source,
@@ -426,8 +458,7 @@ impl TomlModelRouter {
 
         let decision = route_decision(
             &request,
-            tier,
-            tier_source,
+            route_meta,
             &endpoint.provider,
             Some(&endpoint),
             in_flight,
@@ -438,7 +469,7 @@ impl TomlModelRouter {
             endpoint,
             tier,
             &request,
-            tier_source == TierSource::CapabilityMap,
+            route_meta.capability_mapped(),
             route_event_seq,
             self.router_instance_id,
         ))
@@ -491,7 +522,7 @@ impl TomlModelRouter {
                 } else {
                     ResponseFormat::Text
                 },
-                temperature: None,
+                temperature: routed.endpoint().temperature,
                 max_output_tokens: None,
             };
             let started = tokio::time::Instant::now();
@@ -861,6 +892,7 @@ output_usd_per_mtok = 1.0
             run: Some(run),
             node: None,
             capability: CapabilityId::new("repair").unwrap(),
+            tier_override: None,
             complexity: None,
             budget_remaining: BudgetSnapshot {
                 usd_spent: 0.0,
@@ -870,6 +902,52 @@ output_usd_per_mtok = 1.0
             requires_tools: false,
             requires_structured_output: false,
         }
+    }
+
+    /// Issue #53 — the endpoint's configured temperature must reach the
+    /// provider request (previously hardcoded `None`, so the provider
+    /// default applied).
+    #[tokio::test]
+    async fn endpoint_temperature_reaches_provider_request() {
+        let id = ProviderId::new("provider").unwrap();
+        let provider = Arc::new(RecordingModelProvider::new(id));
+        provider.push(Ok(ModelResponse {
+            text: Some("done".into()),
+            structured: None,
+            tool_calls: vec![],
+            usage: Usage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+            },
+            provider_request_id: None,
+            finish_reason: Some("stop".into()),
+        }));
+        let mut cfg = config();
+        cfg.providers[0].endpoints[0].temperature = Some(0.25);
+        let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+        let run = RunId::new();
+        let router = TomlModelRouter::from_parts(TomlModelRouterParts::new(
+            cfg,
+            provider.clone(),
+            BudgetPolicy::default(),
+            Some(log),
+            Some(SharedCostMeter::new()),
+            Some(run),
+        ))
+        .unwrap();
+        let routed = router.route(request(run)).await.unwrap();
+        router
+            .complete(
+                &routed,
+                PromptPack {
+                    messages: vec![],
+                    citations: vec![],
+                    domains: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(provider.recorded()[0].1.temperature, Some(0.25));
     }
 
     #[tokio::test]

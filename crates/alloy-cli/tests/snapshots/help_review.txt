@@ -1,0 +1,13 @@
+Review a unified diff and print the findings (read-only)
+
+Usage: alloy review [OPTIONS] --diff <PATH|->
+
+Options:
+      --diff <PATH|->          Unified diff to review: a file path, or `-` for stdin (produce one with `git diff <base>... | alloy review --diff -`)
+      --workspace <WORKSPACE>  Workspace root used to resolve config files and `.alloy` (CL2) [default: .]
+      --profile <PROFILE>      Catalog profile id: default | autonomous | readonly (CL4)
+      --session <SESSION>      Reuse an existing session instead of creating one (SQ5)
+      --json                   Emit machine-readable JSON on stdout (CL3)
+      --quiet                  Suppress progress rendering on stderr (CL7)
+      --verbose                Raise the tracing filter (CL7)
+  -h, --help                   Print help

@@ -284,6 +284,13 @@ pub(crate) async fn route_and_complete(
         run: Some(ctx.run),
         node: Some(ctx.node),
         capability: ctx.capability.clone(),
+        // MR2: the worker still does not pick a tier — `capability_tiers`
+        // owns that. It forwards the scheduler's `effective_tier`, which is
+        // where RFC-0010 §5.11.4 escalation lives, as a *floor*: the router
+        // raises the configured tier to it and never lowers (RFC-0007
+        // §5.2.1). Without this the escalated retry re-ran on exactly the
+        // endpoint that had just failed.
+        tier_override: Some(ctx.effective_tier),
         complexity: None,
         budget_remaining: ctx.cost_meter.to_budget_snapshot(),
         requires_tools: false, // provider-native tool calling is deferred (§1.4).

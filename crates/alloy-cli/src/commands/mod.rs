@@ -10,6 +10,8 @@ mod events;
 mod gate;
 mod index;
 mod resume;
+mod review;
+mod rollback;
 mod run;
 
 use alloy_runtime::{EventSeq, RunId, SessionEvent, SessionEventType, SessionId, SessionService};
@@ -23,6 +25,7 @@ pub async fn dispatch(globals: Globals, command: Commands) -> Result<Exit, CliEr
     let ctx = resolve::resolve(&globals)?;
     match command {
         Commands::Run(args) => run::exec(ctx, args).await,
+        Commands::Review(args) => review::exec(ctx, args).await,
         Commands::Events(args) => events::exec(ctx, args).await,
         Commands::Approve(args) => approve::exec(ctx, args).await,
         Commands::Cancel(args) => cancel::exec(ctx, args).await,

@@ -259,6 +259,7 @@ planning = "standard"
             max_context: 65536,
             input_usd_per_mtok: Some(2.0),
             output_usd_per_mtok: Some(4.0),
+            temperature: None,
         }
     }
 
@@ -1022,6 +1023,7 @@ planning = "standard"
                 run: Some(run),
                 node: None,
                 capability: CapabilityId::new("repair").unwrap(),
+                tier_override: None,
                 complexity: None,
                 budget_remaining: alloy_runtime::BudgetSnapshot {
                     usd_spent: 0.0,

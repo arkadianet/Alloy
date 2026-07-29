@@ -5,7 +5,9 @@ use std::path::Path;
 
 use alloy_runtime::graph::{FixEvent, GraphEdge, GraphError, GraphNode, GraphQuery, GraphView};
 use alloy_runtime::types::diagnostic::DiagnosticEvent;
-use alloy_runtime::types::ids::{CrateId, Digest, GraphNodeId, Timestamp};
+use alloy_runtime::types::ids::{
+    ArtifactId, CrateId, DiagnosticId, Digest, GraphNodeId, Timestamp, TransactionId,
+};
 use rusqlite::Connection;
 
 use crate::db::from_rusqlite;
@@ -48,11 +50,13 @@ pub(crate) fn run(
             diagnostics(&tx, crate_id.as_ref(), since.as_ref(), version, limits)?
         }
         GraphQuery::Subgraph { seeds, radius } => subgraph(&tx, seeds, *radius, version, limits)?,
-        // Q4/Q5/Q6 Stubs: empty views, truncated, never an error.
-        GraphQuery::Refs { .. }
-        | GraphQuery::Impls { .. }
-        | GraphQuery::Callers { .. }
-        | GraphQuery::SimilarFixes { .. } => {
+        // Q6 as amended by A-0011-5: the recorded fixes are read back.
+        GraphQuery::SimilarFixes {
+            diagnostic_code,
+            limit,
+        } => similar_fixes(&tx, diagnostic_code, *limit, version, limits)?,
+        // Q4/Q5 Stubs: empty views, truncated, never an error.
+        GraphQuery::Refs { .. } | GraphQuery::Impls { .. } | GraphQuery::Callers { .. } => {
             let mut view = GraphView::empty(version);
             view.truncated = true;
             view
@@ -177,6 +181,83 @@ fn diagnostics(
     view.diagnostics = out;
     view.truncated = truncated;
     Ok(view)
+}
+
+/// Q6 (amendment A-0011-5): fixes recorded for `code`, most recent first,
+/// capped by the query's `limit` and by the store's own query cap. Rows are
+/// returned verbatim — the reader decides what, if anything, to show a
+/// model.
+fn similar_fixes(
+    conn: &Connection,
+    code: &str,
+    limit: usize,
+    version: alloy_runtime::GraphVersion,
+    limits: &IngestLimits,
+) -> Result<GraphView, GraphError> {
+    // Q9: the caller's limit never exceeds the store's own cap, and one row
+    // over the cap is fetched to detect truncation.
+    let cap = limit.min(limits.max_query_nodes as usize);
+    let mut stmt = conn
+        .prepare(
+            "SELECT diagnostic_id, diagnostic_code, crate_id, transaction_id, patch_artifact,
+                    verified, recorded_at
+               FROM graph_fixes
+              WHERE diagnostic_code = ?1
+              ORDER BY recorded_at DESC, rowid DESC
+              LIMIT ?2",
+        )
+        .map_err(from_rusqlite)?;
+    let over = i64::try_from(cap.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut rows = stmt
+        .query(rusqlite::params![code, over])
+        .map_err(from_rusqlite)?;
+    let mut out: Vec<FixEvent> = Vec::new();
+    while let Some(row) = rows.next().map_err(from_rusqlite)? {
+        out.push(fix_from_row(row)?);
+    }
+    let truncated = out.len() > cap;
+    out.truncate(cap);
+    let mut view = GraphView::empty(version);
+    view.fixes = out;
+    view.truncated = truncated;
+    Ok(view)
+}
+
+/// Decode one `graph_fixes` row back into its [`FixEvent`].
+fn fix_from_row(row: &rusqlite::Row<'_>) -> Result<FixEvent, GraphError> {
+    let diagnostic: Option<String> = row.get(0).map_err(from_rusqlite)?;
+    let diagnostic_code: Option<String> = row.get(1).map_err(from_rusqlite)?;
+    let crate_id: Option<String> = row.get(2).map_err(from_rusqlite)?;
+    let transaction: Option<String> = row.get(3).map_err(from_rusqlite)?;
+    let patch_artifact: Option<String> = row.get(4).map_err(from_rusqlite)?;
+    let verified: i64 = row.get(5).map_err(from_rusqlite)?;
+    let recorded_at: String = row.get(6).map_err(from_rusqlite)?;
+    Ok(FixEvent {
+        diagnostic: diagnostic
+            .map(|d| {
+                DiagnosticId::parse(&d).map_err(|e| GraphError::Corrupt(format!("fix {d:?}: {e}")))
+            })
+            .transpose()?,
+        diagnostic_code,
+        crate_id: crate_id
+            .map(|c| CrateId::new(c).map_err(|e| GraphError::Corrupt(format!("fix crate_id: {e}"))))
+            .transpose()?,
+        transaction: transaction
+            .map(|t| {
+                TransactionId::parse(&t)
+                    .map_err(|e| GraphError::Corrupt(format!("fix transaction {t:?}: {e}")))
+            })
+            .transpose()?,
+        patch_artifact: patch_artifact
+            .map(|a| {
+                ArtifactId::parse(&a)
+                    .map_err(|e| GraphError::Corrupt(format!("fix artifact {a:?}: {e}")))
+            })
+            .transpose()?,
+        verified: verified != 0,
+        recorded_at: serde_json::from_value(serde_json::Value::String(recorded_at))
+            .map_err(|e| GraphError::Corrupt(format!("fix recorded_at: {e}")))?,
+    })
 }
 
 /// Q7: BFS over `Defines` **and** `Imports` edges in both directions,

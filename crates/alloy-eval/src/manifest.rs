@@ -733,6 +733,7 @@ fn build_fixture_endpoint(manifest: &FixtureManifest) -> Result<ModelEndpoint, E
             .endpoint_prices
             .as_ref()
             .and_then(|prices| prices.output_usd_per_mtok),
+        temperature: None,
     };
     Ok(endpoint)
 }

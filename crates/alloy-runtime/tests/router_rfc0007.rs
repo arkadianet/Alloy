@@ -55,6 +55,7 @@ fn route_request(run: RunId) -> RoutingRequest {
         run: Some(run),
         node: None,
         capability: CapabilityId::new("repair").expect("capability"),
+        tier_override: None,
         complexity: None,
         budget_remaining: BudgetSnapshot {
             usd_spent: 0.0,
@@ -89,6 +90,7 @@ fn endpoint() -> ModelEndpoint {
         max_context: 4096,
         input_usd_per_mtok: Some(2.0),
         output_usd_per_mtok: Some(4.0),
+        temperature: None,
     }
 }
 

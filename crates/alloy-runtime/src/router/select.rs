@@ -11,6 +11,9 @@ use super::types::ModelEndpoint;
 pub(crate) enum TierSource {
     CapabilityMap,
     Default,
+    /// The configured tier was raised by `RoutingRequest.tier_override`
+    /// (RFC-0010 §5.11.4 escalation).
+    Escalation,
 }
 
 impl TierSource {
@@ -18,6 +21,7 @@ impl TierSource {
         match self {
             Self::CapabilityMap => "capability_map",
             Self::Default => "default",
+            Self::Escalation => "escalation",
         }
     }
 }
@@ -30,6 +34,38 @@ pub(crate) fn resolve_tier(
     match config.capability_tiers.get(&key) {
         Some(tier) => (*tier, TierSource::CapabilityMap),
         None => (config.policy.default_tier, TierSource::Default),
+    }
+}
+
+/// Capability ordering used **only** to enforce RFC-0007's no-downgrade rule.
+///
+/// `ModelTier` is deliberately not `Ord`: it is a serde-stable operator-facing
+/// label, and a total order on it would invite cost/quality comparisons the
+/// RFC does not define. This local rank answers exactly one question — "is the
+/// requested tier above the configured one?" — and `Local` sits at the bottom
+/// because an offline endpoint is the least-capable target a caller can ask
+/// escalation to land on.
+const fn capability_rank(tier: ModelTier) -> u8 {
+    match tier {
+        ModelTier::Local => 0,
+        ModelTier::Economy => 1,
+        ModelTier::Standard => 2,
+        ModelTier::Premium => 3,
+    }
+}
+
+/// Raise `(tier, source)` to `requested` when — and only when — the request
+/// asks for a strictly more capable tier (RFC-0007 §5.2.1, RFC-0010 ES6).
+pub(crate) fn apply_tier_override(
+    resolved: (ModelTier, TierSource),
+    requested: Option<ModelTier>,
+) -> (ModelTier, TierSource) {
+    let (tier, source) = resolved;
+    match requested {
+        Some(requested) if capability_rank(requested) > capability_rank(tier) => {
+            (requested, TierSource::Escalation)
+        }
+        _ => (tier, source),
     }
 }
 
@@ -137,6 +173,35 @@ repair = "standard"
         assert_eq!(
             resolve_tier(&config, &CapabilityId::new("unknown").unwrap()),
             (ModelTier::Economy, TierSource::Default)
+        );
+    }
+
+    #[test]
+    fn tier_override_raises_and_never_lowers() {
+        let mapped = (ModelTier::Standard, TierSource::CapabilityMap);
+        // Absent override is the identity.
+        assert_eq!(apply_tier_override(mapped, None), mapped);
+        // Strictly more capable → applied, and the source says so.
+        assert_eq!(
+            apply_tier_override(mapped, Some(ModelTier::Premium)),
+            (ModelTier::Premium, TierSource::Escalation)
+        );
+        // Equal or less capable → inert, source untouched.
+        assert_eq!(
+            apply_tier_override(mapped, Some(ModelTier::Standard)),
+            mapped
+        );
+        assert_eq!(
+            apply_tier_override(mapped, Some(ModelTier::Economy)),
+            mapped
+        );
+        assert_eq!(apply_tier_override(mapped, Some(ModelTier::Local)), mapped);
+        // The rule is about capability rank, not about the map: a defaulted
+        // tier is raised the same way and keeps reporting how it got there.
+        let defaulted = (ModelTier::Local, TierSource::Default);
+        assert_eq!(
+            apply_tier_override(defaulted, Some(ModelTier::Economy)),
+            (ModelTier::Economy, TierSource::Escalation)
         );
     }
 

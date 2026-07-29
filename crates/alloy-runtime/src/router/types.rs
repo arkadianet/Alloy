@@ -39,6 +39,8 @@ pub struct ModelEndpoint {
     pub input_usd_per_mtok: Option<f64>,
     /// Operator price per one million output tokens.
     pub output_usd_per_mtok: Option<f64>,
+    /// Optional operator-configured sampling temperature (issue #53).
+    pub temperature: Option<f32>,
 }
 
 /// Provider health state. RFC-0007 providers always report [`Health::Healthy`].
@@ -181,6 +183,20 @@ pub struct RoutingRequest {
     pub node: Option<NodeId>,
     /// Capability used to resolve a model tier.
     pub capability: CapabilityId,
+    /// Caller-requested tier floor, carrying RFC-0010 §5.11.4 escalation
+    /// (`CapabilityExecContext.effective_tier`) into endpoint selection.
+    ///
+    /// This **raises** the tier resolved from `[capability_tiers]`; it never
+    /// lowers it (RFC-0007 §5.2.1 — nothing downgrades a configured tier). A
+    /// value at or below the configured tier is inert. When the requested
+    /// tier has no endpoint, selection degrades back to the configured tier
+    /// and records `escalation_unserved`.
+    ///
+    /// `None` (the serde default, so older payloads keep deserializing) is
+    /// the identity: routing behaves exactly as it did before the field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_override: Option<ModelTier>,
     /// Ignored complexity hint retained for wire compatibility.
     pub complexity: Option<ComplexityScore>,
     /// Spent budget counters used only by the unmetered test fallback.
@@ -381,6 +397,7 @@ mod tests {
             max_context: 1,
             input_usd_per_mtok: Some(0.0),
             output_usd_per_mtok: Some(0.0),
+            temperature: None,
         }
     }
 
@@ -390,6 +407,7 @@ mod tests {
             run: None,
             node: None,
             capability: CapabilityId::new("repair").unwrap(),
+            tier_override: None,
             complexity: None,
             budget_remaining: BudgetSnapshot {
                 usd_spent: 0.0,

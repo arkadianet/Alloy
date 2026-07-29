@@ -75,6 +75,7 @@ fn main() -> ExitCode {
 fn command_name(c: &Commands) -> &'static str {
     match c {
         Commands::Run(_) => "run",
+        Commands::Review(_) => "review",
         Commands::Events(_) => "events",
         Commands::Approve(_) => "approve",
         Commands::Cancel(_) => "cancel",

@@ -31,7 +31,9 @@ pub use payload::{
     ReviewPayload, ReviewSeverity, ReviewVerdict, PAYLOAD_SCHEMA_VERSION,
 };
 pub use perms::{SessionWorkerPermissions, WorkerPermissions, WorkerToolClass};
-pub use prompt::{system_instruction_digest, EDIT_SYSTEM, REPAIR_SYSTEM, REVIEW_SYSTEM};
+pub use prompt::{
+    system_instruction_digest, truncation_marker, EDIT_SYSTEM, REPAIR_SYSTEM, REVIEW_SYSTEM,
+};
 pub use registry::{CapabilityRegistry, RegError, ResolveHints};
 pub use traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
 pub use workers::{EditWorker, PlanningWorker, RepairWorker, ReviewWorker};

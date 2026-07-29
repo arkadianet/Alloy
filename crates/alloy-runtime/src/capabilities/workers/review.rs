@@ -30,6 +30,14 @@ use super::{
 /// §8.4: findings cap.
 const MAX_FINDINGS: usize = 64;
 
+/// VW6: ceiling on one goal attachment's fenced body. A host bounds its own
+/// input (`alloy review` cuts at 128 KiB); this is the worker's independent
+/// backstop so an arbitrary host cannot push a 10 MiB blob into a prompt.
+const MAX_ATTACHMENT_BYTES: usize = 256 * 1024;
+
+/// VW6: how many goal attachments one review may read.
+const MAX_ATTACHMENTS: usize = 4;
+
 /// Tools this worker may call (TL5, VW5: the patch builtin is excluded).
 const ALLOWED_TOOLS: [&str; 1] = ["fs_read"];
 
@@ -140,6 +148,54 @@ impl Capability for ReviewWorker {
 }
 
 impl ReviewWorker {
+    /// Fence every goal attachment for the prompt (VW6).
+    ///
+    /// Bytes are passed through verbatim apart from the two transformations
+    /// fencing always owes the prompt: secret redaction (SEC) and escaping a
+    /// literal `</workspace>` so untrusted content cannot close its own
+    /// fence (PR12). Neither touches leading whitespace, line structure, or
+    /// trailing whitespace, so a unified diff survives byte for byte.
+    ///
+    /// An attachment that does not decode as UTF-8, or that is missing from
+    /// the store, is skipped with a note rather than failing the review: the
+    /// model is told what it is *not* seeing.
+    async fn fenced_attachments(&self, ctx: &CapabilityContext<'_>) -> Vec<String> {
+        let crate::dag::NodeInputPayload::Goal(goal) = &ctx.input.payload else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for id in goal.attachments.iter().take(MAX_ATTACHMENTS) {
+            let blob = match ctx.artifacts.get(*id).await {
+                Ok(blob) => blob,
+                Err(e) => {
+                    tracing::warn!(artifact = %id, error = %e, "review attachment unreadable");
+                    out.push(super::super::prompt::fence_workspace(
+                        "diff",
+                        &format!("[alloy: omitted — attachment {id} could not be read]"),
+                    ));
+                    continue;
+                }
+            };
+            let total = blob.bytes.len();
+            let Ok(text) = String::from_utf8(blob.bytes) else {
+                out.push(super::super::prompt::fence_workspace(
+                    "diff",
+                    &format!("[alloy: omitted — attachment {id} is not UTF-8 text]"),
+                ));
+                continue;
+            };
+            let body = if total > MAX_ATTACHMENT_BYTES {
+                let kept = crate::obs::truncate_utf8_bytes(&text, MAX_ATTACHMENT_BYTES);
+                let marker = super::super::prompt::truncation_marker(kept.len(), total);
+                format!("{kept}\n{marker}")
+            } else {
+                text
+            };
+            out.push(super::super::prompt::fence_workspace("diff", &body));
+        }
+        out
+    }
+
     async fn run(
         &self,
         ctx: &CapabilityContext<'_>,
@@ -162,9 +218,14 @@ impl ReviewWorker {
             })
             .unwrap_or_default();
 
-        // VW2: read the changed files through the tool bus; results are
-        // untrusted and fenced (TL6/PR6/PR12) before re-entering the prompt.
-        let mut feedback: Vec<String> = Vec::new();
+        // VW6: the material under review — the diff — travels out of band as
+        // a goal attachment in the artifact CAS, never as goal *text*. Goal
+        // text is sanitised for prompt injection on its way through the
+        // context engine (`sanitize_untrusted`: per-line `trim_end`, fence
+        // marker stripping), which silently reshapes a whitespace-sensitive
+        // patch. Attachment bytes go straight into a `<workspace>` fence, so
+        // the model reads exactly what the host handed us.
+        let mut feedback: Vec<String> = self.fenced_attachments(ctx).await;
         for path in changed
             .iter()
             .filter(|p| is_jail_relative(p))

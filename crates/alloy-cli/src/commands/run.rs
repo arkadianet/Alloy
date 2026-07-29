@@ -16,6 +16,7 @@ use alloy_runtime::{
 use serde_json::json;
 
 use super::gate::{self, GateMode};
+use super::rollback;
 use crate::args::RunArgs;
 use crate::assembly::{self, FullAssembly};
 use crate::errx::{CliError, Exit};
@@ -82,7 +83,7 @@ pub async fn exec(ctx: Ctx, args: RunArgs) -> Result<Exit, CliError> {
     let mut full = assembly::assemble_full(base, &ctx.workspace_abs, ctx.readonly()).await?;
 
     tracing::debug!(
-        edit_engine_assembled = full.edit_engine_assembled,
+        edit_engine_assembled = full.edit_engine.is_some(),
         scheduler_refs = std::sync::Arc::strong_count(&full.scheduler),
         "composition root assembled"
     );
@@ -152,7 +153,7 @@ async fn run_after_assembly(
         bootstrap_index(full, ctx, session).await;
     }
 
-    // §7.1 step 4 — submit the goal.
+    // §7.1 step 4 — the goal, shared by every attempt.
     let mut constraints = Vec::new();
     if let Some(v) = args.max_usd {
         constraints.push(Constraint::MaxUsd(v));
@@ -165,31 +166,6 @@ async fn run_after_assembly(
         constraints,
         attachments: vec![],
     };
-    let run = sessions.submit_goal(session, goal.clone()).await?;
-    let dag_id = dag_id_for_run(full, run).await?;
-
-    if !ctx.quiet {
-        eprintln!("session {session}  run {run}");
-    }
-
-    // §7.1 step 6 — plan (template selection is the plan service's, SQ1).
-    let (policy_hash, tool_versions, compiler_fingerprint) = plan_fingerprints(ctx)?;
-    PlanService::plan(
-        &full.plan,
-        PlanContext {
-            session_id: session,
-            run_id: run,
-            dag_id,
-            goal,
-            template_override: None,
-            policy_hash,
-            tool_versions,
-            compiler_fingerprint,
-        },
-    )
-    .await?;
-
-    // §7.1 steps 7–10 — dispatch + render + gates + terminal exit.
     let mode = if args.yes {
         GateMode::AutoAllow
     } else if args.no_input {
@@ -197,7 +173,164 @@ async fn run_after_assembly(
     } else {
         GateMode::Interactive
     };
-    execute_and_render(full, ctx, "run", session, run, mode).await
+
+    // Bounded diagnostics-informed retry loop (issue #53 follow-through).
+    // Each attempt is a fully audited run in the same session: submit →
+    // pre-plan diagnostic seed (re-checks the *edited* workspace, so a
+    // retry's generation-1 prompt sees exactly what the previous patch
+    // broke) → plan → dispatch. Only a RunFailed exit with error-level
+    // diagnostics still present retries; gate denials, cancellations,
+    // budget stops and clean exits return immediately.
+    let mut attempt: u32 = 0;
+    // Set when the post-failure probe's seeded diagnostics still describe
+    // the tree the next attempt will start from: the bootstrap check would
+    // re-run cargo for an identical answer (review finding). Any rollback
+    // that touched — or tried to touch — the tree invalidates this; see
+    // `rollback::probe_still_describes_tree`.
+    let mut seeded_by_probe = false;
+    loop {
+        let run = sessions.submit_goal(session, goal.clone()).await?;
+        let dag_id = dag_id_for_run(full, run).await?;
+
+        if !ctx.quiet {
+            eprintln!("session {session}  run {run}");
+        }
+
+        // Issue #53 — one verify pass before planning, so the repair
+        // worker's generation-1 prompt carries the real rustc diagnostics
+        // instead of guessing from the goal text. Best-effort: a missing
+        // toolchain or sandbox must never fail a run before it starts.
+        // Every retry iteration is immediately preceded by a successful
+        // probe (it is the retry condition), so the flag needs no reset.
+        if !seeded_by_probe {
+            bootstrap_diagnostics(full, ctx, session, run, dag_id).await;
+        }
+
+        // §7.1 step 6 — plan (template selection is the plan service's, SQ1).
+        let (policy_hash, tool_versions, compiler_fingerprint) = plan_fingerprints(ctx)?;
+        PlanService::plan(
+            &full.plan,
+            PlanContext {
+                session_id: session,
+                run_id: run,
+                dag_id,
+                goal: goal.clone(),
+                template_override: None,
+                policy_hash,
+                tool_versions,
+                compiler_fingerprint,
+            },
+        )
+        .await?;
+
+        // §7.1 steps 7–10 — dispatch + render + gates + terminal exit.
+        let exit = execute_and_render(full, ctx, "run", session, run, mode).await?;
+        if exit != Exit::RunFailed || attempt >= args.max_retries {
+            return Ok(exit);
+        }
+        // Post-failure probe: the same verifier + graph seed. Fresh
+        // error-level diagnostics are both the retry signal and the next
+        // attempt's model input; anything else (run failed for a
+        // non-compile reason) returns the honest failure now.
+        let errors = post_failure_errors(full, ctx, session, run, dag_id).await;
+        if errors == 0 {
+            return Ok(exit);
+        }
+        attempt += 1;
+        // Undo this attempt's edits before the next one is submitted, so
+        // attempt N+1 patches the pre-run tree instead of stacking on top of
+        // N's wrong edit. A refusal is reported, never fatal; the next
+        // iteration's pre-plan probe re-reads whatever tree is left.
+        let rolled = rollback::rollback_run(full, ctx, session, run, dag_id).await;
+        // The probe's diagnostics describe the pre-rollback tree; they only
+        // stand in for the next bootstrap when the pass left that tree alone.
+        seeded_by_probe = rollback::probe_still_describes_tree(&rolled);
+        if !ctx.quiet {
+            if let Some(line) = rollback::summary(&rolled) {
+                eprintln!("{line}");
+            }
+            eprintln!(
+                "run failed with {errors} compile error(s) still present; \
+                 retrying with fresh diagnostics ({attempt}/{})",
+                args.max_retries
+            );
+        }
+    }
+}
+
+/// Post-failure diagnostic probe for the retry loop: one sandboxed verify
+/// over the edited workspace, seeded into the graph. Returns the
+/// error-level count, `0` on any probe failure (fail-safe: no retry).
+async fn post_failure_errors(
+    full: &FullAssembly,
+    ctx: &Ctx,
+    session: SessionId,
+    run: RunId,
+    dag_id: alloy_runtime::DagId,
+) -> usize {
+    let exec_ctx = alloy_runtime::NodeExecContext {
+        meta: alloy_runtime::NodeExecRef {
+            session_id: session,
+            run_id: run,
+            dag_id,
+            node_id: alloy_runtime::NodeId::new(),
+            workspace_root: ctx.workspace_abs.clone(),
+            attempt: 1,
+        },
+        cancellation: full.base.handle.cancellation().child_token(),
+    };
+    match alloy_runtime::seed_graph_diagnostics(
+        full.verify_compile.as_ref(),
+        full.graph.as_ref(),
+        &exec_ctx,
+    )
+    .await
+    {
+        Ok(report) => report.errors,
+        Err(e) => {
+            tracing::warn!(error = %e, "post-failure diagnostic probe failed; not retrying");
+            0
+        }
+    }
+}
+
+/// Issue #53 — pre-plan diagnostic seed; a failure is a warning, never
+/// fatal (IX7 spirit). Reuses the scheduler's own compile verifier, so the
+/// check runs sandboxed with the same policy as verify nodes.
+async fn bootstrap_diagnostics(
+    full: &FullAssembly,
+    ctx: &Ctx,
+    session: SessionId,
+    run: RunId,
+    dag_id: alloy_runtime::DagId,
+) {
+    let exec_ctx = alloy_runtime::NodeExecContext {
+        meta: alloy_runtime::NodeExecRef {
+            session_id: session,
+            run_id: run,
+            dag_id,
+            node_id: alloy_runtime::NodeId::new(),
+            workspace_root: ctx.workspace_abs.clone(),
+            attempt: 1,
+        },
+        cancellation: full.base.handle.cancellation().child_token(),
+    };
+    match alloy_runtime::seed_graph_diagnostics(
+        full.verify_compile.as_ref(),
+        full.graph.as_ref(),
+        &exec_ctx,
+    )
+    .await
+    {
+        Ok(report) => {
+            if !ctx.quiet && report.recorded > 0 {
+                eprintln!("seeded {} diagnostic(s) from cargo check", report.recorded);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "diagnostic seed skipped");
+        }
+    }
 }
 
 /// IX3/IX4/IX5 — bootstrap ingest; a failure is a warning, never fatal (IX7).

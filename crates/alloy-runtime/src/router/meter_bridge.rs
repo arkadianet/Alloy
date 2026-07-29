@@ -150,6 +150,7 @@ mod tests {
             run: None,
             node: None,
             capability: CapabilityId::new("repair").unwrap(),
+            tier_override: None,
             complexity: None,
             budget_remaining: BudgetSnapshot {
                 usd_spent: 0.0,
@@ -171,6 +172,7 @@ mod tests {
                 max_context: 1,
                 input_usd_per_mtok: Some(1.0),
                 output_usd_per_mtok: Some(2.0),
+                temperature: None,
             },
             ModelTier::Standard,
             &request,
