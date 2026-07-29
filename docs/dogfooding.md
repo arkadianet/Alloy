@@ -37,6 +37,14 @@ model = "qwen2.5-coder:14b"          # must match the served model id
 Alloy never invents keys: export `ALLOY_API_KEY=local` (any non-empty value)
 or put it in your env file.
 
+`repair_local_diagnostic` escalates its analyze/edit nodes to the `premium`
+tier on their one retry (RFC-0010 §5.11.4 ES1), and RFC-0007 never downgrades
+a tier to satisfy routing — so serve `premium` with something, or the retry
+after a `Model`-class failure fails to route. The commented
+`local-coder-big` endpoint in `router.toml.local-example`
+(`ollama pull qwen2.5-coder:32b`) is the intended landing spot; adding
+`"premium"` to `local-coder`'s `tiers` is the low-effort alternative.
+
 ## 3. Run against a broken fixture, not a precious tree
 
 ```sh

@@ -2714,6 +2714,42 @@ mod tests {
             (LinearScheduler::new_for_test(deps).unwrap(), decisions)
         }
 
+        /// [`Self::build_scheduler_full`] wired to a [`RetryAdmittedSignal`]
+        /// decision log, so a test can await the admitted-retry record and
+        /// act strictly inside the B3 backoff window.
+        fn build_scheduler_with_retry_signal(
+            &self,
+            sched_dir: std::path::PathBuf,
+            capabilities: Arc<dyn CapabilityExecutor>,
+            run_timeout: Duration,
+            runtime_cancel: CancellationToken,
+        ) -> (LinearScheduler, Arc<RetryAdmittedSignal>) {
+            let decisions = RetryAdmittedSignal::new();
+            let deps = LinearSchedulerDeps {
+                dags: self.storage.dags(),
+                artifacts: self.storage.artifacts(),
+                events: self.storage.events(),
+                sessions: self.storage.sessions(),
+                session_plane: self.plane.clone(),
+                runs: self.plane.runs(),
+                verify_compile: Arc::new(crate::adapters::UnavailableVerifyCompile),
+                verify_test: Arc::new(crate::adapters::UnavailableVerifyTest),
+                gate_human: Arc::new(crate::adapters::UnavailableGateHuman),
+                capabilities,
+                decisions: Arc::clone(&decisions) as Arc<dyn crate::obs::DecisionLog>,
+                cost_meters: Arc::new(ProcessCostMeterFactory::new()),
+                runtime_cancel,
+                budget_policy: BudgetPolicy::default(),
+                run_timeout,
+                config: {
+                    let mut c = SchedConfig::new(sched_dir);
+                    c.validate_on_load = false;
+                    c
+                },
+            };
+            (LinearScheduler::new_for_test(deps).unwrap(), decisions)
+        }
+
         /// BE4 probe: identical wiring, but every `DecisionLog::record`
         /// fails, so a pre-CAS record cannot be persisted.
         fn build_scheduler_with_failing_decisions(
@@ -2759,6 +2795,64 @@ mod tests {
                 },
             };
             LinearScheduler::new_for_test(deps).unwrap()
+        }
+    }
+
+    /// Wraps [`RecordingDecisionLog`] and fires [`Self::retry_admitted`] when
+    /// the scheduler records an admitted retry (§5.11.2).
+    ///
+    /// That record is written *after* A4 read the cancellation state and
+    /// *before* the B3 backoff sleep is created, so it is the only signal that
+    /// pins a test's `cancel()` inside the backoff window: cancel earlier and
+    /// the dispatch select's cancel branch wins (proving nothing about B3);
+    /// cancel later and the paused clock's auto-advance can burn the backoff
+    /// off. A bare `yield_now()` pins neither end.
+    struct RetryAdmittedSignal {
+        inner: Arc<RecordingDecisionLog>,
+        admitted: tokio::sync::Notify,
+    }
+    impl RetryAdmittedSignal {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults())),
+                admitted: tokio::sync::Notify::new(),
+            })
+        }
+        /// Resolves once a `retry_admitted: true` decision has been recorded.
+        /// `notify_one` stores a permit, so there is no lost wakeup when the
+        /// waiter arrives after the record.
+        async fn retry_admitted(&self) {
+            self.admitted.notified().await;
+        }
+        fn recorded_decisions(&self) -> Vec<DecisionRecord> {
+            self.inner.recorded_decisions()
+        }
+    }
+    #[async_trait]
+    impl crate::obs::DecisionLog for RetryAdmittedSignal {
+        async fn record(
+            &self,
+            rec: DecisionRecord,
+        ) -> Result<crate::types::ids::EventSeq, crate::obs::ObsError> {
+            let admitted =
+                rec.metadata.get("retry_admitted") == Some(&serde_json::Value::Bool(true));
+            let seq = self.inner.record(rec).await?;
+            if admitted {
+                self.admitted.notify_one();
+            }
+            Ok(seq)
+        }
+        async fn record_model_call(
+            &self,
+            rec: crate::obs::ModelCallRecord,
+        ) -> Result<crate::types::ids::EventSeq, crate::obs::ObsError> {
+            self.inner.record_model_call(rec).await
+        }
+        async fn record_tool_call(
+            &self,
+            rec: crate::obs::ToolCallRecord,
+        ) -> Result<crate::types::ids::EventSeq, crate::obs::ObsError> {
+            self.inner.record_tool_call(rec).await
         }
     }
 
@@ -7619,13 +7713,9 @@ mod tests {
             failure: retryable_model_failure(a, "will retry then get cancelled mid-backoff"),
         })]);
         let runtime_cancel = CancellationToken::new();
-        let (sched, _decisions) = fx.build_scheduler_full(
+        let (sched, decisions) = fx.build_scheduler_with_retry_signal(
             fx._dir.path().join("s1"),
             capabilities,
-            Arc::new(crate::adapters::UnavailableVerifyCompile),
-            Arc::new(crate::adapters::UnavailableVerifyTest),
-            Arc::new(crate::adapters::UnavailableGateHuman),
-            BudgetPolicy::default(),
             Duration::from_secs(3600),
             runtime_cancel.clone(),
         );
@@ -7633,10 +7723,17 @@ mod tests {
         let sched2 = Arc::clone(&sched);
         let handle = tokio::spawn(async move { sched2.run(dag_id).await });
 
-        // Give the run task a chance to reach the backoff sleep, then cancel
-        // the process-wide token without ever advancing the (paused) clock —
-        // if the sleep were not interruptible this would hang forever.
-        tokio::task::yield_now().await;
+        // Wait for attempt 1's retry to be *admitted* — the observable signal
+        // that the run task is past A4 and about to enter the B3 sleep — then
+        // cancel the process-wide token without ever advancing the (paused)
+        // clock. A bare `yield_now()` here guarantees nothing: cancel could
+        // land while the capability is still dispatching (the select's cancel
+        // branch, which says nothing about backoff) or, if the run task parks
+        // and auto-advance fires, only after all five backoffs have burned
+        // through and the node has failed for real. Awaiting the record pins
+        // both ends: the signal makes this task runnable strictly before the
+        // sleep exists, so the clock cannot auto-advance past it either.
+        decisions.retry_admitted().await;
         runtime_cancel.cancel();
 
         let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
@@ -7645,6 +7742,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.state, DagState::Cancelled);
+        // The point of the test: the cancel must have landed *during the
+        // backoff*, which is only true if attempt 1's retry was admitted
+        // first (A4 passed, C8 committed). Cancelling earlier would take the
+        // dispatch-select cancel branch and prove nothing about B3.
+        assert!(
+            decisions.recorded_decisions().iter().any(|d| {
+                d.metadata.get("retry_admitted") == Some(&serde_json::Value::Bool(true))
+            }),
+            "cancel must land after the retry was admitted, i.e. inside the backoff sleep"
+        );
         fx.close().await;
     }
 

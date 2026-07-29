@@ -31,6 +31,23 @@ max_context = 32768
 input_usd_per_mtok = 0.0
 output_usd_per_mtok = 0.0
 
+# Tier escalation target (RFC-0010 §5.11.4 ES1). `repair_local_diagnostic`
+# escalates analyze/edit to `premium` on their retry, and RFC-0007 never
+# downgrades a tier — so serve `premium` with a bigger local model:
+# `ollama pull qwen2.5-coder:32b`, then uncomment. (Lower-effort alternative:
+# add "premium" to `local-coder`'s `tiers` above and the retry re-runs on the
+# same model.)
+# [[providers.endpoints]]
+# id = "local-coder-big"
+# display_name = "Local coder (big)"
+# model = "qwen2.5-coder:32b"
+# tiers = ["premium"]
+# supports_tools = true
+# supports_structured_output = true
+# max_context = 32768
+# input_usd_per_mtok = 0.0
+# output_usd_per_mtok = 0.0
+
 [capability_tiers]
 repair = "standard"
 edit = "standard"

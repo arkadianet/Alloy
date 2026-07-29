@@ -38,6 +38,22 @@ max_context = 200000
 input_usd_per_mtok = 0.0
 output_usd_per_mtok = 0.0
 
+# Tier escalation target (RFC-0010 §5.11.4 ES1). The shipped
+# `repair_local_diagnostic` template escalates its analyze/edit nodes to
+# `premium` on their retry, and RFC-0007 never downgrades a tier to satisfy
+# routing — so uncomment an endpoint serving `premium` (a bigger model) or the
+# escalated retry has nowhere to land.
+# [[providers.endpoints]]
+# id = "team-premium"
+# display_name = "Premium"
+# model = "REPLACE_ME_PREMIUM"
+# tiers = ["premium"]
+# supports_tools = true
+# supports_structured_output = true
+# max_context = 200000
+# input_usd_per_mtok = 0.0
+# output_usd_per_mtok = 0.0
+
 [[providers.endpoints]]
 id = "team-economy"
 display_name = "Economy"

@@ -1137,7 +1137,7 @@ Uses `ctx.dag_id` only (no separate `dag_id` argument).
 
 | Name | Kind | Capability | Retry | Cache | Approval |
 | --- | --- | --- | --- | --- | --- |
-| `analyze` | Analyze | repair | max_attempts=2, Fixed delay_ms=**1000**, retry_on=[Model], no escalate | **false** | none |
+| `analyze` | Analyze | repair | max_attempts=2, Fixed delay_ms=**1000**, retry_on=[Model], escalate_after=**1** → `Premium` | **false** | none |
 | `edit` | Edit | edit | same | **false** | none |
 | `verify` | VerifyCompile | none | max_attempts=1, Fixed 0, retry_on=[] | false | none |
 | `gate` | GateHuman | none | max_attempts=1 | false | reason `"Approve repair diff before completion"` |
@@ -1148,6 +1148,13 @@ Edges — **both** Data and Sequence on each hop (normative; not optional):
 analyze -Data-> edit -Data-> verify -Data-> gate
 analyze -Sequence-> edit -Sequence-> verify -Sequence-> gate
 ```
+
+The escalate pair on the model-backed nodes satisfies V14 (`1 < max_attempts`)
+and V9 (adapter nodes keep both fields `None`); RFC-0010 §5.11.4 ES1/ES3 then
+routes the single retry at `Premium` through
+`CapabilityExecContext.effective_tier` only. Operators MUST serve the
+`premium` tier (RFC-0007 never downgrades a tier to satisfy routing) — see
+`router.toml.example`.
 
 Budgets: LLM `{ max_input: 32768, max_output: 8192 }`; adapters `{0,0}`.  
 `model_tier`: Analyze/Edit `Standard`; adapters `Economy` (ignored).  

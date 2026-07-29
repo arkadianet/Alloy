@@ -176,13 +176,25 @@ fn cap(s: &str) -> CapabilityId {
     CapabilityId::new(s).unwrap_or_else(|_| panic!("invalid catalog capability id: {s}"))
 }
 
+/// Model-backed nodes escalate after the first failed attempt (RFC-0009
+/// §5.7.2; executed by RFC-0010 §5.11.4 ES1/ES3): a `Model`-class failure
+/// that a same-tier retry would most likely reproduce is exactly the case a
+/// bigger model is for. `escalate_after = 1` with `max_attempts = 2` means
+/// attempt 1 runs at `node.model_tier` and the single retry (attempt 2,
+/// `k > n`) routes at [`ModelTier::Premium`] — only via
+/// `CapabilityExecContext.effective_tier`, never by writing `model_tier`
+/// (ES3). `1 < max_attempts` satisfies V14's `EscalateAfterOrder`.
+///
+/// Operators MUST have an endpoint serving `premium` (see
+/// `router.toml.example`); RFC-0007 §5 never downgrades a tier to satisfy
+/// routing, so a retry escalated to an unserved tier fails to route.
 fn llm_retry() -> RetryPolicy {
     RetryPolicy {
         max_attempts: 2,
         backoff: Backoff::Fixed { delay_ms: 1000 },
         retry_on: vec![ErrorClass::Model],
-        escalate_after: None,
-        escalate_to_tier: None,
+        escalate_after: Some(1),
+        escalate_to_tier: Some(ModelTier::Premium),
     }
 }
 
@@ -514,8 +526,9 @@ mod tests {
             Backoff::Fixed { delay_ms: 1000 }
         ));
         assert_eq!(analyze.retry.retry_on, vec![ErrorClass::Model]);
-        assert!(analyze.retry.escalate_after.is_none());
-        assert!(analyze.retry.escalate_to_tier.is_none());
+        // §5.7.2: model-backed nodes escalate after the first failed attempt.
+        assert_eq!(analyze.retry.escalate_after, Some(1));
+        assert_eq!(analyze.retry.escalate_to_tier, Some(ModelTier::Premium));
         assert_eq!(analyze.budget.max_input, 32768);
         assert_eq!(analyze.budget.max_output, 8192);
         assert_eq!(analyze.model_tier, ModelTier::Standard);
@@ -535,8 +548,8 @@ mod tests {
             Backoff::Fixed { delay_ms: 1000 }
         ));
         assert_eq!(edit.retry.retry_on, vec![ErrorClass::Model]);
-        assert!(edit.retry.escalate_after.is_none());
-        assert!(edit.retry.escalate_to_tier.is_none());
+        assert_eq!(edit.retry.escalate_after, Some(1));
+        assert_eq!(edit.retry.escalate_to_tier, Some(ModelTier::Premium));
         assert_eq!(edit.budget.max_input, 32768);
         assert_eq!(edit.budget.max_output, 8192);
         assert_eq!(edit.model_tier, ModelTier::Standard);
