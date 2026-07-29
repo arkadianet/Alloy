@@ -16,7 +16,9 @@ pub use capability::{
     UnavailableCapabilityExecutor,
 };
 pub use diagnostics::{diagnostic_fingerprint, parse_rustc_diagnostics};
-pub use fixes::{AppliedEdit, AppliedEditSource, EventLogEdits, FixRecordingVerifier};
+pub use fixes::{
+    AppliedEdit, AppliedEditSource, EventLogEdits, FixRecordingVerifier, MAX_PENDING_RUNS,
+};
 pub use gate::SessionGateHumanAdapter;
 pub use perms::{SessionVerifyPermissions, VerifyClass, VerifyPermissions};
 pub use seed::{seed_graph_diagnostics, SeedReport};

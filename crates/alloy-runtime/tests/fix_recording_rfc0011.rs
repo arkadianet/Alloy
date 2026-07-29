@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use alloy_runtime::adapters::{
     AppliedEdit, AppliedEditSource, FixRecordingVerifier, NodeExecContext, NodeExecRef, Verdict,
-    VerdictOutcome, Verifier,
+    VerdictOutcome, Verifier, MAX_PENDING_RUNS,
 };
 use alloy_runtime::graph::{FileChange, FixEvent, GraphError, GraphQuery, GraphView, ProjectGraph};
 use alloy_runtime::types::ids::{GraphSnapshotId, GraphVersion};
@@ -108,6 +108,26 @@ impl AppliedEditSource for ScriptedEdits {
     }
 }
 
+/// A single mutable "latest edit", the shape the real event log has: every
+/// run sees whatever was applied last, and a test moves it forward by hand.
+#[derive(Default)]
+struct LatestEdit {
+    current: Mutex<Option<AppliedEdit>>,
+}
+
+impl LatestEdit {
+    fn set(&self, edit: AppliedEdit) {
+        *self.current.lock().unwrap() = Some(edit);
+    }
+}
+
+#[async_trait]
+impl AppliedEditSource for LatestEdit {
+    async fn latest_applied_edit(&self, _session: SessionId, _run: RunId) -> Option<AppliedEdit> {
+        self.current.lock().unwrap().clone()
+    }
+}
+
 // --- helpers ------------------------------------------------------------
 
 fn ctx(run: RunId) -> NodeExecContext {
@@ -146,6 +166,21 @@ fn failing(code: &str) -> Verdict {
         }],
         raw_artifact: None,
     }
+}
+
+fn inconclusive() -> Verdict {
+    Verdict {
+        outcome: VerdictOutcome::Inconclusive {
+            reason: "cargo died before compiling".into(),
+        },
+        diagnostics: vec![],
+        raw_artifact: None,
+    }
+}
+
+/// A `Fail` that named nothing: the build is broken but no code was parsed.
+fn failing_without_codes() -> Verdict {
+    Verdict::fail()
 }
 
 fn an_edit(seq: u64) -> AppliedEdit {
@@ -265,5 +300,160 @@ async fn each_run_keeps_its_own_pending_codes() {
     assert!(
         graph.recorded().is_empty(),
         "run two never failed; run one's codes are not its own"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_that_names_no_code_drops_the_earlier_pending_codes() {
+    // A `Fail` is a fresh statement of what is broken. If it names nothing,
+    // the honest pending set is empty: a later pass must not be attributed
+    // to codes that a *different*, earlier failure reported.
+    let graph = Arc::new(RecordingGraph::default());
+    let edits = Arc::new(LatestEdit::default());
+    let inner = Arc::new(ScriptedVerifier::new(vec![
+        failing("E0308"),
+        failing_without_codes(),
+        Verdict::pass(),
+    ]));
+    let verifier = FixRecordingVerifier::new(
+        inner as Arc<dyn Verifier>,
+        Arc::clone(&graph) as Arc<dyn ProjectGraph>,
+        Arc::clone(&edits) as Arc<dyn AppliedEditSource>,
+    );
+
+    let c = ctx(RunId::new());
+    edits.set(an_edit(1));
+    verifier.verify(&c).await.unwrap(); // fail: E0308 pending
+    edits.set(an_edit(2));
+    verifier.verify(&c).await.unwrap(); // fail again, nothing nameable
+    edits.set(an_edit(3));
+    assert!(verifier.verify(&c).await.unwrap().passed());
+
+    assert!(
+        graph.recorded().is_empty(),
+        "the uncoded failure replaced E0308; nothing may be claimed"
+    );
+}
+
+#[tokio::test]
+async fn a_later_failure_replaces_the_codes_of_the_earlier_one() {
+    // Pending is "what the last failure said", not a union over the run.
+    let graph = Arc::new(RecordingGraph::default());
+    let edits = Arc::new(LatestEdit::default());
+    let inner = Arc::new(ScriptedVerifier::new(vec![
+        failing("E0308"),
+        failing("E0502"),
+        Verdict::pass(),
+    ]));
+    let verifier = FixRecordingVerifier::new(
+        inner as Arc<dyn Verifier>,
+        Arc::clone(&graph) as Arc<dyn ProjectGraph>,
+        Arc::clone(&edits) as Arc<dyn AppliedEditSource>,
+    );
+
+    let c = ctx(RunId::new());
+    edits.set(an_edit(1));
+    verifier.verify(&c).await.unwrap();
+    edits.set(an_edit(2));
+    verifier.verify(&c).await.unwrap();
+    edits.set(an_edit(3));
+    verifier.verify(&c).await.unwrap();
+
+    let codes: Vec<_> = graph
+        .recorded()
+        .into_iter()
+        .filter_map(|f| f.diagnostic_code)
+        .collect();
+    assert_eq!(codes, vec!["E0502".to_string()]);
+}
+
+#[tokio::test]
+async fn an_inconclusive_verdict_leaves_the_pending_codes_untouched() {
+    // Inconclusive decides nothing about the patch (`cargo_exit_verdict`),
+    // so it must neither record nor forget.
+    let graph = Arc::new(RecordingGraph::default());
+    let edits = Arc::new(LatestEdit::default());
+    let inner = Arc::new(ScriptedVerifier::new(vec![
+        failing("E0308"),
+        inconclusive(),
+        Verdict::pass(),
+    ]));
+    let verifier = FixRecordingVerifier::new(
+        inner as Arc<dyn Verifier>,
+        Arc::clone(&graph) as Arc<dyn ProjectGraph>,
+        Arc::clone(&edits) as Arc<dyn AppliedEditSource>,
+    );
+
+    let c = ctx(RunId::new());
+    edits.set(an_edit(1));
+    verifier.verify(&c).await.unwrap();
+    edits.set(an_edit(2));
+    verifier.verify(&c).await.unwrap(); // inconclusive: no state change
+    verifier.verify(&c).await.unwrap(); // pass, on the edit that came after
+
+    let codes: Vec<_> = graph
+        .recorded()
+        .into_iter()
+        .filter_map(|f| f.diagnostic_code)
+        .collect();
+    assert_eq!(codes, vec!["E0308".to_string()]);
+}
+
+#[tokio::test]
+async fn a_pass_on_an_edit_no_newer_than_the_failure_records_nothing() {
+    // The recording condition is strictly "a new edit since the failure".
+    let graph = Arc::new(RecordingGraph::default());
+    let edits = Arc::new(LatestEdit::default());
+    let inner = Arc::new(ScriptedVerifier::new(vec![
+        failing("E0308"),
+        Verdict::pass(),
+    ]));
+    let verifier = FixRecordingVerifier::new(
+        inner as Arc<dyn Verifier>,
+        Arc::clone(&graph) as Arc<dyn ProjectGraph>,
+        Arc::clone(&edits) as Arc<dyn AppliedEditSource>,
+    );
+    let c = ctx(RunId::new());
+    edits.set(an_edit(7));
+    verifier.verify(&c).await.unwrap();
+    verifier.verify(&c).await.unwrap();
+    assert!(graph.recorded().is_empty());
+}
+
+#[tokio::test]
+async fn abandoned_runs_are_evicted_oldest_first_and_never_the_newest() {
+    // Failed/cancelled runs never come back to pass, so their entries would
+    // leak. The map is capped: the oldest failure is forgotten, and the
+    // freshest one still records when it passes.
+    let graph = Arc::new(RecordingGraph::default());
+    let edits = Arc::new(LatestEdit::default());
+    let n = MAX_PENDING_RUNS + 1;
+    let mut verdicts: Vec<Verdict> = (0..n).map(|_| failing("E0308")).collect();
+    verdicts.push(Verdict::pass()); // the oldest run comes back
+    verdicts.push(Verdict::pass()); // so does the newest
+    let inner = Arc::new(ScriptedVerifier::new(verdicts));
+    let verifier = FixRecordingVerifier::new(
+        inner as Arc<dyn Verifier>,
+        Arc::clone(&graph) as Arc<dyn ProjectGraph>,
+        Arc::clone(&edits) as Arc<dyn AppliedEditSource>,
+    );
+
+    let runs: Vec<_> = (0..n).map(|_| ctx(RunId::new())).collect();
+    for (i, c) in runs.iter().enumerate() {
+        edits.set(an_edit(i as u64 + 1));
+        verifier.verify(c).await.unwrap();
+    }
+    edits.set(an_edit(1000));
+
+    verifier.verify(&runs[0]).await.unwrap(); // evicted: nothing to claim
+    assert!(
+        graph.recorded().is_empty(),
+        "the oldest run's pending codes were evicted, so nothing is claimed"
+    );
+    verifier.verify(runs.last().unwrap()).await.unwrap();
+    assert_eq!(
+        graph.recorded().len(),
+        1,
+        "the newest run must never be the one evicted"
     );
 }

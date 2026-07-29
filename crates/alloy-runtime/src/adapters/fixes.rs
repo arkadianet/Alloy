@@ -16,6 +16,28 @@
 //! Recording is bookkeeping, never adjudication: every graph error is
 //! logged and dropped, and the inner verdict is returned unchanged.
 //!
+//! # Per-run state machine
+//!
+//! The decorator keeps at most one *pending set* per `RunId` — the codes
+//! the run's **most recent** failing verification named, plus the sequence
+//! of the last `EditApplied` that was already in the log at that moment.
+//!
+//! | verdict | effect on the run's pending set |
+//! |---|---|
+//! | `Fail` with codes | **replaced** by those codes (edit-at-failure refreshed) |
+//! | `Fail` with no code | **cleared** — the build is broken for reasons this path cannot name, so nothing may later be claimed |
+//! | `Inconclusive` | **untouched** — nothing was decided about the patch |
+//! | `Pass` | **taken**; one `FixEvent` per code is recorded iff the latest applied edit is strictly newer than edit-at-failure |
+//!
+//! A failure never *accumulates* onto an earlier one: attributing a passing
+//! verification to codes some other, older failure reported would credit a
+//! patch for a fix nobody observed.
+//!
+//! The map is bounded by [`MAX_PENDING_RUNS`]. A run that fails and is then
+//! cancelled or abandoned never returns to clear its entry, so on overflow
+//! the oldest remembered failure is evicted (with a warning); the run being
+//! remembered is never the one evicted.
+//!
 //! Author: arkadianet
 
 use std::collections::BTreeMap;
@@ -37,6 +59,13 @@ use crate::types::ids::{
 /// Codes remembered from one failing verification. Bounds the pending map
 /// so a pathological build cannot grow it without limit.
 const MAX_PENDING_CODES: usize = 32;
+
+/// Runs remembered at once. A run whose verify fails and which is then
+/// cancelled or abandoned never returns to clear its own entry, so the map
+/// is capped and the *oldest* remembered failure is evicted to make room.
+/// Well above any plausible number of runs concurrently mid-repair, so an
+/// eviction means something is wrong and is warned about.
+pub const MAX_PENDING_RUNS: usize = 256;
 
 /// The facts a recorded fix borrows from the edit that preceded it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +161,10 @@ struct PendingCode {
 struct Pending {
     codes: Vec<PendingCode>,
     edit_at_failure: Option<EventSeq>,
+    /// Monotonic insertion ticket, so the *oldest* remembered failure can
+    /// be evicted. `RunId` is a random id, so the map's own key order says
+    /// nothing about age.
+    recorded_seq: u64,
 }
 
 /// [`Verifier`] decorator that closes the repair loop's write half.
@@ -139,7 +172,49 @@ pub struct FixRecordingVerifier {
     inner: Arc<dyn Verifier>,
     graph: Arc<dyn ProjectGraph>,
     edits: Arc<dyn AppliedEditSource>,
-    pending: Mutex<BTreeMap<RunId, Pending>>,
+    pending: Mutex<PendingRuns>,
+}
+
+/// The pending map plus the ticket counter that orders it by age.
+#[derive(Debug, Default)]
+struct PendingRuns {
+    by_run: BTreeMap<RunId, Pending>,
+    next_seq: u64,
+}
+
+impl PendingRuns {
+    /// Remember `run`'s failure, replacing whatever it said before.
+    ///
+    /// Eviction can only ever drop a *different*, older run: `run` is
+    /// inserted after the eviction, and replacing an existing key does not
+    /// grow the map, so no eviction happens on that path at all.
+    fn remember(&mut self, run: RunId, codes: Vec<PendingCode>, edit_at_failure: Option<EventSeq>) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if !self.by_run.contains_key(&run) && self.by_run.len() >= MAX_PENDING_RUNS {
+            if let Some(oldest) = self
+                .by_run
+                .iter()
+                .min_by_key(|(_, p)| p.recorded_seq)
+                .map(|(r, _)| *r)
+            {
+                self.by_run.remove(&oldest);
+                tracing::warn!(
+                    evicted_run = %oldest,
+                    cap = MAX_PENDING_RUNS,
+                    "pending fix codes evicted; abandoned runs are leaking entries"
+                );
+            }
+        }
+        self.by_run.insert(
+            run,
+            Pending {
+                codes,
+                edit_at_failure,
+                recorded_seq: seq,
+            },
+        );
+    }
 }
 
 impl FixRecordingVerifier {
@@ -154,7 +229,7 @@ impl FixRecordingVerifier {
             inner,
             graph,
             edits,
-            pending: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(PendingRuns::default()),
         }
     }
 
@@ -193,28 +268,36 @@ impl Verifier for FixRecordingVerifier {
             // inconclusive one proves nothing either way, so it is left
             // alone rather than clearing what a real failure recorded.
             if matches!(verdict.outcome, super::VerdictOutcome::Fail) {
+                // A failure *replaces* the run's pending set rather than
+                // adding to it: it is the current statement of what is
+                // broken. When it names no code at all (a `Fail` whose
+                // diagnostics carry none), the honest replacement is the
+                // empty set — keeping the previous failure's codes would
+                // let a later pass claim them for a patch that may have
+                // fixed something else entirely.
                 let codes = Self::pending_codes(&verdict.diagnostics);
-                if !codes.is_empty() {
-                    let seq = self
-                        .edits
-                        .latest_applied_edit(ctx.meta.session_id, run)
-                        .await
-                        .map(|e| e.seq);
-                    if let Ok(mut map) = self.pending.lock() {
-                        map.insert(
-                            run,
-                            Pending {
-                                codes,
-                                edit_at_failure: seq,
-                            },
-                        );
+                let seq = self
+                    .edits
+                    .latest_applied_edit(ctx.meta.session_id, run)
+                    .await
+                    .map(|e| e.seq);
+                if let Ok(mut map) = self.pending.lock() {
+                    if codes.is_empty() {
+                        map.by_run.remove(&run);
+                    } else {
+                        map.remember(run, codes, seq);
                     }
                 }
             }
             return Ok(verdict);
         }
 
-        let Some(pending) = self.pending.lock().ok().and_then(|mut m| m.remove(&run)) else {
+        let Some(pending) = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut m| m.by_run.remove(&run))
+        else {
             return Ok(verdict); // Nothing failed in this run: nothing was fixed.
         };
         let Some(edit) = self
@@ -224,9 +307,11 @@ impl Verifier for FixRecordingVerifier {
         else {
             return Ok(verdict); // Passed without ever editing: not a fix.
         };
-        if Some(edit.seq) == pending.edit_at_failure {
-            // The same edit that was already applied when the failure was
-            // observed. Nothing new was tried, so nothing is claimed.
+        if pending.edit_at_failure.is_some_and(|at| edit.seq <= at) {
+            // No edit newer than the one already applied when the failure
+            // was observed. Nothing new was tried, so nothing is claimed.
+            // (`<=` rather than `==`: a log that went backwards is still
+            // not evidence of a fix.)
             return Ok(verdict);
         }
 
