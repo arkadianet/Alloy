@@ -214,9 +214,14 @@ pub struct ModelEndpoint {
     pub tiers: Vec<ModelTier>,
     pub supports_tools: bool,
     pub supports_structured_output: bool,
-    /// A-0007-2: endpoint accepts a full JSON Schema `response_format`
-    /// (schema-constrained decoding). Default false; see §5.5.1.
+    /// A-0007-2: endpoint accepts a full JSON Schema `response_format`.
+    /// Enforcement is server-dependent (§5.5.1). Default false; requires
+    /// `supports_structured_output = true` (validated at config load).
     pub supports_json_schema: bool,
+    /// A-0007-2 (round 2): serialize `"strict": true` inside `json_schema`
+    /// (OpenAI strict structured outputs). Default false; requires
+    /// `supports_json_schema = true` (validated at config load). See JS5.
+    pub json_schema_strict: bool,
     pub max_context: u32,
     /// USD per 1_000_000 input tokens. `None` → never invent USD for this endpoint.
     pub input_usd_per_mtok: Option<f64>,
@@ -304,8 +309,9 @@ pub enum ToolChoice {
 pub enum ResponseFormat {
     Text,
     JsonObject,
-    /// A-0007-2: schema-constrained decoding. Only ever constructed for
-    /// endpoints with `supports_json_schema = true` (§5.5.1).
+    /// A-0007-2: requested response schema; enforcement is
+    /// server-dependent (§5.5.1 / JS5). Only ever constructed for
+    /// endpoints with `supports_json_schema = true`.
     JsonSchema { name: String, schema: serde_json::Value },
 }
 
@@ -372,7 +378,7 @@ pub struct RoutingRequest {
     pub budget_remaining: BudgetSnapshot,
     pub requires_tools: bool,
     pub requires_structured_output: bool,
-    /// A-0007-2: optional schema for schema-constrained decoding. Serde
+    /// A-0007-2: optional response schema (enforcement per §5.5.1). Serde
     /// default (`None`), so older payloads keep deserializing. Best-effort:
     /// never filters endpoint selection (§5.3); applied only in §5.5.1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1045,18 +1051,32 @@ Citations / domains are **not** sent on the wire in MVP; they exist for hashing 
 Local models burn repair turns on malformed JSON. OpenAI-compatible local
 servers (vLLM, Ollama ≥ 0.5, llama.cpp) accept the OpenAI wire shape
 `response_format: {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}`
-and constrain decoding to the schema by grammar. A-0007-2 threads a
+and constrain decoding to the schema by grammar. **Enforcement is
+server-dependent**: those grammar-constraining servers decode against the
+schema whether or not `strict` is present, while OpenAI-style hosted
+endpoints guarantee conformance only under `"strict": true` and otherwise
+treat the schema as best-effort guidance. A-0007-2 threads a
 caller-declared schema through the router under these rules:
 
 | Rule | Requirement |
 |---|---|
 | **JS1** | `RoutingRequest.response_schema: Option<JsonSchemaSpec>` is additive and serde-defaulted; `None` is the identity — routing and completion behave exactly as before the amendment. |
 | **JS2** | The schema is **best-effort**: it never participates in §5.3 endpoint selection and never causes `NoEndpoint`. Selection continues to gate only on `supports_tools` / `supports_structured_output`. |
-| **JS3** | Endpoint capability follows the existing convention (`supports_tools`, `supports_structured_output`): a per-endpoint `supports_json_schema` bool in `router.toml`, **default false**, so an operator opts each endpoint in explicitly. |
+| **JS3** | Endpoint capability follows the existing convention (`supports_tools`, `supports_structured_output`): a per-endpoint `supports_json_schema` bool in `router.toml`, **default false**, so an operator opts each endpoint in explicitly. `supports_json_schema = true` **requires** `supports_structured_output = true`: the schema is only ever sent on structured completions and §5.3 gates structured work on `supports_structured_output`, so the combination `supports_json_schema && !supports_structured_output` is a contradiction and config load fails closed with a config error. |
 | **JS4** | `complete` sends `ResponseFormat::JsonSchema` **iff** `requires_structured_output && response_schema.is_some() && endpoint.supports_json_schema`. Otherwise a structured request degrades honestly to `JsonObject` (never `Text`, never an error) and the degrade is logged at debug level. |
-| **JS5** | The provider serializes the OpenAI shape verbatim and deliberately omits `strict`: local servers ignore it and constrain by grammar anyway, while OpenAI strict mode rejects schemas whose `required` narrows `properties`. |
+| **JS5** | The provider serializes the OpenAI shape verbatim. By default `strict` is **omitted**, which means *requested schema, server-dependent enforcement*: grammar-constraining local servers (vLLM, Ollama ≥ 0.5, llama.cpp) constrain decoding regardless, while OpenAI-style servers treat the schema as best-effort. A per-endpoint `json_schema_strict` bool (**default false**; requires `supports_json_schema = true`, validated fail-closed like JS3) opts into serializing `"strict": true` for endpoints whose server honours OpenAI strict mode — off by default because strict mode rejects schemas outside its supported subset (for example a `required` list narrower than `properties`). |
 | **JS6** | Response mapping treats `JsonSchema` exactly like `JsonObject` (§5.7): parse `choices[0].message.content` into `structured` when it is a JSON object. A constrained server can still truncate or refuse, so worker-side extraction/validation (RFC-0013 PS1–PS10) remains mandatory. |
-| **JS7** | Schema authorship lives with the capability owner: RFC-0013 workers declare their response schema next to their system instruction (`capabilities/prompt.rs`), derived from the same `deny_unknown_fields` parse types the worker validates with. |
+| **JS7** | Schema authorship lives with the capability owner: RFC-0013 workers declare their response schema next to their system instruction (`capabilities/prompt.rs`), derived from the same `deny_unknown_fields` parse types the worker validates with. A declared schema and its parser MUST move together: the `edit` schema is patch-only because today's `PatchProposal` parser rejects `ops`, and when the AM-0013-1 line-ops contract (PR #64, exactly one of `patch`/`ops`) merges, `edit_response_schema()` MUST be regenerated in the same change — the `edit_schema_matches_current_parser_surface` test pins this agreement. |
+
+Source compatibility: A-0007-2's additions (`ResponseFormat::JsonSchema`,
+`RoutingRequest.response_schema`, `ModelEndpoint.supports_json_schema` /
+`json_schema_strict`) follow the workspace's established pre-1.0 convention
+for router types — additive public fields/variants without
+`#[non_exhaustive]`, documented in the RFC amendment, with all in-repo
+matches updated atomically (precedent: `ModelEndpoint.temperature` in #53/#54
+and `RoutingRequest.tier_override` in #58). These crates are
+workspace-internal (version 0.1.0, not published); serde/wire compatibility
+is the contract that is kept (JS1), not Rust source compatibility.
 
 ### 5.6 Provider HTTP call (openai-compatible)
 
@@ -1073,7 +1093,11 @@ Body:
     "stream": false,
     optional "temperature",
     optional "max_tokens" <- max_output_tokens,
-    optional "response_format": {"type":"json_object"} when JsonObject
+    optional "response_format": {"type":"json_object"} when JsonObject,
+    optional "response_format":
+        {"type":"json_schema","json_schema":{"name",..,"schema",..,
+         optional "strict": true <- endpoint.json_schema_strict}}
+        when JsonSchema (A-0007-2, §5.5.1)
   }
 ```
 
@@ -1506,7 +1530,8 @@ model = "REPLACE_ME"               # REQUIRED wire model id (BYOM — operator s
 tiers = ["standard"]               # non-empty Vec<ModelTier>; REQUIRED
 supports_tools = true              # bool; default false
 supports_structured_output = true  # bool; default false
-supports_json_schema = false       # bool; default false (A-0007-2, §5.5.1)
+supports_json_schema = false       # bool; default false (A-0007-2, §5.5.1); true requires supports_structured_output = true
+json_schema_strict = false         # bool; default false (A-0007-2 JS5); true requires supports_json_schema = true
 max_context = 200000               # u32; REQUIRED; MUST be > 0
 # Required when profile max_usd_per_run is finite and > 0 (§5.4 / from_paths|from_parts).
 # A literal 0.0 means measured/declared free, not unknown.
@@ -1634,7 +1659,8 @@ pub struct EndpointConfig {
     pub tiers: Vec<ModelTier>,
     pub supports_tools: bool,
     pub supports_structured_output: bool,
-    pub supports_json_schema: bool, // A-0007-2; default false
+    pub supports_json_schema: bool, // A-0007-2; default false; requires supports_structured_output
+    pub json_schema_strict: bool,   // A-0007-2 JS5; default false; requires supports_json_schema
     pub max_context: u32,
     pub input_usd_per_mtok: Option<f64>,
     pub output_usd_per_mtok: Option<f64>,

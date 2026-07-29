@@ -171,7 +171,11 @@ impl<'a> WireRequest<'a> {
                 ResponseFormat::JsonObject => Some(WireResponseFormat::JsonObject),
                 ResponseFormat::JsonSchema { name, schema } => {
                     Some(WireResponseFormat::JsonSchema {
-                        json_schema: WireJsonSchema { name, schema },
+                        json_schema: WireJsonSchema {
+                            name,
+                            schema,
+                            strict: endpoint.json_schema_strict.then_some(true),
+                        },
                     })
                 }
             },
@@ -179,13 +183,17 @@ impl<'a> WireRequest<'a> {
     }
 }
 
-/// OpenAI `response_format` wire shape. The `json_schema` arm matches the
-/// schema-constrained decoding contract that vLLM, Ollama's OpenAI endpoint
-/// (≥ 0.5), and llama.cpp all accept:
+/// OpenAI `response_format` wire shape. The `json_schema` arm is the shape
+/// vLLM, Ollama's OpenAI endpoint (≥ 0.5), and llama.cpp all accept:
 /// `{"type":"json_schema","json_schema":{"name":...,"schema":{...}}}`.
-/// `strict` is deliberately omitted: local servers ignore it and constrain
-/// by grammar anyway, while OpenAI's strict mode would reject schemas whose
-/// `required` list is narrower than `properties`.
+///
+/// Enforcement is server-dependent: grammar-constraining local servers
+/// decode against the schema regardless of `strict`, while OpenAI-style
+/// servers require `"strict": true` for guaranteed conformance and treat
+/// its absence as best-effort. `strict` therefore rides the per-endpoint
+/// `json_schema_strict` opt-in (default off, because OpenAI strict mode
+/// rejects schemas outside its supported subset — for example a `required`
+/// list narrower than `properties`).
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireResponseFormat<'a> {
@@ -197,6 +205,8 @@ enum WireResponseFormat<'a> {
 struct WireJsonSchema<'a> {
     name: &'a str,
     schema: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -645,6 +655,7 @@ mod tests {
             supports_tools: false,
             supports_structured_output: true,
             supports_json_schema: true,
+            json_schema_strict: false,
             max_context: 1,
             input_usd_per_mtok: None,
             output_usd_per_mtok: None,
@@ -674,12 +685,34 @@ mod tests {
             "repair_plan"
         );
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
-        // `strict` stays off the wire (see WireResponseFormat docs).
+        // `strict` stays off the wire by default (see WireResponseFormat
+        // docs): without it, enforcement is server-dependent best-effort.
         assert!(body["response_format"]["json_schema"]
             .as_object()
             .unwrap()
             .get("strict")
             .is_none());
+
+        // Per-endpoint `json_schema_strict` opt-in puts `"strict": true`
+        // inside `json_schema` (OpenAI strict structured outputs).
+        let strict_endpoint = ModelEndpoint {
+            json_schema_strict: true,
+            ..endpoint.clone()
+        };
+        let body = serde_json::to_value(WireRequest::new(&strict_endpoint, &request)).unwrap();
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "repair_plan"
+        );
+        // The flag never leaks into non-schema formats.
+        let plain_strict = CompletionRequest {
+            response_format: ResponseFormat::JsonObject,
+            ..request.clone()
+        };
+        let body = serde_json::to_value(WireRequest::new(&strict_endpoint, &plain_strict)).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert!(body["response_format"].get("json_schema").is_none());
 
         // The pre-amendment shapes are unchanged.
         let plain = CompletionRequest {

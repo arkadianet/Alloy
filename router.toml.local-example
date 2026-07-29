@@ -30,7 +30,8 @@ supports_structured_output = true
 # OpenAI response_format = {type = "json_schema", ...} shape onto its native
 # grammar-constrained `format`, so local models stop burning repair turns on
 # malformed JSON. Set false if your server rejects the shape; Alloy then
-# degrades that endpoint to plain json_object.
+# degrades that endpoint to plain json_object. Ollama constrains by grammar
+# whether or not strict is sent, so json_schema_strict stays off here.
 supports_json_schema = true
 max_context = 32768
 # Optional sampling temperature (0.0..=2.0); omit for the provider default.

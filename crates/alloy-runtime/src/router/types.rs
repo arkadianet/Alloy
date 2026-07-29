@@ -34,12 +34,27 @@ pub struct ModelEndpoint {
     /// Whether the endpoint can request JSON-object output.
     pub supports_structured_output: bool,
     /// Whether the endpoint accepts a full JSON Schema as its
-    /// `response_format` constraint (OpenAI `json_schema` wire shape,
-    /// honoured by vLLM, Ollama ≥ 0.5, and llama.cpp `--jinja` servers).
+    /// `response_format` (OpenAI `json_schema` wire shape).
+    ///
+    /// This requests the schema; **enforcement is server-dependent**:
+    /// grammar-constraining servers (vLLM, Ollama ≥ 0.5, llama.cpp
+    /// `--jinja`) constrain decoding to the schema, while other servers
+    /// treat it as best-effort guidance. Pair with
+    /// [`ModelEndpoint::json_schema_strict`] for OpenAI-style strict
+    /// enforcement.
     ///
     /// Defaults to `false`: servers that reject the shape degrade honestly
     /// to plain `json_object` unless the operator opts the endpoint in.
+    /// Config validation requires `supports_structured_output = true`
+    /// alongside it (the schema is only ever sent on structured
+    /// completions).
     pub supports_json_schema: bool,
+    /// Whether the serialized `json_schema` response format carries
+    /// `"strict": true` (OpenAI strict structured outputs, per-endpoint
+    /// opt-in; default `false`). Grammar-constraining local servers ignore
+    /// the field; OpenAI strict mode rejects schemas outside its supported
+    /// subset, so the operator opts in only where the schemas comply.
+    pub json_schema_strict: bool,
     /// Advisory context-window size.
     pub max_context: u32,
     /// Operator price per one million input tokens.
@@ -130,9 +145,12 @@ pub enum ResponseFormat {
     Text,
     /// Request a JSON object while preserving the original text.
     JsonObject,
-    /// Request output constrained to a named JSON Schema (schema-constrained
-    /// decoding). Only sent to endpoints with `supports_json_schema = true`;
-    /// the router degrades to [`ResponseFormat::JsonObject`] everywhere else.
+    /// Request output against a named JSON Schema. Enforcement is
+    /// server-dependent: grammar-constraining servers decode against the
+    /// schema, others treat it as best-effort guidance (see
+    /// `ModelEndpoint::json_schema_strict` for OpenAI strict mode). Only
+    /// sent to endpoints with `supports_json_schema = true`; the router
+    /// degrades to [`ResponseFormat::JsonObject`] everywhere else.
     JsonSchema {
         /// Stable schema name carried on the wire (OpenAI `json_schema.name`).
         name: String,
@@ -442,6 +460,7 @@ mod tests {
             supports_tools: false,
             supports_structured_output: true,
             supports_json_schema: false,
+            json_schema_strict: false,
             max_context: 1,
             input_usd_per_mtok: Some(0.0),
             output_usd_per_mtok: Some(0.0),
