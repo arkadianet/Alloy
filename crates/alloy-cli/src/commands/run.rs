@@ -172,6 +172,12 @@ async fn run_after_assembly(
         eprintln!("session {session}  run {run}");
     }
 
+    // Issue #53 — one verify pass before planning, so the repair worker's
+    // generation-1 prompt carries the real rustc diagnostics instead of
+    // guessing from the goal text. Best-effort: a missing toolchain or
+    // sandbox must never fail a run before it starts.
+    bootstrap_diagnostics(full, ctx, session, run, dag_id).await;
+
     // §7.1 step 6 — plan (template selection is the plan service's, SQ1).
     let (policy_hash, tool_versions, compiler_fingerprint) = plan_fingerprints(ctx)?;
     PlanService::plan(
@@ -198,6 +204,45 @@ async fn run_after_assembly(
         GateMode::Interactive
     };
     execute_and_render(full, ctx, "run", session, run, mode).await
+}
+
+/// Issue #53 — pre-plan diagnostic seed; a failure is a warning, never
+/// fatal (IX7 spirit). Reuses the scheduler's own compile verifier, so the
+/// check runs sandboxed with the same policy as verify nodes.
+async fn bootstrap_diagnostics(
+    full: &FullAssembly,
+    ctx: &Ctx,
+    session: SessionId,
+    run: RunId,
+    dag_id: alloy_runtime::DagId,
+) {
+    let exec_ctx = alloy_runtime::NodeExecContext {
+        meta: alloy_runtime::NodeExecRef {
+            session_id: session,
+            run_id: run,
+            dag_id,
+            node_id: alloy_runtime::NodeId::new(),
+            workspace_root: ctx.workspace_abs.clone(),
+            attempt: 1,
+        },
+        cancellation: full.base.handle.cancellation().child_token(),
+    };
+    match alloy_runtime::seed_graph_diagnostics(
+        full.verify_compile.as_ref(),
+        full.graph.as_ref(),
+        &exec_ctx,
+    )
+    .await
+    {
+        Ok(n) => {
+            if !ctx.quiet && n > 0 {
+                eprintln!("seeded {n} diagnostic(s) from cargo check");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "diagnostic seed skipped");
+        }
+    }
 }
 
 /// IX3/IX4/IX5 — bootstrap ingest; a failure is a warning, never fatal (IX7).

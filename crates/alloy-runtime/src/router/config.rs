@@ -98,6 +98,9 @@ pub struct EndpointConfig {
     pub input_usd_per_mtok: Option<f64>,
     /// Operator price per million output tokens.
     pub output_usd_per_mtok: Option<f64>,
+    /// Optional sampling temperature sent with every completion on this
+    /// endpoint (issue #53). `None` leaves the provider default in force.
+    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +160,8 @@ struct EndpointFile {
     max_context: u32,
     input_usd_per_mtok: Option<f64>,
     output_usd_per_mtok: Option<f64>,
+    #[serde(default)]
+    temperature: Option<f32>,
 }
 
 const fn default_connect_timeout_ms() -> u64 {
@@ -310,6 +315,13 @@ impl TryFrom<EndpointFile> for EndpointConfig {
     fn try_from(file: EndpointFile) -> Result<Self, Self::Error> {
         let id = EndpointId::new(file.id)
             .map_err(|_| config_error("endpoint id must contain 1..=128 bytes"))?;
+        if let Some(t) = file.temperature {
+            if !t.is_finite() || !(0.0..=2.0).contains(&t) {
+                return Err(config_error(
+                    "endpoint temperature must be within 0.0..=2.0",
+                ));
+            }
+        }
         Ok(Self {
             id,
             display_name: file.display_name,
@@ -320,6 +332,7 @@ impl TryFrom<EndpointFile> for EndpointConfig {
             max_context: file.max_context,
             input_usd_per_mtok: file.input_usd_per_mtok,
             output_usd_per_mtok: file.output_usd_per_mtok,
+            temperature: file.temperature,
         })
     }
 }
@@ -337,6 +350,7 @@ impl EndpointConfig {
             max_context: self.max_context,
             input_usd_per_mtok: self.input_usd_per_mtok,
             output_usd_per_mtok: self.output_usd_per_mtok,
+            temperature: self.temperature,
         }
     }
 }
@@ -482,6 +496,35 @@ Repair = "standard"
             config.capability_tiers.get("repair"),
             Some(&ModelTier::Standard)
         );
+    }
+
+    /// Issue #53 — optional endpoint sampling temperature. Workers do
+    /// mechanical repair; provider defaults (Ollama ≈0.8) are too hot, and
+    /// the knob is operator-owned like every other endpoint field.
+    #[test]
+    fn endpoint_temperature_parses_defaults_and_validates() {
+        let with = sample("https://example.com").replace(
+            "max_context = 1024",
+            "max_context = 1024\ntemperature = 0.2",
+        );
+        let config = RouterConfig::from_str("test", &with).unwrap();
+        assert_eq!(config.providers[0].endpoints[0].temperature, Some(0.2));
+
+        let config = RouterConfig::from_str("test", &sample("https://example.com")).unwrap();
+        assert_eq!(config.providers[0].endpoints[0].temperature, None);
+
+        for bad in [
+            "temperature = 2.5",
+            "temperature = -0.1",
+            "temperature = nan",
+        ] {
+            let body = sample("https://example.com")
+                .replace("max_context = 1024", &format!("max_context = 1024\n{bad}"));
+            assert!(
+                RouterConfig::from_str("test", &body).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

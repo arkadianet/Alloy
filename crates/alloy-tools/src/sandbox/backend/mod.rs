@@ -270,6 +270,57 @@ pub fn stage_shadow_cargo_home(
     Ok(Some(shadow))
 }
 
+/// Token-free `.cargo/config[.toml]` files in the jail's proper ancestor
+/// directories (dogfood finding, 2026-07-29, round 2).
+///
+/// Cargo merges config from every ancestor of the workspace and
+/// hard-errors when one exists but is unreadable, so a jail under `$HOME`
+/// failed every sandboxed verify even after the shadow `CARGO_HOME`.
+/// Ancestor files cannot be shadowed (env only redirects `CARGO_HOME`) or
+/// bind-sanitized (Landlock rules are per-mount), so read access is
+/// granted to the real file — but only when it parses and carries no
+/// `token`/`secret-key`. A secret-bearing or unreadable ancestor config is
+/// skipped: cargo will then fail its config load and verify reports an
+/// honest Inconclusive rather than the sandbox leaking a credential.
+/// (`build.target-dir` in these files is neutralized by the forced
+/// per-exec `CARGO_TARGET_DIR`.)
+pub fn ancestor_cargo_configs(jail: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in jail.ancestors().skip(1) {
+        for name in ["config.toml", "config"] {
+            let p = dir.join(".cargo").join(name);
+            if !p.is_file() {
+                continue;
+            }
+            let token_free = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|text| text.parse::<toml::Value>().ok())
+                .is_some_and(|value| !contains_secret_keys(&value));
+            if token_free {
+                out.push(p);
+            } else {
+                tracing::warn!(
+                    path = %p.display(),
+                    "ancestor cargo config skipped (unreadable, unparseable, or token-bearing); \
+                     cargo config load will fail closed"
+                );
+            }
+        }
+    }
+    out
+}
+
+/// `true` when any table at any depth carries a `token` / `secret-key`.
+fn contains_secret_keys(value: &toml::Value) -> bool {
+    if let toml::Value::Table(table) = value {
+        if table.keys().any(|k| matches!(&**k, "token" | "secret-key")) {
+            return true;
+        }
+        return table.iter().any(|(_, nested)| contains_secret_keys(nested));
+    }
+    false
+}
+
 /// Remove `token` / `secret-key` (secrets) and `target-dir` (a shared
 /// build cache outside the jail would fail the write sandbox) at every
 /// table depth.
@@ -351,6 +402,53 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(std::fs::read_to_string(shadow.join("config")).unwrap(), "");
+    }
+
+    /// Dogfood finding (2026-07-29, round 2): cargo also walks the
+    /// workspace's *ancestor* directories for `.cargo/config.toml` and
+    /// hard-errors when one is unreadable — a jail under `$HOME` failed
+    /// every verify even with the shadow CARGO_HOME. Token-free ancestor
+    /// configs become read grants; token-bearing ones are skipped
+    /// (fail-closed: cargo then errors and verify reports Inconclusive).
+    #[test]
+    fn ancestor_configs_grants_token_free_and_skips_secret_bearing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mid = dir.path().join("mid");
+        let jail = mid.join("jail");
+        std::fs::create_dir_all(&jail).unwrap();
+        std::fs::create_dir_all(dir.path().join(".cargo")).unwrap();
+        std::fs::create_dir_all(mid.join(".cargo")).unwrap();
+        std::fs::write(
+            dir.path().join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"/srv/shared\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            mid.join(".cargo/config.toml"),
+            "[registry]\ntoken = \"sekrit\"\n",
+        )
+        .unwrap();
+        let found = ancestor_cargo_configs(&jail);
+        assert!(
+            found.contains(&dir.path().join(".cargo/config.toml")),
+            "token-free ancestor must be granted: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.starts_with(&mid)),
+            "token-bearing ancestor must be skipped: {found:?}"
+        );
+    }
+
+    /// The jail's own `.cargo/config.toml` is not an ancestor grant (it is
+    /// inside the RW jail already), and no ancestors → empty.
+    #[test]
+    fn ancestor_configs_excludes_the_jail_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let jail = dir.path().join("jail");
+        std::fs::create_dir_all(jail.join(".cargo")).unwrap();
+        std::fs::write(jail.join(".cargo/config.toml"), "[net]\n").unwrap();
+        let found = ancestor_cargo_configs(&jail);
+        assert!(!found.iter().any(|p| p.starts_with(&jail)), "{found:?}");
     }
 
     /// No operator config → `None`: the real `CARGO_HOME` stays in use.

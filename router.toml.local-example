@@ -27,6 +27,9 @@ tiers = ["standard", "economy"]
 supports_tools = true
 supports_structured_output = true
 max_context = 32768
+# Optional sampling temperature (0.0..=2.0); omit for the provider default.
+# Low values suit mechanical repair/edit work (issue #53).
+temperature = 0.2
 # Local tokens are free; $0 keeps the budget meter honest.
 input_usd_per_mtok = 0.0
 output_usd_per_mtok = 0.0
