@@ -210,6 +210,7 @@ RFC and V2 conflict, V2 wins — see [change control](docs/roadmap/IMPLEMENTATIO
 
 ## License
 
-Not yet finalized. `Cargo.toml` declares `MIT OR Apache-2.0`, but
-[`LICENSE.md`](LICENSE.md) is still a placeholder — treat the licensing terms as
-undetermined until that file carries real text.
+Dual-licensed under either the [MIT license](LICENSE.md#mit-license) or the
+[Apache License, Version 2.0](LICENSE.md#apache-license-version-20), at your
+option — matching `Cargo.toml`'s `MIT OR Apache-2.0` declaration. See
+[`LICENSE.md`](LICENSE.md) for the full texts.

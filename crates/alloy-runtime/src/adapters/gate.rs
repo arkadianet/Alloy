@@ -103,6 +103,7 @@ mod tests {
                 retain_tool_bodies: false,
                 run_timeout: Duration::from_secs(30),
                 budget_policy: BudgetPolicy::default(),
+                capture: Default::default(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();
@@ -138,6 +139,7 @@ mod tests {
                     profile: ProfileId::new("default").unwrap(),
                     budget: BudgetPolicy::default(),
                     language_backends: vec![LanguageId::new("rust").unwrap()],
+                    provenance: None,
                 })
                 .await
                 .unwrap();

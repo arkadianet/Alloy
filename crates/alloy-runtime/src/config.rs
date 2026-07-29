@@ -91,6 +91,9 @@ pub struct RuntimeConfig {
     pub run_timeout: Duration,
     /// From profile `[budgets]`, or [`BudgetPolicy::default`] when the table is absent (RFC-0007 §7.6).
     pub budget_policy: BudgetPolicy,
+    /// Corpus-capture policy from the profile's `[capture]` table
+    /// (research §7.11 item 1). Absent table = capture disabled.
+    pub capture: crate::obs::CapturePolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +102,8 @@ struct ProfileFile {
     budgets: Option<BudgetsSection>,
     #[serde(default)]
     observability: ObservabilitySection,
+    #[serde(default)]
+    capture: CaptureSection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +120,34 @@ struct ObservabilitySection {
     retain_full_prompts: bool,
     #[serde(default)]
     retain_tool_bodies: bool,
+}
+
+/// `[capture]` — corpus capture, distinct from `[observability]` retention.
+#[derive(Debug, Deserialize)]
+struct CaptureSection {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    prompts: bool,
+    #[serde(default)]
+    tool_bodies: bool,
+    #[serde(default = "default_true")]
+    require_consent: bool,
+}
+
+impl Default for CaptureSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prompts: false,
+            tool_bodies: false,
+            require_consent: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_usd() -> f64 {
@@ -182,6 +215,12 @@ impl RuntimeConfig {
             retain_tool_bodies: profile.observability.retain_tool_bodies,
             run_timeout: Duration::from_secs(60 * 30),
             budget_policy,
+            capture: crate::obs::CapturePolicy {
+                enabled: profile.capture.enabled,
+                prompts: profile.capture.prompts,
+                tool_bodies: profile.capture.tool_bodies,
+                require_consent: profile.capture.require_consent,
+            },
         })
     }
 }
@@ -296,6 +335,53 @@ retain_tool_bodies = false
         assert_eq!(cfg.budget_policy.max_tokens_per_run, 100);
         assert_eq!(cfg.budget_policy.max_parallel_nodes, 1);
         assert_eq!(fs::read_to_string(&dotenv).unwrap(), "SENTINEL=1\n");
+    }
+
+    /// §7.11 item 1: `[capture]` parses distinctly from `[observability]`,
+    /// and an absent table means capture disabled with consent required.
+    #[test]
+    fn capture_section_parses_and_defaults_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
+        // Absent [capture]: disabled, consent required.
+        let cfg = RuntimeConfig::load(ConfigPaths {
+            profile: profile.clone(),
+            router: router.clone(),
+            example_env: example.clone(),
+            data_dir: None,
+            workspace_root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap();
+        assert!(!cfg.capture.enabled);
+        assert!(cfg.capture.require_consent);
+
+        // Explicit [capture] parses independently of [observability].
+        fs::write(
+            &profile,
+            r#"
+[profile]
+id = "default"
+[observability]
+retain_full_prompts = false
+[capture]
+enabled = true
+prompts = true
+tool_bodies = false
+require_consent = true
+"#,
+        )
+        .unwrap();
+        let cfg = RuntimeConfig::load(ConfigPaths {
+            profile,
+            router,
+            example_env: example,
+            data_dir: None,
+            workspace_root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap();
+        assert!(cfg.capture.enabled && cfg.capture.prompts && !cfg.capture.tool_bodies);
+        assert!(cfg.capture.require_consent);
+        assert!(!cfg.retain_full_prompts, "retention is not capture");
     }
 
     #[test]

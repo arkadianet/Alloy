@@ -25,18 +25,14 @@ use crate::error::AdapterError;
 use crate::types::diagnostic::DiagnosticEvent;
 use crate::types::ids::{ArtifactId, DagId, GateId, NodeId, RunId, SessionId};
 
-/// Compile verification adapter.
+/// One verifier trait for every "did it work" question (research §7.11
+/// item 5; RFC-0019 grows this). Compile, test, and any future verifier
+/// (clippy, `NoNewUnsafe`) answer through the same [`Verdict`] type so two
+/// implementations of the same question can never silently disagree again.
 #[async_trait]
-pub trait VerifyCompileAdapter: Send + Sync {
-    /// Run compile/check for a node.
-    async fn check(&self, ctx: &NodeExecContext) -> Result<VerifyOutcome, AdapterError>;
-}
-
-/// Test verification adapter.
-#[async_trait]
-pub trait VerifyTestAdapter: Send + Sync {
-    /// Run tests for a node.
-    async fn test(&self, ctx: &NodeExecContext) -> Result<VerifyOutcome, AdapterError>;
+pub trait Verifier: Send + Sync {
+    /// Run the verification for a node.
+    async fn verify(&self, ctx: &NodeExecContext) -> Result<Verdict, AdapterError>;
 }
 
 /// Human gate adapter.
@@ -79,15 +75,95 @@ pub struct NodeExecContext {
     pub cancellation: CancellationToken,
 }
 
-/// Verify adapter outcome.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerifyOutcome {
-    /// Whether verification succeeded.
-    pub ok: bool,
+/// Three-valued verification outcome (research §7.11 item 6).
+///
+/// The old `ok: bool` mislabelled infrastructure failures as agent
+/// failures; `Inconclusive` is the honest label for "the verifier could not
+/// produce an answer" — a signal-killed cargo, truncated output, or a
+/// missing exit code. Training labels and retry policy both depend on the
+/// distinction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictOutcome {
+    /// The property verified holds.
+    Pass,
+    /// The property verified does not hold — an agent-attributable failure.
+    Fail,
+    /// The verifier ran but could not answer; retryable, never an agent
+    /// failure label.
+    Inconclusive {
+        /// Why no answer exists.
+        reason: String,
+    },
+}
+
+/// Verifier result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Verdict {
+    /// Three-valued outcome.
+    pub outcome: VerdictOutcome,
     /// Diagnostics produced.
     pub diagnostics: Vec<DiagnosticEvent>,
     /// Optional raw log artifact.
     pub raw_artifact: Option<ArtifactId>,
+}
+
+impl Verdict {
+    /// A bare passing verdict.
+    #[must_use]
+    pub fn pass() -> Self {
+        Self {
+            outcome: VerdictOutcome::Pass,
+            diagnostics: vec![],
+            raw_artifact: None,
+        }
+    }
+
+    /// A bare failing verdict.
+    #[must_use]
+    pub fn fail() -> Self {
+        Self {
+            outcome: VerdictOutcome::Fail,
+            diagnostics: vec![],
+            raw_artifact: None,
+        }
+    }
+
+    /// `true` iff the outcome is [`VerdictOutcome::Pass`].
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        matches!(self.outcome, VerdictOutcome::Pass)
+    }
+}
+
+/// The one shared decision for "did cargo's answer mean pass, fail, or
+/// no-answer" (research §7.11 items 5/6). Both the runtime verify adapters
+/// and `alloy-eval`'s `compile_clean` MUST route through this function, so
+/// a disagreement is a compile error rather than a silent divergence.
+///
+/// - exit 0 with no error-level diagnostics → `Pass`
+/// - exit 0 **with** error-level diagnostics → `Fail` (diagnostics win)
+/// - exit 101 → `Fail` (the normal compile/test failure signal)
+/// - any other exit, or no exit code → `Inconclusive` (cargo itself failed;
+///   nothing about the agent's patch was decided)
+#[must_use]
+pub fn cargo_exit_verdict(exit_code: Option<i64>, has_error_diagnostics: bool) -> VerdictOutcome {
+    match exit_code {
+        Some(0) => {
+            if has_error_diagnostics {
+                VerdictOutcome::Fail
+            } else {
+                VerdictOutcome::Pass
+            }
+        }
+        Some(101) => VerdictOutcome::Fail,
+        Some(other) => VerdictOutcome::Inconclusive {
+            reason: format!("cargo exited {other}"),
+        },
+        None => VerdictOutcome::Inconclusive {
+            reason: "no exit code reported".into(),
+        },
+    }
 }
 
 /// Human approval decision.
@@ -102,11 +178,11 @@ pub enum Approval {
     AllowOnce,
 }
 
-/// Unavailable compile adapter stub.
+/// Unavailable verifier stub (compile slot).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnavailableVerifyCompile;
 
-/// Unavailable test adapter stub.
+/// Unavailable verifier stub (test slot).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnavailableVerifyTest;
 
@@ -115,15 +191,15 @@ pub struct UnavailableVerifyTest;
 pub struct UnavailableGateHuman;
 
 #[async_trait]
-impl VerifyCompileAdapter for UnavailableVerifyCompile {
-    async fn check(&self, _ctx: &NodeExecContext) -> Result<VerifyOutcome, AdapterError> {
+impl Verifier for UnavailableVerifyCompile {
+    async fn verify(&self, _ctx: &NodeExecContext) -> Result<Verdict, AdapterError> {
         Err(AdapterError::Unavailable)
     }
 }
 
 #[async_trait]
-impl VerifyTestAdapter for UnavailableVerifyTest {
-    async fn test(&self, _ctx: &NodeExecContext) -> Result<VerifyOutcome, AdapterError> {
+impl Verifier for UnavailableVerifyTest {
+    async fn verify(&self, _ctx: &NodeExecContext) -> Result<Verdict, AdapterError> {
         Err(AdapterError::Unavailable)
     }
 }
