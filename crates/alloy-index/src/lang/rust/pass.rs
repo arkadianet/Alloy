@@ -453,14 +453,7 @@ fn walk_items(
             syn::Item::Fn(i) => {
                 if let Some((id, path)) = emit_item(&i.sig.ident, scope, ctx, pass, out)? {
                     pass.fn_items.insert(path.clone());
-                    collect_refs(
-                        item,
-                        Some(&i.sig.generics),
-                        RefOrigin::Node { id, path },
-                        scope,
-                        ctx,
-                        pass,
-                    );
+                    collect_refs(item, Some(&i.sig.generics), id, path, scope, ctx, pass);
                 }
             }
             syn::Item::Struct(i) => {
@@ -551,14 +544,7 @@ fn emit_with_refs(
     out: &mut ScanOutput,
 ) -> Result<(), GraphError> {
     if let Some((id, path)) = emit_item(ident, scope, ctx, pass, out)? {
-        collect_refs(
-            item,
-            generics,
-            RefOrigin::Node { id, path },
-            scope,
-            ctx,
-            pass,
-        );
+        collect_refs(item, generics, id, path, scope, ctx, pass);
     }
     Ok(())
 }
@@ -595,11 +581,12 @@ struct RefCollector<'p> {
 impl<'ast> syn::visit::Visit<'ast> for RefCollector<'_> {
     fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
     fn visit_macro(&mut self, _: &'ast syn::Macro) {}
-    fn visit_item_use(&mut self, _: &'ast syn::ItemUse) {}
     // Items declared inside bodies live in their own scope; attributing
     // their contents to the enclosing item risks invented edges (G7).
-    fn visit_item_mod(&mut self, _: &'ast syn::ItemMod) {}
-    fn visit_item_impl(&mut self, _: &'ast syn::ItemImpl) {}
+    // Root entry bypasses this via the free-function walk in
+    // [`collect_refs`], so only *nested* items (which syn routes through
+    // this trait method) are suppressed — `use`, `mod`, `impl` included.
+    fn visit_item(&mut self, _: &'ast syn::Item) {}
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
@@ -690,22 +677,21 @@ fn push_refs<F>(
 fn collect_refs(
     item: &syn::Item,
     generics: Option<&syn::Generics>,
-    origin: RefOrigin,
+    id: alloy_runtime::GraphNodeId,
+    path: String,
     scope: &ModScope<'_>,
     ctx: &CrateCtx<'_>,
     pass: &mut DeepPass,
 ) {
-    let (id, path) = match &origin {
-        RefOrigin::Node { id, path } => (*id, path.clone()),
-        RefOrigin::SelfType(_) => unreachable!("module-level items resolve their own origin"),
-    };
     push_refs(
         generic_names(generics),
         move || RefOrigin::Node {
             id,
             path: path.clone(),
         },
-        |c| syn::visit::Visit::visit_item(c, item),
+        // Free-function walk: dispatches to the per-kind visitors without
+        // the `visit_item` override, which exists to blank *nested* items.
+        |c| syn::visit::visit_item(c, item),
         scope,
         ctx,
         pass,

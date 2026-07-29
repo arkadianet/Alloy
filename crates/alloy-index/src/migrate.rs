@@ -263,6 +263,54 @@ pub(crate) fn check_model_version(conn: &Connection) -> Result<(), GraphError> {
 mod tests {
     use super::*;
 
+    /// Review finding on #62: the v1→v2 edge-table recreation is exercised
+    /// with real rows and `PRAGMA foreign_keys=ON` — rows survive the copy
+    /// and the recreated table still enforces its node foreign keys.
+    #[test]
+    fn v1_to_v2_migrates_populated_edges_and_keeps_foreign_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        // Stand up a genuine v1 database with content.
+        conn.execute_batch(
+            "CREATE TABLE graph_schema_migrations (
+               version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+             );
+             INSERT INTO graph_schema_migrations VALUES (1, 'test');",
+        )
+        .unwrap();
+        conn.execute_batch(V1_SQL).unwrap();
+        conn.execute_batch(
+            "INSERT INTO graph_nodes (id, kind, path, crate_id, file, digest)
+               VALUES ('n1','module','a','c',NULL,NULL),
+                      ('n2','item','a::f','c',NULL,NULL);
+             INSERT INTO graph_edges (from_id, to_id, kind, confidence)
+               VALUES ('n1','n2','defines',1.0);",
+        )
+        .unwrap();
+
+        let version = migrate(&conn, true).unwrap();
+        assert!(version >= 2);
+        // The pre-existing row survived the table recreation.
+        let (from, to, kind): (String, String, String) = conn
+            .query_row("SELECT from_id, to_id, kind FROM graph_edges", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            (from.as_str(), to.as_str(), kind.as_str()),
+            ("n1", "n2", "defines")
+        );
+        // New kinds are admitted...
+        conn.execute("INSERT INTO graph_edges VALUES ('n1','n2','calls',1.0)", [])
+            .unwrap();
+        // ...and the recreated table still enforces its foreign keys.
+        let orphan = conn.execute(
+            "INSERT INTO graph_edges VALUES ('ghost','n2','calls',1.0)",
+            [],
+        );
+        assert!(orphan.is_err(), "foreign keys must survive the recreation");
+    }
+
     // T17 (unit arm) — RS4: fidelity is a pure function of model_version.
     #[test]
     fn fidelity_tracks_model_version() {

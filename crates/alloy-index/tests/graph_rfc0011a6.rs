@@ -114,12 +114,10 @@ fn edge_pairs(data_dir: &Path, kind: &str) -> Vec<(String, String)> {
              WHERE e.kind = ?1 ORDER BY nf.path, nt.path",
         )
         .unwrap();
-    let out = stmt
-        .query_map([kind], |r| Ok((r.get(0)?, r.get(1)?)))
+    stmt.query_map([kind], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
         .map(Result::unwrap)
-        .collect();
-    out
+        .collect()
 }
 
 fn pairs(rows: &[(String, String)]) -> Vec<(&str, &str)> {
@@ -269,7 +267,7 @@ async fn semantic_edges_are_deterministic_and_idempotent() {
 // Queries: Refs / Impls / Callers round-trip, ordering, limits
 // ---------------------------------------------------------------------
 
-// A-0011-6b: Refs returns the anchor plus incoming `references` and
+// A-0011-6c: Refs returns the anchor plus incoming `references` and
 // `imports` edges, deterministically ordered (Q8).
 #[tokio::test]
 async fn refs_round_trips_incoming_references_and_imports() {
@@ -310,7 +308,7 @@ async fn refs_round_trips_incoming_references_and_imports() {
     g.close().await.unwrap();
 }
 
-// A-0011-6b: Callers returns incoming `calls` edges only.
+// A-0011-6c: Callers returns incoming `calls` edges only.
 #[tokio::test]
 async fn callers_round_trips_incoming_calls_edges() {
     let fx = Fx::cross();
@@ -348,7 +346,7 @@ async fn callers_round_trips_incoming_calls_edges() {
     g.close().await.unwrap();
 }
 
-// A-0011-6b: Impls answers both directions — implementers of a trait, and
+// A-0011-6c: Impls answers both directions — implementers of a trait, and
 // traits implemented by a type.
 #[tokio::test]
 async fn impls_answers_for_trait_and_for_type() {
@@ -383,7 +381,7 @@ async fn impls_answers_for_trait_and_for_type() {
     g.close().await.unwrap();
 }
 
-// A-0011-6b: an unknown anchor is an honest empty view — never an error,
+// A-0011-6c: an unknown anchor is an honest empty view — never an error,
 // never `truncated` (nothing was withheld).
 #[tokio::test]
 async fn unknown_anchor_returns_empty_untruncated_views() {
@@ -490,4 +488,52 @@ async fn model_v2_database_truncates_and_reingests_with_semantic_edges() {
         .query_row("SELECT model_version FROM graph_meta", [], |r| r.get(0))
         .unwrap();
     assert_eq!(model, 3);
+}
+
+/// A-0011-6b honesty: items declared inside a body live in their own scope —
+/// their references must NOT be attributed to the enclosing module-level
+/// item (the RefCollector doc's "items nested inside bodies" clause).
+#[tokio::test]
+async fn nested_body_items_do_not_leak_refs_to_the_enclosing_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let data = dir.path().join("data");
+    write(
+        &ws.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/nb\"]\nresolver = \"2\"\n",
+    );
+    write(
+        &ws.join("crates/nb/Cargo.toml"),
+        "[package]\nname = \"nb\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        &ws.join("crates/nb/src/lib.rs"),
+        "pub struct Config;\n\
+         pub fn target() -> u8 { 1 }\n\
+         pub fn outer() -> u8 {\n\
+             fn nested() -> u8 { crate::target() }\n\
+             struct Inner { _c: crate::Config }\n\
+             nested()\n\
+         }\n",
+    );
+    let g = SqliteProjectGraph::open(GraphOpenOptions::for_data_dir(&data))
+        .await
+        .unwrap();
+    g.rebuild(&ws).await.unwrap();
+    g.close().await.unwrap();
+    // Sanity: the ingest saw the crate at all (guards a vacuous pass).
+    assert!(
+        !edge_pairs(&data, "defines").is_empty(),
+        "fixture crate was not ingested"
+    );
+    for kind in ["calls", "references"] {
+        let from_outer: Vec<_> = edge_pairs(&data, kind)
+            .into_iter()
+            .filter(|(src, _)| src == "nb::outer")
+            .collect();
+        assert!(
+            from_outer.is_empty(),
+            "nested-body {kind} leaked to the enclosing item: {from_outer:?}"
+        );
+    }
 }
