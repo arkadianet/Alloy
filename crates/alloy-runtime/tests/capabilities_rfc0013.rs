@@ -13,8 +13,8 @@ use std::time::Duration;
 use alloy_runtime::adapters::{NodeExecRef, ToolCaller, ToolCallerError};
 use alloy_runtime::capabilities::EditAppliedPayload;
 use alloy_runtime::graph::{
-    derive_node_id, FileChange, FixEvent, GraphError, GraphNode, GraphNodeKind, GraphQuery,
-    GraphView, ProjectGraph,
+    derive_node_id, FileChange, FixEvent, GraphEdge, GraphEdgeKind, GraphError, GraphNode,
+    GraphNodeKind, GraphQuery, GraphView, ProjectGraph,
 };
 use alloy_runtime::storage::{
     ArtifactBlob, ArtifactMeta, ArtifactPut, ArtifactStore, SessionRows, StoreError,
@@ -127,14 +127,26 @@ impl ToolCaller for QueueToolCaller {
     }
 }
 
-/// Read-only `ProjectGraph` double: answers `SimilarFixes`, `Symbol` and
-/// `Callers` from canned tables and records the queries it saw. Every write
-/// is `Disabled`, so a worker that tried to write would fail loudly (SEC4).
+/// Read-only `ProjectGraph` double: answers `SimilarFixes`, `Symbol`,
+/// `Subgraph` and `Callers` from canned tables and records the queries it
+/// saw. Every write is `Disabled`, so a worker that tried to write would
+/// fail loudly (SEC4).
+///
+/// The query shapes mirror the real `alloy-index` store (verified on both
+/// main and `feat/graph-refs-impls-callers`): a file-path `Symbol` resolves
+/// through `graph_files.module_id` to the file's **Module** node only
+/// (`query.rs::symbol`); `Subgraph` exposes the module's item children via
+/// `Defines` edges; and `Callers` answers only for **Item** anchors,
+/// because the deep pass anchors `Calls` edges exclusively on module-level
+/// `fn` item nodes (`pass.rs`) and the read is `to_id = anchor`
+/// (`query.rs::neighbours`).
 #[derive(Default)]
 struct FixesGraph {
     fixes: HashMap<String, Vec<FixEvent>>,
-    /// Nodes served by `Symbol` (matched on `path` or `file`).
-    symbols: Vec<GraphNode>,
+    /// Nodes known to the graph, served by `Symbol` and `Subgraph`.
+    nodes: Vec<GraphNode>,
+    /// `Defines` edges served by `Subgraph`.
+    edges: Vec<GraphEdge>,
     /// Caller nodes served by `Callers`, keyed by the callee node id.
     callers: HashMap<GraphNodeId, Vec<GraphNode>>,
     seen: Mutex<Vec<GraphQuery>>,
@@ -149,11 +161,13 @@ impl FixesGraph {
     }
 
     fn with_callers(
-        symbols: Vec<GraphNode>,
+        nodes: Vec<GraphNode>,
+        edges: Vec<GraphEdge>,
         callers: HashMap<GraphNodeId, Vec<GraphNode>>,
     ) -> Self {
         Self {
-            symbols,
+            nodes,
+            edges,
             callers,
             ..Self::default()
         }
@@ -185,12 +199,31 @@ impl ProjectGraph for FixesGraph {
                 }
             }
             GraphQuery::Symbol { path } => {
+                // Exact rust-path match, else the file-path fallback that
+                // yields the file's Module node only (`query.rs::symbol`).
                 view.nodes = self
-                    .symbols
+                    .nodes
                     .iter()
-                    .filter(|n| n.path == *path || n.file.as_deref() == Some(path.as_str()))
+                    .filter(|n| n.path == *path)
                     .cloned()
                     .collect();
+                if view.nodes.is_empty() {
+                    view.nodes = self
+                        .nodes
+                        .iter()
+                        .filter(|n| {
+                            n.kind == GraphNodeKind::Module
+                                && n.file.as_deref() == Some(path.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                }
+            }
+            GraphQuery::Subgraph { seeds, .. } => {
+                if self.nodes.iter().any(|n| seeds.contains(&n.id)) {
+                    view.nodes = self.nodes.clone();
+                    view.edges = self.edges.clone();
+                }
             }
             GraphQuery::Callers { fn_node } => {
                 view.nodes = self.callers.get(fn_node).cloned().unwrap_or_default();
@@ -899,9 +932,21 @@ async fn repair_worker_omits_the_similar_fixes_note_when_the_graph_has_none() {
     );
 }
 
-/// The canned graph shape for the caller-hint tests: `src/main.rs` resolves
-/// to one node whose recorded caller lives in `src/startup.rs`.
+/// The canned graph shape for the caller-hint tests, mirroring the real
+/// store's resolution chain: `src/main.rs` resolves to the `app` **Module**
+/// node, which `Defines` the `app::main` **Item**, whose recorded caller
+/// lives in `src/startup.rs`. A worker that anchored `Callers` on the
+/// module node would get an honest empty view here, exactly as it would in
+/// production.
 fn callers_graph() -> Arc<FixesGraph> {
+    let module = GraphNode {
+        id: derive_node_id(GraphNodeKind::Module, "app\0app"),
+        kind: GraphNodeKind::Module,
+        path: "app".into(),
+        crate_id: alloy_runtime::CrateId::new("app").ok(),
+        file: Some("src/main.rs".into()),
+        digest: None,
+    };
     let callee = GraphNode {
         id: derive_node_id(GraphNodeKind::Item, "app\0app::main"),
         kind: GraphNodeKind::Item,
@@ -918,9 +963,19 @@ fn callers_graph() -> Arc<FixesGraph> {
         file: Some("src/startup.rs".into()),
         digest: None,
     };
+    let defines = GraphEdge {
+        from: module.id,
+        to: callee.id,
+        kind: GraphEdgeKind::Defines,
+        confidence: 1.0,
+    };
     let mut callers = HashMap::new();
     callers.insert(callee.id, vec![caller]);
-    Arc::new(FixesGraph::with_callers(vec![callee], callers))
+    Arc::new(FixesGraph::with_callers(
+        vec![module, callee],
+        vec![defines],
+        callers,
+    ))
 }
 
 #[tokio::test]
@@ -939,20 +994,36 @@ async fn repair_worker_asks_for_callers_and_fences_them_into_the_prompt() {
     let outcome = fx.executor.execute(&ctx).await.unwrap();
     let _: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
 
-    // Bounded reads: one Symbol per distinct diagnosed path, one Callers
-    // per resolved item.
+    // Bounded reads: one Symbol per distinct diagnosed path, one Subgraph
+    // to expand the resolved module to its Defines'd items (the only nodes
+    // the real store anchors Calls edges on), one Callers per item.
     let symbols = graph
         .seen()
         .iter()
         .filter(|q| matches!(q, GraphQuery::Symbol { .. }))
         .count();
-    let callers = graph
+    let subgraphs = graph
         .seen()
         .iter()
-        .filter(|q| matches!(q, GraphQuery::Callers { .. }))
+        .filter(|q| matches!(q, GraphQuery::Subgraph { .. }))
         .count();
+    let callers: Vec<GraphNodeId> = graph
+        .seen()
+        .iter()
+        .filter_map(|q| match q {
+            GraphQuery::Callers { fn_node } => Some(*fn_node),
+            _ => None,
+        })
+        .collect();
     assert_eq!(symbols, 1, "one Symbol read for the one diagnosed path");
-    assert_eq!(callers, 1, "one Callers read for the one resolved item");
+    assert_eq!(subgraphs, 1, "one Subgraph read to expand the module");
+    assert_eq!(callers.len(), 1, "one Callers read for the one item");
+    assert_eq!(
+        callers[0],
+        derive_node_id(GraphNodeKind::Item, "app\0app::main"),
+        "Callers anchors on the item node, never the module: a module \
+         anchor returns empty against the real store"
+    );
 
     // The fence reaches the model as User content, compact and honest.
     let requests = fx.provider.requests();

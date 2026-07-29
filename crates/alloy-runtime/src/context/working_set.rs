@@ -1,10 +1,13 @@
 //! WorkingSet domain builder: files + graph projection + diagnostics
 //! (RFC-0012 §4.3). Each sub-part independently degrades to empty (E2).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::graph::{GraphError, GraphNode, GraphQuery, GraphView, GraphViewHandle};
+use crate::graph::{
+    GraphEdge, GraphEdgeKind, GraphError, GraphNode, GraphNodeKind, GraphQuery, GraphView,
+    GraphViewHandle,
+};
 use crate::types::diagnostic::{DiagnosticEvent, DiagnosticLevel};
 use crate::types::ids::CrateId;
 
@@ -134,9 +137,9 @@ pub(super) async fn query_once_retry_busy(
 }
 
 /// Build the graph slice: `Symbol` per seed path, one `Subgraph` for all
-/// seeds (D10), then bounded `Callers`/`Refs` impact reads per seed
-/// (A-0012-1a). Only these query kinds plus `Diagnostics` exist in this
-/// module (D14 as amended).
+/// seeds (D10), then bounded `Callers`/`Refs` impact reads over the item
+/// anchors derived from the seeds (A-0012-1a). Only these query kinds plus
+/// `Diagnostics` exist in this module (D14 as amended).
 pub(super) async fn fetch_graph(
     handle: &GraphViewHandle,
     pinned_seed_nodes: &[GraphNode],
@@ -180,20 +183,20 @@ pub(super) async fn fetch_graph(
         {
             Ok(view) => {
                 let seed_id_set: BTreeSet<_> = seeds.iter().map(|n| n.id).collect();
+                // A-0012-1: bounded impact reads after the neighbourhood,
+                // anchored on **item** nodes. A file-path seed resolves to
+                // its module node (`alloy-index` Q2 resolves file paths
+                // through `graph_files.module_id`), but the store anchors
+                // `Calls`/`References` edges exclusively on item nodes, so
+                // each module seed is first expanded to the items it
+                // `Defines` in the D10 subgraph view.
+                let anchors = impact_anchors(&seeds, &view.nodes, &view.edges, max_impact_seeds);
                 let neighbourhood: Vec<GraphNode> = view
                     .nodes
                     .into_iter()
                     .filter(|n| !seed_id_set.contains(&n.id))
                     .collect();
-                // A-0012-1: bounded impact reads after the neighbourhood.
-                let impact = fetch_impact(
-                    handle,
-                    &mut fetch,
-                    &seeds,
-                    max_impact_seeds,
-                    max_impact_nodes,
-                )
-                .await;
+                let impact = fetch_impact(handle, &mut fetch, &anchors, max_impact_nodes).await;
                 fetch.projection = Some(GraphProjection {
                     version: view.version,
                     fidelity: view.fidelity,
@@ -234,30 +237,69 @@ struct ImpactFetch {
     truncated: bool,
 }
 
-/// Issue at most `2 × max_impact_seeds` `Callers`/`Refs` queries over the
-/// leading seeds (A-0012-1a). An error records a degradation and stops the
-/// impact fetch — never the projection (E2). Empty views are honest
-/// absence: no entry, no degradation, no marker (A-0012-1c).
+/// Derive the impact anchors (A-0012-1a): item seeds anchor themselves;
+/// module seeds expand to the **item** nodes they `Defines` in the D10
+/// subgraph view, in seed order then view order. At most
+/// `max_impact_seeds` anchors, so the A13 query bound is unchanged.
+///
+/// This is the shape the `alloy-index` store dictates: `Symbol` on a file
+/// path resolves to the file's module node (`query.rs::symbol`,
+/// `graph_files.module_id`), while `Calls`/`References` edges anchor only
+/// on item nodes (`lang/rust/pass.rs`), and `Callers`/`Refs` answer with
+/// `to_id = anchor` lookups (`query.rs::neighbours`) — so a module-anchored
+/// impact query can only ever return empty.
+fn impact_anchors(
+    seeds: &[GraphNode],
+    view_nodes: &[GraphNode],
+    view_edges: &[GraphEdge],
+    max_impact_seeds: usize,
+) -> Vec<GraphNode> {
+    let by_id: BTreeMap<_, _> = view_nodes.iter().map(|n| (n.id, n)).collect();
+    let mut seen = BTreeSet::new();
+    let mut anchors: Vec<GraphNode> = Vec::new();
+    'seeds: for seed in seeds {
+        let children = view_edges
+            .iter()
+            .filter(|e| e.kind == GraphEdgeKind::Defines && e.from == seed.id)
+            .filter_map(|e| by_id.get(&e.to).copied())
+            .filter(|n| n.kind == GraphNodeKind::Item);
+        let own = std::iter::once(seed).filter(|s| s.kind == GraphNodeKind::Item);
+        for anchor in own.chain(children) {
+            if anchors.len() == max_impact_seeds {
+                break 'seeds;
+            }
+            if seen.insert(anchor.id) {
+                anchors.push(anchor.clone());
+            }
+        }
+    }
+    anchors
+}
+
+/// Issue at most 2 `Callers`/`Refs` queries per anchor — `≤ 2 ×
+/// max_impact_seeds` in total, since [`impact_anchors`] caps the anchor
+/// list (A-0012-1a). An error records a degradation and stops the impact
+/// fetch — never the projection (E2). Empty views are honest absence: no
+/// entry, no degradation, no marker (A-0012-1c).
 async fn fetch_impact(
     handle: &GraphViewHandle,
     fetch: &mut GraphFetch,
-    seeds: &[GraphNode],
-    max_impact_seeds: usize,
+    anchors: &[GraphNode],
     max_impact_nodes: usize,
 ) -> ImpactFetch {
     let mut out = ImpactFetch::default();
-    if max_impact_seeds == 0 || max_impact_nodes == 0 {
+    if max_impact_nodes == 0 {
         return out;
     }
-    'seeds: for seed in seeds.iter().take(max_impact_seeds) {
+    'seeds: for anchor in anchors {
         for (relation, query) in [
             (
                 ImpactRelation::Caller,
-                GraphQuery::Callers { fn_node: seed.id },
+                GraphQuery::Callers { fn_node: anchor.id },
             ),
             (
                 ImpactRelation::Reference,
-                GraphQuery::Refs { node: seed.id },
+                GraphQuery::Refs { node: anchor.id },
             ),
         ] {
             fetch.queried += 1;
@@ -267,11 +309,11 @@ async fn fetch_impact(
                         out.truncated = true;
                     }
                     for node in view.nodes {
-                        if node.id == seed.id {
+                        if node.id == anchor.id {
                             continue; // a self-row is noise, not impact
                         }
                         out.entries.push(ImpactEntry {
-                            seed_path: seed.path.clone(),
+                            seed_path: anchor.path.clone(),
                             relation,
                             node,
                         });

@@ -334,8 +334,18 @@ pub struct ScriptedGraph {
     pub diagnostics: Mutex<Vec<DiagnosticEvent>>,
     /// When set, every served view reports `truncated = true` (Q9).
     pub truncated: Mutex<bool>,
-    /// When set, `Callers`/`Refs` on `toy_core::io` serve populated views
-    /// (A-0012-1); unset mirrors the M7 store, whose stubs return empty.
+    /// When set, the double serves the post-A-0011-6 store shape (the
+    /// `feat/graph-refs-impls-callers` branch): the `Subgraph` view carries
+    /// the `toy_core::io::read_all` **Item** node via a `Defines` edge, and
+    /// `Callers`/`Refs` serve populated views **only when anchored on that
+    /// item node's id** — never on a module id, because the real deep pass
+    /// anchors `Calls`/`References` edges exclusively on item nodes
+    /// (`alloy-index/src/lang/rust/pass.rs`: module-level `fn` items are
+    /// "the only admissible `Calls` targets"), and the real read path
+    /// answers `Callers`/`Refs` with `to_id = anchor` edge lookups
+    /// (`alloy-index/src/query.rs::neighbours`). Unset mirrors the M7
+    /// store, whose `Callers`/`Refs` stubs return empty and whose manifest
+    /// pass emits no item nodes.
     pub impact: Mutex<bool>,
     /// When set, every `Callers`/`Refs` query fails with `Io`.
     pub fail_impact: Mutex<bool>,
@@ -368,6 +378,19 @@ impl ScriptedGraph {
     /// The deterministic id of the `toy_core::io` module node.
     pub fn io_node_id() -> alloy_runtime::types::ids::GraphNodeId {
         derive_node_id(GraphNodeKind::Module, "toy-core\0toy_core::io")
+    }
+
+    /// The `toy_core::io::read_all` **Item** node: the only node kind the
+    /// real store's `Calls`/`References` edges ever anchor on.
+    pub fn read_all_node() -> GraphNode {
+        GraphNode {
+            id: derive_node_id(GraphNodeKind::Item, "toy-core\0toy_core::io::read_all"),
+            kind: GraphNodeKind::Item,
+            path: "toy_core::io::read_all".to_owned(),
+            crate_id: Some(alloy_runtime::CrateId::new("toy-core").unwrap()),
+            file: Some("crates/toy-core/src/io.rs".to_owned()),
+            digest: None,
+        }
     }
 
     /// The out-of-crate caller node served for `Callers(toy_core::io)`.
@@ -420,15 +443,32 @@ impl ScriptedGraph {
         let mut view = GraphView::empty(version);
         view.fidelity = GraphFidelity::Manifest;
         view.truncated = *self.truncated.lock().unwrap();
+        let impact = *self.impact.lock().unwrap();
         match q {
             GraphQuery::Symbol { path } => {
-                view.nodes = nodes
-                    .into_iter()
-                    .filter(|n| n.path == *path || n.file.as_deref() == Some(path.as_str()))
-                    .collect();
+                // Faithful to `alloy-index/src/query.rs::symbol` (identical
+                // on main and on `feat/graph-refs-impls-callers`): an exact
+                // rust-path match over `graph_nodes.path`, else a file-path
+                // fallback that resolves through `graph_files.module_id` —
+                // i.e. a file path yields the file's **Module** node only,
+                // never an item.
+                let mut all = nodes;
+                if impact {
+                    all.push(Self::read_all_node());
+                }
+                view.nodes = all.iter().filter(|n| n.path == *path).cloned().collect();
+                if view.nodes.is_empty() && (path.contains('/') || path.ends_with(".rs")) {
+                    view.nodes = all
+                        .into_iter()
+                        .filter(|n| {
+                            n.kind == GraphNodeKind::Module
+                                && n.file.as_deref() == Some(path.as_str())
+                        })
+                        .collect();
+                }
             }
             GraphQuery::Subgraph { .. } => {
-                view.edges = vec![
+                let mut edges = vec![
                     GraphEdge {
                         from: nodes[0].id,
                         to: nodes[1].id,
@@ -443,20 +483,36 @@ impl ScriptedGraph {
                     },
                 ];
                 view.nodes = nodes;
+                if impact {
+                    // The deep-pass store shape: the module Defines its
+                    // item child, which is how a module seed is expanded
+                    // to `Calls`/`References`-anchorable item nodes.
+                    let item = Self::read_all_node();
+                    edges.push(GraphEdge {
+                        from: Self::io_node_id(),
+                        to: item.id,
+                        kind: GraphEdgeKind::Defines,
+                        confidence: 1.0,
+                    });
+                    view.nodes.push(item);
+                }
+                view.edges = edges;
             }
             GraphQuery::Diagnostics { .. } => {
                 view.diagnostics = self.diagnostics.lock().unwrap().clone();
             }
-            GraphQuery::Callers { fn_node }
-                if *self.impact.lock().unwrap() && *fn_node == Self::io_node_id() =>
-            {
+            // `Callers`/`Refs` answer only for the **item** anchor: the
+            // real `neighbours()` read is `to_id = anchor` over edges the
+            // deep pass anchors on item nodes exclusively, so a module
+            // anchor honestly returns empty even on the semantic store.
+            GraphQuery::Callers { fn_node } if impact && *fn_node == Self::read_all_node().id => {
                 view.nodes = vec![Self::caller_node()];
             }
-            GraphQuery::Refs { node }
-                if *self.impact.lock().unwrap() && *node == Self::io_node_id() =>
-            {
+            GraphQuery::Refs { node } if impact && *node == Self::read_all_node().id => {
                 // A node already present in the subgraph: exercises the
-                // "relation line only, no duplicate node line" path.
+                // "relation line only, no duplicate node line" path. A
+                // module *source* is real: `Refs` includes incoming
+                // `Imports` edges, whose `from` is the importing module.
                 view.nodes = vec![nodes[2].clone()];
             }
             _ => {}

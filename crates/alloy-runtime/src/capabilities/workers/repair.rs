@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::adapters::{CapabilityExecError, CapabilityOutcome};
 use crate::context::AssembleInputs;
 use crate::dag::{NodeInputPayload, NodeKind};
-use crate::graph::GraphQuery;
+use crate::graph::{GraphEdgeKind, GraphNodeKind, GraphQuery};
 use crate::types::budget::ModelTier;
 use crate::types::diagnostic::DiagnosticEvent;
 use crate::types::ids::CapabilityId;
@@ -42,6 +42,10 @@ const MAX_SIMILAR_FIXES: usize = 8;
 const MAX_SIMILAR_FIXES_BYTES: usize = 1024;
 /// A-0012-1: distinct diagnosed paths resolved for caller impact.
 const MAX_CALLER_PATHS: usize = 4;
+/// A-0012-1: item anchors expanded from one resolved module (`Calls` edges
+/// anchor on item nodes, so a resolved module node must be expanded to the
+/// items it `Defines` before `Callers` can answer).
+const MAX_CALLER_ITEMS: usize = 4;
 /// A-0012-1: total caller lines shown, across all diagnosed paths.
 const MAX_CALLER_LINES: usize = 8;
 /// RW2-style byte cap on the assembled callers note.
@@ -359,8 +363,14 @@ async fn similar_fix_notes(
 /// mirroring A-0011-5c's posture).
 ///
 /// Bounded like every other graph read: at most [`MAX_CALLER_PATHS`]
-/// `Symbol` resolutions, one `Callers` query per resolved item, and
-/// [`MAX_CALLER_LINES`] rendered lines. A graph error or an empty view —
+/// `Symbol` resolutions, one `Subgraph` per resolved module, one `Callers`
+/// query per item anchor (at most [`MAX_CALLER_ITEMS`] per path), and
+/// [`MAX_CALLER_LINES`] rendered lines. The anchor chain follows the
+/// `alloy-index` store: a file-path `Symbol` resolves to the file's
+/// **module** node (`query.rs::symbol`, via `graph_files.module_id`), but
+/// `Calls` edges anchor exclusively on **item** nodes
+/// (`lang/rust/pass.rs`), so the module is expanded to the items it
+/// `Defines` before `Callers` is asked. A graph error or an empty view —
 /// today's store, whose `Callers` stub returns empty — is "no known
 /// callers": no fence, no error, never a failure (RW4). Read-only via the
 /// `GraphViewHandle`; PW/SEC posture unchanged.
@@ -396,29 +406,59 @@ async fn caller_hints(
         let Some(node) = view.nodes.first() else {
             continue;
         };
-        let Ok(callers) = ctx
-            .graph
-            .query(GraphQuery::Callers { fn_node: node.id })
-            .await
-        else {
-            continue;
+        // Expand a module node to the items it `Defines`: the only nodes
+        // the store anchors `Calls` edges on. An item resolution (a
+        // rust-path `Symbol`) anchors itself.
+        let anchors: Vec<crate::graph::GraphNode> = if node.kind == GraphNodeKind::Item {
+            vec![node.clone()]
+        } else {
+            let Ok(sub) = ctx
+                .graph
+                .query(GraphQuery::Subgraph {
+                    seeds: vec![node.id],
+                    radius: 1,
+                })
+                .await
+            else {
+                continue;
+            };
+            let item_ids: Vec<_> = sub
+                .edges
+                .iter()
+                .filter(|e| e.kind == GraphEdgeKind::Defines && e.from == node.id)
+                .map(|e| e.to)
+                .collect();
+            sub.nodes
+                .into_iter()
+                .filter(|n| n.kind == GraphNodeKind::Item && item_ids.contains(&n.id))
+                .take(MAX_CALLER_ITEMS)
+                .collect()
         };
-        for caller in callers.nodes {
-            if lines.len() >= MAX_CALLER_LINES {
-                break 'outer;
-            }
-            if caller.id == node.id {
-                continue;
-            }
-            let file = caller.file.as_deref().unwrap_or("-");
-            let line = format!("{} ({file}) calls into {path}", caller.path);
-            if lines.contains(&line) {
-                continue;
-            }
-            lines.push(line);
-            if let Some(f) = caller.file {
-                if is_jail_relative(&f) && !caller_paths.contains(&f) {
-                    caller_paths.push(f);
+        for anchor in anchors {
+            let Ok(callers) = ctx
+                .graph
+                .query(GraphQuery::Callers { fn_node: anchor.id })
+                .await
+            else {
+                continue 'outer;
+            };
+            for caller in callers.nodes {
+                if lines.len() >= MAX_CALLER_LINES {
+                    break 'outer;
+                }
+                if caller.id == anchor.id {
+                    continue;
+                }
+                let file = caller.file.as_deref().unwrap_or("-");
+                let line = format!("{} ({file}) calls into {path}", caller.path);
+                if lines.contains(&line) {
+                    continue;
+                }
+                lines.push(line);
+                if let Some(f) = caller.file {
+                    if is_jail_relative(&f) && !caller_paths.contains(&f) {
+                        caller_paths.push(f);
+                    }
                 }
             }
         }

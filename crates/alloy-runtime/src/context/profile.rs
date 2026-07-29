@@ -74,7 +74,14 @@ impl DomainWeights {
 }
 
 /// Profile-driven configuration, parsed from `[context]` by RFC-0015.
+///
+/// `#[non_exhaustive]` per the crate's compat convention (as for the
+/// RFC-0012 `types` structs): construct via [`ContextProfile::v2_defaults`]
+/// / [`Default`] and mutate fields, so additive knobs (like A-0012-1d's
+/// impact caps) never break downstream construction. Missing `[context]`
+/// keys already default via [`ContextProfile::from_toml_table`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ContextProfile {
     /// V2 Appendix B default: `32_000`.
     pub total_token_budget: usize,
@@ -100,6 +107,13 @@ pub struct ContextProfile {
     /// Total impact entries admitted to the projection (default `8`)
     /// (A-0012-1d).
     pub max_impact_nodes: usize,
+}
+
+impl Default for ContextProfile {
+    /// The V2 Appendix B defaults ([`ContextProfile::v2_defaults`]).
+    fn default() -> Self {
+        Self::v2_defaults()
+    }
 }
 
 impl ContextProfile {

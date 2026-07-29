@@ -167,6 +167,25 @@ fn profile_v2_defaults_match_appendix_b() {
     assert_eq!(p.max_conversation_events, 200);
     assert_eq!(p.graph_radius, 1);
     assert_eq!(p.cache_capacity, 32);
+    assert_eq!(p.max_impact_seeds, 4);
+    assert_eq!(p.max_impact_nodes, 8);
+}
+
+#[test]
+fn profile_is_constructible_and_extensible_from_outside_the_crate() {
+    // Compat convention for additive knobs (A-0012-1d and future ones):
+    // `ContextProfile` is `#[non_exhaustive]`, so external code constructs
+    // via `Default`/`v2_defaults` and mutates — this test *is* external
+    // code, so it proves the pattern compiles. A `[context]` table without
+    // the new keys keeps parsing (missing keys default).
+    let mut p = ContextProfile::default();
+    p.max_impact_seeds = 2;
+    assert_eq!(p.max_impact_seeds, 2);
+    assert_eq!(ContextProfile::default(), ContextProfile::v2_defaults());
+    let table: toml::Table = toml::from_str("total_token_budget = 1000").unwrap();
+    let parsed = ContextProfile::from_toml_table(&table).unwrap();
+    assert_eq!(parsed.max_impact_seeds, 4);
+    assert_eq!(parsed.max_impact_nodes, 8);
 }
 
 #[test]
@@ -1800,11 +1819,11 @@ async fn impact_callers_and_refs_render_inside_the_graph_fence() {
     let text = pack_text(&pack);
     assert!(text.contains("working_set:graph"));
     assert!(
-        text.contains("calls toy_cli::main -> toy_core::io"),
+        text.contains("calls toy_cli::main -> toy_core::io::read_all"),
         "caller relation line missing:\n{text}"
     );
     assert!(
-        text.contains("refs toy_core::io::reader -> toy_core::io"),
+        text.contains("refs toy_core::io::reader -> toy_core::io::read_all"),
         "reference relation line missing:\n{text}"
     );
     // The caller node itself is listed with its file so the model can see
@@ -1822,6 +1841,50 @@ async fn impact_callers_and_refs_render_inside_the_graph_fence() {
     );
     // No new fence kind: impact is part of the graph section.
     assert!(!text.contains("working_set:impact"));
+}
+
+#[tokio::test]
+async fn impact_anchors_are_item_nodes_expanded_from_module_seeds() {
+    // The production shape (verified against alloy-index on both main and
+    // feat/graph-refs-impls-callers): a file-path `Symbol` resolves to the
+    // file's **Module** node (`query.rs::symbol` falls back through
+    // `graph_files.module_id`), while `Calls`/`References` edges anchor
+    // exclusively on **Item** nodes (`pass.rs`: module-level `fn` items are
+    // "the only admissible `Calls` targets"; `query.rs::neighbours` answers
+    // with `to_id = anchor`). The engine must therefore expand a module
+    // seed to its `Defines`d item children before issuing `Callers`/`Refs`
+    // — a module-anchored impact query can only ever return empty.
+    let fx = Fx::new(GraphMode::Toy);
+    fx.graph.set_impact(true);
+    let pack = fx
+        .engine()
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let item_id = ScriptedGraph::read_all_node().id;
+    let module_id = ScriptedGraph::io_node_id();
+    let anchors: Vec<_> = fx
+        .graph
+        .recorded()
+        .iter()
+        .filter_map(|q| match q {
+            GraphQuery::Callers { fn_node } => Some(*fn_node),
+            GraphQuery::Refs { node } => Some(*node),
+            _ => None,
+        })
+        .collect();
+    assert!(!anchors.is_empty(), "impact queries were issued");
+    assert!(
+        anchors.iter().all(|a| *a == item_id),
+        "every impact query anchors on the item node"
+    );
+    assert!(
+        !anchors.contains(&module_id),
+        "no impact query anchors on the module node: it would return empty \
+         against the real store"
+    );
+    // And the expansion produced real impact content.
+    assert!(pack_text(&pack).contains("calls toy_cli::main -> toy_core::io::read_all"));
 }
 
 #[tokio::test]

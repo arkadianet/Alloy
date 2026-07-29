@@ -246,7 +246,10 @@ pub struct GraphProjection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ImpactEntry {
-    /// Canonical path of the seed the impact was queried for.
+    /// Canonical path of the anchor node the impact was queried for: the
+    /// seed itself when the seed is an item, else an item node the seed
+    /// module `Defines` (A-0012-1a — `Calls`/`References` edges anchor on
+    /// item nodes, so module seeds are expanded before querying).
     pub seed_path: String,
     /// How [`ImpactEntry::node`] relates to the seed.
     pub relation: ImpactRelation,
