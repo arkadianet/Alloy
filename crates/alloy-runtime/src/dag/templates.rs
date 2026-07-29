@@ -185,9 +185,12 @@ fn cap(s: &str) -> CapabilityId {
 /// `CapabilityExecContext.effective_tier`, never by writing `model_tier`
 /// (ES3). `1 < max_attempts` satisfies V14's `EscalateAfterOrder`.
 ///
-/// Operators MUST have an endpoint serving `premium` (see
-/// `router.toml.example`); RFC-0007 §5 never downgrades a tier to satisfy
-/// routing, so a retry escalated to an unserved tier fails to route.
+/// RFC-0013 MR2 forwards that tier to the router as
+/// `RoutingRequest.tier_override`, so the escalation actually changes the
+/// endpoint. Operators SHOULD serve `premium` (see `router.toml.example`) for
+/// the retry to reach a bigger model; when nothing serves it, RFC-0007 §5.2.1
+/// routes the retry at the configured tier and records `escalation_unserved`
+/// — escalation only ever raises a tier, never lowers one.
 fn llm_retry() -> RetryPolicy {
     RetryPolicy {
         max_attempts: 2,

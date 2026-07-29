@@ -283,6 +283,19 @@ max_context = 65536
 input_usd_per_mtok = 2.0
 output_usd_per_mtok = 4.0
 
+# Escalation target: serves `premium` only, so a routed decision naming this
+# endpoint is proof that `CapabilityExecContext.effective_tier` reached
+# selection rather than stopping at the context field.
+[[providers.endpoints]]
+id = "premium-endpoint"
+display_name = "Premium"
+model = "operator-premium"
+tiers = ["premium"]
+supports_structured_output = {supports_structured}
+max_context = 65536
+input_usd_per_mtok = 8.0
+output_usd_per_mtok = 16.0
+
 [capability_tiers]
 repair = "standard"
 edit = "standard"
@@ -606,6 +619,71 @@ async fn repair_worker_produces_plan_from_predecessor_failure_ir() {
         .filter(|d| d.kind == DecisionKind::Custom("worker_attempt".into()))
         .collect();
     assert_eq!(attempts.len(), 1);
+}
+
+/// Returns the endpoint id every `ModelRoute` decision selected, in order.
+fn routed_endpoints(fx: &Fixture) -> Vec<String> {
+    fx.decisions
+        .recorded_decisions()
+        .into_iter()
+        .filter(|d| d.kind == DecisionKind::ModelRoute)
+        .map(|d| d.metadata["endpoint_id"].as_str().unwrap_or("").to_owned())
+        .collect()
+}
+
+/// RFC-0010 §5.11.4 ES1/ES3 + RFC-0013 MR2, end to end through the real
+/// router: an escalated `effective_tier` must change the endpoint the attempt
+/// actually runs on. `repair` maps to `standard`, so a route landing on the
+/// `premium`-only endpoint can only come from the escalation.
+#[tokio::test]
+async fn escalated_effective_tier_routes_to_the_premium_endpoint() {
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        ..FixtureSpec::default()
+    });
+    let mut ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, goal());
+    ctx.effective_tier = ModelTier::Premium; // what the scheduler's L12 writes.
+    ctx.attempt = 2;
+    ctx.meta.attempt = 2;
+
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+
+    assert_eq!(routed_endpoints(&fx), vec!["premium-endpoint".to_owned()]);
+    let route = fx
+        .decisions
+        .recorded_decisions()
+        .into_iter()
+        .find(|d| d.kind == DecisionKind::ModelRoute)
+        .expect("route decision");
+    assert_eq!(route.metadata["tier"], "premium");
+    assert_eq!(route.metadata["tier_source"], "escalation");
+    assert_eq!(route.metadata["requested_tier"], "premium");
+}
+
+/// The un-escalated attempt is unchanged: `effective_tier` equals the node's
+/// planner-set tier and the configured `capability_tiers` entry still owns the
+/// route.
+#[tokio::test]
+async fn unescalated_effective_tier_routes_at_the_capability_tier() {
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, goal());
+    assert_eq!(ctx.effective_tier, ModelTier::Standard);
+    fx.executor.execute(&ctx).await.unwrap();
+
+    assert_eq!(routed_endpoints(&fx), vec!["endpoint".to_owned()]);
+    let route = fx
+        .decisions
+        .recorded_decisions()
+        .into_iter()
+        .find(|d| d.kind == DecisionKind::ModelRoute)
+        .expect("route decision");
+    assert_eq!(route.metadata["tier"], "standard");
+    assert_eq!(route.metadata["tier_source"], "capability_map");
+    assert_eq!(route.metadata["escalation_unserved"], false);
 }
 
 #[tokio::test]

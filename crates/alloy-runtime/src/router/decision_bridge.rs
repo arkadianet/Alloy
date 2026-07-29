@@ -40,7 +40,7 @@ struct BudgetDecisionInput<'a> {
     node: Option<NodeId>,
     capability: &'a str,
     tier: ModelTier,
-    source: TierSource,
+    capability_mapped: bool,
     check: BudgetCheck,
     counters: BudgetCounters,
     budget_source: &'static str,
@@ -49,10 +49,34 @@ struct BudgetDecisionInput<'a> {
     in_flight: usize,
 }
 
+/// The tier a route landed on, and how it got there (§5.2.1).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RouteTier {
+    /// Tier endpoint selection actually used.
+    pub(crate) tier: ModelTier,
+    /// How `tier` was derived.
+    pub(crate) source: TierSource,
+    /// How the *configured* tier was resolved, before any escalation. This is
+    /// what `capability_mapped` reports: an escalation raises a configured
+    /// tier, it does not replace the lookup that produced it.
+    pub(crate) base_source: TierSource,
+    /// `RoutingRequest.tier_override` as the caller sent it, whether or not
+    /// it was applied.
+    pub(crate) requested: Option<ModelTier>,
+    /// The requested escalation had no endpoint, so `tier` fell back to the
+    /// configured one.
+    pub(crate) escalation_unserved: bool,
+}
+
+impl RouteTier {
+    pub(crate) fn capability_mapped(self) -> bool {
+        self.base_source == TierSource::CapabilityMap
+    }
+}
+
 pub(crate) fn route_decision(
     request: &RoutingRequest,
-    tier: ModelTier,
-    source: TierSource,
+    route_tier: RouteTier,
     provider_id: &ProviderId,
     endpoint: Option<&ModelEndpoint>,
     in_flight: usize,
@@ -60,9 +84,9 @@ pub(crate) fn route_decision(
     // `capability` keeps the caller's spelling; tier lookup uses ASCII-lowercased keys.
     let mut metadata = serde_json::json!({
         "capability": request.capability.as_str(),
-        "capability_mapped": source == TierSource::CapabilityMap,
-        "tier": tier_name(tier),
-        "tier_source": source.as_str(),
+        "capability_mapped": route_tier.capability_mapped(),
+        "tier": tier_name(route_tier.tier),
+        "tier_source": route_tier.source.as_str(),
         "provider_id": provider_id.as_str(),
         "requires_tools": request.requires_tools,
         "requires_structured_output": request.requires_structured_output,
@@ -71,6 +95,16 @@ pub(crate) fn route_decision(
     let object = metadata
         .as_object_mut()
         .expect("route metadata is constructed as an object");
+    if let Some(requested) = route_tier.requested {
+        object.insert(
+            "requested_tier".into(),
+            serde_json::json!(tier_name(requested)),
+        );
+        object.insert(
+            "escalation_unserved".into(),
+            serde_json::json!(route_tier.escalation_unserved),
+        );
+    }
     if let Some(endpoint) = endpoint {
         object.insert(
             "endpoint_id".into(),
@@ -93,8 +127,7 @@ pub(crate) fn route_decision(
 
 pub(crate) fn budget_decision_for_route(
     request: &RoutingRequest,
-    tier: ModelTier,
-    source: TierSource,
+    route_tier: RouteTier,
     check: BudgetCheck,
     counters: BudgetCounters,
     budget_source: &'static str,
@@ -105,8 +138,8 @@ pub(crate) fn budget_decision_for_route(
         run: request.run,
         node: request.node,
         capability: request.capability.as_str(),
-        tier,
-        source,
+        tier: route_tier.tier,
+        capability_mapped: route_tier.capability_mapped(),
         check,
         counters,
         budget_source,
@@ -130,11 +163,7 @@ pub(crate) fn budget_decision_for_complete(
         node: routed.node(),
         capability: routed.capability().as_str(),
         tier: routed.tier(),
-        source: if routed.capability_mapped() {
-            TierSource::CapabilityMap
-        } else {
-            TierSource::Default
-        },
+        capability_mapped: routed.capability_mapped(),
         check,
         counters,
         budget_source: "meter",
@@ -145,7 +174,7 @@ pub(crate) fn budget_decision_for_complete(
 fn budget_decision(input: BudgetDecisionInput<'_>) -> DecisionRecord {
     let metadata = serde_json::json!({
         "capability": input.capability,
-        "capability_mapped": input.source == TierSource::CapabilityMap,
+        "capability_mapped": input.capability_mapped,
         "tier": tier_name(input.tier),
         "budget_check": budget_check_name(input.check),
         "tokens_in": input.counters.tokens_in,
@@ -200,6 +229,7 @@ mod tests {
             run: None,
             node: None,
             capability: CapabilityId::new("repair").unwrap(),
+            tier_override: None,
             complexity: None,
             budget_remaining: BudgetSnapshot {
                 usd_spent: 1.0,
@@ -211,8 +241,13 @@ mod tests {
         };
         let record = budget_decision_for_route(
             &request,
-            ModelTier::Standard,
-            TierSource::Default,
+            RouteTier {
+                tier: ModelTier::Standard,
+                source: TierSource::Default,
+                base_source: TierSource::Default,
+                requested: None,
+                escalation_unserved: false,
+            },
             BudgetCheck::UsdExhausted,
             BudgetCounters {
                 tokens_in: 2,

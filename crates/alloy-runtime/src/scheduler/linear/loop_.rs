@@ -1406,6 +1406,15 @@ impl LinearScheduler {
                 // the re-dispatch that follows must not serve it a second time.
                 rc.mark_backoff_served(node_id);
                 if !delay.is_zero() {
+                    // Test-only: announce that the sleep is about to be
+                    // polled. Nothing between here and the `select!` awaits,
+                    // so on the single-threaded test runtime a waiter cannot
+                    // observe this until the sleep future exists and is
+                    // `Pending`.
+                    #[cfg(test)]
+                    if let Some(probe) = &self.deps.config.backoff_entered {
+                        probe.notify_one();
+                    }
                     // B3: cancel during backoff is immediate.
                     tokio::select! {
                         () = tokio::time::sleep(delay) => {}
@@ -2714,17 +2723,21 @@ mod tests {
             (LinearScheduler::new_for_test(deps).unwrap(), decisions)
         }
 
-        /// [`Self::build_scheduler_full`] wired to a [`RetryAdmittedSignal`]
-        /// decision log, so a test can await the admitted-retry record and
-        /// act strictly inside the B3 backoff window.
-        fn build_scheduler_with_retry_signal(
+        /// [`Self::build_scheduler_full`] plus a `backoff_entered` probe, so
+        /// a test can act with the B3 sleep future already pending.
+        fn build_scheduler_with_backoff_probe(
             &self,
             sched_dir: std::path::PathBuf,
             capabilities: Arc<dyn CapabilityExecutor>,
             run_timeout: Duration,
             runtime_cancel: CancellationToken,
-        ) -> (LinearScheduler, Arc<RetryAdmittedSignal>) {
-            let decisions = RetryAdmittedSignal::new();
+        ) -> (
+            LinearScheduler,
+            Arc<RecordingDecisionLog>,
+            Arc<tokio::sync::Notify>,
+        ) {
+            let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+            let backoff_entered = Arc::new(tokio::sync::Notify::new());
             let deps = LinearSchedulerDeps {
                 dags: self.storage.dags(),
                 artifacts: self.storage.artifacts(),
@@ -2744,10 +2757,15 @@ mod tests {
                 config: {
                     let mut c = SchedConfig::new(sched_dir);
                     c.validate_on_load = false;
+                    c.backoff_entered = Some(Arc::clone(&backoff_entered));
                     c
                 },
             };
-            (LinearScheduler::new_for_test(deps).unwrap(), decisions)
+            (
+                LinearScheduler::new_for_test(deps).unwrap(),
+                decisions,
+                backoff_entered,
+            )
         }
 
         /// BE4 probe: identical wiring, but every `DecisionLog::record`
@@ -2795,64 +2813,6 @@ mod tests {
                 },
             };
             LinearScheduler::new_for_test(deps).unwrap()
-        }
-    }
-
-    /// Wraps [`RecordingDecisionLog`] and fires [`Self::retry_admitted`] when
-    /// the scheduler records an admitted retry (§5.11.2).
-    ///
-    /// That record is written *after* A4 read the cancellation state and
-    /// *before* the B3 backoff sleep is created, so it is the only signal that
-    /// pins a test's `cancel()` inside the backoff window: cancel earlier and
-    /// the dispatch select's cancel branch wins (proving nothing about B3);
-    /// cancel later and the paused clock's auto-advance can burn the backoff
-    /// off. A bare `yield_now()` pins neither end.
-    struct RetryAdmittedSignal {
-        inner: Arc<RecordingDecisionLog>,
-        admitted: tokio::sync::Notify,
-    }
-    impl RetryAdmittedSignal {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                inner: Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults())),
-                admitted: tokio::sync::Notify::new(),
-            })
-        }
-        /// Resolves once a `retry_admitted: true` decision has been recorded.
-        /// `notify_one` stores a permit, so there is no lost wakeup when the
-        /// waiter arrives after the record.
-        async fn retry_admitted(&self) {
-            self.admitted.notified().await;
-        }
-        fn recorded_decisions(&self) -> Vec<DecisionRecord> {
-            self.inner.recorded_decisions()
-        }
-    }
-    #[async_trait]
-    impl crate::obs::DecisionLog for RetryAdmittedSignal {
-        async fn record(
-            &self,
-            rec: DecisionRecord,
-        ) -> Result<crate::types::ids::EventSeq, crate::obs::ObsError> {
-            let admitted =
-                rec.metadata.get("retry_admitted") == Some(&serde_json::Value::Bool(true));
-            let seq = self.inner.record(rec).await?;
-            if admitted {
-                self.admitted.notify_one();
-            }
-            Ok(seq)
-        }
-        async fn record_model_call(
-            &self,
-            rec: crate::obs::ModelCallRecord,
-        ) -> Result<crate::types::ids::EventSeq, crate::obs::ObsError> {
-            self.inner.record_model_call(rec).await
-        }
-        async fn record_tool_call(
-            &self,
-            rec: crate::obs::ToolCallRecord,
-        ) -> Result<crate::types::ids::EventSeq, crate::obs::ObsError> {
-            self.inner.record_tool_call(rec).await
         }
     }
 
@@ -7517,6 +7477,14 @@ mod tests {
 
         // Attempt 1 (k=1, not > escalate_after=1) uses the base tier;
         // attempt 2 (k=2 > 1) escalates to Premium (ES1/ES3/ES4).
+        //
+        // This asserts only the scheduler's half of the contract — what
+        // `effective_tier` the capability was dispatched with. That the tier
+        // then changes the *endpoint* the attempt runs on is RFC-0007's half,
+        // proved against a real `TomlModelRouter` by
+        // `escalated_effective_tier_routes_to_the_premium_endpoint` in
+        // `tests/capabilities_rfc0013.rs`. Both are needed: this test passed
+        // for a release while escalation was cosmetic downstream.
         assert_eq!(
             capabilities.tiers(),
             vec![ModelTier::Economy, ModelTier::Premium]
@@ -7713,7 +7681,7 @@ mod tests {
             failure: retryable_model_failure(a, "will retry then get cancelled mid-backoff"),
         })]);
         let runtime_cancel = CancellationToken::new();
-        let (sched, decisions) = fx.build_scheduler_with_retry_signal(
+        let (sched, decisions, backoff_entered) = fx.build_scheduler_with_backoff_probe(
             fx._dir.path().join("s1"),
             capabilities,
             Duration::from_secs(3600),
@@ -7721,19 +7689,22 @@ mod tests {
         );
         let sched = Arc::new(sched);
         let sched2 = Arc::clone(&sched);
+        let started = tokio::time::Instant::now();
         let handle = tokio::spawn(async move { sched2.run(dag_id).await });
 
-        // Wait for attempt 1's retry to be *admitted* — the observable signal
-        // that the run task is past A4 and about to enter the B3 sleep — then
-        // cancel the process-wide token without ever advancing the (paused)
-        // clock. A bare `yield_now()` here guarantees nothing: cancel could
-        // land while the capability is still dispatching (the select's cancel
-        // branch, which says nothing about backoff) or, if the run task parks
-        // and auto-advance fires, only after all five backoffs have burned
-        // through and the node has failed for real. Awaiting the record pins
-        // both ends: the signal makes this task runnable strictly before the
-        // sleep exists, so the clock cannot auto-advance past it either.
-        decisions.retry_admitted().await;
+        // Cancel with the B3 sleep future already created and pending.
+        //
+        // The obvious signals do not pin that window. A bare `yield_now()`
+        // can land while the capability is still dispatching, taking the C3
+        // select's cancel branch — which says nothing about backoff. The C8
+        // `retry_admitted` decision is written a whole `loop_step` earlier,
+        // so cancelling on it races L1's `is_cancelled()` check and would
+        // usually end the run *before* `dispatch_node` reaches the sleep at
+        // all: the test would pass while proving nothing. `backoff_entered`
+        // fires from inside `dispatch_node` with no await between it and the
+        // `select!`, and this runtime is single-threaded, so by the time this
+        // line resumes the sleep has been polled and is pending.
+        backoff_entered.notified().await;
         runtime_cancel.cancel();
 
         let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
@@ -7742,15 +7713,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(outcome.state, DagState::Cancelled);
-        // The point of the test: the cancel must have landed *during the
-        // backoff*, which is only true if attempt 1's retry was admitted
-        // first (A4 passed, C8 committed). Cancelling earlier would take the
-        // dispatch-select cancel branch and prove nothing about B3.
+        // The sleep was interrupted, not served: the paused clock never
+        // reached the 10s deadline. Absent B3's cancel branch the only way
+        // out of that sleep is burning the full delay.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "cancel must interrupt the backoff, not wait it out (elapsed {:?})",
+            started.elapsed()
+        );
+        // And the interrupted sleep was a retry's backoff: A4 admitted it and
+        // C8 committed before the sleep was entered.
         assert!(
             decisions.recorded_decisions().iter().any(|d| {
                 d.metadata.get("retry_admitted") == Some(&serde_json::Value::Bool(true))
             }),
-            "cancel must land after the retry was admitted, i.e. inside the backoff sleep"
+            "the interrupted sleep must be a retry's backoff"
         );
         fx.close().await;
     }

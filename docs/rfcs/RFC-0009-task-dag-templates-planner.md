@@ -1152,9 +1152,12 @@ analyze -Sequence-> edit -Sequence-> verify -Sequence-> gate
 The escalate pair on the model-backed nodes satisfies V14 (`1 < max_attempts`)
 and V9 (adapter nodes keep both fields `None`); RFC-0010 §5.11.4 ES1/ES3 then
 routes the single retry at `Premium` through
-`CapabilityExecContext.effective_tier` only. Operators MUST serve the
-`premium` tier (RFC-0007 never downgrades a tier to satisfy routing) — see
-`router.toml.example`.
+`CapabilityExecContext.effective_tier` only, which RFC-0013 MR2 forwards to
+the router as `RoutingRequest.tier_override`. Operators SHOULD serve the
+`premium` tier (see `router.toml.example`) to get a bigger model on the retry;
+when they do not, RFC-0007 §5.2.1 routes that attempt at the configured tier
+and records `escalation_unserved` rather than failing it. Escalation never
+lowers a configured tier.
 
 Budgets: LLM `{ max_input: 32768, max_output: 8192 }`; adapters `{0,0}`.  
 `model_tier`: Analyze/Edit `Standard`; adapters `Economy` (ignored).  

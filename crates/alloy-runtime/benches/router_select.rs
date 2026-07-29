@@ -84,6 +84,7 @@ fn request(run: RunId) -> RoutingRequest {
         run: Some(run),
         node: None,
         capability: CapabilityId::new("repair").expect("capability id"),
+        tier_override: None,
         complexity: None,
         budget_remaining: BudgetSnapshot {
             usd_spent: 0.0,

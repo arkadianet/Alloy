@@ -43,9 +43,15 @@ output_usd_per_mtok = 0.0
 
 # Tier escalation target (RFC-0010 §5.11.4 ES1). The shipped
 # `repair_local_diagnostic` template escalates its analyze/edit nodes to
-# `premium` on their retry, and RFC-0007 never downgrades a tier to satisfy
-# routing — so uncomment an endpoint serving `premium` (a bigger model) or the
-# escalated retry has nowhere to land.
+# `premium` on their retry, so uncomment an endpoint serving `premium` (a
+# bigger model) to give that retry somewhere better to land.
+#
+# Leaving this commented is supported and safe. With no `premium` endpoint the
+# escalated retry routes at the capability's configured tier instead — exactly
+# where it would have run without escalation — and the route decision records
+# `escalation_unserved = true` (metric `routes_escalation_unserved`). You lose
+# the escalation, not the retry. What is never allowed is the reverse: an
+# escalation can only raise a tier, never lower one (RFC-0007 §5.2.1).
 # [[providers.endpoints]]
 # id = "team-premium"
 # display_name = "Premium"

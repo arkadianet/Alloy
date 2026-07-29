@@ -372,7 +372,10 @@ mod tests {
     /// decide for its model-backed nodes: base tier on attempt 1, Premium on
     /// the single retry. `es1_escalation_applies_to_capability_context_after_
     /// threshold` in `loop_.rs` proves the same decision reaches
-    /// `CapabilityExecContext.effective_tier` (ES3).
+    /// `CapabilityExecContext.effective_tier` (ES3), and
+    /// `escalated_effective_tier_routes_to_the_premium_endpoint` in
+    /// `tests/capabilities_rfc0013.rs` proves that tier reaches the routed
+    /// endpoint.
     #[test]
     fn repair_template_llm_nodes_escalate_on_their_retry() {
         use crate::dag::{NodeKind, TemplateCatalog, TemplateId};
