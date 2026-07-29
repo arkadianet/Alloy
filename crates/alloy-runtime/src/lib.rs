@@ -138,9 +138,10 @@ pub use scheduler::{
     SchedulerMetrics,
 };
 pub use session::{
-    clamp_events_page_limit, validate_mvp_profile, ReplanReason, RunControlState, RunController,
-    RunGoalRecord, Session, SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE,
-    MVP_PROFILES, TRAJECTORY_SCHEMA_VERSION,
+    clamp_events_page_limit, validate_mvp_profile, DirectRunExecutor, ReplanReason,
+    RunControlState, RunController, RunExecCtx, RunExecutor, RunGoalRecord, Session,
+    SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE, MVP_PROFILES,
+    TRAJECTORY_SCHEMA_VERSION,
 };
 pub use storage::{
     install_sqlite_event_sink, store_to_runtime, store_to_session, AlloyStorage, ArtifactBlob,

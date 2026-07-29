@@ -108,6 +108,7 @@ mod tests {
                 gates: crate::config::GatesConfig::default(),
                 sandbox_echo: None,
                 gate_timeout: None,
+                max_repair_generations: 2,
                 capture: Default::default(),
             })
             .unwrap();

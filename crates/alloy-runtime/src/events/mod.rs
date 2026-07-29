@@ -38,6 +38,9 @@ pub enum SessionEventType {
     BudgetWarning,
     /// Replan requested.
     ReplanRequested,
+    /// Replanned run re-armed / repair generation completed (RFC-0017
+    /// AM-0003-1 / AM-0003-3).
+    ReplanResumed,
     /// Run completed.
     RunCompleted,
     /// Error event.

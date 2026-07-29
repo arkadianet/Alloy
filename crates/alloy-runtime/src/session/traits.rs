@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::run_state::RunControlState;
 use crate::adapters::Approval;
 use crate::error::{RunError, SessionError};
 use crate::events::SessionEvent;
@@ -59,6 +60,37 @@ pub trait RunController: Send + Sync {
     /// Idempotent with respect to a missing waiter (amendment A7): a
     /// `(run, gate)` with no registered waiter is not an error.
     async fn expire_gate(&self, run: RunId, gate: GateId) -> Result<(), RunError>;
+
+    /// Re-arm an **externally** replanned run (RFC-0017 AM-0003-1):
+    /// `ReplanRequested → Accepted` — not `Running`, so re-entry reuses
+    /// §6.3's existing `Accepted` arm and no second `RunAccepted` is
+    /// emitted. Requires no live execution lease and a stored DAG not
+    /// `Running`. Idempotent from `Accepted` (no second event); every other
+    /// state, or a held lease, is [`RunError::InvalidPhase`]. Appends
+    /// `ReplanResumed`. The caller then calls [`Self::start`].
+    async fn resume_after_replan(&self, run: RunId) -> Result<(), RunError>;
+
+    /// In-run generation bump, step 1 of 2 (RFC-0017 AM-0003-3). Drops all
+    /// gate waiters for the run and appends a `ReplanRequested` session
+    /// event carrying `reason`. Leaves the row `Running` (rule RC1 — never
+    /// writes `RunControlState::ReplanRequested`). Requires a live
+    /// execution lease for `run` (callable only from inside `start`'s
+    /// dispatch); otherwise [`RunError::InvalidPhase`] (rule RC2).
+    async fn begin_repair_generation(
+        &self,
+        run: RunId,
+        reason: &ReplanReason,
+    ) -> Result<(), RunError>;
+
+    /// In-run generation bump, step 2 of 2 (RFC-0017 AM-0003-3). Appends
+    /// `ReplanResumed` `{ run_id, generation }`. Same lease precondition as
+    /// [`Self::begin_repair_generation`]. Leaves the row `Running`.
+    async fn complete_repair_generation(&self, run: RunId, generation: u64)
+        -> Result<(), RunError>;
+
+    /// Read the durable control state (RFC-0017 AM-0003-3, rule RC4).
+    /// Takes the per-run mutex, parses the stored state, writes nothing.
+    async fn control_state(&self, run: RunId) -> Result<RunControlState, RunError>;
 }
 
 /// Session record snapshot.

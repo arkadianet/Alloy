@@ -36,6 +36,7 @@ retain_tool_bodies = false
 
 [limits]
 run_timeout_secs = 1800
+max_repair_generations = 2          # 0..=8; 0 disables auto-replan (RFC-0017 AM-0015-2)
 
 # Corpus capture (research §7.11 item 1) — distinct from [observability]:
 # retention is what the log keeps for debugging; capture is what may enter a

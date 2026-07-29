@@ -81,6 +81,7 @@ pub fn type_name(t: SessionEventType) -> &'static str {
         SessionEventType::ApprovalResolved => "approval_resolved",
         SessionEventType::BudgetWarning => "budget_warning",
         SessionEventType::ReplanRequested => "replan_requested",
+        SessionEventType::ReplanResumed => "replan_resumed",
         SessionEventType::RunCompleted => "run_completed",
         SessionEventType::Error => "error",
     }
@@ -160,7 +161,8 @@ pub fn summary(ev: &SessionEvent) -> String {
         SessionEventType::SessionCreated
         | SessionEventType::GoalSubmitted
         | SessionEventType::EditApplied
-        | SessionEventType::ReplanRequested => type_name(ev.type_).to_owned(),
+        | SessionEventType::ReplanRequested
+        | SessionEventType::ReplanResumed => type_name(ev.type_).to_owned(),
     }
 }
 

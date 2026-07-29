@@ -422,6 +422,7 @@ planning = "standard"
                 gates: Default::default(),
                 sandbox_echo: None,
                 gate_timeout: None,
+                max_repair_generations: 2,
             })
             .unwrap();
             let handle = rt.start().await.unwrap();

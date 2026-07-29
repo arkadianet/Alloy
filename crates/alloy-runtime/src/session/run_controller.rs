@@ -791,6 +791,16 @@ impl RunController for RunControllerView {
             self.inner.mark_accepted_emitted(run);
         }
 
+        // One absolute deadline for the whole dispatch, however many repair
+        // generations the executor runs behind the seam (RFC-0017 GN7).
+        let run_timeout = self
+            .inner
+            .handle
+            .config()
+            .map_err(runtime_to_run)?
+            .run_timeout;
+        let executor = self.inner.executor();
+
         // The lease is held across the await so a cancelled/aborted `start` future still
         // releases it via `Drop`; a completed dispatch releases it explicitly below.
         let lease = self.inner.acquire_lease(run);
@@ -798,7 +808,15 @@ impl RunController for RunControllerView {
         info!(run_id = %run, dag_id = %dag_id, redispatch = !first_dispatch, "run start");
 
         let ticket = lock.unlock();
-        let result = self.inner.handle.run_dag(dag_id).await;
+        // §6.3 step 8 (AM-0003-2): dispatch through the injected executor.
+        let result = executor
+            .execute(super::run_executor::RunExecCtx {
+                run_id: run,
+                session_id: row.session_id,
+                dag_id,
+                deadline: std::time::Instant::now() + run_timeout,
+            })
+            .await;
         let lock = ticket.relock().await;
 
         let applied = self.apply_start_outcome(run, dag_id, result).await;
@@ -1041,5 +1059,134 @@ impl RunController for RunControllerView {
         self.inner.metrics.bump_replans_requested();
         info!(run_id = %run, "replan requested");
         Ok(())
+    }
+
+    /// RFC-0017 AM-0003-1 — re-arm an externally replanned run:
+    /// `ReplanRequested → Accepted`, so the next `start` re-enters §6.3's
+    /// existing `Accepted` re-dispatch arm (no second `RunAccepted`).
+    async fn resume_after_replan(&self, run: RunId) -> Result<(), RunError> {
+        require_running(&self.inner, "resume_after_replan")?;
+        let _lock = self.inner.lock_run(run).await;
+
+        let row = load_run(&self.inner, run).await?;
+        let state = parse_state(&row)?;
+
+        // A held execution lease means a dispatch is in flight; nothing may
+        // rewrite the row underneath it.
+        if self.inner.has_live(run) {
+            return Err(RunError::InvalidPhase("execution lease held".into()));
+        }
+        match state {
+            // Idempotent: already re-armed; no second event.
+            RunControlState::Accepted => return Ok(()),
+            RunControlState::ReplanRequested => {}
+            other => {
+                return Err(RunError::InvalidPhase(format!(
+                    "resume_after_replan from {}",
+                    other.as_str()
+                )));
+            }
+        }
+
+        // (a) The stored DAG must not be mid-execution.
+        let (_dag_id, generation) = {
+            let dag_id = parse_goal(&row)?.dag_id;
+            let dag = self
+                .inner
+                .storage
+                .dags()
+                .get(dag_id)
+                .await
+                .map_err(store_to_run)?
+                .ok_or_else(|| {
+                    RunError::Internal(format!("dag not found for replan resume: {dag_id}"))
+                })?;
+            if dag.state == DagState::Running {
+                return Err(RunError::InvalidPhase("dag running".into()));
+            }
+            (dag_id, dag.generation)
+        };
+
+        // (b) Re-arm to Accepted — not Running (AM-0003-1).
+        upsert_state(&self.inner, &row, RunControlState::Accepted).await?;
+
+        // (c) Audit event.
+        append_run_event(
+            &self.inner,
+            row.session_id,
+            run,
+            SessionEventType::ReplanResumed,
+            json!({ "run_id": run, "generation": generation }),
+        )
+        .await?;
+
+        info!(run_id = %run, generation, "replanned run re-armed");
+        Ok(())
+    }
+
+    /// RFC-0017 AM-0003-3 — in-run generation bump, step 1 of 2. Lease-gated
+    /// (RC2); never writes `replan_requested` (RC1) — the row stays
+    /// `Running` for the whole loop.
+    async fn begin_repair_generation(
+        &self,
+        run: RunId,
+        reason: &ReplanReason,
+    ) -> Result<(), RunError> {
+        require_running(&self.inner, "begin_repair_generation")?;
+        let _lock = self.inner.lock_run(run).await;
+
+        if !self.inner.has_live(run) {
+            return Err(RunError::InvalidPhase("no execution lease".into()));
+        }
+        let row = load_run(&self.inner, run).await?;
+
+        // SEC9b: an approval granted in generation N never carries into N+1.
+        self.inner.gates.clear_run(run);
+        append_run_event(
+            &self.inner,
+            row.session_id,
+            run,
+            SessionEventType::ReplanRequested,
+            json!({ "reason": reason }),
+        )
+        .await?;
+
+        self.inner.metrics.bump_replans_requested();
+        info!(run_id = %run, "repair generation begun (row stays running)");
+        Ok(())
+    }
+
+    /// RFC-0017 AM-0003-3 — in-run generation bump, step 2 of 2.
+    async fn complete_repair_generation(
+        &self,
+        run: RunId,
+        generation: u64,
+    ) -> Result<(), RunError> {
+        require_running(&self.inner, "complete_repair_generation")?;
+        let _lock = self.inner.lock_run(run).await;
+
+        if !self.inner.has_live(run) {
+            return Err(RunError::InvalidPhase("no execution lease".into()));
+        }
+        let row = load_run(&self.inner, run).await?;
+
+        append_run_event(
+            &self.inner,
+            row.session_id,
+            run,
+            SessionEventType::ReplanResumed,
+            json!({ "run_id": run, "generation": generation }),
+        )
+        .await?;
+
+        info!(run_id = %run, generation, "repair generation replanned");
+        Ok(())
+    }
+
+    /// RFC-0017 AM-0003-3 — durable control-state read (RC4). Writes nothing.
+    async fn control_state(&self, run: RunId) -> Result<RunControlState, RunError> {
+        let _lock = self.inner.lock_run(run).await;
+        let row = load_run(&self.inner, run).await?;
+        parse_state(&row)
     }
 }

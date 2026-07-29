@@ -35,3 +35,4 @@ retain_tool_bodies = false
 
 [limits]
 run_timeout_secs = 900
+max_repair_generations = 2          # 0..=8; 0 disables auto-replan (RFC-0017 AM-0015-2)

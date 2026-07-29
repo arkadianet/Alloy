@@ -106,6 +106,12 @@ pub struct RuntimeConfig {
     /// Gate timeout from `[limits].gate_timeout_secs`; `None` waits
     /// indefinitely (RFC-0015 §5.2 `[limits]`).
     pub gate_timeout: Option<Duration>,
+    /// Maximum automatic repair-generation bumps per run (RFC-0017
+    /// AM-0015-2). Total generations ≤ 1 + this value; `0` disables
+    /// auto-replan. From `[limits].max_repair_generations`; default 2;
+    /// accepted `0..=8`. Deliberately **not** on `SchedConfig` — the
+    /// scheduler never reads it (RFC-0017 §3.7).
+    pub max_repair_generations: u32,
     /// Corpus-capture policy from the profile's `[capture]` table
     /// (research §7.11 item 1). Absent table = capture disabled.
     pub capture: crate::obs::CapturePolicy,
@@ -231,6 +237,8 @@ struct LimitsSection {
     run_timeout_secs: u64,
     #[serde(default)]
     gate_timeout_secs: Option<u64>,
+    #[serde(default = "default_max_repair_generations")]
+    max_repair_generations: u32,
 }
 
 /// `[capture]` — corpus capture, distinct from `[observability]` retention.
@@ -275,6 +283,9 @@ fn default_deny() -> String {
 }
 fn default_run_timeout_secs() -> u64 {
     60 * 30
+}
+fn default_max_repair_generations() -> u32 {
+    2
 }
 
 impl RuntimeConfig {
@@ -388,13 +399,25 @@ impl RuntimeConfig {
             }
         }
 
-        let (run_timeout, gate_timeout) = match &profile.limits {
+        let (run_timeout, gate_timeout, max_repair_generations) = match &profile.limits {
             Some(l) => (
                 Duration::from_secs(l.run_timeout_secs),
                 l.gate_timeout_secs.map(Duration::from_secs),
+                l.max_repair_generations,
             ),
-            None => (Duration::from_secs(default_run_timeout_secs()), None),
+            None => (
+                Duration::from_secs(default_run_timeout_secs()),
+                None,
+                default_max_repair_generations(),
+            ),
         };
+        // RFC-0017 AM-0015-2: fail closed on an out-of-range bound — no
+        // clamping-to-valid.
+        if max_repair_generations > 8 {
+            return Err(RuntimeError::Config(format!(
+                "profile {profile_display} [limits].max_repair_generations must be in 0..=8 (RFC-0017 AM-0015-2), got {max_repair_generations}"
+            )));
+        }
 
         Ok(Self {
             data_dir,
@@ -411,6 +434,7 @@ impl RuntimeConfig {
             gates,
             sandbox_echo: profile.sandbox,
             gate_timeout,
+            max_repair_generations,
             capture: crate::obs::CapturePolicy {
                 enabled: profile.capture.enabled,
                 prompts: profile.capture.prompts,
@@ -418,6 +442,35 @@ impl RuntimeConfig {
                 require_consent: profile.capture.require_consent,
             },
         })
+    }
+}
+
+impl RuntimeConfig {
+    /// Crate-internal test fixture: the baseline config unit tests configure
+    /// runtimes with (30 s run timeout, default policies, `dir`-rooted
+    /// paths). Exists so test modules outside `config` — notably the
+    /// scheduler's, which must never name `max_repair_generations` (RFC-0017
+    /// AC 31) — need not spell out every field.
+    #[cfg(test)]
+    pub(crate) fn test_defaults(dir: &Path) -> Self {
+        Self {
+            data_dir: dir.join("runtime"),
+            data_dir_rule: "test",
+            profile_path: dir.join("profiles/default.toml"),
+            router_path: dir.join("router.toml"),
+            env_file_hint: dir.join("example.env"),
+            retain_full_prompts: false,
+            retain_tool_bodies: false,
+            run_timeout: Duration::from_secs(30),
+            budget_policy: BudgetPolicy::default(),
+            context_profile: crate::context::ContextProfile::v2_defaults(),
+            profile_id: Some("default".into()),
+            gates: GatesConfig::default(),
+            sandbox_echo: None,
+            gate_timeout: None,
+            max_repair_generations: default_max_repair_generations(),
+            capture: Default::default(),
+        }
     }
 }
 
@@ -626,6 +679,74 @@ retain_full_prompts = false
         })
         .unwrap();
         assert_eq!(cfg.budget_policy, BudgetPolicy::default());
+    }
+
+    /// RFC-0017 AM-0015-2 / AC 31 (config half): `[limits]
+    /// max_repair_generations` maps to `RuntimeConfig`, defaulting to 2 when
+    /// absent (with or without a `[limits]` table).
+    #[test]
+    fn max_repair_generations_defaults_to_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
+        let load = |profile: PathBuf, router: PathBuf, example: PathBuf| {
+            RuntimeConfig::load(ConfigPaths {
+                profile,
+                router,
+                example_env: example,
+                data_dir: None,
+                workspace_root: Some(dir.path().to_path_buf()),
+            })
+        };
+        // No [limits] table at all.
+        let cfg = load(profile.clone(), router.clone(), example.clone()).unwrap();
+        assert_eq!(cfg.max_repair_generations, 2);
+
+        // [limits] present without the key.
+        fs::write(
+            &profile,
+            "[profile]\nid = \"default\"\n[limits]\nrun_timeout_secs = 60\n",
+        )
+        .unwrap();
+        let cfg = load(profile.clone(), router.clone(), example.clone()).unwrap();
+        assert_eq!(cfg.max_repair_generations, 2);
+        assert_eq!(cfg.run_timeout, Duration::from_secs(60));
+
+        // Explicit 0 (auto-replan disabled) and 8 (ceiling) are accepted.
+        for v in [0u32, 8] {
+            fs::write(
+                &profile,
+                format!("[profile]\nid = \"default\"\n[limits]\nmax_repair_generations = {v}\n"),
+            )
+            .unwrap();
+            let cfg = load(profile.clone(), router.clone(), example.clone()).unwrap();
+            assert_eq!(cfg.max_repair_generations, v);
+        }
+    }
+
+    /// RFC-0017 AM-0015-2: out-of-range `max_repair_generations` is an
+    /// assembly-time config error — fail closed, no clamping-to-valid.
+    #[test]
+    fn max_repair_generations_out_of_range_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
+        fs::write(
+            &profile,
+            "[profile]\nid = \"default\"\n[limits]\nmax_repair_generations = 9\n",
+        )
+        .unwrap();
+        let err = RuntimeConfig::load(ConfigPaths {
+            profile,
+            router,
+            example_env: example,
+            data_dir: None,
+            workspace_root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_repair_generations") && msg.contains("0..=8"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

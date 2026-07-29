@@ -183,7 +183,19 @@ impl RunCtx<'_> {
 #[async_trait]
 impl Scheduler for LinearScheduler {
     async fn run(&self, dag_id: DagId) -> Result<DagOutcome, SchedError> {
-        self.run_impl(dag_id).await
+        self.run_impl(dag_id, self.deps.run_timeout).await
+    }
+
+    /// AM-0010-2 (RFC-0017): same entry sequence as [`Self::run`], but the
+    /// per-run clock (R12 / §5.19) is seeded from `remaining` instead of
+    /// `deps.run_timeout`, so generations of one run share an absolute
+    /// deadline.
+    async fn run_within(
+        &self,
+        dag_id: DagId,
+        remaining: Duration,
+    ) -> Result<DagOutcome, SchedError> {
+        self.run_impl(dag_id, remaining).await
     }
 
     async fn cancel(&self, dag_id: DagId) -> Result<(), SchedError> {
@@ -213,7 +225,11 @@ impl LinearScheduler {
     // §5.1 `run` entry sequence
     // -----------------------------------------------------------------
 
-    async fn run_impl(&self, dag_id: DagId) -> Result<DagOutcome, SchedError> {
+    async fn run_impl(
+        &self,
+        dag_id: DagId,
+        run_timeout: Duration,
+    ) -> Result<DagOutcome, SchedError> {
         let checkpoint = self.checkpoint();
 
         // R1
@@ -247,7 +263,7 @@ impl LinearScheduler {
         // `Result` without an early `?`, write the result, THEN return it —
         // `guard` drops at the end of this function's scope either way.
         let result = self
-            .run_owned(&checkpoint, dag_id, run_id, &guard.owned)
+            .run_owned(&checkpoint, dag_id, run_id, &guard.owned, run_timeout)
             .await;
         if let Ok(outcome) = &result {
             self.metrics.inc_run_terminal(outcome.state);
@@ -279,6 +295,7 @@ impl LinearScheduler {
         dag_id: DagId,
         run_id: RunId,
         owned: &super::own::OwnedDag,
+        run_timeout: Duration,
     ) -> Result<DagOutcome, SchedError> {
         // R4b: re-load under ownership.
         let mut dag = self
@@ -384,7 +401,7 @@ impl LinearScheduler {
             run_cancel: &owned.run_cancel, // O1: fired by `cancel(dag_id)`.
             run_id,
             run_started: Instant::now(), // R12
-            run_timeout: self.deps.run_timeout,
+            run_timeout,
             effective_budget: effective.policy.clone(),
             gate_wait_total: std::sync::Mutex::new(Duration::ZERO),
             expired_gates: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2447,24 +2464,8 @@ mod tests {
         async fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let mut rt = AlloyRuntime::new();
-            rt.configure(crate::config::RuntimeConfig {
-                data_dir: dir.path().join("runtime"),
-                data_dir_rule: "test",
-                profile_path: dir.path().join("profiles/default.toml"),
-                router_path: dir.path().join("router.toml"),
-                env_file_hint: dir.path().join("example.env"),
-                retain_full_prompts: false,
-                retain_tool_bodies: false,
-                run_timeout: Duration::from_secs(30),
-                budget_policy: BudgetPolicy::default(),
-                context_profile: crate::context::ContextProfile::v2_defaults(),
-                profile_id: Some("default".into()),
-                gates: crate::config::GatesConfig::default(),
-                sandbox_echo: None,
-                gate_timeout: None,
-                capture: Default::default(),
-            })
-            .unwrap();
+            rt.configure(crate::config::RuntimeConfig::test_defaults(dir.path()))
+                .unwrap();
             let handle = rt.start().await.unwrap();
             let storage = install_sqlite_event_sink(
                 &handle,
@@ -4036,6 +4037,45 @@ mod tests {
         assert!(
             failure.notes.contains("run timeout"),
             "unexpected notes: {}",
+            failure.notes
+        );
+        fx.close().await;
+    }
+
+    /// RFC-0017 AC 25c: `run_within` seeds the per-run clock (R12) from its
+    /// argument, not from `deps.run_timeout` — with a 30 s deps budget and a
+    /// 100 ms `remaining`, the run times out at 100 ms and says so.
+    #[tokio::test(start_paused = true)]
+    async fn ac25c_run_within_seeds_run_clock_from_argument() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let (dag_id, _node) = seed_hanging_node(&fx, session, 60_000).await;
+
+        let sched = Arc::new(fx.build_scheduler(
+            fx._dir.path().join("s-ac25c"),
+            Arc::new(HangingCapability),
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(30),
+        ));
+        let handle = tokio::spawn({
+            let sched = Arc::clone(&sched);
+            async move {
+                crate::scheduler::Scheduler::run_within(&*sched, dag_id, Duration::from_millis(100))
+                    .await
+            }
+        });
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let outcome = handle.await.unwrap().unwrap();
+
+        assert_eq!(outcome.state, DagState::Failed);
+        let failure = outcome.failure.expect("failure ir");
+        assert_eq!(failure.error_class, ErrorClass::Timeout);
+        assert!(
+            failure.notes.contains("run timeout after 100ms"),
+            "clock must be seeded from `remaining`, got: {}",
             failure.notes
         );
         fx.close().await;
