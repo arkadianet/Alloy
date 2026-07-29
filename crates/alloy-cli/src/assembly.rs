@@ -14,14 +14,14 @@ use std::sync::Arc;
 use alloy_index::{GraphOpenOptions, SqliteProjectGraph};
 use alloy_runtime::{
     install_sqlite_event_sink, AlloyRuntime, AlloyStorage, AppliedEditSource, CapabilityExecutor,
-    CapabilityRegistry, ContextEngine, DecisionLog, DefaultContextEngine, EventDecisionLog,
-    EventLogEdits, FixRecordingVerifier, GraphViewHandle, LinearScheduler, LinearSchedulerDeps,
-    McpVerifyCompileAdapter, McpVerifyTestAdapter, ModelProvider, OpenAiCompatibleProvider,
-    OpenAiCompatibleSpec, ProcessCostMeterFactory, ProcessRunRouterProvider, ProjectGraph,
-    RegistryCapabilityExecutor, RouterConfig, RuntimeConfig, RuntimeHandle, SchedConfig,
-    SecretString, SessionGateHumanAdapter, SessionId, SessionPlane, SessionVerifyPermissions,
-    SessionWorkerPermissions, TemplatePlanService, ToolCaller, ToolName, ToolSelector, Verifier,
-    WorkerConfig, WorkerDeps,
+    CapabilityRegistry, ContextEngine, DecisionLog, DefaultContextEngine, EditEngine,
+    EventDecisionLog, EventLogEdits, FixRecordingVerifier, GraphViewHandle, LinearScheduler,
+    LinearSchedulerDeps, McpVerifyCompileAdapter, McpVerifyTestAdapter, ModelProvider,
+    OpenAiCompatibleProvider, OpenAiCompatibleSpec, ProcessCostMeterFactory,
+    ProcessRunRouterProvider, ProjectGraph, RegistryCapabilityExecutor, RouterConfig,
+    RuntimeConfig, RuntimeHandle, SchedConfig, SecretString, SessionGateHumanAdapter, SessionId,
+    SessionPlane, SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService,
+    ToolCaller, ToolName, ToolSelector, Verifier, WorkerConfig, WorkerDeps, WorkerPermissions,
 };
 use alloy_tools::mcp::{McpPlatform, ToolHandle, ToolHandleToolCaller};
 use alloy_tools::{
@@ -63,8 +63,13 @@ pub struct FullAssembly {
     pub plan: TemplatePlanService,
     /// The installed scheduler (kept for wiring assertions).
     pub scheduler: Arc<LinearScheduler>,
-    /// PF10 — whether a `GitEditEngine` was assembled (false under readonly).
-    pub edit_engine_assembled: bool,
+    /// PF10 — the assembled `GitEditEngine`, or `None` under readonly (where
+    /// refusal is structural). The retry loop needs it directly, not only
+    /// through the MCP patch backend, to roll a failed attempt's edits back.
+    pub edit_engine: Option<Arc<dyn EditEngine>>,
+    /// The same worker permission source the patch builtin uses, so a
+    /// CLI-side rollback presents a token minted by one authority (PM5).
+    pub worker_perms: Arc<dyn WorkerPermissions>,
     /// Compile verifier, re-used for the pre-plan diagnostic seed (issue #53).
     pub verify_compile: Arc<dyn alloy_runtime::Verifier>,
 }
@@ -231,24 +236,24 @@ pub async fn assemble_full(
     // refusing stub instead — refusal is structural, not a handler check.
     let path_policy = PathPolicy::from_profile(&sandbox_profile, Vec::new())
         .map_err(|e| CliError::new(Exit::Sandbox, format!("path policy: {e}")))?;
-    let (patch_backend, edit_engine_assembled): (Arc<dyn PatchApplyBackend>, bool) = if readonly {
-        (Arc::new(StubPatchApplyBackend), false)
-    } else {
-        let engine = GitEditEngine::new(GitEditEngineConfig::new(
-            Arc::clone(&broker),
-            path_policy,
-            trusted_exec_path(&homes),
-            storage.artifacts() as _,
-            storage.events() as _,
-        ))
-        .map_err(|e| CliError::new(Exit::Internal, format!("edit engine: {e}")))?;
-        (
-            Arc::new(EditEnginePatchBackend::new(
-                Arc::new(engine) as Arc<dyn alloy_runtime::EditEngine>
-            )),
-            true,
-        )
-    };
+    let (patch_backend, edit_engine): (Arc<dyn PatchApplyBackend>, Option<Arc<dyn EditEngine>>) =
+        if readonly {
+            (Arc::new(StubPatchApplyBackend), None)
+        } else {
+            let engine = GitEditEngine::new(GitEditEngineConfig::new(
+                Arc::clone(&broker),
+                path_policy,
+                trusted_exec_path(&homes),
+                storage.artifacts() as _,
+                storage.events() as _,
+            ))
+            .map_err(|e| CliError::new(Exit::Internal, format!("edit engine: {e}")))?;
+            let engine = Arc::new(engine) as Arc<dyn EditEngine>;
+            (
+                Arc::new(EditEnginePatchBackend::new(Arc::clone(&engine))),
+                Some(engine),
+            )
+        };
 
     // Step 7 — MCP host: max_in_flight pinned to 1 (CR7), cancel a child of
     // the runtime token (CR8), no read-only roots beyond the jail (CR9).
@@ -342,7 +347,7 @@ pub async fn assemble_full(
             ToolSelector::name(tool_name("apply_patch")),
         ],
     )));
-    let worker_perms = Arc::new(SessionWorkerPermissions::new(
+    let worker_perms: Arc<dyn WorkerPermissions> = Arc::new(SessionWorkerPermissions::new(
         storage.sessions() as _,
         Some("**".into()),
         if readonly { None } else { Some("**".into()) },
@@ -351,7 +356,7 @@ pub async fn assemble_full(
         routers: Arc::clone(&routers) as _,
         context,
         tools: worker_tools,
-        perms: worker_perms as _,
+        perms: Arc::clone(&worker_perms),
         graph: GraphViewHandle::new(Arc::clone(&graph) as Arc<dyn ProjectGraph>),
         artifacts: storage.artifacts() as _,
         decisions: Arc::clone(&decisions) as _,
@@ -398,7 +403,8 @@ pub async fn assemble_full(
         routers,
         plan,
         scheduler: sched,
-        edit_engine_assembled,
+        edit_engine,
+        worker_perms,
         verify_compile: verify_compile as _,
     })
 }
@@ -537,7 +543,7 @@ mod tests {
                     // The scheduler was built and installed (CR1/step 12).
                     assert!(Arc::strong_count(&full.scheduler) >= 2);
                     // PF10 — readonly assembles no GitEditEngine.
-                    assert_eq!(full.edit_engine_assembled, !readonly);
+                    assert_eq!(full.edit_engine.is_some(), !readonly);
                     let storage = Arc::clone(&full.base.storage);
                     shutdown_all(
                         full.base.rt,

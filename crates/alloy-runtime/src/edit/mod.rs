@@ -8,10 +8,12 @@
 
 mod engine;
 mod error;
+mod journal;
 mod types;
 
 pub use engine::EditEngine;
 pub use error::EditError;
+pub use journal::{rollback_run_edits, transactions_of_run, DeclinedRollback, RollbackReport};
 pub use types::{
     EditAppliedPayload, EditContext, EditRequest, EditRequestKind, EditTransaction, EditValidation,
     FilePatch, Hunk, PatchSet, SemanticEditOp, TxState, WorkspaceDigest, EDIT_APPLIED_SCHEMA,
