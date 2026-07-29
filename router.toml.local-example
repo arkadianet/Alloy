@@ -1,0 +1,38 @@
+# router.toml.local-example — Author: arkadianet
+# Local-model dogfooding config (see docs/dogfooding.md).
+# Copy to router.toml. http:// is allowed for loopback only (RFC-0007).
+
+[policy]
+default_tier = "standard"
+connect_timeout_ms = 10000
+# Local inference is slow; give completions room before the router times out.
+request_timeout_ms = 600000
+shutdown_grace_ms = 5000
+max_in_flight = 2
+
+[[providers]]
+id = "local"
+kind = "openai_compatible"
+base_url = "http://127.0.0.1:11434/v1/"
+# Ollama ignores the key but Alloy requires the env var to exist and never
+# invents one: export ALLOY_API_KEY=local
+api_key_env = "ALLOY_API_KEY"
+
+[[providers.endpoints]]
+id = "local-coder"
+display_name = "Local coder"
+# Must match the model id your server actually serves (`ollama list`).
+model = "qwen2.5-coder:14b"
+tiers = ["standard", "economy"]
+supports_tools = true
+supports_structured_output = true
+max_context = 32768
+# Local tokens are free; $0 keeps the budget meter honest.
+input_usd_per_mtok = 0.0
+output_usd_per_mtok = 0.0
+
+[capability_tiers]
+repair = "standard"
+edit = "standard"
+review = "economy"
+planning = "standard"
