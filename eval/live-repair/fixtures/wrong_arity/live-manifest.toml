@@ -1,0 +1,14 @@
+live_manifest_version = 1
+id = "wrong_arity"
+goal = "fix the compile error in src/main.rs"
+expected_outcome = "compile_clean"
+tags = ["e0061", "arity"]
+
+[license]
+class = "permitted"
+spdx = "Alloy-Original"
+source_note = "Alloy-original live-repair benchmark fixture by arkadianet."
+
+[workspace]
+path = "workspace"
+package = "wrong-arity"
