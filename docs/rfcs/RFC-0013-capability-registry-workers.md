@@ -139,7 +139,7 @@ Each deferral names the seam that already carries it, so nothing needs redesigni
 | §12.1 MCP host is the sole tool bus | Workers reach tools only via `Arc<dyn ToolCaller>` (TL1) |
 | §12.2 `apply_patch` "not a second write stack" | EW1: the `EditWorker` never touches `EditEngine` directly |
 | §12.2 "Deleted for Alloy workers: `graph_query` MCP" | RFC-0011 SEC2; workers use `GraphViewHandle` in-process |
-| §12.3 permission model / "no raw bash" | `WorkerPermissions` mints only `FsRead` / `FsWrite`; never `Exec`, never `Network`, never `GitWrite` (PM3) |
+| §12.3 permission model / "no raw bash" | `WorkerPermissions` mints `FsRead` for reads and `FsRead + FsWrite + GitWrite + Exec(git)` for patches — the minimum RFC-0008's checkpointing actually needs; never `Network`, never a non-`git` `Exec` (PM3, PM3a) |
 | §6.4 replanning, single writer | Workers emit `FailureIr` only; RFC-0010 decides `ReplanRequired` (CW1) |
 | §20 R5 token explosion | Budget clamp before every completion (BG3); context engine owns truncation |
 | §21.1 checklist "≤4 LLM capabilities; registry kept — Pass" | RG1/RG2 + T2 |
@@ -165,9 +165,10 @@ Each amendment is **additive** and named so a reviewer can accept or reject it i
 | **AM-V2-3** | V2 §9.2 `CapabilityContext.prompt_pack: PromptPack` | Replaced by `context: Arc<dyn ContextEngine>` | A pre-assembled pack cannot be re-assembled after a tool result or a parse-repair turn, and cannot honour the *effective* tier chosen by RFC-0010's escalation. Workers assemble at each turn; PR1 keeps assembly out of worker hands. |
 | **AM-V2-4** | V2 §9.2 `CapabilityOutput` | Superseded by RFC-0010's `CapabilityOutcome`; its four fields are preserved inside the versioned payload (§8.1) | RFC-0010 merged first and owns the seam; re-introducing `CapabilityOutput` would fork the contract. `artifacts`, `confidence`, `metrics` are payload fields; `failure` is the `Failed` arm. |
 | **AM-V2-5** | V2 §9.2 `CapabilityContext.session/node` | Extended with `run`, `dag`, `attempt`, `kind`, `workspace_root`, `effective_tier`, `deadline`, `cost_meter` | All are present on RFC-0010's `CapabilityExecContext`; a worker cannot build a run-attributed `RoutingRequest` or a jail-relative tool call without them. (Supersedes the previous draft's narrower "RFC-0007 binding amendment".) |
-| **AM-0012-1** | RFC-0012 `ContextEngine` | **Discharged — already shipped.** The RFC-0012 implementation provides an inherent `DefaultContextEngine::assemble_with(req, AssembleInputs)` where `AssembleInputs { run, input: Option<NodeInputEnvelope>, diagnostics: Vec<DiagnosticEvent>, budget: Option<TokenBudget>, focus_paths: Vec<String> }` (`#[non_exhaustive]`, constructed via `default()` + mutation). Node-local material rides it: the predecessor payloads inside `input`'s `FromPredecessors` envelope, the diagnostics being repaired in `diagnostics`, edit targets in `focus_paths`. `assemble(req)` equals `assemble_with(req, AssembleInputs::default())` by construction. | Workers never hand-roll strings (PR1); no trait change needed. |
+| **AM-0012-1** | RFC-0012 `ContextEngine` | **Discharged — already shipped.** The RFC-0012 implementation provides an inherent `DefaultContextEngine::assemble_with(req, AssembleInputs)` where `AssembleInputs { run, input: Option<NodeInputEnvelope>, diagnostics: Vec<DiagnosticEvent>, budget: Option<TokenBudget>, focus_paths: Vec<String> }` (`#[non_exhaustive]`, constructed via `default()` + mutation). Node-local material rides it: the predecessor payloads inside `input`'s `FromPredecessors` envelope, the diagnostics being repaired in `diagnostics`, edit targets in `focus_paths`. `assemble(req)` equals `assemble_with(req, AssembleInputs::default())` by construction. **Residual pin:** an inherent method on `DefaultContextEngine` is not reachable through `Arc<dyn ContextEngine>`, which is what `WorkerDeps.context` holds. `assemble_with` MUST therefore also exist as an **additive, defaulted trait method** on `ContextEngine` whose default body delegates to `assemble(req)` (ignoring the inputs it cannot use), with `DefaultContextEngine` overriding it with the shipped inherent behaviour. Defaulted ⇒ no existing implementor breaks. | Workers never hand-roll strings (PR1); trait gains one defaulted method, no breaking change. |
 | **AM-0012-2** | RFC-0012 | **Discharged — already shipped.** `assemble*` returns the router `PromptPack` (`alloy_runtime::router` type); `ArtifactKind::PromptPack` remains an unrelated storage classification. | No change needed. |
 | **AM-0009-1** | RFC-0009 `TemplatePlanService` doc comment ("inject as `Arc<dyn PlanService>` into the PlanningWorker (RFC-0013)") | Doc-only correction: `PlanService` is injected into the **CLI / host**, never into a worker | PW2: a worker holding a `PlanService` could write topology from inside a node, breaking the single-writer rule (V2 §6.4, ADR F-03). The doc comment is updated in the same PR. |
+| **AM-0010-1** | RFC-0010 `CapabilityExecContext.cost_meter` doc comment ("Workers MUST record model usage here and MUST NOT construct their own meter") | Doc-only reframing: the first clause predates this RFC's metering analysis and is superseded by **BG2** — the *router bound to this meter* records the usage, so the worker's obligation is to **pass the meter to `RunRouterProvider`**, not to write to it. The second clause stands unchanged. The field itself is unchanged and remains meaningful for the seam's other consumers (budget snapshots for `RoutingRequest`, in-worker `remaining`-budget reads). | Following the comment literally double-counts: `add_worker_metrics` delegates to `add_model_usage`, so a worker write after a routed completion inflates tokens and USD. No struct change; only the comment and this framing. |
 | **AM-0007-1** | RFC-0007 | Confirmed, not changed: `TomlModelRouter` is the sole producer of `DecisionLog::record_model_call` and `SharedCostMeter::add_model_usage` for completions it performs | BG2 forbids workers from double-recording; `add_worker_metrics` delegates to `add_model_usage`, so a worker calling it after a routed completion would double-count tokens and USD. |
 
 **Explicitly not amended:** `CapabilityExecutor`, `CapabilityExecContext`, `CapabilityOutcome`, `CapabilityExecError`, `NodeExecRef`, `NodeInputEnvelope`, `NodeOutputEnvelope`, `FailureIr`, `WorkerMetrics`, `ToolCaller`, `ToolCall`, `ToolResult`, `PermissionToken`, `GraphViewHandle`, `ModelRouter`, `RoutingRequest`, `PromptPack`, `EditRequest`, `PatchSet`. RFC-0013 consumes all of these as-merged.
@@ -305,9 +306,15 @@ pub const CAPABILITY_CATALOG: [&str; 4] = ["planning", "repair", "edit", "review
 pub const MAX_LLM_CAPABILITIES: usize = 4;
 
 /// Trivial-resolve registry (V2 §9.2). Fails closed.
+///
+/// Owns the [`WorkerDeps`] as well as the implementations: the executor needs
+/// `deps.routers` at dispatch time (step X6) and holds only `Arc<CapabilityRegistry>`.
+/// A registry built without deps (`new`) is a **test/inspection** registry; an
+/// executor over one fails closed (RG9).
 #[derive(Default)]
 pub struct CapabilityRegistry {
     impls: BTreeMap<CapabilityId, Arc<dyn Capability>>,
+    deps: Option<WorkerDeps>,
 }
 
 /// Resolution hints. Empty in MVP; the seam for future scoring.
@@ -316,7 +323,15 @@ pub struct CapabilityRegistry {
 pub struct ResolveHints;
 
 impl CapabilityRegistry {
+    /// Deps-less registry: registration and `describe_all` work, dispatch does not (RG9).
     pub fn new() -> Self;
+
+    /// Attach the composition root's dependencies (RG9).
+    #[must_use]
+    pub fn with_deps(self, deps: WorkerDeps) -> Self;
+
+    /// Dependencies, when attached.
+    pub fn deps(&self) -> Option<&WorkerDeps>;
 
     /// Register one implementation. Fails closed on catalog violations.
     pub fn register(&mut self, cap: Arc<dyn Capability>) -> Result<(), RegError>;
@@ -334,7 +349,8 @@ impl CapabilityRegistry {
     /// Descriptors, sorted by id.
     pub fn describe_all(&self) -> Vec<CapabilityDescriptor>;
 
-    /// Day-1 production registry: all four MVP workers, in catalog order.
+    /// Day-1 production registry: all four MVP workers, in catalog order,
+    /// with `deps` attached (equivalent to `new().with_deps(deps)` + registration).
     pub fn mvp(deps: WorkerDeps) -> Result<Self, RegError>;
 }
 
@@ -353,6 +369,8 @@ pub enum RegError {
     KindMismatch { id: CapabilityId, kind: NodeKind },
     #[error("capability {id} declares unregistered tool selector")]
     UnknownToolSelector { id: CapabilityId },
+    #[error("registry has no worker dependencies attached")]
+    DepsMissing,
 }
 ```
 
@@ -360,6 +378,9 @@ pub enum RegError {
 
 ```rust
 /// Sole production `CapabilityExecutor` (RFC-0010 §3.8).
+///
+/// Reaches `WorkerDeps` (notably `routers`, needed at step X6) through the
+/// registry. Over a deps-less registry every dispatch fails closed (RG9).
 pub struct RegistryCapabilityExecutor {
     registry: Arc<CapabilityRegistry>,
 }
@@ -373,7 +394,7 @@ impl CapabilityExecutor for RegistryCapabilityExecutor {
 }
 ```
 
-The executor holds the registry only; the per-worker dependencies live inside each worker (constructor injection), which is what keeps `CapabilityExecContext` unchanged.
+The executor holds the registry only. Per-worker seams (`context`, `tools`, `perms`, `graph`, `artifacts`, `decisions`) are cloned into each worker at registration; the **process-level** seams the executor itself needs — `routers` above all, since only it can bind a router to `ctx.cost_meter` and `ctx.meta.run_id` at dispatch time — are read back from `registry.deps()` (RG9). Either way `CapabilityExecContext` stays unchanged.
 
 ### 3.5 `WorkerDeps` (composition-root injection)
 
@@ -535,14 +556,15 @@ pub struct WorkerConfig {
 
 | Rule | Statement |
 | --- | --- |
-| **RG1** | At most `MAX_LLM_CAPABILITIES` (4) capabilities may be registered. `register` returns `RegError::TooMany` on the fifth. |
+| **RG1** | At most `MAX_LLM_CAPABILITIES` (4) capabilities may be registered. `register` MUST check the count **first**, before the catalog, duplicate, kind, and selector checks, returning `RegError::TooMany` on the fifth attempt. Order matters for reachability: a closed 4-entry catalog with a duplicate check in front makes a fifth *distinct* registration impossible, so a catalog-first ordering would leave `TooMany` dead code that no test could reach. Checking the count first keeps the cap a real, testable guard (T2). |
 | **RG2** | `register` MUST reject any id not in `CAPABILITY_CATALOG` with `RegError::NotInCatalog`. The catalog is a compile-time array; adding an entry is an RFC amendment, not a config change. |
 | **RG3** | `Capability::accepts_kind` MUST agree with `dag::validate::expected_capability`: `planning↔Plan`, `repair↔Analyze`, `edit↔Edit`, `review↔Review`. `register` MUST verify agreement and return `RegError::KindMismatch` otherwise. A unit test asserts the two tables agree (T5). |
 | **RG4** | Duplicate registration of the same id MUST return `RegError::Duplicate`. Registration is not idempotent. |
 | **RG5** | `resolve` performs a map lookup; `hints` is ignored in MVP (**Stub**, V2 §9.2 "trivial resolve"). Unknown id ⇒ `RegError::Unknown`, never a default worker. |
-| **RG6** | `required_tools()` MUST only name selectors satisfiable by the registered builtins (`fs_read`, `cargo_check`, `cargo_test`, `apply_patch`). `register` returns `UnknownToolSelector` otherwise. No worker may declare `graph_query` or `bash` (SEC5). |
+| **RG6** | `required_tools()` MUST only name selectors from the **worker-satisfiable set `{ fs_read, apply_patch }`** — the strict intersection of the registered builtins with what SEC1/TL7 permit a worker to call. `cargo_check` and `cargo_test` are registered builtins but are **forbidden declarations** for a capability (verification is a runtime adapter), and `graph_query` / `bash` do not exist for workers at all (SEC5). Anything outside the pair is `RegError::UnknownToolSelector` at registration — a declaration-time failure, not a call-time one. |
 | **RG7** | `CapabilityRegistry::mvp` registers in `CAPABILITY_CATALOG` order and skips `review` when `WorkerConfig.enable_review == false`. It MUST return an error rather than partially register. |
 | **RG8** | The registry is immutable after construction: `RegistryCapabilityExecutor` holds `Arc<CapabilityRegistry>` and there is no interior mutability. Hot-reload is deferred. |
+| **RG9** | The registry owns `Option<WorkerDeps>`. `mvp(deps)` / `with_deps(deps)` attach it; `new()` leaves it `None` for tests and `alloy capabilities` inspection. An executor built over a deps-less registry MUST fail **closed** on every dispatch with `CapabilityExecError::Internal("registry has no worker dependencies")` (from `RegError::DepsMissing`) — never a silently degraded run, never a lazily constructed default router. |
 
 ### 4.2 Fail-closed resolution
 
@@ -557,7 +579,7 @@ Unused catalog ids that were never registered resolve to `RegError::Unknown`. Th
 | X3 | `registry.resolve(&ctx.capability, &ResolveHints)` | `Internal` (RG5) |
 | X4 | `cap.accepts_kind(ctx.kind)` | `Internal("capability/kind mismatch")` |
 | X5 | Check `ctx.cancellation` once before any work | `Cancelled` |
-| X6 | `routers.router_for(ctx.meta.run_id, &ctx.cost_meter)` | `Internal` (config) / `Worker` |
+| X6 | `registry.deps()` → `RegError::DepsMissing` when absent (RG9); then `deps.routers.router_for(ctx.meta.run_id, &ctx.cost_meter)` | `Internal("registry has no worker dependencies")` / `Internal` (config) / `Worker` |
 | X7 | Build `CapabilityContext` (§3.6) | infallible |
 | X8 | `tokio::select!` the worker future against `ctx.cancellation`; the worker itself is **not** given a timer (RFC-0010 owns the node deadline and already wraps dispatch in `tokio::time::timeout`) | `Cancelled` |
 | X9 | Return the worker's `CapabilityOutcome` verbatim | — |
@@ -575,7 +597,7 @@ The executor MUST NOT rewrite `failure.node` (RFC-0010 CE2 does that), MUST NOT 
 | `edit` | `[name(fs_read), name(apply_patch)]` | `WorkspaceWrite` | `true` |
 | `review` | `[name(fs_read)]` | `ReadOnly` | `true` |
 
-No worker declares `cargo_check` or `cargo_test`: verification is a runtime adapter (SEC1).
+Every entry is drawn from the worker-satisfiable set `{ fs_read, apply_patch }` (RG6). `cargo_check` / `cargo_test` are registered builtins but are **not** in that set: verification is a runtime adapter (SEC1, TL7), so declaring one is a registration error, not merely an unused declaration.
 
 ---
 
@@ -602,12 +624,13 @@ No worker declares `cargo_check` or `cargo_test`: verification is a runtime adap
 
 | Rule | Statement |
 | --- | --- |
-| **PR1** | Every `PromptPack` MUST come from `ContextEngine::assemble` / `assemble_with`. A worker MUST NOT construct `PromptPack { .. }` or mutate `pack.messages` except by **prepending** its single owned system instruction (§6.2). CI grep T6 checks `capabilities/**` for `PromptPack {` and `ChatMessage {` outside `prompt.rs`. |
+| **PR1** | Every `PromptPack` MUST come from `ContextEngine::assemble` / `assemble_with`. `prompt.rs` is the **only** module permitted to touch `pack.messages`, and only to (i) prepend the capability's owned system instruction (§6.2) and (ii) append fenced `User` feedback messages per PR6. Worker modules MUST NOT construct `PromptPack { .. }` or `ChatMessage { .. }`. CI grep T6 checks `capabilities/**` for both literals outside `prompt.rs`. |
 | **PR2** | The `AssembleRequest` MUST carry `session`, `node`, `capability`, and `token_budget = ctx.budget.max_input` (BG3). |
 | **PR3** | Node-local material (the predecessor envelope, the `FailureIr` being repaired, diagnostics, edit-target paths) MUST be passed through the shipped `AssembleInputs` fields (`input` / `diagnostics` / `focus_paths` — see AM-0012-1, discharged), never concatenated into a message body by the worker. |
 | **PR4** | `pack.citations` MUST be preserved unmodified through the completion and recorded (§13.2). A worker MUST NOT drop, rewrite, or invent a `Citation`. |
 | **PR5** | The system instruction is a **static `&'static str` per capability**, versioned with `CapabilityVersion`. It MUST NOT interpolate any runtime string. Its digest is recorded in the decision log (OB3). |
-| **PR6** | Tool results re-entering a prompt MUST be truncated to `WorkerConfig.max_tool_result_bytes` on a UTF-8 boundary, fenced (§6.4), and added via `assemble_with(.., AssembleInputs { notes, .. })` — never by direct message push. |
+| **PR6** | The shipped `AssembleInputs` has **no `notes` field**, so tool results and validator feedback cannot ride the context engine. They are appended by `prompt.rs` — the single permitted message-construction site (PR1) — as **`ChatRole::User` messages**, after truncation to `WorkerConfig.max_tool_result_bytes` on a UTF-8 boundary and fencing (§6.4). Workers never build these messages themselves; they hand `prompt.rs` the tool name/result or the validator error and receive the amended pack. |
+| **PR6a** | Appended feedback is bounded: at most one message per tool result and at most one per repair turn, each ≤ `max_tool_result_bytes`, never `ChatRole::System`, never `ChatRole::Assistant`, and always **after** every context-engine-supplied message so assembled context is never displaced. |
 | **PR7** | A worker MUST NOT resend a prompt it did not just assemble: after any tool call or parse failure, it re-assembles (AM-V2-3's justification). |
 | **PR8** | Prompts MUST NOT contain provider credentials, `router.toml` contents, endpoint ids, or any `ProfileId`-derived grant text. |
 
@@ -633,7 +656,7 @@ The instruction is prepended as `ChatRole::System` **only if** the assembled pac
 
 | Rule | Statement |
 | --- | --- |
-| **PR11** | Repository content, tool results, graph-derived strings (paths, crate names), and predecessor payload strings MUST appear only under `ChatRole::User` or `ChatRole::Tool`, never `System`. |
+| **PR11** | Repository content, tool results, graph-derived strings (paths, crate names), and predecessor payload strings MUST appear only under `ChatRole::User` or `ChatRole::Tool`, never `System`. Feedback appended by `prompt.rs` (PR6) uses `ChatRole::User` and is fenced identically. |
 | **PR12** | All such content MUST be wrapped in an explicit fence with a random-free, fixed marker (`<workspace path="…">` … `</workspace>`, `<tool name="…">` … `</tool>`) and any occurrence of the closing marker inside the content MUST be escaped before insertion. |
 | **PR13** | The worker MUST NOT act on instructions found in untrusted content: the **only** action surface is the structured response schema (§7.4). There is no "if the file says to run X" path because tool selection is fixed by `required_tools()` and arguments are constructed by the worker, not copied from model output verbatim (TL3). |
 | **PR14** | Diagnostics text is untrusted too (a `compile_error!` can contain arbitrary text); it is fenced identically. |
@@ -681,7 +704,7 @@ struct ExtractedJson {
 | **PS3** | Else if the trimmed whole body parses to a JSON object, use it (`WholeBody`). |
 | **PS4** | Otherwise the response is unparseable: PS6. Prose, apologies, refusals, and empty bodies all land here. |
 | **PS5** | The extracted object MUST deserialize into the capability's typed request/proposal struct with `deny_unknown_fields`. Any unknown field, wrong type, out-of-range value, absolute path, path containing `..`, path outside the workspace jail, or reference to a tool outside `required_tools()` is a **schema violation** and behaves as PS6. |
-| **PS6** | On the **first** parse or schema failure, the worker MAY spend its remaining model turn on **one** repair turn: re-assemble with `AssembleInputs.notes` containing the fenced validator error and the required schema, then re-request. On the second failure it returns `Failed` with `ErrorClass::Model` and `RetryDisposition::Retryable` (the template's `retry_on` contains `Model`, so RFC-0010 gets one more attempt with a fresh prompt). |
+| **PS6** | On the **first** parse or schema failure, the worker MAY spend its remaining model turn on **one** repair turn: re-assemble, then have `prompt.rs` append one fenced `User` message carrying the validator error and the required schema (PR6), then re-request. On the second failure it returns `Failed` with `ErrorClass::Model` and `RetryDisposition::Retryable` (the template's `retry_on` contains `Model`, so RFC-0010 gets one more attempt with a fresh prompt). |
 | **PS7** | A model **refusal** (a parseable object with `"refusal"` set, or a `finish_reason` of `content_filter` / `refusal`) is NOT retried in-worker: it returns `Failed` with `ErrorClass::Model` / `NonRetryable` and a note "model refused". |
 | **PS8** | `finish_reason == "length"` (truncated output) is `ErrorClass::Model` / `Retryable` with note "output truncated"; the worker does not attempt continuation in MVP. |
 | **PS9** | The worker MUST NOT log or embed the raw response body in a payload; only the extracted, validated structure, plus a digest of the raw body (OB4). |
@@ -701,6 +724,7 @@ Every success payload is a JSON object written verbatim into `NodeOutputEnvelope
 | **OC2** | Every payload carries `confidence: f32` in `[0.0, 1.0]` and `metrics: WorkerMetrics` (V2 §9.2's surviving fields, AM-V2-4). A worker that has no model-reported confidence MUST emit a deterministic value derived from its own checks, and MUST NOT fabricate a model confidence — `WorkerMetrics.confidence` stays `None` when the provider supplied none. |
 | **OC3** | Every payload carries `artifacts: Vec<ArtifactId>` (may be empty) — the V2 `CapabilityOutput.artifacts` field. |
 | **OC4** | Every payload carries `citations: Vec<Citation>` copied from the assembled `PromptPack` (PR4). |
+| **OC0** | Payload types live in `capabilities::payload` and are re-exported **only** at `alloy_runtime::capabilities::*`, never at the crate root: `EditAppliedPayload` collides with RFC-0008's crate-root export of the same name, and a root re-export would either shadow it or force a rename of a merged public type. Test T24. |
 | **OC5** | Payload structs are `#[serde(deny_unknown_fields)]` on the read side and derive both `Serialize` and `Deserialize`, so a successor can decode a predecessor's payload into a typed struct. |
 | **OC6** | No payload field may name topology (`follow_up_nodes`, `next_nodes`, `edges`, `nodes_to_add`) or graph mutation (SEC4, T3). |
 | **OC7** | Payloads are bounded: `notes`/`summary` strings ≤ 4 KiB, vectors ≤ 256 entries, total serialized payload ≤ 64 KiB. Oversize ⇒ truncate lists and set `truncated: true`. |
@@ -740,7 +764,9 @@ pub struct RepairStep {
 }
 ```
 
-### 8.3 `edit` — `EditAppliedPayload`
+### 8.3 `edit` — `capabilities::EditAppliedPayload`
+
+> **Name-collision pin.** RFC-0008 already exports an `EditAppliedPayload` at the `alloy_runtime` crate root (its edit-event wire shape). The capability payload keeps this name — it is the right name and the schemas are not interchangeable — but lives **module-qualified** as `alloy_runtime::capabilities::EditAppliedPayload` and MUST NOT be re-exported at the crate root. Call sites disambiguate with the module path or a local alias (`use alloy_runtime::capabilities::EditAppliedPayload as EditNodePayload;`). A unit test asserts both types exist and neither shadows the other at the root.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -902,13 +928,13 @@ Four registered; three make model calls (`repair`, `edit`, `review`). `MAX_LLM_C
 | Rule | Statement |
 | --- | --- |
 | **BG1** | `RunRouterProvider::router_for` MUST bind the router to the `SharedCostMeter` the scheduler passed in `ctx.cost_meter` and to `ctx.run`. A worker MUST assert (debug + unit test) that the meter it received is the one the router was built with; a mismatch is `CapabilityExecError::Internal`. |
-| **BG2** | Workers MUST NOT call `SharedCostMeter::add_model_usage` or `add_worker_metrics`. `add_worker_metrics` delegates to `add_model_usage`, so calling it after a routed completion double-counts tokens and USD. Metering happens once, inside RFC-0007. CI grep T9; behavioural test T14. |
+| **BG2** | Workers MUST NOT call `SharedCostMeter::add_model_usage` or `add_worker_metrics`. `add_worker_metrics` delegates to `add_model_usage`, so calling it after a routed completion double-counts tokens and USD. Metering happens once, inside RFC-0007. **Note:** the merged `CapabilityExecContext.cost_meter` doc comment says "Workers MUST record model usage here"; it predates this analysis and is reframed by **AM-0010-1** — the worker's obligation is to hand the meter to `RunRouterProvider` (BG1), and the field stays for the seam's other consumers (budget snapshots, remaining-budget reads). CI grep T9; behavioural test T14. |
 | **BG3** | `AssembleRequest.token_budget = ctx.budget.max_input`. The worker MUST NOT raise it. Output ceilings are the endpoint's / provider's; MVP does not set `max_output_tokens` (RFC-0007 leaves it `None`). |
 | **BG4** | `RouterError::BudgetDenied(check)` ⇒ `Failed` with `ErrorClass::Budget` / `NonRetryable` and a note naming the exhausted ceiling. The worker MUST NOT retry or downgrade tier to fit. |
 | **BG5** | Before each model or tool call the worker checks `ctx.remaining()`; if it is zero or the operation would obviously exceed it, the worker returns `Failed` with `ErrorClass::Timeout` / `Retryable` and note "node deadline reached before <op>". RFC-0010 also enforces the deadline externally; this is cooperative, not authoritative. |
 | **BG6** | On `ctx.cancel` firing, the worker returns `Err(CapabilityExecError::Cancelled)` promptly, dropping any in-flight tool future (RFC-0006 cancellation is by drop). It MUST NOT emit a `Failed` outcome for cancellation. |
 | **BG7** | `WorkerMetrics.duration_ms` is measured across the whole attempt; `tool_calls` counts every `ToolCaller::call`; `cache_hits` is `0` in MVP (no worker-level cache). `model_tier_used` is `ctx.effective_tier`; `provider_id` comes from the routed endpoint. |
-| **BG8** | On a soft failure, `WorkerMetrics.error_class` MUST equal `FailureIr.error_class`. |
+| **BG8** | On a **soft failure no `WorkerMetrics` value is emitted at all**: `FailureIr` has no metrics field and there is no payload to carry one, so CW7's "discard after logging" is the whole story. The attempt's classification rides the `worker_attempt` decision metadata (`error_class`, `model_turns`, `tool_calls`, OB3) and the `worker.execute` span (OB2). A worker MUST NOT invent a side channel — no metrics artifact, no session event, no meter write (BG2) — to smuggle `WorkerMetrics` out of a failed attempt. |
 
 ---
 
@@ -922,7 +948,8 @@ Four registered; three make model calls (`repair`, `edit`, `review`). `MAX_LLM_C
 pub enum WorkerToolClass {
     /// `fs_read` under the workspace jail.
     Read,
-    /// `apply_patch` write grant.
+    /// `apply_patch`: workspace write **plus** the git authority RFC-0008's
+    /// checkpoint borrows from the caller (PM3).
     Patch,
 }
 
@@ -937,8 +964,9 @@ pub trait WorkerPermissions: Send + Sync {
     ) -> Result<PermissionToken, AdapterError>;
 }
 
-/// Day-1 impl: resolves `Session.profile` and mints workspace-scoped globs.
-pub struct SessionWorkerPermissions { /* sessions, read_glob, write_glob */ }
+/// Day-1 impl: resolves `Session.profile` and mints workspace-scoped globs,
+/// plus the git argv glob the `Patch` class needs (PM3).
+pub struct SessionWorkerPermissions { /* sessions, read_glob, write_glob, git_args_glob */ }
 ```
 
 ### 11.2 Rules
@@ -947,7 +975,8 @@ pub struct SessionWorkerPermissions { /* sessions, read_glob, write_glob */ }
 | --- | --- |
 | **PM1** | A worker obtains every `PermissionToken` from `ctx.perms.token_for(&ctx.exec_ref(), class)`. |
 | **PM2** | A worker MUST NOT construct `PermissionToken { .. }` or `Grant::*` literals. CI grep T10 (`capabilities/**` excluding `perms.rs`). |
-| **PM3** | `SessionWorkerPermissions` mints only `Grant::FsRead(Glob)` for `Read` and `Grant::FsWrite(Glob)` for `Patch`. It MUST NEVER mint `Grant::Exec`, `Grant::Network`, or `Grant::GitWrite` (V2 §12.3 "no raw bash"; checkpoint creation is the patch backend's own business under RFC-0008). CI grep T11. |
+| **PM3** | `SessionWorkerPermissions` mints `Grant::FsRead(Glob)` for `Read`, and for `Patch` the **exact triple** `FsRead(Glob) + FsWrite(Glob) + GitWrite + Exec(ExecAllow { binary: "git", args_glob: Some(..) })`. A narrower `Patch` token cannot apply a patch at all: merged RFC-0008/0006 authz requires `GitWrite` on any mutating `apply_patch`, and `GitEditEngine`'s pre-apply checkpoint runs `git` **through the sandbox with the caller's token**, so the caller must hold `Exec(git)`. The earlier claim that "checkpoint creation is the backend's own business" was wrong: the backend borrows the worker's authority, it does not carry its own. |
+| **PM3a** | The `Exec` grant is **git-only**: `binary == "git"` with an args glob scoped to the checkpoint commands RFC-0008 issues. `SessionWorkerPermissions` MUST NEVER mint `Grant::Network`, and MUST NEVER mint an `Exec` grant for any other binary (no `cargo`, no `sh`, no `bash` — V2 §12.3 "no raw bash"). The `Read` class MUST NEVER carry `Exec`, `GitWrite`, or `FsWrite`. CI grep T11 asserts the two class shapes exactly. |
 | **PM4** | Globs are derived from `Session.workspace_root` and are jail-relative; a missing session row or an unconfigured glob is `AdapterError::PermissionDenied`, never `Internal` (mirrors `SessionVerifyPermissions`). |
 | **PM5** | Tokens are minted **per tool call**, not cached across calls or attempts (CW3). |
 | **PM6** | `ToolCallerError::PermissionDenied` / `TokenExpired` / `InvalidToken` MUST surface as `ErrorClass::Tool` / `NonRetryable` — a denial is a policy answer, not a transient fault. |
@@ -1027,7 +1056,7 @@ Additional rules:
 | **SEC5** | No worker may declare or call `graph_query` or `bash` (RFC-0011 SEC2, V2 §12.3 "no raw bash"). | T18 |
 | **SEC6** | Capability count is capped at 4 and the catalog is closed (RG1/RG2). | T2 |
 | **SEC7** | Untrusted content is fenced and role-separated (PR11–PR15); the model's only action surface is the validated response schema. | T19, T22 |
-| **SEC8** | Workers never mint `Exec` / `Network` / `GitWrite` grants (PM3). | T11 |
+| **SEC8** | Workers never mint a grant themselves (PM2), and `SessionWorkerPermissions` mints exactly two shapes: `Read` = `FsRead` only; `Patch` = `FsRead + FsWrite + GitWrite + Exec(git)`. Never `Network`; never `Exec` for a non-`git` binary (PM3, PM3a). | T11 |
 | **SEC9** | No `unsafe` anywhere in scope; `alloy-runtime` already carries `#![forbid(unsafe_code)]`. | compiler |
 
 ### 14.2 Crate dependencies
@@ -1047,10 +1076,11 @@ Additional rules:
 | ID | Test | Covers |
 | --- | --- | --- |
 | **T1** | `registry_resolves_registered_capability` / `registry_unknown_id_fails_closed` | RG5 |
-| **T2** | `registry_rejects_fifth_capability_and_non_catalog_id` | RG1, RG2, SEC6 |
+| **T2** | `registry_rejects_fifth_capability_before_catalog_check` — registers four, then a fifth *catalog-valid duplicate-id* impl and asserts `TooMany` (not `Duplicate`), proving the count check runs first and is reachable; plus `registry_rejects_non_catalog_id` | RG1, RG2, SEC6 |
 | **T5** | `catalog_kind_map_matches_dag_validate_expected_capability` | RG3 |
 | — | `registry_rejects_duplicate_registration` | RG4 |
-| — | `registry_rejects_unknown_tool_selector` | RG6 |
+| — | `registry_rejects_cargo_check_and_cargo_test_selectors` — a registered builtin outside `{fs_read, apply_patch}` is still `UnknownToolSelector` | RG6, SEC1 |
+| — | `executor_over_deps_less_registry_fails_closed_internal` | RG9 |
 | — | `mvp_registry_registers_four_or_three_with_review_disabled` | RG7 |
 | — | `executor_maps_unknown_capability_to_internal` | §4.2 |
 | — | `executor_rejects_attempt_mismatch_and_bad_envelope_schema` | X1, X2 |
@@ -1064,8 +1094,11 @@ Additional rules:
 | — | `unified_diff_parse_rejects_rename_binary_and_dotdot_paths` | EW4 |
 | — | `patch_over_max_argument_bytes_is_internal_non_retryable` | EW5, FM7 |
 | — | `payload_roundtrip_is_serde_stable_for_all_four_schemas` | OC1–OC5 |
+| **T24** | `capability_payloads_are_module_qualified_not_root_reexported` — `alloy_runtime::EditAppliedPayload` still resolves to RFC-0008's type while `alloy_runtime::capabilities::EditAppliedPayload` resolves to this one | OC0 |
 | — | `payload_truncation_sets_truncated_and_bounds_size` | OC7 |
-| — | `session_worker_permissions_mints_only_fs_grants` | PM3 |
+| — | `session_worker_permissions_read_class_is_fs_read_only` | PM3, PM3a |
+| — | `session_worker_permissions_patch_class_mints_fs_read_write_gitwrite_and_exec_git` | PM3 |
+| — | `session_worker_permissions_never_mints_network_or_non_git_exec` | PM3a, SEC8 |
 | — | `session_worker_permissions_missing_session_is_permission_denied` | PM4 |
 | — | `failure_mapping_table_is_total` (one case per FM row) | §12 |
 
@@ -1074,6 +1107,7 @@ Additional rules:
 | ID | Test | Covers |
 | --- | --- | --- |
 | **T14** | `worker_never_adds_to_the_cost_meter_router_does` — snapshot before/after shows exactly one `model_calls` increment per completion | BG2 |
+| — | `soft_failure_emits_no_worker_metrics_only_decision_metadata` | BG8, CW7 |
 | — | `repair_worker_produces_plan_from_predecessor_failure_ir` | RW1, RW2 |
 | — | `repair_worker_tolerates_empty_graph_view` (with `GraphViewHandle::null()`) | RW4, CX7 |
 | — | `repair_worker_rejects_diff_in_rationale` | RW5 |
@@ -1106,7 +1140,7 @@ Mechanised as ordinary `#[test]`s over source text, matching RFC-0010's and RFC-
 | **T8** | `pw2_no_plan_service_in_capabilities` | PW2 |
 | **T9** | `bg2_no_meter_writes_in_capabilities` — no `add_model_usage` / `add_worker_metrics` | BG2 |
 | **T10** | `pm2_no_permission_token_literals_outside_perms` | PM2 |
-| **T11** | `sec8_no_exec_network_gitwrite_grants` | PM3, SEC8 |
+| **T11** | `sec8_grant_shapes_are_exactly_two` — `capabilities/**` contains no `Grant::Network`, no `ExecAllow { binary: … }` whose binary is not `"git"`, and grant construction appears only in `perms.rs` | PM3, PM3a, SEC8 |
 | **T13** | `sec1_no_verify_capability_names` — no `cargo_check` / `cargo_test` / `verify` / `gate` identifiers under `capabilities/**` (excluding rule doc comments and negative assertions) | SEC1 |
 | **T15** | `ob1_no_model_or_tool_call_records_in_capabilities` | OB1 |
 | **T16** | `sec2_no_direct_io_in_capabilities` — no `std::fs`, `std::process`, `tokio::fs`, `tokio::process`, `Command`, `std::env::var` | SEC2 |
@@ -1116,13 +1150,15 @@ Mechanised as ordinary `#[test]`s over source text, matching RFC-0010's and RFC-
 
 ### 15.4 Cross-subsystem end-to-end (`crates/alloy-tools/tests/scheduler_repair_e2e.rs`, extended)
 
-**T20 — `repair_local_diagnostic_e2e_with_scripted_provider`.** The existing RFC-0010 e2e already runs real SQLite storage, a real `LinearScheduler`, a real MCP host with `cargo_check` inside a Landlock jail, and a real gate approval — with a *stub* `CapabilityExecutor` standing in for RFC-0013. This RFC replaces that stub with the real one:
+**T20 — `repair_local_diagnostic_e2e_with_scripted_provider`.** The existing RFC-0010 e2e already runs real SQLite storage, a real `LinearScheduler`, a real MCP host with `cargo_check` inside a Landlock jail, and a real gate approval — with a *stub* `CapabilityExecutor` standing in for RFC-0013. This RFC replaces that stub with the real one.
+
+**Generation framing (pin).** The inherited fixture is a two-generation trace: generation 1's `verify` soft-fails against the broken crate, and the test plays the role of RFC-0009's auto-replan to produce generation 2. The RFC-0013 assertions — including "exactly two `model_calls`" — are stated over **generation 2 only**. Generation 1 therefore MUST NOT reach an LLM worker: the test keeps the inherited **inert stub executor** for generation 1 (it fabricates the gen-1 `analyze`/`edit` outputs that set up the failing verify) and swaps in `RegistryCapabilityExecutor` for generation 2, resetting the meter/decision-log expectations at the boundary. Wiring both generations to the real workers would mean four completions and a scripted fixture that has to "fail" on purpose — measuring the harness, not the workers.
 
 1. Build `ScriptedProvider` (`alloy-eval`, dev-dependency) with two keyed responses: a `RepairPlanPayload`-shaped JSON for the `repair` turn, and a `PatchProposal` carrying the unified diff that fixes the fixture crate for the `edit` turn.
 2. Build `ProcessRunRouterProvider` over a `RouterConfig` whose `[capability_tiers]` maps `repair`/`edit` to `standard`, with the scripted provider and the run's `SharedCostMeter`.
 3. Build `WorkerDeps` with the real `ToolHandleToolCaller`, `SessionWorkerPermissions`, `GraphViewHandle::null()`, a thin `ContextEngine` (RFC-0012), the real artifact store, and a `RecordingDecisionLog`.
 4. Inject `RegistryCapabilityExecutor::new(Arc::new(CapabilityRegistry::mvp(deps)?))` into `LinearSchedulerDeps.capabilities`.
-5. Assert: the DAG reaches `Succeeded`; every node has `output_ref`; `analyze`'s payload decodes as `RepairPlanPayload`; `edit`'s decodes as `EditAppliedPayload` with non-empty `files_touched` and a `patch_artifact`; the fixture crate now compiles (the real `cargo_check` passes in generation 2); the gate was approved through the real `RunController`; the cost meter shows exactly **two** `model_calls`; the decision log contains two `worker_attempt` records and two `ModelCall` records and **no duplicates**.
+5. Assert, **over generation 2**: the DAG reaches `Succeeded`; every node has `output_ref`; `analyze`'s payload decodes as `RepairPlanPayload`; `edit`'s decodes as `capabilities::EditAppliedPayload` with non-empty `files_touched` and a `patch_artifact`; the fixture crate now compiles (the real `cargo_check` passes); the gate was approved through the real `RunController`; generation 2 contributes exactly **two** `model_calls` to the meter (generation 1 contributes zero — it never reached an LLM worker); the decision log gains exactly two `worker_attempt` records and two `ModelCall` records, with **no duplicates**.
 
 Skip policy mirrors the existing file: absent a working Landlock jail the test skips unless `ALLOY_REQUIRE_LANDLOCK=1`.
 
@@ -1158,23 +1194,26 @@ Registry + four workers; `repair` and `edit` exercised end-to-end; `review` and 
 - [ ] 1. `alloy-runtime::capabilities` exists with the module layout of §3.1 and compiles under `#![forbid(unsafe_code)]` / `#![deny(missing_docs)]`.
 - [ ] 2. `Capability`, `CapabilityDescriptor`, `CapabilityVersion`, `SideEffectClass`, `ResolveHints`, `RegError` match §3.2–§3.3.
 - [ ] 3. `CAPABILITY_CATALOG == ["planning", "repair", "edit", "review"]` and `MAX_LLM_CAPABILITIES == 4` (**RG1**, **RG2**, T2).
-- [ ] 4. `register` rejects a fifth capability with `RegError::TooMany` (**RG1**).
+- [ ] 4. `register` checks the count **before** the catalog/duplicate/kind/selector checks and rejects a fifth registration with `RegError::TooMany`, proven reachable by T2 (**RG1**).
 - [ ] 5. `register` rejects a non-catalog id with `RegError::NotInCatalog` (**RG2**).
 - [ ] 6. `register` rejects a duplicate id with `RegError::Duplicate` (**RG4**).
 - [ ] 7. `accepts_kind` agrees with `dag::validate::expected_capability` for all four ids, asserted by a test (**RG3**, T5).
-- [ ] 8. `register` rejects a selector outside the four registered builtins (**RG6**).
+- [ ] 8. `register` rejects any selector outside `{ fs_read, apply_patch }`, including the registered-but-forbidden `cargo_check` / `cargo_test` (**RG6**, **SEC1**).
+- [ ] 8a. The registry carries `Option<WorkerDeps>`; an executor over a deps-less registry fails closed with `Internal` on every dispatch (**RG9**).
 - [ ] 9. `resolve` on an unregistered id returns `RegError::Unknown`; no default worker is substituted (**RG5**).
 - [ ] 10. `CapabilityRegistry::mvp` registers in catalog order and honours `enable_review` (**RG7**).
 - [ ] 11. `RegistryCapabilityExecutor` implements RFC-0010's `CapabilityExecutor` with **no change** to `CapabilityExecutor`, `CapabilityExecContext`, `CapabilityOutcome`, or `CapabilityExecError`.
 - [ ] 12. The executor performs steps X1–X9 in order, including the attempt and envelope-schema assertions.
 - [ ] 13. The executor never retries, never rewrites `failure.node`, and never transforms a `Succeeded` payload.
-- [ ] 14. `WorkerDeps` carries every seam of §3.5 and is `Clone`.
+- [ ] 14. `WorkerDeps` carries every seam of §3.5, is `Clone`, and is reachable from the executor via `registry.deps()` (**RG9**).
 - [ ] 15. `CapabilityContext` carries every field of §3.6, including `run`, `attempt`, `effective_tier`, `deadline`, and `cost_meter`.
 - [ ] 16. `RunRouterProvider` memoizes one router per `RunId` and binds it to the passed `SharedCostMeter` (**BG1**).
 - [ ] 17. A router/meter mismatch is detected and reported as `CapabilityExecError::Internal`.
 - [ ] 18. Every prompt originates from `ContextEngine::assemble` / `assemble_with`; no `PromptPack` literal exists outside `prompt.rs` (**PR1**, T6).
 - [ ] 19. `AssembleRequest.token_budget == ctx.budget.max_input` (**PR2**, **BG3**).
 - [ ] 20. Node-local material reaches the prompt only via the shipped `AssembleInputs` fields (**PR3**).
+- [ ] 20a. `assemble_with` is reachable through `Arc<dyn ContextEngine>` as a **defaulted** trait method (default delegates to `assemble`), overridden by `DefaultContextEngine`; no existing implementor breaks (**AM-0012-1** residual pin).
+- [ ] 20b. Tool results and validator feedback are appended by `prompt.rs` as bounded, fenced `ChatRole::User` messages after the context-engine messages — never `System`, never a nonexistent `AssembleInputs.notes` (**PR6**, **PR6a**).
 - [ ] 21. `PromptPack.citations` are preserved unmodified into both the decision record and the success payload (**PR4**, **OC4**, **OB5**).
 - [ ] 22. Each LLM worker owns exactly one static system instruction with no runtime interpolation (**PR5**).
 - [ ] 23. Untrusted content appears only under `User`/`Tool` roles and is fenced with escaped terminators (**PR11**, **PR12**, T19).
@@ -1187,6 +1226,7 @@ Registry + four workers; `repair` and `edit` exercised end-to-end; `review` and 
 - [ ] 30. Raw model bodies never appear in payloads, notes, or logs; only a digest is recorded (**PS9**, **OB4**).
 - [ ] 31. All four payload schemas carry `schema_version: 1`, `capability`, `confidence`, `citations`, `artifacts`, `metrics` (**OC1**–**OC4**).
 - [ ] 32. Payload structs round-trip through serde and reject unknown fields (**OC5**).
+- [ ] 32a. Capability payloads are exported only under `alloy_runtime::capabilities`; RFC-0008's crate-root `EditAppliedPayload` is neither shadowed nor renamed (**OC0**, T24).
 - [ ] 33. No payload field names topology or graph mutation (**OC6**, **SEC4**, T3).
 - [ ] 34. Payload size bounds are enforced and set `truncated` (**OC7**).
 - [ ] 35. `RepairWorker` decodes goal and `FromPredecessors` inputs, dedupes diagnostics by fingerprint, and caps at 32 (**RW1**, **RW2**).
@@ -1205,9 +1245,9 @@ Registry + four workers; `repair` and `edit` exercised end-to-end; `review` and 
 - [ ] 48. No worker calls `add_model_usage` or `add_worker_metrics`; a full run shows exactly one meter increment per completion (**BG2**, T9, T14).
 - [ ] 49. `BudgetDenied` is `Budget` / `NonRetryable` and is never worked around by tier downgrade (**BG4**).
 - [ ] 50. Deadline exhaustion in-worker is `Timeout` / `Retryable`; cancellation returns `Err(Cancelled)` and never a `Failed` outcome (**BG5**, **BG6**).
-- [ ] 51. `WorkerMetrics` fields are populated per **BG7**, and `error_class` matches `FailureIr.error_class` on failure (**BG8**).
+- [ ] 51. `WorkerMetrics` fields are populated per **BG7** on success; on a soft failure no `WorkerMetrics` is emitted anywhere and the classification appears only in the `worker_attempt` metadata and span (**BG8**, **CW7**).
 - [ ] 52. Every `PermissionToken` comes from `WorkerPermissions`; no literal exists outside `perms.rs` (**PM1**, **PM2**, T10).
-- [ ] 53. `SessionWorkerPermissions` mints only `FsRead`/`FsWrite`, never `Exec`/`Network`/`GitWrite` (**PM3**, **SEC8**, T11).
+- [ ] 53. `SessionWorkerPermissions` mints exactly two shapes — `Read` = `FsRead`; `Patch` = `FsRead + FsWrite + GitWrite + Exec(git)` — and never `Network` or a non-`git` `Exec` (**PM3**, **PM3a**, **SEC8**, T11).
 - [ ] 54. A missing session row or unconfigured glob is `PermissionDenied`, not `Internal` (**PM4**).
 - [ ] 55. Tokens are minted per call, never cached across calls or attempts (**PM5**, **CW3**).
 - [ ] 56. All tool calls carry attribution and a `{node}:{attempt}:{seq}` call id (**TL2**).
@@ -1222,9 +1262,9 @@ Registry + four workers; `repair` and `edit` exercised end-to-end; `review` and 
 - [ ] 65. No worker declares or calls `graph_query` or `bash` (**SEC5**, T18).
 - [ ] 66. No new external dependency is added to `alloy-runtime`; `semver` is not introduced (**C1**).
 - [ ] 67. `alloy-runtime` still does not depend on `alloy-tools` / `alloy-index` / `alloy-eval` (**C2**).
-- [ ] 68. `LinearSchedulerDeps.capabilities` is `RegistryCapabilityExecutor` in the production composition root; `UnavailableCapabilityExecutor` survives only in tests and pre-wiring defaults.
+- [ ] 68. `LinearSchedulerDeps.capabilities` is `RegistryCapabilityExecutor` in the production composition root; `UnavailableCapabilityExecutor` survives only in tests and pre-wiring defaults. **Discharged by RFC-0015**, which owns that composition root (Appendix C.1): this AC is **vacuously true** while no production wiring exists in-tree, and RFC-0013's evidence is the e2e wiring (T20) plus the fact that `RegistryCapabilityExecutor` is the only `CapabilityExecutor` impl this RFC ships. Reviewers MUST check the box on that basis and re-verify it as an RFC-0015 gate.
 - [ ] 69. The end-to-end `repair_local_diagnostic` trace passes offline with `ScriptedProvider`, leaving the fixture crate compiling and the DAG `Succeeded` (**T20**).
-- [ ] 70. The e2e asserts exactly two `model_calls` on the meter and no duplicated decision records (**T20**, **BG2**).
+- [ ] 70. The e2e asserts exactly two `model_calls` **contributed by generation 2** (generation 1 keeps the inert stub executor and contributes none) and no duplicated decision records (**T20**, **BG2**).
 - [ ] 71. Two identical scripted runs produce payloads equal after masking ids and durations (**T21**).
 - [ ] 72. No `TODO`, `todo!()`, `unimplemented!()`, or placeholder implementation remains in scope; the only inert surfaces are `ResolveHints` (RG5) and the registered-but-unreached `review` / `planning` workers, each named by a rule.
 
@@ -1247,7 +1287,7 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 | 9 | No TODO / placeholders | **None** — AC 72 |
 | 10 | Code review | **Approved** |
 | 11 | Security rules | **SEC1–SEC9** each have a passing grep or unit test |
-| 12 | Amendment review | Each of AM-V2-1…5, AM-0009-1, AM-0007-1 explicitly accepted in review (AM-0012-1/2 are discharged by the shipped RFC-0012 implementation) |
+| 12 | Amendment review | Each of AM-V2-1…5, AM-0009-1, AM-0010-1, AM-0007-1 explicitly accepted in review; AM-0012-1/2 are discharged by the shipped RFC-0012 implementation apart from AM-0012-1's residual defaulted-trait-method pin, which is reviewed with them |
 
 ---
 
@@ -1293,7 +1333,7 @@ Fixture: a crate whose `lib.rs` holds one E0502-class borrow error. Generation 1
 | 2 | `RegistryCapabilityExecutor` | X1–X7: resolve `repair`, `accepts_kind(Analyze)`, `router_for(run, meter)`, build `CapabilityContext` | — |
 | 3 | `RepairWorker` | Loads the predecessor artifact → `FailureIr` with 1 diagnostic (`E0502`, `src/lib.rs:14`) | 1 diagnostic after dedupe |
 | 4 | `RepairWorker` | `graph.query(GraphQuery::Diagnostics { crate_id: None, since: None })` | Empty view (M7 thin) — not an error |
-| 5 | `RepairWorker` | `context.assemble_with(AssembleRequest { capability: "repair", token_budget: 32768, .. }, AssembleInputs { diagnostics, predecessor_payloads, notes: [] })` | `PromptPack` with 3 citations (conversation, `src/lib.rs`, diagnostics) |
+| 5 | `RepairWorker` | `context.assemble_with(AssembleRequest { capability: "repair", token_budget: 32768, .. }, AssembleInputs { run, input: Some(envelope), diagnostics, budget, focus_paths: [] })` | `PromptPack` with 3 citations (conversation, `src/lib.rs`, diagnostics) |
 | 6 | `RepairWorker` | Prepends `REPAIR_SYSTEM`; `router.route(RoutingRequest { capability: "repair", requires_structured_output: true, .. })` | `RoutedModel` on the `standard` endpoint |
 | 7 | Router | `complete` → provider → `ModelCallRecord` appended, `add_model_usage(Standard, 2481, 402, usd)` | Meter: 1 model call |
 | 8 | `RepairWorker` | PS1: `structured` object present → validates as the repair schema | `target_files: ["src/lib.rs"]`, 2 steps |
@@ -1301,10 +1341,10 @@ Fixture: a crate whose `lib.rs` holds one E0502-class borrow error. Generation 1
 | 10 | Scheduler | C4: puts `NodeOutputEnvelope`, sets `output_ref`, `Analyze → Succeeded` | — |
 | 11 | Scheduler | L11/C5: assembles `edit`'s input as `FromPredecessors { preds: [analyze] }` | — |
 | 12 | `EditWorker` | Decodes the predecessor payload as `RepairPlanPayload` (EW2) | plan in hand |
-| 13 | `EditWorker` | `assemble_with(.., AssembleInputs { predecessor_payloads: [plan], .. })` + `EDIT_SYSTEM`; route + complete | Meter: 2 model calls |
+| 13 | `EditWorker` | `assemble_with(.., AssembleInputs { input: Some(envelope carrying the plan), focus_paths: ["src/lib.rs"], .. })` + `EDIT_SYSTEM`; route + complete | Meter: 2 model calls (generation 2) |
 | 14 | `EditWorker` | PS1 → `PatchProposal { patch: "<unified diff>", .. }`; local parse → `PatchSet` with 1 `Modify`, 1 hunk, 9 lines | validated |
 | 15 | `EditWorker` | `artifacts.put(ArtifactKind::Patch, canonical PatchSet JSON)` | `patch_artifact` |
-| 16 | `EditWorker` | `perms.token_for(exec_ref, Patch)` → `FsWrite("<ws>/**")`; `tools.call(apply_patch { patch, dry_run: true })` | `ok`, `files_touched: ["src/lib.rs"]` |
+| 16 | `EditWorker` | `perms.token_for(exec_ref, Patch)` → `FsRead("<ws>/**") + FsWrite("<ws>/**") + GitWrite + Exec(git)` (PM3); `tools.call(apply_patch { patch, dry_run: true })` | `ok`, `files_touched: ["src/lib.rs"]` |
 | 17 | `EditWorker` | `tools.call(apply_patch { patch, dry_run: false })` | `ok`, `transaction_id: Some(..)` |
 | 18 | `EditWorker` | Emits `EditAppliedPayload { files_touched, transaction_id, patch_artifact, hunk_count: 1, dry_run: false, .. }` | `Succeeded` |
 | 19 | Scheduler | `VerifyCompile` → real `cargo_check` in the Landlock jail | exit 0 |
@@ -1334,17 +1374,17 @@ Fixture: a crate whose `lib.rs` holds one E0502-class borrow error. Generation 1
 | §12.1 host is sole tool bus | TL1 | RFC-0010 M5 grep |
 | §12.2 `apply_patch` "not a second write stack" | EW1 | T7 |
 | §12.2 no worker `graph_query` | SEC5 | T18 |
-| §12.3 permissions / no raw bash | PM3, SEC8 | T11 |
+| §12.3 permissions / no raw bash | PM3, PM3a, SEC8 (git-only `Exec`; no `Network`) | T11 |
 | §6.4 single topology writer | CW1, PW2 | T8 |
 | §20 R5 token explosion | BG3 | AC 19 |
 | §21.1 "≤4 LLM capabilities; registry kept — Pass" | RG1, RG2 | T2 |
 
 ## Appendix C — Contract for RFC-0015 (CLI, profiles & config)
 
-1. RFC-0015 owns the composition root of §3.8 and MUST construct `WorkerDeps` exactly once per process, injecting `RegistryCapabilityExecutor` into `LinearSchedulerDeps.capabilities`. `UnavailableCapabilityExecutor` MUST NOT appear on any production path.
+1. RFC-0015 owns the composition root of §3.8 and MUST construct `WorkerDeps` exactly once per process, attach it to the registry (`CapabilityRegistry::mvp(deps)`, RG9), and inject `RegistryCapabilityExecutor` into `LinearSchedulerDeps.capabilities`. `UnavailableCapabilityExecutor` MUST NOT appear on any production path. **This discharges RFC-0013 AC 68**, which is vacuous until RFC-0015 lands and MUST be re-verified as an RFC-0015 merge gate.
 2. RFC-0015 MUST source `WorkerConfig` from the active profile and MUST document every knob in `example.env` / profile docs; it MUST NEVER write `.env`.
 3. RFC-0015 owns `router.toml` loading and MUST ensure `[capability_tiers]` covers `repair`, `edit`, and `review`; a missing entry falls back to RFC-0007's default tier and is surfaced as a warning, not a crash.
-4. RFC-0015 owns the read/write glob strings passed to `SessionWorkerPermissions` and MUST scope them to the session's `workspace_root`. It MUST NOT configure `Exec`, `Network`, or `GitWrite` grants for workers (SEC8).
+4. RFC-0015 owns the read/write glob strings and the `git` argv glob passed to `SessionWorkerPermissions`, and MUST scope them to the session's `workspace_root`. It MUST NOT widen the `Patch` class beyond `FsRead + FsWrite + GitWrite + Exec(git)`, and MUST NOT configure `Network` or a non-`git` `Exec` grant for workers (PM3a, SEC8).
 5. RFC-0015 owns `RunRouterProvider::release(run)` after a run's outcome is surfaced, alongside `ProcessCostMeterFactory::release` (RFC-0010 B9).
 6. RFC-0015 MAY expose `alloy capabilities` listing `CapabilityRegistry::describe_all()`; the output is descriptive only and MUST NOT allow registration at runtime (RG8).
 7. RFC-0015 surfaces `EditAppliedPayload.files_touched` in the gate prompt and `RepairPlanPayload.summary` in `alloy events`; both are untrusted repository-derived strings and MUST be rendered as data (no terminal escape passthrough).
