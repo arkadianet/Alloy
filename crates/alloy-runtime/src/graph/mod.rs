@@ -429,6 +429,16 @@ pub trait ProjectGraph: Send + Sync {
     /// Ingest one compiler/tool diagnostic (IN13).
     async fn record_diagnostic(&self, d: DiagnosticEvent) -> Result<(), GraphError>;
 
+    /// Drop every recorded diagnostic; returns how many were removed.
+    ///
+    /// A full check of the workspace supersedes all prior diagnostics —
+    /// the pre-plan seed calls this so retries never prompt the model with
+    /// already-fixed errors (dogfood, 2026-07-29). Default no-op for
+    /// stores without diagnostic persistence.
+    async fn clear_diagnostics(&self) -> Result<u64, GraphError> {
+        Ok(0)
+    }
+
     /// Ingest one applied-fix record (IN14).
     async fn record_fix(&self, f: FixEvent) -> Result<(), GraphError>;
 

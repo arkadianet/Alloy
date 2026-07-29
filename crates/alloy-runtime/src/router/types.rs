@@ -39,6 +39,8 @@ pub struct ModelEndpoint {
     pub input_usd_per_mtok: Option<f64>,
     /// Operator price per one million output tokens.
     pub output_usd_per_mtok: Option<f64>,
+    /// Optional operator-configured sampling temperature (issue #53).
+    pub temperature: Option<f32>,
 }
 
 /// Provider health state. RFC-0007 providers always report [`Health::Healthy`].
@@ -381,6 +383,7 @@ mod tests {
             max_context: 1,
             input_usd_per_mtok: Some(0.0),
             output_usd_per_mtok: Some(0.0),
+            temperature: None,
         }
     }
 

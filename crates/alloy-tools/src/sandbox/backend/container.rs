@@ -155,7 +155,12 @@ impl ContainerBackend {
             if p.ends_with("toolchains") {
                 continue;
             }
-            if p.file_name().and_then(|s| s.to_str()) == Some("settings.toml") {
+            if matches!(
+                p.file_name().and_then(|s| s.to_str()),
+                Some("settings.toml" | "config.toml" | "config")
+            ) {
+                // Ancestor cargo configs are a native-backend grant; the
+                // container image resolves its own cargo config.
                 continue;
             }
             args.push(format!("--volume={}:{}:ro", p.display(), p.display()));

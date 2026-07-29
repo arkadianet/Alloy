@@ -101,6 +101,7 @@ mod tests {
             max_context: 1,
             input_usd_per_mtok: None,
             output_usd_per_mtok: None,
+            temperature: None,
         }
     }
 
