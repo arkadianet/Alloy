@@ -96,8 +96,13 @@ pub struct IngestLimits {
     /// Max packages (default `1_000`).
     pub max_crates: u32,
     /// Max bytes hashed per file (default `4 MiB`); larger files are tracked
-    /// by a marker digest over their length and counted as skipped.
+    /// by a marker digest over their length and counted as skipped — and
+    /// never handed to `syn` (RFC-0014 SC3).
     pub max_file_bytes: u64,
+    /// Max item nodes per pass (default `200_000`) — RFC-0014 amendment
+    /// A-0014-1 (SY15). `0` is rejected at open: a zero cap would let the
+    /// store claim `SynDeep` while emitting nothing.
+    pub max_items: u32,
     /// Max nodes returned by one query (default `2_000`) — Q9.
     pub max_query_nodes: u32,
 }
@@ -109,6 +114,7 @@ impl Default for IngestLimits {
             max_files: 50_000,
             max_crates: 1_000,
             max_file_bytes: 4 * 1024 * 1024,
+            max_items: 200_000,
             max_query_nodes: 2_000,
         }
     }

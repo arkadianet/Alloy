@@ -22,6 +22,7 @@
 //! - [`dag`] — TaskDag types, validation, templates, cache, I/O envelopes (RFC-0009)
 //! - [`planner`] — [`PlanService`] / [`TemplatePlanService`] (RFC-0009)
 //! - [`edit`] — EditEngine trait + TextPatch / SemanticOps IR (RFC-0008)
+//! - [`lang`] — [`LanguageBackend`] seam, toolchain runner, registry (RFC-0014)
 //! - [`config`] — TOML + env load (never writes `.env`)
 //!
 //! Author: arkadianet
@@ -37,6 +38,7 @@ pub mod edit;
 pub mod error;
 pub mod events;
 pub mod graph;
+pub mod lang;
 pub mod logging;
 pub mod obs;
 pub mod planner;
@@ -86,6 +88,10 @@ pub use graph::{
     derive_node_id, FileChange, FileChangeKind, FixEvent, GraphEdge, GraphEdgeKind, GraphError,
     GraphFidelity, GraphNode, GraphNodeKind, GraphQuery, GraphView, GraphViewHandle, IngestReport,
     NullProjectGraph, ProjectGraph,
+};
+pub use lang::{
+    scope_package, selector_args, LangError, LanguageBackend, LanguageManifest, LanguageRegistry,
+    McpToolchainRunner, RustToolchain, Scope, TestReport, TestSelector, TextEdit, ToolchainRunner,
 };
 pub use obs::{
     apply_prompt_retention, apply_tool_retention, hash_content, hash_prompt, hash_tool_body,

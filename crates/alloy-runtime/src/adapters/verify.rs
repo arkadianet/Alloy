@@ -106,7 +106,7 @@ async fn run_verify(
     class: VerifyClass,
 ) -> Result<VerifyOutcome, AdapterError> {
     let token = perms.token_for(&ctx.meta, class).await?;
-    let (name, arguments) = build_tool_call(class, &ctx.meta.workspace_root);
+    let (name, arguments) = build_tool_call(class, &ctx.meta.workspace_root, None, None);
     let call = ToolCall::new(name, arguments)
         .with_attribution(
             Some(ctx.meta.session_id),
@@ -146,9 +146,19 @@ async fn run_verify(
 
 /// §5.13.1: tool call construction. `workspace_root` MUST come from the
 /// session row (via `ctx.meta`), never the node payload or environment (V1).
-fn build_tool_call(class: VerifyClass, workspace_root: &Path) -> (ToolName, Value) {
+///
+/// RFC-0014 LB9: this is the **only** cargo argv construction path — the
+/// verify adapters (no `package`, no filter) and `McpToolchainRunner`
+/// (scope/selector arguments) both go through it. `test_name_filter` is
+/// meaningful for `Test` only and ignored for `Compile`.
+pub(crate) fn build_tool_call(
+    class: VerifyClass,
+    workspace_root: &Path,
+    package: Option<&str>,
+    test_name_filter: Option<&str>,
+) -> (ToolName, Value) {
     let workspace_root = workspace_root.display().to_string();
-    match class {
+    let (name, mut arguments) = match class {
         VerifyClass::Compile => (
             ToolName::new("cargo_check").expect("cargo_check is a valid tool name"),
             serde_json::json!({
@@ -156,11 +166,21 @@ fn build_tool_call(class: VerifyClass, workspace_root: &Path) -> (ToolName, Valu
                 "message_format": "json", // V2
             }),
         ),
-        VerifyClass::Test => (
-            ToolName::new("cargo_test").expect("cargo_test is a valid tool name"),
-            serde_json::json!({ "workspace_root": workspace_root }),
-        ),
+        VerifyClass::Test => {
+            let mut args = serde_json::json!({ "workspace_root": workspace_root });
+            if let Some(filter) = test_name_filter {
+                args["test_name_filter"] = Value::String(filter.to_string());
+            }
+            (
+                ToolName::new("cargo_test").expect("cargo_test is a valid tool name"),
+                args,
+            )
+        }
+    };
+    if let Some(package) = package {
+        arguments["package"] = Value::String(package.to_string());
     }
+    (name, arguments)
 }
 
 async fn put_raw_log(
@@ -195,7 +215,7 @@ async fn put_raw_log(
 
 /// Outcome of §5.13.2's classification, before diagnostics/raw-log handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CargoOutcome {
+pub(crate) enum CargoOutcome {
     /// Exit 0.
     Ok,
     /// Exit 101, no signal, not truncated — a normal compile/test failure
@@ -203,10 +223,17 @@ enum CargoOutcome {
     SoftFail,
 }
 
+impl CargoOutcome {
+    /// `true` for a clean exit.
+    pub(crate) fn is_ok(self) -> bool {
+        matches!(self, Self::Ok)
+    }
+}
+
 /// §5.13.2 VC1-VC5: total classification of a `ToolCaller::call` success.
 /// `content.exit_code` is authoritative when present (per the RFC table's
 /// own column framing); `is_error()`/`error()` select which branch applies.
-fn classify_cargo_result(result: &ToolResult) -> Result<CargoOutcome, AdapterError> {
+pub(crate) fn classify_cargo_result(result: &ToolResult) -> Result<CargoOutcome, AdapterError> {
     let exit_code = content_i64(&result.content, "exit_code");
     let signal = content_i64(&result.content, "signal");
 
@@ -278,7 +305,7 @@ fn content_bool(content: &Value, key: &str) -> bool {
     content.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn cargo_stdout_utf8(content: &Value) -> &str {
+pub(crate) fn cargo_stdout_utf8(content: &Value) -> &str {
     content
         .get("stdout_utf8")
         .and_then(Value::as_str)
@@ -549,7 +576,7 @@ mod tests {
 
     #[test]
     fn build_tool_call_compile_shape() {
-        let (name, args) = build_tool_call(VerifyClass::Compile, Path::new("/ws"));
+        let (name, args) = build_tool_call(VerifyClass::Compile, Path::new("/ws"), None, None);
         assert_eq!(name.as_str(), "cargo_check");
         assert_eq!(args["workspace_root"], "/ws");
         assert_eq!(args["message_format"], "json");
@@ -558,10 +585,33 @@ mod tests {
 
     #[test]
     fn build_tool_call_test_shape() {
-        let (name, args) = build_tool_call(VerifyClass::Test, Path::new("/ws"));
+        let (name, args) = build_tool_call(VerifyClass::Test, Path::new("/ws"), None, None);
         assert_eq!(name.as_str(), "cargo_test");
         assert_eq!(args["workspace_root"], "/ws");
         assert_eq!(args.as_object().unwrap().len(), 1);
+    }
+
+    // RFC-0014 LB9: the shared path carries scope/selector arguments for the
+    // toolchain runner without changing the verify adapters' shape above.
+    #[test]
+    fn build_tool_call_carries_package_and_filter_for_the_lang_seam() {
+        let (_, args) = build_tool_call(
+            VerifyClass::Compile,
+            Path::new("/ws"),
+            Some("toy-core"),
+            None,
+        );
+        assert_eq!(args["package"], "toy-core");
+        assert_eq!(args.as_object().unwrap().len(), 3);
+        let (_, args) = build_tool_call(
+            VerifyClass::Test,
+            Path::new("/ws"),
+            Some("toy-core"),
+            Some("io::reads"),
+        );
+        assert_eq!(args["package"], "toy-core");
+        assert_eq!(args["test_name_filter"], "io::reads");
+        assert_eq!(args.as_object().unwrap().len(), 3);
     }
 
     // ---- end-to-end adapter tests over a recording ToolCaller double ----

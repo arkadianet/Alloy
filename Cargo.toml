@@ -40,6 +40,9 @@ trybuild = "1"
 assert_cmd = "2"
 predicates = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# RFC-0014 LC7: minimal, non-macro syn for the item/import deep pass —
+# consumed by alloy-index alone; no `printing`, no proc-macro bridge.
+syn = { version = "2", default-features = false, features = ["full", "parsing", "clone-impls"] }
 globset = "0.4"
 rustix = { version = "0.38", features = ["process", "fs", "thread", "mount", "net", "stdio", "pipe"] }
 libc = "0.2"

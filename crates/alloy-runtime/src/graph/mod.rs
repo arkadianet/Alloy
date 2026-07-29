@@ -40,7 +40,9 @@ pub enum GraphNodeKind {
     Crate,
     /// A Rust module inferred from source-file layout.
     Module,
-    /// A named item (fn/struct/trait/impl). **Stub** in MVP: never ingested (IN9).
+    /// A named module-level item (fn/struct/enum/union/trait/type/const/
+    /// static). Ingested by the RFC-0014 `syn` deep pass (SY3); `impl`
+    /// blocks stay deferred (SY5).
     Item,
 }
 
@@ -66,7 +68,8 @@ pub enum GraphEdgeKind {
     /// Structural containment: workspace→crate, crate→module, module→module,
     /// module→item.
     Defines,
-    /// `use` relationship. **Stub** in MVP: never ingested (IN8).
+    /// `use` relationship, written only for in-workspace targets. Ingested
+    /// by the RFC-0014 `syn` deep pass (SY11–SY13).
     Imports,
 }
 
@@ -89,7 +92,7 @@ impl GraphEdgeKind {
 pub enum GraphFidelity {
     /// Manifest + file-layout facts only. The MVP value.
     Manifest,
-    /// Reserved: `syn` item-level parse (Beta).
+    /// `syn` item-level parse (RFC-0014 deep pass, `model_version = 2`).
     SynDeep,
     /// Reserved: rust-analyzer passthrough (Beta/M3).
     Analyzer,
@@ -322,6 +325,10 @@ pub struct IngestReport {
     pub crates: u32,
     /// Module nodes written.
     pub modules: u32,
+    /// Item nodes written (RFC-0014 amendment A-0014-3).
+    pub items: u32,
+    /// Imports edges written (RFC-0014 amendment A-0014-3).
+    pub imports: u32,
     /// Files tracked for digest invalidation.
     pub files: u32,
     /// Files skipped by a cap or a skip rule (IN3).

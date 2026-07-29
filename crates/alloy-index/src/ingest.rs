@@ -1,8 +1,10 @@
-//! Deterministic, offline, exec-free ingest (RFC-0011 §6).
+//! Deterministic, offline, exec-free ingest (RFC-0011 §6, RFC-0014 §5).
 //!
-//! Facts come from exactly two sources (IN — §6.2): `Cargo.toml` manifests
-//! parsed with `toml`, and a bounded, sorted, symlink-free `std::fs` walk.
-//! No subprocess, no network, no Rust parsing (IN7 is file-layout only).
+//! Facts come from exactly three sources: `Cargo.toml` manifests parsed
+//! with `toml`, a bounded, sorted, symlink-free `std::fs` walk, and — at
+//! `model_version = 2` — a `syn` item/import parse (RFC-0014 amendment
+//! A-0014-2 supersedes IN7's layout-only module guessing with
+//! declaration-driven inference). No subprocess, no network.
 
 use std::path::{Path, PathBuf};
 
@@ -52,6 +54,8 @@ pub(crate) struct ScanOutput {
     pub(crate) files: Vec<FileRow>,
     pub(crate) crates: u32,
     pub(crate) modules: u32,
+    pub(crate) items: u32,
+    pub(crate) imports: u32,
     pub(crate) skipped: u32,
     pub(crate) warnings: Vec<String>,
 }
@@ -98,17 +102,19 @@ fn workspace_key() -> String {
 fn crate_key(package: &str, manifest_rel: &str) -> String {
     format!("{package}\0{manifest_rel}")
 }
-fn module_key(package: &str, module_path: &str) -> String {
+/// G4/SY4 stable key for module and item nodes alike:
+/// `<crate_id>\0<rust_path>`.
+pub(crate) fn module_key(package: &str, module_path: &str) -> String {
     format!("{package}\0{module_path}")
 }
 
 /// `crate_ident`: package name with `-` → `_` (§4.2).
-fn crate_ident(package: &str) -> String {
+pub(crate) fn crate_ident(package: &str) -> String {
     package.replace('-', "_")
 }
 
 /// Normalise a path to workspace-relative `/`-separated form (G12).
-fn rel_str(rel: &Path) -> String {
+pub(crate) fn rel_str(rel: &Path) -> String {
     let mut out = String::new();
     for comp in rel.components() {
         if !out.is_empty() {
@@ -142,13 +148,15 @@ fn sorted_entries(dir: &Path, skipped: &mut u32) -> Result<Vec<(String, PathBuf)
 
 /// A discovered workspace member.
 #[derive(Debug)]
-struct Member {
-    package: String,
-    dir_rel: PathBuf,
-    lib_path: Option<String>,
+pub(crate) struct Member {
+    pub(crate) package: String,
+    pub(crate) dir_rel: PathBuf,
+    pub(crate) lib_path: Option<String>,
     /// `[[bin]]` entries: name plus explicit `path` when present. Name-only
     /// bins resolve to the conventional `src/bin/<name>.rs` at seed time.
-    bin_paths: Vec<(String, Option<String>)>,
+    pub(crate) bin_paths: Vec<(String, Option<String>)>,
+    /// `[package] edition`, used to pick the parse target (TC3).
+    pub(crate) edition: Option<String>,
 }
 
 /// Parse the root manifest and discover members (§6.3).
@@ -325,24 +333,22 @@ fn parse_member_manifest(
             }
         }
     }
+    let edition = doc
+        .get("package")
+        .and_then(|p| p.get("edition"))
+        .and_then(|e| e.as_str())
+        .map(str::to_string);
     Ok(Some(Member {
         package: package.to_string(),
         dir_rel,
         lib_path,
         bin_paths,
+        edition,
     }))
 }
 
-/// One inferred module, queued for descent.
-struct ModuleSeed {
-    module_path: String,
-    file_rel: PathBuf,
-    /// Directory that holds this module's children (IN7c), when it may have
-    /// any.
-    children_dir: Option<PathBuf>,
-}
-
-/// Full scan of `root` (§6.5 steps 1–6). Pure with respect to the database.
+/// Full scan of `root` (§6.5 steps 1–6, plus the RFC-0014 §5 deep pass).
+/// Pure with respect to the database.
 #[tracing::instrument(skip_all, fields(root = tracing::field::Empty), name = "index.rebuild")]
 pub(crate) fn scan_workspace(root: &Path, limits: &IngestLimits) -> Result<ScanOutput, GraphError> {
     if !root.is_dir() {
@@ -366,7 +372,9 @@ pub(crate) fn scan_workspace(root: &Path, limits: &IngestLimits) -> Result<ScanO
         digest: None,
     });
 
-    let mut file_budget = 0u32;
+    // RFC-0014 §5.5: the syn deep pass composes with this manifest pass in
+    // the same scan, behind the same single-writer transaction (X1).
+    let mut pass = crate::lang::rust::pass::DeepPass::new(&members);
     for member in &members {
         out.crates += 1;
         let manifest_rel = if member.dir_rel.as_os_str().is_empty() {
@@ -394,15 +402,16 @@ pub(crate) fn scan_workspace(root: &Path, limits: &IngestLimits) -> Result<ScanO
             kind: GraphEdgeKind::Defines,
         });
 
-        ingest_crate_modules(
+        crate::lang::rust::pass::ingest_crate(
             root,
             member,
             crate_node_id,
             limits,
-            &mut file_budget,
+            &mut pass,
             &mut out,
         )?;
     }
+    crate::lang::rust::pass::resolve_imports(&pass, &mut out);
 
     // Deterministic final order (Q8 / §4.6): nodes by (kind, path), edges by
     // (from_path, to_path, kind).
@@ -413,234 +422,6 @@ pub(crate) fn scan_workspace(root: &Path, limits: &IngestLimits) -> Result<ScanO
     });
     out.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
-}
-
-/// IN7a–IN7g for one crate.
-fn ingest_crate_modules(
-    root: &Path,
-    member: &Member,
-    crate_node_id: GraphNodeId,
-    limits: &IngestLimits,
-    file_budget: &mut u32,
-    out: &mut ScanOutput,
-) -> Result<(), GraphError> {
-    let ident = crate_ident(&member.package);
-    let dir = &member.dir_rel;
-    let mut seeds: Vec<ModuleSeed> = Vec::new();
-
-    // IN7a: library root.
-    let lib_rel = member
-        .lib_path
-        .as_deref()
-        .map(|p| dir.join(p))
-        .filter(|p| root.join(p).is_file())
-        .or_else(|| {
-            let conventional = dir.join("src/lib.rs");
-            root.join(&conventional).is_file().then_some(conventional)
-        });
-    if let Some(lib_rel) = lib_rel {
-        let children_dir = lib_rel.parent().map(Path::to_path_buf);
-        seeds.push(ModuleSeed {
-            module_path: ident.clone(),
-            file_rel: lib_rel,
-            children_dir,
-        });
-    }
-
-    // IN7b: binary roots. Bin roots never descend — layout inference cannot
-    // attribute `src/` children between a lib root and a bin root without
-    // parsing, and G7 forbids inventing the answer.
-    //
-    // Deduped by resolved file path (BTreeMap: sorted, deterministic — IN5):
-    // conventional roots first, explicit `[[bin]]` entries last so an
-    // explicit name wins for the same file. Name-only `[[bin]]` entries
-    // resolve to the conventional `src/bin/<name>.rs`.
-    let mut bin_files: std::collections::BTreeMap<PathBuf, String> =
-        std::collections::BTreeMap::new();
-    let main_rel = dir.join("src/main.rs");
-    if root.join(&main_rel).is_file() {
-        bin_files.insert(main_rel, "main".into());
-    }
-    let bin_dir = root.join(dir).join("src/bin");
-    if bin_dir.is_dir() {
-        for (name, path) in sorted_entries(&bin_dir, &mut out.skipped)? {
-            if path.is_file() && name.ends_with(".rs") {
-                let stem = name.trim_end_matches(".rs").to_string();
-                bin_files.insert(dir.join("src/bin").join(&name), stem);
-            }
-        }
-    }
-    for (name, path) in &member.bin_paths {
-        let rel = match path {
-            Some(path) => dir.join(path),
-            None => dir.join("src/bin").join(format!("{name}.rs")),
-        };
-        if root.join(&rel).is_file() {
-            bin_files.insert(rel, name.clone());
-        }
-    }
-    for (rel, bin_name) in bin_files {
-        seeds.push(ModuleSeed {
-            module_path: format!("{ident}::{bin_name}"),
-            file_rel: rel,
-            children_dir: None,
-        });
-    }
-
-    // Every crate-root file (lib and bins alike) is claimed: none may
-    // reappear as a lib child module, wherever its path puts it.
-    let claimed: std::collections::BTreeSet<PathBuf> =
-        seeds.iter().map(|s| s.file_rel.clone()).collect();
-
-    // Descend (IN7c–IN7e), breadth-first over a work queue, entries sorted.
-    // (seed, parent (id, module path), depth)
-    type QueueEntry = (ModuleSeed, Option<(GraphNodeId, String)>, u32);
-    let mut queue: std::collections::VecDeque<QueueEntry> = seeds
-        .into_iter()
-        .map(|s| (s, None::<(GraphNodeId, String)>, 0u32))
-        .collect();
-
-    while let Some((seed, parent, depth)) = queue.pop_front() {
-        if depth > limits.max_depth {
-            return Err(GraphError::LimitExceeded(format!(
-                "max_depth {} exceeded under {}",
-                limits.max_depth,
-                seed.file_rel.display()
-            )));
-        }
-        *file_budget += 1;
-        if *file_budget > limits.max_files {
-            return Err(GraphError::LimitExceeded(format!(
-                "max_files {} exceeded",
-                limits.max_files
-            )));
-        }
-
-        let file_rel_s = rel_str(&seed.file_rel);
-        let (digest, byte_len, oversized) = hash_file(&root.join(&seed.file_rel), limits)?;
-        if oversized {
-            out.skipped += 1;
-        }
-        let node_id = derive_node_id(
-            GraphNodeKind::Module,
-            &module_key(&member.package, &seed.module_path),
-        );
-        out.modules += 1;
-        out.nodes.push(NodeRow {
-            id: node_id,
-            kind: GraphNodeKind::Module,
-            path: seed.module_path.clone(),
-            crate_id: Some(member.package.clone()),
-            file: Some(file_rel_s.clone()),
-            digest: Some(digest.clone()),
-        });
-        out.files.push(FileRow {
-            path: file_rel_s,
-            crate_id: member.package.clone(),
-            module_id: node_id,
-            digest,
-            byte_len,
-        });
-        match parent {
-            Some((parent_id, parent_path)) => out.edges.push(EdgeRow {
-                from: parent_id,
-                to: node_id,
-                from_path: parent_path,
-                to_path: seed.module_path.clone(),
-                kind: GraphEdgeKind::Defines,
-            }),
-            None => out.edges.push(EdgeRow {
-                from: crate_node_id,
-                to: node_id,
-                from_path: member.package.clone(),
-                to_path: seed.module_path.clone(),
-                kind: GraphEdgeKind::Defines,
-            }),
-        }
-
-        let Some(children_dir) = seed.children_dir else {
-            continue;
-        };
-        let children_abs = root.join(&children_dir);
-        if !children_abs.is_dir() {
-            continue;
-        }
-
-        let mut child_names: Vec<(String, PathBuf, PathBuf)> = Vec::new(); // (module name, file rel, child children dir)
-        let entries = sorted_entries(&children_abs, &mut out.skipped)?;
-        let dir_names: std::collections::BTreeSet<String> = entries
-            .iter()
-            .filter(|(_, p)| p.is_dir())
-            .map(|(n, _)| n.clone())
-            .collect();
-        for (name, path) in &entries {
-            if path.is_file() {
-                if !name.ends_with(".rs")
-                    || *name == "mod.rs"
-                    || claimed.contains(&children_dir.join(name))
-                {
-                    continue;
-                }
-                let stem = name.trim_end_matches(".rs").to_string();
-                let file_rel = children_dir.join(name);
-                // IN7d: `name.rs` wins over `name/mod.rs`.
-                if dir_names.contains(&stem) && children_abs.join(&stem).join("mod.rs").is_file() {
-                    out.warnings.push(format!(
-                        "{}: both {stem}.rs and {stem}/mod.rs exist; {stem}.rs wins (IN7d)",
-                        rel_str(&children_dir)
-                    ));
-                }
-                child_names.push((stem.clone(), file_rel, children_dir.join(&stem)));
-            } else if path.is_dir() {
-                if name.starts_with('.') || name == "target" {
-                    out.skipped += 1;
-                    continue;
-                }
-                // IN7d handled above; only a dir with mod.rs and no sibling
-                // `name.rs` becomes a module here (IN7c/IN7e).
-                let sibling = format!("{name}.rs");
-                let has_sibling = entries.iter().any(|(n, p)| p.is_file() && *n == sibling);
-                if !has_sibling && path.join("mod.rs").is_file() {
-                    child_names.push((
-                        name.clone(),
-                        children_dir.join(name).join("mod.rs"),
-                        children_dir.join(name),
-                    ));
-                }
-            }
-        }
-
-        for (child, file_rel, child_dir) in child_names {
-            queue.push_back((
-                ModuleSeed {
-                    module_path: format!("{}::{child}", seed.module_path),
-                    file_rel,
-                    children_dir: Some(child_dir),
-                },
-                Some((node_id, seed.module_path.clone())),
-                depth + 1,
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Hash one file's bytes; oversized files get a size-only marker digest and
-/// are counted as skipped by the caller (IN3).
-pub(crate) fn hash_file(
-    abs: &Path,
-    limits: &IngestLimits,
-) -> Result<(Digest, u64, bool), GraphError> {
-    let meta = std::fs::metadata(abs)
-        .map_err(|e| GraphError::Io(format!("stat {}: {e}", abs.display())))?;
-    let byte_len = meta.len();
-    if byte_len > limits.max_file_bytes {
-        let marker = Digest::sha256(format!("alloyg1-oversize\0{byte_len}").as_bytes());
-        return Ok((marker, byte_len, true));
-    }
-    let bytes =
-        std::fs::read(abs).map_err(|e| GraphError::Io(format!("read {}: {e}", abs.display())))?;
-    Ok((Digest::sha256(&bytes), byte_len, false))
 }
 
 /// Parse the stored kind tag.
