@@ -154,7 +154,10 @@ mod tests {
         };
         storage
             .sessions()
-            .upsert_session(&session, &crate::types::provenance::SessionProvenance::unknown())
+            .upsert_session(
+                &session,
+                &crate::types::provenance::SessionProvenance::unknown(),
+            )
             .await
             .unwrap();
 
@@ -194,7 +197,10 @@ mod tests {
         };
         storage
             .sessions()
-            .upsert_session(&session, &crate::types::provenance::SessionProvenance::unknown())
+            .upsert_session(
+                &session,
+                &crate::types::provenance::SessionProvenance::unknown(),
+            )
             .await
             .unwrap();
 
@@ -245,7 +251,10 @@ mod tests {
         };
         storage
             .sessions()
-            .upsert_session(&session, &crate::types::provenance::SessionProvenance::unknown())
+            .upsert_session(
+                &session,
+                &crate::types::provenance::SessionProvenance::unknown(),
+            )
             .await
             .unwrap();
 
