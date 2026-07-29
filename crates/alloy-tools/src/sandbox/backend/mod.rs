@@ -310,33 +310,43 @@ pub fn ancestor_cargo_configs(jail: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `true` when any table at any depth carries a `token` / `secret-key`.
+/// `true` when any table at any depth — including tables nested inside
+/// arrays — carries a `token` / `secret-key`.
 fn contains_secret_keys(value: &toml::Value) -> bool {
-    if let toml::Value::Table(table) = value {
-        if table.keys().any(|k| matches!(&**k, "token" | "secret-key")) {
-            return true;
+    match value {
+        toml::Value::Table(table) => {
+            table.keys().any(|k| matches!(&**k, "token" | "secret-key"))
+                || table.iter().any(|(_, nested)| contains_secret_keys(nested))
         }
-        return table.iter().any(|(_, nested)| contains_secret_keys(nested));
+        toml::Value::Array(items) => items.iter().any(contains_secret_keys),
+        _ => false,
     }
-    false
 }
 
 /// Remove `token` / `secret-key` (secrets) and `target-dir` (a shared
 /// build cache outside the jail would fail the write sandbox) at every
 /// table depth.
 fn strip_unsafe_config_keys(value: &mut toml::Value) {
-    if let toml::Value::Table(table) = value {
-        let unsafe_keys: Vec<String> = table
-            .keys()
-            .filter(|k| matches!(&***k, "token" | "secret-key" | "target-dir"))
-            .cloned()
-            .collect();
-        for key in unsafe_keys {
-            table.remove(&key);
+    match value {
+        toml::Value::Table(table) => {
+            let unsafe_keys: Vec<String> = table
+                .keys()
+                .filter(|k| matches!(&***k, "token" | "secret-key" | "target-dir"))
+                .cloned()
+                .collect();
+            for key in unsafe_keys {
+                table.remove(&key);
+            }
+            for (_, nested) in table.iter_mut() {
+                strip_unsafe_config_keys(nested);
+            }
         }
-        for (_, nested) in table.iter_mut() {
-            strip_unsafe_config_keys(nested);
+        toml::Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_unsafe_config_keys(item);
+            }
         }
+        _ => {}
     }
 }
 
@@ -449,6 +459,43 @@ mod tests {
         std::fs::write(jail.join(".cargo/config.toml"), "[net]\n").unwrap();
         let found = ancestor_cargo_configs(&jail);
         assert!(!found.iter().any(|p| p.starts_with(&jail)), "{found:?}");
+    }
+
+    /// External review finding on #54: secrets can hide inside TOML
+    /// arrays (arrays of inline tables); both the ancestor-grant screen
+    /// and the shadow sanitizer must recurse through them.
+    #[test]
+    fn secret_keys_inside_arrays_deny_grant_and_get_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mid = dir.path().join("mid");
+        let jail = mid.join("jail");
+        std::fs::create_dir_all(&jail).unwrap();
+        std::fs::create_dir_all(mid.join(".cargo")).unwrap();
+        std::fs::write(
+            mid.join(".cargo/config.toml"),
+            "extra = [{ token = \"sekrit\" }]\n",
+        )
+        .unwrap();
+        assert!(
+            ancestor_cargo_configs(&jail).is_empty(),
+            "array-nested token must deny the grant"
+        );
+
+        let cargo_home = dir.path().join("cargo");
+        let stage = dir.path().join("stage");
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(
+            cargo_home.join("config.toml"),
+            "[net]\ngit-fetch-with-cli = true\nextra = [{ token = \"sekrit\" }]\n",
+        )
+        .unwrap();
+        let shadow = stage_shadow_cargo_home(&cargo_home, &stage)
+            .unwrap()
+            .unwrap();
+        let sanitized = std::fs::read_to_string(shadow.join("config.toml")).unwrap();
+        assert!(!sanitized.contains("sekrit"), "{sanitized}");
+        assert!(sanitized.contains("git-fetch-with-cli"), "{sanitized}");
     }
 
     /// No operator config → `None`: the real `CARGO_HOME` stays in use.

@@ -191,8 +191,12 @@ pub(super) async fn emit_run_finished(
         .map_err(runtime_to_run)
 }
 
-/// True if `(run, gate)` has a durable `ApprovalRequested` (RFC-0015 SQ9:
-/// out-of-band approval from a process holding no waiter).
+/// True if `(run, gate)` has a durable `ApprovalRequested` that is still
+/// **open** — i.e. not followed by a durable `ApprovalResolved` for the
+/// same gate (RFC-0015 SQ9: out-of-band approval from a process holding
+/// no waiter). A resolved-then-re-requested gate (GR3 re-emission) counts
+/// as open again; a resolved gate must not be re-approvable through this
+/// fallback (external review finding on #54).
 async fn has_durable_gate_request(
     inner: &SessionInner,
     session: SessionId,
@@ -202,25 +206,31 @@ async fn has_durable_gate_request(
     let events = inner.storage.events();
     let gate_str = gate.to_string();
     let mut after = None;
+    let mut open = false;
     loop {
         let page = events
             .list_session_events(session, after, crate::session::MAX_EVENTS_PAGE)
             .await
             .map_err(store_to_run)?;
         let Some(last) = page.last() else {
-            return Ok(false);
+            return Ok(open);
         };
         after = Some(last.seq);
         let short_page = page.len() < crate::session::MAX_EVENTS_PAGE;
-        if page.iter().any(|ev| {
-            ev.run_id == Some(run)
-                && ev.type_ == SessionEventType::ApprovalRequested
-                && ev.payload.get("gate_id").and_then(|v| v.as_str()) == Some(gate_str.as_str())
-        }) {
-            return Ok(true);
+        for ev in &page {
+            if ev.run_id != Some(run)
+                || ev.payload.get("gate_id").and_then(|v| v.as_str()) != Some(gate_str.as_str())
+            {
+                continue;
+            }
+            match ev.type_ {
+                SessionEventType::ApprovalRequested => open = true,
+                SessionEventType::ApprovalResolved => open = false,
+                _ => {}
+            }
         }
         if short_page {
-            return Ok(false);
+            return Ok(open);
         }
     }
 }
