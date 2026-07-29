@@ -418,6 +418,7 @@ planning = "standard"
                 budget_policy: BudgetPolicy::default(),
                 context_profile: alloy_runtime::ContextProfile::v2_defaults(),
                 capture: Default::default(),
+                planner: alloy_runtime::PlannerConfig::new(),
                 profile_id: None,
                 gates: Default::default(),
                 sandbox_echo: None,

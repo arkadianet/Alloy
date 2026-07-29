@@ -145,3 +145,123 @@ fn ac48_driver_never_touches_run_lifecycle() {
         }
     }
 }
+
+/// AC 34: every shipped profile keeps `mode = "template"` — the LLM planner
+/// is opt-in and eval-gated (RFC-0017 §12.4); no catalog profile enables it.
+#[test]
+fn ac34_shipped_profiles_stay_template_mode() {
+    let profiles = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+    let entries = std::fs::read_dir(&profiles)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", profiles.display()));
+    let mut seen = 0usize;
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "toml") {
+            continue;
+        }
+        seen += 1;
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        for (idx, line) in text.lines().enumerate() {
+            // TOML comments (`#`) may *document* the rule without violating it.
+            let code = line.split('#').next().unwrap_or("");
+            assert!(
+                !code.replace(' ', "").contains("mode=\"llm\""),
+                "AC 34 violated: {}:{} sets planner mode llm",
+                path.display(),
+                idx + 1
+            );
+        }
+        assert!(
+            text.replace(' ', "").contains("mode=\"template\""),
+            "AC 34: {} does not pin [planner] mode = \"template\"",
+            path.display()
+        );
+    }
+    assert_eq!(seen, 3, "expected the three shipped profiles");
+}
+
+/// AC 14b (grep half): nothing under `src/planner` reads the process CWD —
+/// the proposer's workspace root comes from `ProposerDeps` (PP1).
+#[test]
+fn ac14b_planner_never_reads_current_dir() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/planner");
+    let mut files = Vec::new();
+    walk_rs_files(&dir, &mut files);
+    assert!(!files.is_empty());
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        for (idx, line) in text.lines().enumerate() {
+            if is_comment_line(line) {
+                continue;
+            }
+            assert!(
+                !line.contains("current_dir"),
+                "AC 14b violated: {}:{} reads the process CWD",
+                file.display(),
+                idx + 1
+            );
+        }
+    }
+}
+
+/// AC 41: `capabilities/**` imports no plan service or driver symbol
+/// (PW2 / T8 extended) — a worker holding a `PlanService` could write
+/// topology from inside a node.
+#[test]
+fn ac41_capabilities_import_no_plan_service_or_driver() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/capabilities");
+    let mut files = Vec::new();
+    walk_rs_files(&dir, &mut files);
+    assert!(!files.is_empty());
+    let needles = ["PlanService", "LlmPlanService", "GenerationDriver"];
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        for (idx, line) in text.lines().enumerate() {
+            if is_comment_line(line) {
+                continue;
+            }
+            for needle in needles {
+                assert!(
+                    !line.contains(needle),
+                    "AC 41 violated: {}:{} references {needle}",
+                    file.display(),
+                    idx + 1
+                );
+            }
+        }
+    }
+}
+
+/// AC 38 (grep half): `rationale` from a proposal is audit-only — no prompt
+/// assembly code under `capabilities/prompt.rs` or `context/` interpolates a
+/// proposal rationale into model-facing content.
+#[test]
+fn ac38_rationale_never_enters_downstream_prompts() {
+    for sub in ["src/capabilities/prompt.rs", "src/context"] {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(sub);
+        let mut files = Vec::new();
+        if root.is_dir() {
+            walk_rs_files(&root, &mut files);
+        } else {
+            files.push(root);
+        }
+        for file in files {
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+            for (idx, line) in text.lines().enumerate() {
+                if is_comment_line(line) {
+                    continue;
+                }
+                assert!(
+                    !line.contains(".rationale"),
+                    "AC 38 violated: {}:{} touches a proposal rationale",
+                    file.display(),
+                    idx + 1
+                );
+            }
+        }
+    }
+}

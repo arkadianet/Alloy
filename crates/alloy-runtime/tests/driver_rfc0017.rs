@@ -307,6 +307,7 @@ impl Harness {
             gate_timeout: None,
             max_repair_generations: options.max_repair_generations,
             capture: Default::default(),
+            planner: alloy_runtime::PlannerConfig::new(),
         })
         .unwrap();
         let handle = rt.start().await.unwrap();

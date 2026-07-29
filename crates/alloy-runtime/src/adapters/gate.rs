@@ -110,6 +110,7 @@ mod tests {
                 gate_timeout: None,
                 max_repair_generations: 2,
                 capture: Default::default(),
+                planner: crate::PlannerConfig::new(),
             })
             .unwrap();
             let handle = rt.start().await.unwrap();

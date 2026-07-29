@@ -89,6 +89,10 @@ pub use dag::{
     TemplateCatalog, TemplateEdgeSpec, TemplateId, TemplateIdMap, TemplateManifest,
     TemplateNodeSpec, ValidateOpts, ENVELOPE_SCHEMA_VERSION,
 };
+pub use dag::{
+    allocate_proposal_ids, compile_proposal, CompileArgs, ProposalRejection, ProposedDagManifest,
+    ProposedNodeSpec, PROPOSAL_SCHEMA_VERSION,
+};
 pub use driver::{
     DriveError, DriverMetrics, GenerationDriver, GenerationDriverDeps, GenerationPolicy,
     PlanFingerprints,
@@ -124,7 +128,7 @@ pub use obs::{
 };
 pub use planner::{
     DisabledLlmPlanService, PlanContext, PlanError, PlanProducedPayload, PlanResult, PlanService,
-    PlanSource, TemplatePlanService,
+    PlanSource, PlannerConfig, PlannerMode, TemplatePlanService,
 };
 pub use router::{
     classify_provider_error, classify_router_error, ChatMessage, ChatRole, Citation,

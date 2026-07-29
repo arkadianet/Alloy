@@ -35,8 +35,19 @@ retain_full_prompts = false
 retain_tool_bodies = false
 
 [limits]
-run_timeout_secs = 1800
+run_timeout_secs = 1800             # ABSOLUTE bound across repair generations (RFC-0017 GN7)
 max_repair_generations = 2          # 0..=8; 0 disables auto-replan (RFC-0017 AM-0015-2)
+
+# Plan source (RFC-0017 §7.1, AM-0015-2). "llm" is opt-in and eval-gated
+# (§12.4); every shipped profile stays "template" until the holdout gate
+# passes. Values are the §3.3 defaults, spelled out for discoverability.
+[planner]
+mode = "template"            # "template" | "llm"
+max_proposed_nodes = 8       # 2..=16
+proposal_max_bytes = 16384   # 1024..=32768 — hard-capped under OC7's 64 KiB payload bound
+planning_max_input = 16384   # tokens, planning capability call
+planning_max_output = 4096
+planning_timeout_ms = 120000
 
 # Corpus capture (research §7.11 item 1) — distinct from [observability]:
 # retention is what the log keeps for debugging; capture is what may enter a

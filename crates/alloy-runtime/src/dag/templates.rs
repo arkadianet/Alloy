@@ -218,7 +218,7 @@ fn cap(s: &str) -> CapabilityId {
 /// the retry to reach a bigger model; when nothing serves it, RFC-0007 §5.2.1
 /// routes the retry at the configured tier and records `escalation_unserved`
 /// — escalation only ever raises a tier, never lowers one.
-fn llm_retry() -> RetryPolicy {
+pub(crate) fn llm_retry() -> RetryPolicy {
     RetryPolicy {
         max_attempts: 2,
         backoff: Backoff::Fixed { delay_ms: 1000 },
@@ -228,7 +228,7 @@ fn llm_retry() -> RetryPolicy {
     }
 }
 
-fn adapter_retry() -> RetryPolicy {
+pub(crate) fn adapter_retry() -> RetryPolicy {
     RetryPolicy {
         max_attempts: 1,
         backoff: Backoff::Fixed { delay_ms: 0 },
@@ -242,7 +242,7 @@ fn adapter_retry() -> RetryPolicy {
 /// Inconclusive` (signal-killed cargo, truncated output — research §7.11
 /// item 6) is an infrastructure no-answer, and one bounded re-run is the
 /// correct response. Genuine `Compile`/`Test` failures stay non-retryable.
-fn verify_retry() -> RetryPolicy {
+pub(crate) fn verify_retry() -> RetryPolicy {
     RetryPolicy {
         max_attempts: 2,
         backoff: Backoff::Fixed { delay_ms: 1000 },
