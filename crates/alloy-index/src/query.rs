@@ -348,22 +348,40 @@ fn neighbours(
         });
     }
 
-    let placeholders = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let node_sql = format!("SELECT {NODE_COLS} FROM graph_nodes WHERE id IN ({placeholders})");
     let id_params: Vec<String> = ids.into_iter().collect();
-    let nodes = query_nodes(
-        conn,
-        &node_sql,
-        rusqlite::params_from_iter(id_params.iter()),
-    )?;
+    let nodes = query_nodes_by_ids(conn, &id_params)?;
     finish_view(nodes, edges, version, limits)
 }
 
-/// Q7: BFS over `Defines` **and** `Imports` edges in both directions,
-/// radius clamped. Imports participate since the RFC-0014 deep pass — the
-/// Appendix B projection reaches an imported node across one hop.
+/// Fetch nodes by id in bounded chunks: a high-degree anchor can put tens
+/// of thousands of ids in play, and one placeholder per id would exceed
+/// SQLite's variable limit (32766 for the bundled build). Chunk order does
+/// not matter — `finish_view` sorts (Q8).
+fn query_nodes_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<GraphNode>, GraphError> {
+    const CHUNK: usize = 512;
+    let mut nodes = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT {NODE_COLS} FROM graph_nodes WHERE id IN ({placeholders})");
+        nodes.extend(query_nodes(
+            conn,
+            &sql,
+            rusqlite::params_from_iter(chunk.iter()),
+        )?);
+    }
+    Ok(nodes)
+}
+
+/// Q7 as amended by A-0011-6f: BFS over the **structural** edges —
+/// `Defines` and `Imports` — in both directions, radius clamped. Imports
+/// participate since the RFC-0014 deep pass (its Appendix B projection
+/// reaches an imported node across one hop). The semantic kinds
+/// (`References`/`Calls`/`Impls`) are never traversed — a call graph is
+/// asked for via `Callers`/`Refs`/`Impls`, not pulled into a neighbourhood
+/// — but semantic edges whose endpoints both land in the view are returned
+/// (the §5 edge-inclusion rule).
 fn subgraph(
     conn: &Connection,
     seeds: &[GraphNodeId],
@@ -385,16 +403,20 @@ fn subgraph(
             let from: String = row.get(0).map_err(from_rusqlite)?;
             let to: String = row.get(1).map_err(from_rusqlite)?;
             let kind: String = row.get(2).map_err(from_rusqlite)?;
-            adjacency.entry(from.clone()).or_default().push(to.clone());
-            adjacency.entry(to.clone()).or_default().push(from.clone());
+            // Only structural kinds enter the adjacency (Q7 / A-0011-6f);
+            // every kind stays in `edge_rows` for in-view inclusion.
+            if kind == GraphEdgeKind::Defines.as_str() || kind == GraphEdgeKind::Imports.as_str() {
+                adjacency.entry(from.clone()).or_default().push(to.clone());
+                adjacency.entry(to.clone()).or_default().push(from.clone());
+            }
             edge_rows.push((from, to, kind));
         }
     }
 
     // Unknown seeds are ignored (Q7). The visited set is capped at
     // `max_query_nodes + 1`: one over the cap is enough to detect Q9
-    // truncation, and it bounds both memory and the SQL `IN` placeholder
-    // count well under SQLite's variable limit. BFS order over sorted
+    // truncation, and it bounds memory (the node fetch is chunked, so the
+    // SQL variable limit is safe at any cap). BFS order over sorted
     // adjacency is deterministic, so the capped set is too (Q8).
     let visit_cap = limits.max_query_nodes as usize + 1;
     let mut visited: BTreeSet<String> = BTreeSet::new();
@@ -434,12 +456,8 @@ fn subgraph(
     if visited.is_empty() {
         return Ok(GraphView::empty(version));
     }
-    let placeholders = std::iter::repeat_n("?", visited.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!("SELECT {NODE_COLS} FROM graph_nodes WHERE id IN ({placeholders})");
     let ids: Vec<String> = visited.iter().cloned().collect();
-    let nodes = query_nodes(conn, &sql, rusqlite::params_from_iter(ids.iter()))?;
+    let nodes = query_nodes_by_ids(conn, &ids)?;
 
     // Edges with both endpoints in the view (post-truncation, in finish_view).
     let edges = edge_rows

@@ -157,6 +157,8 @@ Small, additive, and recorded here so no reviewer treats them as drift.
 | **A-0014-2** | RFC-0011 IN7 ("module inference MUST NOT parse Rust source") is amended for `model_version = 2`: declaration-driven inference replaces sibling-guessing | RFC-0011 §6.4 | The prohibition exists because MVP has no parser; SY7 states the superseding rule and keeps IN7f's "invent nothing" |
 | **A-0014-3** | `IngestReport` gains `items: u32`, `imports: u32` | `alloy-runtime::graph` | Its own doc comment authorises field additions as deliberate API changes |
 | **A-0014-4** | `GraphView.fidelity` becomes a computed value from `graph_meta.model_version` instead of the `GraphView::empty` default | `alloy-index::query` | RS4 — one function decides fidelity, so it cannot silently lie |
+| **A-0014-5** *(post-merge, 2026-07-30, with RFC-0011 A-0011-6)* | SY10's no-body-descent rule is scoped to the **node-emitting item walker**, which still never descends. A dedicated *reference collector* (RFC-0011 §2.3b) MAY walk the bodies and signatures of already-emitted module-level items to record `References`/`Calls`/`Impls` edges. It emits **no nodes** (SY5 holds), never enters macro invocations or attributes, and blanks items nested inside bodies. SC3 is not weakened: `syn::parse_file` already recursed over the full token tree to build the AST the walker holds, so visiting that AST introduces no recursion a parse bomb could not already trigger, and the `max_file_bytes` gate runs before either. | §5 SY10, SC3 | A-0011-6a needs body-level facts; the rule's purpose (bounded recursion, linear node emission) survives intact |
+| **A-0014-6** *(post-merge, 2026-07-30, with RFC-0011 A-0011-6)* | LC7's `syn` feature list gains `visit` (read-only AST traversal), becoming `["full", "parsing", "clone-impls", "visit"]`. Still non-macro: `printing`, `fold`, `visit-mut`, `quote` and the proc-macro bridge remain forbidden, and the T20 placement rule (workspace pin, `alloy-index` alone) is untouched. | §9 LC7, T20 | The collector uses `syn::visit::Visit`; `visit` generates no code and links no compiler machinery |
 
 No amendment touches the `ProjectGraph` trait, the `GraphQuery` enum, or an Appendix A table shape — RFC-0011 E.3.3 holds.
 
@@ -397,7 +399,7 @@ This is the section that pays for itself before a line of Beta code is written. 
 | **SY7** | Module inference becomes **declaration-driven** (amendment A-0014-2): roots still come from the manifest (IN7a/IN7b), then `mod foo;` / `mod foo { … }` in the parent decides children, `#[path = "…"]` is honoured, and directory sibling-guessing (IN7c/IN7e) is retired. `cfg` is **not evaluated**: a `#[cfg]`-gated `mod` whose file exists is emitted and noted in warnings. IN7f survives verbatim — *missing* nodes are acceptable, *invented* ones are not (G7). |
 | **SY8** | Path collisions (two items resolving to the same `(Item, path)` — typically `cfg`-duplicated definitions) keep the **first in sorted traversal order**, drop the rest, and push one warning. Disambiguating suffixes are forbidden: they make ids depend on sibling contents and break IN6. |
 | **SY9** | A file that fails to parse is **skipped**, counted in `IngestReport.skipped`, and warned about — never fatal, mirroring IN12. `LangError::Parse` carries the path and reason, never source text. |
-| **SY10** | The visitor MUST NOT descend into function bodies, expressions, or macro invocations. It walks items and nested `mod` blocks only. This bounds recursion (SC3) and keeps the pass linear in item count, not token count. |
+| **SY10** | *(amended by A-0014-5, §2.4)* The **node-emitting item walker** MUST NOT descend into function bodies, expressions, or macro invocations. It walks items and nested `mod` blocks only. This bounds recursion (SC3) and keeps node emission linear in item count, not token count. The A-0014-5 reference collector may walk bodies of already-emitted items for edge collection; it emits no nodes and never enters macros. |
 
 ### 5.3 Imports
 
@@ -487,7 +489,7 @@ alloy-cli ──► alloy-tools ──► alloy-runtime ◄── alloy-index
 | # | Rule |
 | --- | --- |
 | **LC6** | `syn` is added **when this RFC is implemented, and not before** (RS8). Until then the identifier `syn` MUST NOT appear as a dependency in `Cargo.toml`, `crates/*/Cargo.toml`, or any lockfile entry introduced deliberately. T18 asserts this in both directions: before implementation it must be absent everywhere; after, present in `alloy-index` only. |
-| **LC7** | The dependency is minimal and non-macro: `syn = { version = "2", default-features = false, features = ["full", "parsing", "clone-impls"] }`, added to `[workspace.dependencies]` and consumed as `syn = { workspace = true }` by `alloy-index` alone. `quote`, `proc-macro2`'s `proc-macro` feature, `syn`'s `printing`/`fold`/`visit-mut` features, and `proc_macro` linkage are **not** taken — nothing here generates code, and `derive`/`printing` would pull the compiler's proc-macro bridge into a plain library. |
+| **LC7** | *(amended by A-0014-6, §2.4)* The dependency is minimal and non-macro: `syn = { version = "2", default-features = false, features = ["full", "parsing", "clone-impls", "visit"] }`, added to `[workspace.dependencies]` and consumed as `syn = { workspace = true }` by `alloy-index` alone. `quote`, `proc-macro2`'s `proc-macro` feature, `syn`'s `printing`/`fold`/`visit-mut` features, and `proc_macro` linkage are **not** taken — nothing here generates code, and `derive`/`printing` would pull the compiler's proc-macro bridge into a plain library. |
 
 `alloy-index/Cargo.toml` after this RFC — one line added to the RFC-0011 list:
 
@@ -643,7 +645,7 @@ Trait + value types; `RustBackend` with all eight methods; syn item/import pass 
 - [ ] 8. `RustBackend` and the syn pass live in `crates/alloy-index/src/lang/rust/` (LC2).
 - [ ] 9. `crates/alloy-runtime/Cargo.toml` still contains no `alloy-index` (RFC-0011 C2, T9 still green).
 - [ ] 10. The workspace still has exactly five crates; no `alloy-lang-*`, no `crate-type = ["cdylib"]`, no dynamic loader (RS9, T21).
-- [ ] 11. `syn` appears in `[workspace.dependencies]` and in `alloy-index`'s manifest only, with `default-features = false` and features `["full","parsing","clone-impls"]` (LC7, T20).
+- [ ] 11. `syn` appears in `[workspace.dependencies]` and in `alloy-index`'s manifest only, with `default-features = false` and features `["full","parsing","clone-impls","visit"]` (LC7 as amended by A-0014-6, T20).
 - [ ] 12. Before this RFC is implemented, `syn` appears in no manifest at all (RS8, T20).
 - [ ] 13. `std::process::Command` appears in neither `alloy-runtime/src/lang/**` nor `alloy-index/src/**` (LC5, T28, RFC-0011 T12).
 - [ ] 14. Both crates keep `#![forbid(unsafe_code)]` and `#![deny(missing_docs)]`.
@@ -671,7 +673,7 @@ Trait + value types; `RustBackend` with all eight methods; syn item/import pass 
 - [ ] 30. Module inference is declaration-driven, honours `#[path]`, does not evaluate `cfg`, and invents no node for a file that does not exist (SY7, T8).
 - [ ] 31. Path collisions keep the first in traversal order and warn; no disambiguating suffixes (SY8, T9).
 - [ ] 32. An unparseable file is skipped, counted and warned — never fatal (SY9, T10).
-- [ ] 33. The visitor never descends into function bodies or macro invocations (SY10).
+- [ ] 33. The node-emitting item walker never descends into function bodies or macro invocations; the A-0014-5 reference collector walks bodies for edges only, emitting no nodes and never entering macros (SY10 as amended).
 - [ ] 34. `Imports` edges are written only for in-workspace targets; `std::`/registry imports produce no edge and no node (SY11, T11).
 - [ ] 35. Groups, globs, renames and `pub use` behave as SY12 specifies (T12).
 - [ ] 36. Two ingests of an unchanged tree in separate processes produce identical digests and `IngestReport`s (SY14, T14).

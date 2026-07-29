@@ -560,14 +560,18 @@ fn generic_names(generics: Option<&syn::Generics>) -> BTreeSet<String> {
 /// Syntactic reference/call collector (A-0011-6). Records only shapes whose
 /// resolution has a chance of being confident:
 ///
-/// - type paths (signatures, fields, aliases), except bare generic
-///   parameters and `Self`;
+/// - type paths (signatures, fields, aliases);
 /// - trait bounds (`T: Codec`, supertraits);
 /// - struct-literal paths;
 /// - multi-segment value paths (`io::open`) — single-segment value paths
 ///   are overwhelmingly locals and are skipped;
 /// - call-expression callees, single-segment included (same-module helper
 ///   calls), marked as calls.
+///
+/// Every collected path passes the [`RefCollector::push_path`] gate, which
+/// drops any path whose head segment is `Self` or a generic parameter in
+/// scope (`T::helper()` resolves through the generic, whatever else shares
+/// its name — A-0011-6b).
 ///
 /// Never entered: attributes, macro invocations (tokens are unparsed),
 /// `use` declarations (handled by [`collect_use`]), method-call receivers'
@@ -576,6 +580,24 @@ fn generic_names(generics: Option<&syn::Generics>) -> BTreeSet<String> {
 struct RefCollector<'p> {
     generics: BTreeSet<String>,
     out: &'p mut Vec<(RawPath, bool)>,
+}
+
+impl RefCollector<'_> {
+    /// The single gate every collected path passes through: a path whose
+    /// head segment is `Self` or a generic parameter in scope resolves
+    /// through the generic (which shadows aliases, crate idents and module
+    /// children alike), so recording it risks an invented edge (G7). This
+    /// applies uniformly — calls, value paths, struct literals, type paths
+    /// and trait bounds — single- and multi-segment.
+    fn push_path(&mut self, path: &syn::Path, is_call: bool) {
+        if let Some(head) = path.segments.first() {
+            let head = head.ident.to_string();
+            if head == "Self" || self.generics.contains(&head) {
+                return;
+            }
+        }
+        self.out.push((raw_of(path), is_call));
+    }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for RefCollector<'_> {
@@ -588,10 +610,22 @@ impl<'ast> syn::visit::Visit<'ast> for RefCollector<'_> {
     // this trait method) are suppressed — `use`, `mod`, `impl` included.
     fn visit_item(&mut self, _: &'ast syn::Item) {}
 
+    // Nested generic scopes (an impl's or trait's method `fn m<U>(…)`)
+    // add their type parameters before their bounds/signature/body are
+    // visited — syn walks a signature's generics before its inputs and a
+    // fn's signature before its block. Names accumulate for the rest of
+    // the item; over-suppression is acceptable, invention is not (G7).
+    fn visit_generics(&mut self, node: &'ast syn::Generics) {
+        for p in node.type_params() {
+            self.generics.insert(p.ident.to_string());
+        }
+        syn::visit::visit_generics(self, node);
+    }
+
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*node.func {
             if p.qself.is_none() {
-                self.out.push((raw_of(&p.path), true));
+                self.push_path(&p.path, true);
             }
             // The callee path is consumed as a call; only arguments recurse
             // (a turbofish's type arguments are consumed with it).
@@ -607,7 +641,7 @@ impl<'ast> syn::visit::Visit<'ast> for RefCollector<'_> {
         // Single-segment value paths are overwhelmingly locals; the honesty
         // rule skips them rather than risk a shadowed false edge.
         if node.qself.is_none() && node.path.segments.len() >= 2 {
-            self.out.push((raw_of(&node.path), false));
+            self.push_path(&node.path, false);
         }
         syn::visit::visit_expr_path(self, node);
     }
@@ -615,24 +649,14 @@ impl<'ast> syn::visit::Visit<'ast> for RefCollector<'_> {
     fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
         // A struct literal's path names a type even when single-segment.
         if node.qself.is_none() {
-            self.out.push((raw_of(&node.path), false));
+            self.push_path(&node.path, false);
         }
         syn::visit::visit_expr_struct(self, node);
     }
 
     fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
         if node.qself.is_none() {
-            let single = node.path.segments.len() == 1;
-            let head = node
-                .path
-                .segments
-                .first()
-                .map(|s| s.ident.to_string())
-                .unwrap_or_default();
-            let is_generic_param = single && self.generics.contains(&head);
-            if head != "Self" && !is_generic_param {
-                self.out.push((raw_of(&node.path), false));
-            }
+            self.push_path(&node.path, false);
         }
         // Recurse for generic arguments (`Vec<Config>` reaches `Config`).
         syn::visit::visit_type_path(self, node);
@@ -641,7 +665,7 @@ impl<'ast> syn::visit::Visit<'ast> for RefCollector<'_> {
     fn visit_trait_bound(&mut self, node: &'ast syn::TraitBound) {
         // `T: Codec`, supertraits, `impl<T: Codec>` — bounds are trait
         // paths, not `TypePath`s, so they need their own hook.
-        self.out.push((raw_of(&node.path), false));
+        self.push_path(&node.path, false);
         syn::visit::visit_trait_bound(self, node);
     }
 }

@@ -490,6 +490,206 @@ async fn model_v2_database_truncates_and_reingests_with_semantic_edges() {
     assert_eq!(model, 3);
 }
 
+// ---------------------------------------------------------------------
+// Q7 as amended (A-0011-6f): Subgraph traversal stays structural
+// ---------------------------------------------------------------------
+
+// Subgraph BFS walks `Defines`/`Imports` only; the semantic kinds are never
+// traversed — a call graph is asked for via Callers/Refs/Impls, not pulled
+// into a neighbourhood. Semantic edges whose endpoints both land in the
+// view are still returned (the §5 edge-inclusion rule).
+#[tokio::test]
+async fn subgraph_traverses_structural_edges_only() {
+    let fx = Fx::cross();
+    let g = fx.built().await;
+    let encode = item("xc-core", "xc_core::encode");
+
+    // Radius 1 from `encode`: only the defining module — not the Calls
+    // targets (`helper`), Calls sources (`main`, `JsonCodec`) or the
+    // References target (`Config`).
+    let view = g
+        .query(GraphQuery::Subgraph {
+            seeds: vec![encode],
+            radius: 1,
+        })
+        .await
+        .unwrap();
+    let paths: Vec<&str> = view.nodes.iter().map(|n| n.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["xc_core", "xc_core::encode"],
+        "semantic edges must not be traversed (Q7 as amended by A-0011-6f)"
+    );
+
+    // Radius 2 reaches `helper` and `Config` structurally (via the module),
+    // and the semantic edges between in-view nodes are returned.
+    let view = g
+        .query(GraphQuery::Subgraph {
+            seeds: vec![encode],
+            radius: 2,
+        })
+        .await
+        .unwrap();
+    let paths: Vec<&str> = view.nodes.iter().map(|n| n.path.as_str()).collect();
+    assert!(paths.contains(&"xc_core::helper") && paths.contains(&"xc_core::Config"));
+    let helper = item("xc-core", "xc_core::helper");
+    let config = item("xc-core", "xc_core::Config");
+    assert!(
+        view.edges
+            .iter()
+            .any(|e| e.kind == GraphEdgeKind::Calls && e.from == encode && e.to == helper),
+        "in-view semantic edges are still returned"
+    );
+    assert!(view
+        .edges
+        .iter()
+        .any(|e| e.kind == GraphEdgeKind::References && e.from == encode && e.to == config));
+
+    // Even at the radius cap, the caller of `encode` (one Calls hop away,
+    // four structural hops away) stays out of view.
+    let view = g
+        .query(GraphQuery::Subgraph {
+            seeds: vec![encode],
+            radius: 3,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !view.nodes.iter().any(|n| n.path == "xc_cli::main::main"),
+        "Calls edges must not shortcut the structural BFS"
+    );
+    g.close().await.unwrap();
+}
+
+// ---------------------------------------------------------------------
+// Q4/Q5 robustness: high-degree anchors and SQLite's variable limit
+// ---------------------------------------------------------------------
+
+// A neighbourhood query over an anchor with tens of thousands of incident
+// edges must not build one SQL placeholder per node — SQLite's bundled
+// variable limit is 32766. Synthetic rows are injected straight into the
+// store (the graph is a derived cache; G1 says every row is fair game).
+#[tokio::test]
+async fn high_degree_anchor_stays_under_the_sqlite_variable_limit() {
+    let fx = Fx::cross();
+    let g = fx.built().await;
+    g.close().await.unwrap();
+    drop(g);
+
+    let encode = item("xc-core", "xc_core::encode").to_string();
+    {
+        let mut conn = rusqlite::Connection::open(fx.data.join("graph/graph.sqlite")).unwrap();
+        let tx = conn.transaction().unwrap();
+        for i in 0..40_000u32 {
+            let path = format!("xc_core::synthetic::caller_{i:05}");
+            let id = item("xc-core", &path).to_string();
+            tx.execute(
+                "INSERT INTO graph_nodes (id, kind, path, crate_id) VALUES (?1, 'item', ?2, 'xc-core')",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO graph_edges (from_id, to_id, kind) VALUES (?1, ?2, 'calls')",
+                rusqlite::params![id, encode],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    let g = fx.open().await;
+    let view = g
+        .query(GraphQuery::Callers {
+            fn_node: item("xc-core", "xc_core::encode"),
+        })
+        .await
+        .expect("a high-degree anchor must not blow the SQL variable limit");
+    assert!(view.truncated, "40k callers against the 2k node cap");
+    assert_eq!(view.nodes.len(), 2_000);
+    g.close().await.unwrap();
+}
+
+// ---------------------------------------------------------------------
+// A-0011-6b: generic parameters never resolve (G7)
+// ---------------------------------------------------------------------
+
+// A generic parameter can share its name with a `use` alias, a workspace
+// crate ident, or a module child. Rustc resolves the path through the
+// generic (which shadows them all); the pass performs no inference there,
+// so it must record nothing — an invented edge violates G7. Control fns
+// without the shadowing generic guard against over-suppression.
+#[tokio::test]
+async fn generic_parameter_heads_never_resolve_to_workspace_items() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let data = dir.path().join("data");
+    write(
+        &ws.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    write(
+        &ws.join("crates/gen-dep/Cargo.toml"),
+        "[package]\nname = \"gen-dep\"\n",
+    );
+    write(
+        &ws.join("crates/gen-dep/src/lib.rs"),
+        "pub fn helper() -> u8 { 1 }\npub struct Thing;\n",
+    );
+    write(
+        &ws.join("crates/gen-app/Cargo.toml"),
+        "[package]\nname = \"gen-app\"\n",
+    );
+    write(
+        &ws.join("crates/gen-app/src/lib.rs"),
+        "use gen_dep as T;\n\
+         pub struct App;\n\
+         pub trait Maker { type Thing; fn helper() -> u8; }\n\
+         // The generic shadows the alias: `T::helper` is the trait fn.\n\
+         pub fn alias_shadowed<T: Maker>() -> u8 { T::helper() }\n\
+         // The generic shadows the workspace crate ident.\n\
+         #[allow(non_camel_case_types)]\n\
+         pub fn crate_shadowed<gen_dep: Maker>() -> u8 { gen_dep::helper() }\n\
+         // A multi-segment *type* path headed by the generic.\n\
+         pub fn type_shadowed<T: Maker>(_x: T::Thing) -> u8 { 0 }\n\
+         // A method-level generic inside an impl block.\n\
+         impl App { pub fn m<T: Maker>() -> u8 { T::helper() } }\n\
+         // Controls: no shadowing generic in scope, so these DO resolve.\n\
+         pub fn control_alias() -> u8 { T::helper() }\n\
+         pub fn control_crate() -> u8 { gen_dep::helper() }\n",
+    );
+    let g = SqliteProjectGraph::open(GraphOpenOptions::for_data_dir(&data))
+        .await
+        .unwrap();
+    g.rebuild(&ws).await.unwrap();
+    g.close().await.unwrap();
+
+    let calls = edge_pairs(&data, "calls");
+    let refs = edge_pairs(&data, "references");
+    for shadowed in [
+        "gen_app::alias_shadowed",
+        "gen_app::crate_shadowed",
+        "gen_app::type_shadowed",
+        "gen_app::App",
+    ] {
+        let invented: Vec<_> = calls
+            .iter()
+            .chain(refs.iter())
+            .filter(|(from, to)| from == shadowed && to.starts_with("gen_dep::"))
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "generic-headed path invented an edge (G7): {invented:?}"
+        );
+    }
+    // Over-suppression guard: the unshadowed controls resolve as before.
+    for control in ["gen_app::control_alias", "gen_app::control_crate"] {
+        assert!(
+            pairs(&calls).contains(&(control, "gen_dep::helper")),
+            "control call from {control} was wrongly suppressed: {calls:?}"
+        );
+    }
+}
+
 /// A-0011-6b honesty: items declared inside a body live in their own scope —
 /// their references must NOT be attributed to the enclosing module-level
 /// item (the RefCollector doc's "items nested inside bodies" clause).
