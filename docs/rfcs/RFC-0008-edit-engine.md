@@ -589,6 +589,9 @@ pub enum EditError {
     #[error("untracked path in patch: {path}")]
     UntrackedPath { path: String },
 
+    #[error("create targets a tracked path (file exists): {path}")]
+    CreateOnTrackedPath { path: String },
+
     #[error("tracked deny-glob path present: {path}")]
     TrackedDeniedPath { path: String },
 
@@ -1196,6 +1199,7 @@ CAS **does** store patch bytes (needed for reconstruction). RFC-0004 retention a
 | V14 | Not a git repo / toplevel ≠ jail | `Environment(...)` (permanent) |
 | V15 | SemanticOps | `UnsupportedOp` |
 | V16 | `Modify`/`Delete` path not in `git ls-files -z` set (untracked or ignored) | `UntrackedPath` |
+| V16 | `Create` path already in the `git ls-files -z` set | `CreateOnTrackedPath` |
 | V17 | Tracked path matches deny-glob | `TrackedDeniedPath` |
 | V18 | Symlink at target path | `PathDenied { reason: "symlink" }` |
 | V19 | Non-regular file (dir/fifo/socket) at modify/delete target | `PathDenied { reason: "not a regular file" }` |
@@ -1309,7 +1313,7 @@ Before checkpoint on the mutating path:
 1. `git rev-parse --show-toplevel` canonicalize → MUST equal `path_policy.jail()`; else `Environment("repo toplevel != jail")`.
 2. Confirm `.git` is a **directory** (not a gitfile). Host `symlink_metadata(jail.join(".git"))` — if the probe fails or the entry is not a directory → `Environment("linked worktree not supported")` (covers linked worktrees where toplevel can still equal jail).
 3. `git ls-files -z` → build the **tracked-path set** (NUL-delimited). **Non-UTF-8 tracked paths:** if any NUL-separated entry is not valid UTF-8 → `Environment("non-utf8 tracked path")` (fail closed; `deny_matches_rel` is `&str`). Otherwise any tracked path with `path_policy.deny_matches_rel` → `TrackedDeniedPath` (V17).
-4. **Tracked-set invariant (V16):** every `Modify` and `Delete` path MUST be in the tracked-path set; every `Create` path MUST NOT be. Violation → `UntrackedPath` (covers untracked **and** git-ignored paths). Paths outside the patch are left untouched.
+4. **Tracked-set invariant (V16):** every `Modify` and `Delete` path MUST be in the tracked-path set; violation → `UntrackedPath` (covers untracked **and** git-ignored paths). Every `Create` path MUST NOT be in the set; violation → `CreateOnTrackedPath` (the file exists — the honest correction is `Modify`, not a different path). Paths outside the patch are left untouched. *(Amended per issue #37: one error previously covered both directions, describing the `Create` case as the opposite of what happened.)*
 5. Nested `.git` markers below jail are not walked by digest; patch paths under one → `Environment("submodule path not supported")`. A marker is a `.git` **gitfile** (how git records a submodule's worktree) *or* a `.git` **directory** (a nested clone), probed with `symlink_metadata` so a symlinked `.git` is never followed out of the jail.
 6. V30 digest-excluded patch paths (§5.4) — also enforced here as a final pre-checkpoint guard.
 
@@ -1558,6 +1562,7 @@ Engine is process-lifetime, session-agnostic (§3.5). Dropping the engine MUST N
 | `ContextMismatch` | hunk context | Drift | no |
 | `OverlappingHunks` | validation | Bad patch | no |
 | `UntrackedPath` | ls-files tracked-set miss | Untracked/ignored modify | no |
+| `CreateOnTrackedPath` | ls-files tracked-set hit on create | File already exists | no |
 | `TrackedDeniedPath` | ls-files ∩ deny | Secrets tracked | no |
 | `CheckpointFailed` | transient git create (e.g. ref race) | Fail closed pre-mutate | yes |
 | `Environment` | git < 2.23 / unborn HEAD / jail mismatch / backend unavailable / SHA-256 | Permanent misconfig | no |
@@ -1667,6 +1672,7 @@ Permission-class errors MUST become `PatchApplyError::PermissionDenied` so execu
 | `ContextMismatch` | `Conflict(msg)` | no |
 | `OverlappingHunks` | `InvalidPatch(msg)` | no |
 | `UntrackedPath` | `Conflict(msg)` | no |
+| `CreateOnTrackedPath` | `Conflict(msg)` | no |
 | `TrackedDeniedPath` | `PermissionDenied(PathNotCovered(path))` | no |
 | `CheckpointFailed` | `Io(msg)` | yes |
 | `Environment` | `Unsupported(msg)` | no (permanent) |

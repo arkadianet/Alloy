@@ -37,6 +37,19 @@ pub enum RuntimeEvent {
         /// Grace period milliseconds.
         grace_ms: u64,
     },
+    /// An audit record could not be persisted (issue #22). The failing
+    /// `DecisionLog` call still returns its error; this event exists so a
+    /// caller that swallows that error (per RFC-0006 §5.9, obs never
+    /// changes a tool call's return value) leaves a durable trace instead
+    /// of only a warn line.
+    AuditRecordDropped {
+        /// Session the record was for (may not exist — that can be the failure).
+        session: String,
+        /// Record type: `decision`, `model_call`, or `tool_call`.
+        record_type: String,
+        /// Failure detail.
+        error: String,
+    },
     /// Runtime stopped.
     Stopped,
     /// Fatal failure.
