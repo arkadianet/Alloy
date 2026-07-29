@@ -49,6 +49,38 @@ The default profile keeps the guard rails on: Landlock/container sandbox,
 `require_cargo_check`, human gate before edits land, $5 / 2M-token budget
 ceilings per run. `--dry-run` shows the plan without dispatching.
 
+## 3b. Review a diff (Alloy on Alloy's own PRs)
+
+`alloy review` runs the `review` capability over a unified diff and prints
+its findings. The CLI spawns nothing — not even `git` — so the diff is piped
+in or named as a file:
+
+```sh
+git diff origin/main... | alloy review --diff -
+alloy review --diff /tmp/pr.diff --json
+```
+
+Findings print as `severity file:line message`, then `summary:` and
+`verdict:`. Exit `0` means `approve`; exit `16` (`EX_REVIEW_CHANGES`) means
+the reviewer asked for changes — a successful run with an opinion, not a
+failure. The planned template (`review_diff`) is a single read-only node: no
+edit, no gate, no cargo. Note that the `readonly` profile's
+`max_usd_per_run = 0` denies the model call, so review under the default
+profile for now.
+
+The diff does not travel in the goal text. It is stored as a `Patch`
+artifact and attached to the goal; the `review` worker reads those bytes
+back and fences them verbatim. Goal *text* is sanitised for prompt injection
+on its way through the context engine (per-line `trim_end`, fence-marker
+stripping), which would quietly reshape a whitespace-sensitive patch —
+blank context lines, trailing-whitespace changes, `>>>>>>>` conflict
+markers. Diffs over 128 KiB are cut, and the cut is stated in three places
+that agree: an `[alloy: truncated — {kept} of {total} bytes shown]` marker
+inside the fenced diff the model reads, a `(diff truncated: …)` line on
+stdout, and `diff_truncated` / `diff_bytes` / `diff_total_bytes` in the
+`--json` envelope. The model's own findings cap is a separate field,
+`findings_truncated`.
+
 ## 4. What to record when it misbehaves
 
 File an issue per failure with:

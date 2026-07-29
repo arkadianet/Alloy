@@ -176,6 +176,27 @@ fn build_provider(
     Ok(Arc::new(provider))
 }
 
+/// Host affirmations this process makes about the runs it will dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct AssemblyOptions {
+    /// Whether the scheduler's load-time validation requires a `GateHuman`
+    /// node (RFC-0009 V11).
+    ///
+    /// `true` everywhere a run may change the workspace. `alloy review`
+    /// dispatches exactly one template, `review_diff`, whose every node is
+    /// read-only (`TemplateManifest::is_read_only`) and which therefore
+    /// carries no gate to require.
+    pub require_gates: bool,
+}
+
+impl Default for AssemblyOptions {
+    fn default() -> Self {
+        Self {
+            require_gates: true,
+        }
+    }
+}
+
 /// Assemble steps 4–12 on top of [`assemble_read`]'s base.
 ///
 /// `readonly` applies PF10 structurally: no `GitEditEngine`, a refusing
@@ -184,6 +205,16 @@ pub async fn assemble_full(
     base: ReadAssembly,
     workspace_root: &Path,
     readonly: bool,
+) -> Result<FullAssembly, CliError> {
+    assemble_full_with(base, workspace_root, readonly, AssemblyOptions::default()).await
+}
+
+/// [`assemble_full`] with explicit host affirmations (CR1).
+pub async fn assemble_full_with(
+    base: ReadAssembly,
+    workspace_root: &Path,
+    readonly: bool,
+    options: AssemblyOptions,
 ) -> Result<FullAssembly, CliError> {
     let cfg = base.cfg.clone();
     let storage = Arc::clone(&base.storage);
@@ -387,7 +418,11 @@ pub async fn assemble_full(
             runtime_cancel: handle.cancellation(),
             budget_policy: cfg.budget_policy.clone(),
             run_timeout: cfg.run_timeout,
-            config: SchedConfig::new(cfg.data_dir.clone()),
+            config: {
+                let mut sched = SchedConfig::new(cfg.data_dir.clone());
+                sched.validate_opts.require_gates = options.require_gates;
+                sched
+            },
         })
         .map_err(|e| CliError::new(Exit::State, format!("scheduler: {e}")))?,
     );

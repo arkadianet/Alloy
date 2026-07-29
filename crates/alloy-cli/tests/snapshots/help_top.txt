@@ -4,6 +4,7 @@ Usage: alloy [OPTIONS] [COMMAND]
 
 Commands:
   run      Take a goal to a compile-verified patch (or an honest failure)
+  review   Review a unified diff and print the findings (read-only)
   events   List session events from durable storage
   approve  Resolve a human gate from any process
   cancel   Cancel a run

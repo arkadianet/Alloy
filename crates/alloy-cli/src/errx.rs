@@ -41,6 +41,12 @@ pub enum Exit {
     State,
     /// `15` — graph open / rebuild failed.
     Graph,
+    /// `16` — a review completed and asked for changes (`alloy review`).
+    ///
+    /// Not a failure: the run succeeded and the verdict is the answer (VW4).
+    /// It has its own code so CI can tell "the reviewer wants changes" from
+    /// "the review could not be produced" (`EX_RUN_FAILED`).
+    ReviewChanges,
 }
 
 impl Exit {
@@ -64,6 +70,7 @@ impl Exit {
             Exit::ProfileRefused => 13,
             Exit::State => 14,
             Exit::Graph => 15,
+            Exit::ReviewChanges => 16,
         }
     }
 
@@ -87,6 +94,7 @@ impl Exit {
             Exit::ProfileRefused => "EX_PROFILE_REFUSED",
             Exit::State => "EX_STATE",
             Exit::Graph => "EX_GRAPH",
+            Exit::ReviewChanges => "EX_REVIEW_CHANGES",
         }
     }
 }
@@ -346,7 +354,7 @@ mod tests {
         );
     }
 
-    /// §9.2 — the taxonomy is closed: exactly sixteen codes, 0..=15, each
+    /// §9.2 — the taxonomy is closed: exactly seventeen codes, 0..=16, each
     /// with a unique number and name.
     #[test]
     fn taxonomy_is_closed_and_dense() {
@@ -367,6 +375,7 @@ mod tests {
             Exit::ProfileRefused,
             Exit::State,
             Exit::Graph,
+            Exit::ReviewChanges,
         ];
         for (i, e) in all.iter().enumerate() {
             assert_eq!(u8::try_from(i).unwrap(), e.code());
