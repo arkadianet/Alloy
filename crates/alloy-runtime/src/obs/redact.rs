@@ -77,12 +77,27 @@ impl CapturePolicy {
         }
     }
 
-    /// Whether capture is permitted for a session with the given
-    /// `corpus_ok` consent. Fail closed on every axis.
+    /// Whether capture of `scope` is permitted for a session with the
+    /// given `corpus_ok` consent. Fail closed on every axis: the master
+    /// switch, the per-scope flag, and consent must all authorise it —
+    /// `enabled` alone never grants anything.
     #[must_use]
-    pub fn permits_capture(&self, corpus_ok: bool) -> bool {
-        self.enabled && (corpus_ok || !self.require_consent)
+    pub fn permits_capture(&self, scope: CaptureScope, corpus_ok: bool) -> bool {
+        let scope_on = match scope {
+            CaptureScope::Prompts => self.prompts,
+            CaptureScope::ToolBodies => self.tool_bodies,
+        };
+        self.enabled && scope_on && (corpus_ok || !self.require_consent)
     }
+}
+
+/// What kind of content a capture decision is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureScope {
+    /// Rendered prompts / completions.
+    Prompts,
+    /// Tool argument/result bodies.
+    ToolBodies,
 }
 
 impl Default for CapturePolicy {
@@ -537,19 +552,45 @@ mod tests {
         let p = CapturePolicy::default();
         assert!(!p.enabled && !p.prompts && !p.tool_bodies);
         assert!(p.require_consent);
-        assert!(!p.permits_capture(true), "disabled beats consent");
-        let enabled = CapturePolicy {
+        assert!(
+            !p.permits_capture(CaptureScope::Prompts, true),
+            "disabled beats consent"
+        );
+
+        // enabled alone grants nothing: the scope flag must be on too.
+        let enabled_no_scope = CapturePolicy {
             enabled: true,
             ..CapturePolicy::disabled()
         };
-        assert!(enabled.permits_capture(true));
-        assert!(!enabled.permits_capture(false), "no consent, no capture");
+        for scope in [CaptureScope::Prompts, CaptureScope::ToolBodies] {
+            assert!(
+                !enabled_no_scope.permits_capture(scope, true),
+                "{scope:?}: no scope flag, no capture"
+            );
+        }
+
+        let prompts_on = CapturePolicy {
+            enabled: true,
+            prompts: true,
+            ..CapturePolicy::disabled()
+        };
+        assert!(prompts_on.permits_capture(CaptureScope::Prompts, true));
+        assert!(
+            !prompts_on.permits_capture(CaptureScope::ToolBodies, true),
+            "prompt scope must not authorise tool bodies"
+        );
+        assert!(
+            !prompts_on.permits_capture(CaptureScope::Prompts, false),
+            "no consent, no capture"
+        );
+
         let no_consent_needed = CapturePolicy {
             enabled: true,
+            prompts: true,
             require_consent: false,
             ..CapturePolicy::disabled()
         };
-        assert!(no_consent_needed.permits_capture(false));
+        assert!(no_consent_needed.permits_capture(CaptureScope::Prompts, false));
     }
     use serde_json::json;
 

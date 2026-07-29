@@ -460,15 +460,25 @@ impl InProcessMcpHost {
         outcome.map(|result| result.with_call_id(call.call_id.clone()))
     }
 
-    /// Canonical `{arguments, outcome}` digest for a tool call. Deterministic:
-    /// `serde_json`'s map is a `BTreeMap`, so key order is sorted, and the
-    /// same call with the same outcome always hashes identically.
+    /// Canonical `{arguments, outcome}` digest for a tool call.
+    /// Deterministic and *stable*: only the logical content is hashed —
+    /// `call_id` (per-call correlation) and `duration_ms` (wall clock) are
+    /// projected out, so the same arguments with the same logical outcome
+    /// hash identically across calls and processes. `serde_json`'s map is a
+    /// `BTreeMap`, so key order is sorted.
     fn content_hash_for(
         call: &ToolCall,
         outcome: &Result<ToolResult, McpError>,
     ) -> alloy_runtime::Digest {
         let outcome_json = match outcome {
-            Ok(result) => serde_json::json!({ "ok": result }),
+            Ok(result) => serde_json::json!({
+                "ok": {
+                    "name": result.name.as_str(),
+                    "content": result.content,
+                    "is_error": result.is_error(),
+                    "error": result.error().map(std::string::ToString::to_string),
+                }
+            }),
             Err(err) => serde_json::json!({ "mcp_error": err.to_string() }),
         };
         let canonical = serde_json::json!({

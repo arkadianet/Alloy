@@ -72,10 +72,17 @@ pub fn tool_versions_digest(toolchain: &ToolchainRecord) -> Digest {
         &toolchain.rustc_version,
         &toolchain.cargo_version,
     ] {
-        bytes.push(0x00);
-        bytes.extend_from_slice(field.as_bytes());
+        push_framed(&mut bytes, field);
     }
     Digest::sha256(&bytes)
+}
+
+/// Unambiguous field framing: u64-LE length prefix, then the bytes. A
+/// separator-based framing would collide on inputs containing the
+/// separator; a length prefix cannot.
+fn push_framed(out: &mut Vec<u8>, field: &str) {
+    out.extend_from_slice(&(field.len() as u64).to_le_bytes());
+    out.extend_from_slice(field.as_bytes());
 }
 
 /// Compiler fingerprint: the exact `rustc` plus the target triple it
@@ -85,10 +92,8 @@ pub fn tool_versions_digest(toolchain: &ToolchainRecord) -> Digest {
 pub fn compiler_fingerprint_digest(toolchain: &ToolchainRecord, target_triple: &str) -> Digest {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"alloy.compiler_fingerprint.v1");
-    bytes.push(0x00);
-    bytes.extend_from_slice(toolchain.rustc_version.as_bytes());
-    bytes.push(0x00);
-    bytes.extend_from_slice(target_triple.as_bytes());
+    push_framed(&mut bytes, &toolchain.rustc_version);
+    push_framed(&mut bytes, target_triple);
     Digest::sha256(&bytes)
 }
 
@@ -105,10 +110,10 @@ pub fn policy_hash_digest(
 ) -> Digest {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"alloy.policy_hash.v1");
-    bytes.push(0x00);
-    bytes.extend_from_slice(profile.as_str().as_bytes());
-    bytes.push(0x00);
-    bytes.extend_from_slice(&serde_json::to_vec(policy).expect("BudgetPolicy JSON serialization"));
+    push_framed(&mut bytes, profile.as_str());
+    let policy_json = serde_json::to_vec(policy).expect("BudgetPolicy JSON serialization");
+    bytes.extend_from_slice(&(policy_json.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&policy_json);
     Digest::sha256(&bytes)
 }
 
@@ -223,6 +228,35 @@ mod tests {
         assert_ne!(
             policy_hash_digest(&default_profile, &policy),
             policy_hash_digest(&autonomous, &policy)
+        );
+    }
+
+    /// Field framing is length-prefixed, so shifting bytes across a field
+    /// boundary (which a separator-based framing would conflate) changes
+    /// the digest.
+    #[test]
+    fn fingerprint_framing_is_unambiguous_across_field_boundaries() {
+        let a = ToolchainRecord {
+            channel: "1.97.1\u{0}x".into(),
+            rustc_version: "r".into(),
+            cargo_version: "c".into(),
+        };
+        let b = ToolchainRecord {
+            channel: "1.97.1".into(),
+            rustc_version: "\u{0}x\u{0}r".into(),
+            cargo_version: "c".into(),
+        };
+        assert_ne!(tool_versions_digest(&a), tool_versions_digest(&b));
+
+        let tc = toolchain();
+        assert_ne!(
+            compiler_fingerprint_digest(&tc, "a\u{0}b"),
+            {
+                let mut moved = tc.clone();
+                moved.rustc_version = format!("{}\u{0}a", moved.rustc_version);
+                compiler_fingerprint_digest(&moved, "b")
+            },
+            "bytes moved across the field boundary must not collide"
         );
     }
 }

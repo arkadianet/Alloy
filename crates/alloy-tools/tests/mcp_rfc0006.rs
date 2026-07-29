@@ -1479,6 +1479,36 @@ async fn decision_log_contract() {
     assert!(!records[2].denied);
 }
 
+/// §7.11 item 2: successful results hash over logical content only —
+/// per-call correlation ids and wall-clock duration are projected out, so
+/// equal arguments + equal output give equal digests across calls.
+#[tokio::test]
+async fn tool_call_content_hash_ignores_call_id_and_duration() {
+    let fx = Fixture::new();
+    fx.write("stable.txt", b"same bytes every time");
+    let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+    let host = fx.host(fx.broker()).with_decision_log(log.clone());
+    let session = SessionId::new();
+
+    for call_id in ["first-call", "second-call"] {
+        host.call(
+            call("fs_read", json!({ "path": "stable.txt" }))
+                .with_attribution(Some(session), None, None)
+                .with_call_id(call_id.to_string()),
+            token(vec![Grant::FsRead(Glob("*.txt".into()))]),
+        )
+        .await
+        .unwrap();
+    }
+
+    let records = log.recorded_tool_calls();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0].content_hash, records[1].content_hash,
+        "call_id and duration must not perturb the digest"
+    );
+}
+
 /// §7.11 item 2: the same call with the same outcome hashes identically, and
 /// different arguments hash differently — the digest is a stable join key.
 #[tokio::test]

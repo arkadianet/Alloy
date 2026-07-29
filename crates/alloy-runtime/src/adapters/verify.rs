@@ -387,10 +387,11 @@ mod tests {
     }
 
     #[test]
-    fn vc1_exit_101_no_signal_not_truncated_is_soft_fail() {
+    fn vc1_exit_101_no_signal_not_truncated_is_a_fail_verdict() {
         let r = failed_result(Some(101), None, false, exec_failed(Some(101), None));
         assert_eq!(classify_cargo_result(&r).unwrap(), CargoRan::Exited(101));
-        assert_eq!(cargo_exit_verdict(Some(101), true), VerdictOutcome::Fail);
+        // 101 is Fail on its own — independent of the diagnostics rule.
+        assert_eq!(cargo_exit_verdict(Some(101), false), VerdictOutcome::Fail);
     }
 
     #[test]

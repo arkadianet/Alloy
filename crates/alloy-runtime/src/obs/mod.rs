@@ -37,5 +37,5 @@ pub(crate) use redact::truncate_utf8_bytes;
 pub(crate) use redact::BODY_MAX_BYTES as MODEL_PROMPT_BODY_MAX_BYTES;
 pub use redact::{
     apply_prompt_retention, apply_tool_retention, redact_json_strings, redact_secrets,
-    CapturePolicy, RetentionPolicy,
+    CapturePolicy, CaptureScope, RetentionPolicy,
 };
