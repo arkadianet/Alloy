@@ -37,6 +37,15 @@ model = "qwen2.5-coder:14b"          # must match the served model id
 Alloy never invents keys: export `ALLOY_API_KEY=local` (any non-empty value)
 or put it in your env file.
 
+`repair_local_diagnostic` escalates its analyze/edit nodes to the `premium`
+tier on their one retry (RFC-0010 §5.11.4 ES1), and that tier now reaches
+endpoint selection — so serve `premium` with something if you want the retry
+to run on a better model. The commented `local-coder-big` endpoint in
+`router.toml.local-example` (`ollama pull qwen2.5-coder:32b`) is the intended
+landing spot; adding `"premium"` to `local-coder`'s `tiers` is the low-effort
+alternative. Serving nothing is also fine: the retry then routes at the
+configured tier and the route decision records `escalation_unserved = true`.
+
 ## 3. Run against a broken fixture, not a precious tree
 
 ```sh

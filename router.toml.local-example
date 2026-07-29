@@ -35,6 +35,28 @@ temperature = 0.6
 input_usd_per_mtok = 0.0
 output_usd_per_mtok = 0.0
 
+# Tier escalation target (RFC-0010 §5.11.4 ES1). `repair_local_diagnostic`
+# escalates analyze/edit to `premium` on their retry. To make that escalation
+# mean something, serve `premium` with a bigger local model:
+# `ollama pull qwen2.5-coder:32b`, then uncomment. (Lower-effort alternative:
+# add "premium" to `local-coder`'s `tiers` above and the retry re-runs on the
+# same model.)
+#
+# If you do neither, nothing breaks: with no `premium` endpoint the escalated
+# retry routes at the configured tier — the same `local-coder` that just
+# failed — and the route decision records `escalation_unserved = true`. An
+# escalation only ever raises a tier; it never lowers one (RFC-0007 §5.2.1).
+# [[providers.endpoints]]
+# id = "local-coder-big"
+# display_name = "Local coder (big)"
+# model = "qwen2.5-coder:32b"
+# tiers = ["premium"]
+# supports_tools = true
+# supports_structured_output = true
+# max_context = 32768
+# input_usd_per_mtok = 0.0
+# output_usd_per_mtok = 0.0
+
 [capability_tiers]
 repair = "standard"
 edit = "standard"

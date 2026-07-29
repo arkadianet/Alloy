@@ -62,6 +62,7 @@ fn route_request(run: RunId) -> RoutingRequest {
         run: Some(run),
         node: None,
         capability: CapabilityId::new("repair").expect("capability"),
+        tier_override: None,
         complexity: None,
         budget_remaining: BudgetSnapshot {
             usd_spent: 0.0,
@@ -302,6 +303,167 @@ async fn no_endpoint_records_model_route() {
     assert_eq!(decision.metadata["in_flight_at_route"], 1);
     assert!(decision.metadata.get("endpoint_id").is_none());
     assert!(decision.metadata.get("model").is_none());
+    assert_eq!(router.metrics().routes_no_endpoint, 1);
+}
+
+/// Config with a `premium`-only endpoint alongside the `standard` one, so a
+/// routed tier is observable in `endpoint_id` rather than inferred.
+fn escalation_config_source() -> String {
+    r#"
+[policy]
+default_tier = "standard"
+max_in_flight = 2
+shutdown_grace_ms = 50
+
+[[providers]]
+id = "provider"
+kind = "openai_compatible"
+base_url = "https://example.com"
+api_key_env = "MODEL_KEY"
+
+[[providers.endpoints]]
+id = "standard-endpoint"
+display_name = "Standard"
+model = "operator-standard"
+tiers = ["standard"]
+supports_structured_output = true
+max_context = 4096
+input_usd_per_mtok = 2.0
+output_usd_per_mtok = 4.0
+
+[[providers.endpoints]]
+id = "premium-endpoint"
+display_name = "Premium"
+model = "operator-premium"
+tiers = ["premium"]
+supports_structured_output = true
+max_context = 4096
+input_usd_per_mtok = 8.0
+output_usd_per_mtok = 16.0
+
+[capability_tiers]
+repair = "standard"
+"#
+    .to_owned()
+}
+
+fn escalation_router(source: &str) -> (Arc<RecordingDecisionLog>, RunId, TomlModelRouter) {
+    let provider = Arc::new(RecordingModelProvider::new(
+        ProviderId::new("provider").expect("provider"),
+    ));
+    let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+    let run = RunId::new();
+    let router = build_router(
+        RouterConfig::from_str("escalation", source).expect("valid escalation config"),
+        provider,
+        BudgetPolicy::default(),
+        log.clone(),
+        SharedCostMeter::new(),
+        run,
+    );
+    (log, run, router)
+}
+
+/// RFC-0010 §5.11.4 ES1/ES3 + RFC-0013 MR2: an escalated attempt carries
+/// `CapabilityExecContext.effective_tier = Premium`, and that tier MUST reach
+/// endpoint selection — otherwise escalation is cosmetic and the retry runs
+/// on exactly the model that just failed.
+#[tokio::test]
+async fn tier_override_routes_to_the_escalated_endpoint() {
+    let (log, run, router) = escalation_router(&escalation_config_source());
+    let mut request = route_request(run);
+    request.tier_override = Some(ModelTier::Premium);
+
+    let routed = router.route(request).await.expect("premium endpoint");
+    assert_eq!(routed.tier(), ModelTier::Premium);
+    assert_eq!(routed.endpoint().id.as_str(), "premium-endpoint");
+    assert_eq!(routed.endpoint().model, "operator-premium");
+
+    let decision = log.recorded_decisions().pop().expect("route decision");
+    assert_eq!(decision.metadata["tier"], "premium");
+    assert_eq!(decision.metadata["tier_source"], "escalation");
+    assert_eq!(decision.metadata["requested_tier"], "premium");
+    assert_eq!(decision.metadata["endpoint_id"], "premium-endpoint");
+    // The capability→tier map still resolved, it was merely raised.
+    assert_eq!(decision.metadata["capability_mapped"], true);
+}
+
+/// The absent override is the identity: base routing is untouched.
+#[tokio::test]
+async fn absent_tier_override_routes_at_the_capability_tier() {
+    let (log, run, router) = escalation_router(&escalation_config_source());
+    let routed = router.route(route_request(run)).await.expect("standard");
+    assert_eq!(routed.tier(), ModelTier::Standard);
+    assert_eq!(routed.endpoint().id.as_str(), "standard-endpoint");
+    let decision = log.recorded_decisions().pop().expect("route decision");
+    assert_eq!(decision.metadata["tier_source"], "capability_map");
+    assert!(decision.metadata.get("requested_tier").is_none());
+}
+
+/// RFC-0007 §5.2.1: nothing downgrades a configured tier. An override *below*
+/// the capability tier is inert — escalation raises, it never lowers.
+#[tokio::test]
+async fn tier_override_never_downgrades_the_capability_tier() {
+    let (log, run, router) = escalation_router(&escalation_config_source());
+    let mut request = route_request(run);
+    request.tier_override = Some(ModelTier::Economy);
+
+    let routed = router.route(request).await.expect("standard endpoint");
+    assert_eq!(routed.tier(), ModelTier::Standard);
+    assert_eq!(routed.endpoint().id.as_str(), "standard-endpoint");
+    let decision = log.recorded_decisions().pop().expect("route decision");
+    assert_eq!(decision.metadata["tier"], "standard");
+    assert_eq!(decision.metadata["tier_source"], "capability_map");
+    assert_eq!(decision.metadata["requested_tier"], "economy");
+    assert_eq!(decision.metadata["escalation_unserved"], false);
+}
+
+/// A single-endpoint config (what both shipped examples ship by default)
+/// escalating to an unserved `premium` MUST degrade to the configured tier,
+/// not hard-fail the retry with `NoEndpoint`. The fall back is recorded, so
+/// "escalation had no target" is observable rather than silent.
+#[tokio::test]
+async fn unserved_escalation_falls_back_to_the_capability_tier() {
+    let (log, run, router) = escalation_router(&config_source("https://example.com"));
+    let mut request = route_request(run);
+    request.tier_override = Some(ModelTier::Premium);
+
+    let routed = router.route(request).await.expect("degrades to standard");
+    assert_eq!(routed.tier(), ModelTier::Standard);
+    assert_eq!(routed.endpoint().id.as_str(), "endpoint");
+
+    let decision = log.recorded_decisions().pop().expect("route decision");
+    assert_eq!(decision.metadata["tier"], "standard");
+    assert_eq!(decision.metadata["tier_source"], "capability_map");
+    assert_eq!(decision.metadata["requested_tier"], "premium");
+    assert_eq!(decision.metadata["escalation_unserved"], true);
+    assert_eq!(router.metrics().routes_escalation_unserved, 1);
+    assert_eq!(router.metrics().routes_no_endpoint, 0);
+}
+
+/// Degradation is confined to the override: when the *configured* tier has no
+/// endpoint either, `NoEndpoint` still names the configured tier (RFC-0007's
+/// "no failover to another tier" is intact).
+#[tokio::test]
+async fn unserved_escalation_over_an_unserved_base_still_fails_closed() {
+    let (log, run, router) = escalation_router(&escalation_config_source());
+    let mut request = route_request(run);
+    request.tier_override = Some(ModelTier::Premium);
+    request.requires_tools = true; // no endpoint in this config supports tools
+
+    assert!(matches!(
+        router.route(request).await,
+        Err(RouterError::NoEndpoint {
+            tier: ModelTier::Standard,
+            requires_tools: true,
+            ..
+        })
+    ));
+    let decision = log.recorded_decisions().pop().expect("route decision");
+    assert_eq!(decision.metadata["error"], "no_endpoint");
+    assert_eq!(decision.metadata["tier"], "standard");
+    assert_eq!(decision.metadata["requested_tier"], "premium");
+    assert_eq!(decision.metadata["escalation_unserved"], true);
     assert_eq!(router.metrics().routes_no_endpoint, 1);
 }
 

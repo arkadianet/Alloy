@@ -55,6 +55,19 @@ pub struct SchedConfig {
     pub validate_on_load: bool,
     /// Options for the load-time validation.
     pub validate_opts: ValidateOpts,
+    /// Test-only probe fired immediately before the §5.11.3 B3 backoff
+    /// `select!` is polled.
+    ///
+    /// It exists because no durable record separates "retry admitted" from
+    /// "parked in the backoff sleep": the C8 `retry_admitted` decision is
+    /// written a whole `loop_step` *earlier*, so a test that cancels on it
+    /// races the L1 cancellation check and can terminate the run without the
+    /// sleep future ever existing. Signalling here — with the run task still
+    /// holding the executor, so the waiter cannot run until the `select!`
+    /// polls the sleep to `Pending` — is what makes "cancel lands inside the
+    /// backoff" deterministic on the single-threaded test runtime.
+    #[cfg(test)]
+    pub(crate) backoff_entered: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl SchedConfig {
@@ -72,6 +85,8 @@ impl SchedConfig {
                 enforce_linear_mvp: true,
                 require_gates: true,
             },
+            #[cfg(test)]
+            backoff_entered: None,
         }
     }
 }

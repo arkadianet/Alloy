@@ -150,6 +150,7 @@ mod tests {
             run: None,
             node: None,
             capability: CapabilityId::new("repair").unwrap(),
+            tier_override: None,
             complexity: None,
             budget_remaining: BudgetSnapshot {
                 usd_spent: 0.0,
