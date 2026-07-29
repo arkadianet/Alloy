@@ -4,17 +4,42 @@
 //! bootstrapped before v1, sequential `if current < N` blocks run inside one
 //! transaction, and `current_version = SELECT MAX(version)`.
 
-use alloy_runtime::graph::GraphError;
+use alloy_runtime::graph::{GraphError, GraphFidelity};
 use rusqlite::Connection;
 
 use crate::db::from_rusqlite;
 
-/// Schema version shipped by this crate (rule S3).
+/// Schema version shipped by this crate (rule S3). Still `1` at Beta: the
+/// v1 `CHECK` lists already admit `'item'`/`'imports'` rows (RFC-0014 SY2 —
+/// no DDL, no migration).
 pub(crate) const GRAPH_SCHEMA_VERSION: u32 = 1;
 
 /// Ingest-semantics version (rule S4). A mismatch truncates and re-ingests;
-/// it never migrates — the graph is a derived cache (G1).
-pub(crate) const GRAPH_MODEL_VERSION: u32 = 1;
+/// it never migrates — the graph is a derived cache (G1). `2` since the
+/// RFC-0014 `syn` deep pass (SY1): a manifest-only v1 database is wiped and
+/// re-ingested deeply, never merged.
+pub(crate) const GRAPH_MODEL_VERSION: u32 = 2;
+
+/// RS4 / amendment A-0014-4: the **only** place a fidelity value is decided.
+/// Every construction site reads `graph_meta.model_version` (directly or via
+/// [`GRAPH_MODEL_VERSION`]) and calls this, so fidelity cannot silently lie.
+pub(crate) fn fidelity_for_model_version(model_version: u32) -> GraphFidelity {
+    if model_version >= 2 {
+        GraphFidelity::SynDeep
+    } else {
+        GraphFidelity::Manifest
+    }
+}
+
+/// Read `graph_meta.model_version` (the fidelity source of truth — RS4).
+pub(crate) fn read_model_version(conn: &Connection) -> Result<u32, GraphError> {
+    conn.query_row(
+        "SELECT model_version FROM graph_meta WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(from_rusqlite)
+}
 
 // Appendix A, verbatim.
 const V1_SQL: &str = r#"
@@ -161,13 +186,7 @@ pub(crate) fn migrate(conn: &Connection, refuse_newer: bool) -> Result<u32, Grap
 /// Rule S4: model-version discipline. On mismatch, truncate the derived
 /// tables and reset the meta row; never merge or migrate.
 pub(crate) fn check_model_version(conn: &Connection) -> Result<(), GraphError> {
-    let stored: u32 = conn
-        .query_row(
-            "SELECT model_version FROM graph_meta WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(from_rusqlite)?;
+    let stored = read_model_version(conn)?;
     if stored == GRAPH_MODEL_VERSION {
         return Ok(());
     }
@@ -192,4 +211,20 @@ pub(crate) fn check_model_version(conn: &Connection) -> Result<(), GraphError> {
     .map_err(from_rusqlite)?;
     tx.commit().map_err(from_rusqlite)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T17 (unit arm) — RS4: fidelity is a pure function of model_version.
+    #[test]
+    fn fidelity_tracks_model_version() {
+        assert_eq!(fidelity_for_model_version(1), GraphFidelity::Manifest);
+        assert_eq!(fidelity_for_model_version(2), GraphFidelity::SynDeep);
+        assert_eq!(
+            fidelity_for_model_version(GRAPH_MODEL_VERSION),
+            GraphFidelity::SynDeep
+        );
+    }
 }
