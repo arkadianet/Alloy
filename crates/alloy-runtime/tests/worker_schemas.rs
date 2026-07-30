@@ -210,8 +210,20 @@ fn edit_schema_validates_and_rejects() {
     ));
     // confidence omitted (serde default).
     assert!(validates(&schema, &json!({ "patch": "p", "summary": "s" })));
-    // Missing patch.
-    assert!(!validates(&schema, &json!({ "summary": "s" })));
+    // Ops form (AM-0013-1 / PR #64) — schema admits both keys; either/or
+    // is enforced by the worker parser (provider schemas lack portable oneOf).
+    assert!(validates(
+        &schema,
+        &json!({
+            "ops": [{ "op": "replace_lines" }],
+            "summary": "s"
+        })
+    ));
+    // Summary alone is schema-valid (required list is just summary); the
+    // parser still rejects neither-patch-nor-ops.
+    assert!(validates(&schema, &json!({ "summary": "s" })));
+    // Missing required summary.
+    assert!(!validates(&schema, &json!({ "patch": "p" })));
     // Unknown key.
     assert!(!validates(
         &schema,
