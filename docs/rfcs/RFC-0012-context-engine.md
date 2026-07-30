@@ -3,6 +3,7 @@
 | Field | Value |
 | --- | --- |
 | **Status** | Draft |
+| **Implementation** | M7 thin: merged · amendment A-0012-1 (bounded Callers/Refs impact): merged (#63) · **Beta deep posture: landed** — the WorkingSet consumes the syn-deep projection (store-side population per RFC-0011/#62) with documented weight hygiene; *measured* re-weighting stays with the Beta holdout (RFC-0016). Status detail: §2.2a, §14.2 |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0007](./RFC-0007-model-router-provider.md) (merged — owns `PromptPack`), [RFC-0011](./RFC-0011-project-graph.md) (merged seam — owns `GraphViewHandle`) |
@@ -145,6 +146,14 @@ This RFC therefore makes the thin behaviour **normative**:
 - Deepening to Beta MUST NOT change the `ContextEngine` trait, `AssembleRequest`, `WorkingSet`, `DomainId`, `PromptPack`, or the citation grammar. Only the **population** of `WorkingSet.graph` and the value of `GraphView.fidelity` change (rule **C5**, §14).
 - No `TODO`, no `todo!()`, no `unimplemented!()` in scope. The word **Stub** in this document marks the only permitted "does nothing yet" behaviour — `compact` (A12) and the five reserved domains (D1) — each pinned by a rule ID and an acceptance criterion.
 
+### 2.2a Beta deep posture (status note)
+
+The roadmap's Beta line — *"RFC-0012 deep (WorkingSet graph projections; weight hygiene)"* with the acceptance criterion *"Context WorkingSet includes graph projections; still exactly three live domains"* — is met as follows:
+
+- **Rich graph projections: landed.** The population change happened store-side, exactly where C5 puts it: RFC-0011's deep pass (A-0011-6, merged as #62) writes `Item` nodes and `Imports` / `References` / `Calls` / `Impls` edges at `GRAPH_MODEL_VERSION = 3`, so every served view is labelled `GraphFidelity::SynDeep`. The context side needed **no §3 shape change** — seeds, neighbourhood, edges, citations and clamps are kind-generic by construction — only proof: the test double now serves the faithful deep shape (SynDeep label, import edges, anchor-inclusive impact views), and T4j / T4k / T8i pin the acceptance criterion, including the five reserved domains staying inert (D1). Bounded `Callers` / `Refs` impact reads inside the projection shipped separately as amendment **A-0012-1** (#63); `Impls` / `SimilarFixes` remain forbidden in `context/**` (D14 as amended).
+- **Weight hygiene: landed; *measured* weights: still deferred.** The hygienic half is in force and now pinned for non-default profiles: weights are validated (D2, D19), normalised by the live-weight sum (B4), and exactly applied — T2j pins the arithmetic, T2k proves the rendered budget follows the profile's weights rather than hard-coded constants. Re-deriving the weights from holdout data is the Beta exit gate's measurement (RFC-0016), not a code change here; the V2 Appendix B defaults stay in force until that measurement exists.
+- **Stub contract unchanged.** `compact` stays an A12 no-op, the five reserved domains stay empty (D1), and no embedding index exists (SEC7). The `domains` manifest schema and `CONTEXT_FORMAT_VERSION = 1` are untouched — recording weights in the manifest was considered and rejected: a manifest change bumps `format_version` (CIT9), which RFC-0016's fixtures pin.
+
 ### 2.3 Relationship to merged RFCs + authorised amendments
 
 Reused **unchanged**: `PromptPack`, `ChatMessage`, `ChatRole`, `Citation` (RFC-0007); `GraphViewHandle`, `GraphQuery`, `GraphView`, `GraphNode`, `GraphEdge`, `GraphFidelity`, `GraphError`, `GraphVersion`, `CrateId`, `GraphNodeId` (RFC-0011); `SessionId`, `RunId`, `NodeId`, `CapabilityId`, `ArtifactId`, `DiagnosticId`, `Digest`, `DigestHasher`, `Timestamp`, `TokenBudget`, `Goal` (RFC-0001); `SessionEvent`, `SessionEventType`, `EventSeq`, `EventStore`, `ArtifactStore`, `ArtifactMeta`, `ArtifactKind`, `StoreError` (RFC-0002); `DiagnosticEvent`, `DiagnosticLevel`, `SpanRef` (RFC-0001); `redact_secrets` (RFC-0004); `NodeInputEnvelope`, `NodeInputPayload` (RFC-0009); `CapabilityExecContext` (RFC-0010).
@@ -218,7 +227,7 @@ Wiring: the composition root (`alloy-cli`, RFC-0015) constructs a `DefaultContex
 | --- | --- | --- |
 | `PromptPack` with `citations` never populated | Every citation populated with a digest (CIT1) | Prompt-cache prefix keys |
 | `PromptPack.domains: Option<Value>` always `None` | The domain manifest (§7.3) | A typed `DomainManifest` struct (would be a C7 change) |
-| `GraphViewHandle` with zero consumers | The MVP consumer (§4.3) | `Callers` / `Refs` / `Impls` / `SimilarFixes` use |
+| `GraphViewHandle` with zero consumers | The MVP consumer (§4.3) | `Impls` / `SimilarFixes` use (`Callers` / `Refs` shipped by A-0012-1, §2.3a) |
 | `EventStore::list_session_events` / `replay_session` | Conversation domain projection (§4.2) | Cross-session conversation recall |
 | `ArtifactStore::meta` / `get` | Artifacts domain projection (§4.4) | Artifact ranking by relevance |
 | `DiagnosticEvent`, `FailureIr.diagnostics` | Diagnostics slice of the WorkingSet (§4.3) | Diagnostic clustering by fingerprint family |
@@ -1215,6 +1224,8 @@ Rule **C6**: **no new `[workspace.dependencies]` entry.** Everything needed is a
 | T2g | `allowances_match_the_section_six_three_table` | B4 — exact integers |
 | T2h | `redistribution_runs_exactly_once_in_live_order` | B5 |
 | T2i | `final_estimate_never_exceeds_effective_budget` | B12 |
+| T2j | `allowances_follow_non_default_weights_exactly` | B4 weight hygiene — non-default, non-normalised weights applied exactly; floor loss bounded (in-crate, `budget.rs`) |
+| T2k | `weights_actually_shift_the_budget_between_domains` | B4 end to end — moving weight between domains moves the rendered budget; weights are the profile's, never hard-coded |
 
 ### 13.3 Unit — domains
 
@@ -1240,11 +1251,13 @@ Rule **C6**: **no new `[workspace.dependencies]` entry.** Everything needed is a
 | T4b | `empty_graph_view_yields_graph_empty_and_files_still_render` | E2 — the roadmap's "may have an empty graph projection" |
 | T4c | `graph_busy_retries_once_then_degrades` | E4 |
 | T4d | `graph_corrupt_maps_to_graph_unavailable` | E2 |
-| T4e | `only_symbol_diagnostics_and_subgraph_are_queried` | D14 — the fake records query kinds |
+| T4e | `only_the_read_path_query_kinds_are_queried` *(renamed by A-0012-1a)* | D14 as amended — the fake records query kinds; `Callers` / `Refs` permitted, `Impls` / `SimilarFixes` absent |
 | T4f | `subgraph_is_one_query_for_all_seeds` | D10 |
 | T4g | `fidelity_manifest_is_labelled_and_not_called_a_call_graph` | CIT6 |
 | T4h | `graph_view_truncated_propagates_a_marker` | B7 |
 | T4i | `seed_derivation_is_sorted_and_deduplicated` | D9, A1 |
+| T4j | `syn_deep_fidelity_is_labelled_and_recorded_in_the_manifest` | CIT6 for the deep posture — the "module layout only" caveat is exclusive to Manifest data |
+| T4k | `deep_projection_flows_into_the_working_set_with_reserved_domains_inert` | The Beta acceptance criterion — item-level nodes, import edges and impact facts with per-node citations; the five reserved domains stay inert (D1) |
 
 ### 13.5 Unit — assembly, citations, determinism
 
@@ -1304,6 +1317,7 @@ Rule **C6**: **no new `[workspace.dependencies]` entry.** Everything needed is a
 | T8f | `pack_contains_no_secret_from_a_planted_env_style_line` | SEC2 — plants an `AWS_API_KEY=…` line in a fixture file (a name the merged RFC-0004 redactor matches: `*_api_key` / `*_secret` / `*_token` / `*_password`), asserts redaction. Widening the pattern set — e.g. `AWS_SECRET_ACCESS_KEY` — is RFC-0004 scope, not this RFC's |
 | T8g | `assemble_succeeds_with_a_null_graph_end_to_end` | E1 — the M7 "empty graph projection" path |
 | T8h | `two_processes_assemble_identical_bytes` | A1 across process boundaries |
+| T8i | `assemble_over_the_deep_store_shape` | The Beta acceptance criterion, integration-level, over the syn-deep store shape (`GRAPH_MODEL_VERSION = 3`): item nodes, import edges, `fidelity=syn_deep`, still three live domains |
 
 ### 13.9 CI grep rules (`crates/alloy-runtime/tests/rfc0012_ci_greps.rs`)
 
@@ -1340,8 +1354,8 @@ T5i serialises two packs assembled from the same fixture and compares bytes. T8h
 
 | Item | Seam | Milestone |
 | --- | --- | --- |
-| Rich graph projections (item-level nodes, import edges) | `GraphProjection` + `GraphFidelity::SynDeep` — population only (C5) | **Beta** ("0012 deep") |
-| Weight hygiene / measured weights | `ContextProfile.weights` is already profile-driven | **Beta** |
+| Rich graph projections (item-level nodes, import edges) | `GraphProjection` + `GraphFidelity::SynDeep` — population only (C5) | **Beta — landed** ("0012 deep"): the store populates Item/Imports (RFC-0011, #62); the engine consumes any fidelity with no §3 change; bounded `Callers`/`Refs` impact shipped by A-0012-1 (#63); T4j/T4k/T8i pin the acceptance criterion |
+| Weight hygiene / measured weights | `ContextProfile.weights` is already profile-driven | **Beta — hygiene landed, measurement deferred**: validation (D2/D19) and exact application (B4; T2j/T2k) are in force; re-deriving weights from holdout data is RFC-0016's Beta exit gate, not a code change here |
 | Summarization / economy compaction | `ContextEngine::compact` + `CompactStrategy::Summarize` + `SummaryId` | Post-Beta, gated on Eval |
 | Architecture / Scratchpad / LongTerm live | `DomainId` variants + profile liveness (D18) | Post-Beta, "when metrics show need" |
 | Embedding fuzzy recall | none — explicitly absent (SEC7) | Deferred (ADR F-23) |
@@ -1672,7 +1686,7 @@ Rule **E1** restated for emphasis, adopted verbatim from RFC-0011 Appendix C: **
 ### D.3 RFC-0011 Beta (deep graph)
 
 1. MUST NOT change `GraphQuery`, `GraphView`, `GraphNode`, `GraphEdge` or `GraphViewHandle` — this RFC's projection depends on their shapes (C5).
-2. Raising `GraphFidelity` to `SynDeep` is the intended and only signal needed to make `GraphProjection` richer; no code change here is required beyond a fixture update (CIT6).
+2. Raising `GraphFidelity` to `SynDeep` is the intended and only signal needed to make `GraphProjection` richer; no code change here is required beyond a fixture update (CIT6). *(Status: done — the deep fixture and T4j / T4k / T8i landed with the Beta deep work; no §3 shape changed.)*
 
 ---
 
