@@ -816,8 +816,12 @@ impl RunController for RunControllerView {
                 dag_id,
                 deadline: {
                     let now = std::time::Instant::now();
-                    now.checked_add(run_timeout)
-                        .unwrap_or_else(std::time::Instant::far_future)
+                    now.checked_add(run_timeout).unwrap_or_else(|| {
+                        // Saturate: prefer a year-long deadline over panicking
+                        // on an absurd profile timeout.
+                        now.checked_add(std::time::Duration::from_secs(365 * 24 * 3600))
+                            .unwrap_or(now)
+                    })
                 },
             })
             .await;
