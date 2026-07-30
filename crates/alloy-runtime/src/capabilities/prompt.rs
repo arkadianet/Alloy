@@ -130,15 +130,13 @@ pub fn repair_response_schema() -> JsonSchemaSpec {
 
 /// Formal JSON Schema for [`EDIT_SYSTEM`]'s response contract (A-0007-2).
 ///
-/// RECONCILIATION (PR #64 / AM-0013-1): this schema is deliberately
-/// patch-only because the CURRENT `PatchProposal` parser rejects an `ops`
-/// key (`deny_unknown_fields`). A schema that admitted `ops` would steer a
-/// grammar-constrained model toward output today's parser cannot accept.
-/// When the line-ops contract (exactly one of `patch` / `ops`) merges, this
-/// schema MUST be regenerated in the same change that widens the parser —
-/// the `edit_schema_matches_current_parser_surface` test in
-/// `workers/edit.rs` pins the agreement and will fail if either side moves
-/// alone.
+/// Matches the live `PatchProposal` parser (PR #64 / AM-0013-1): exactly
+/// one of `patch` / `ops`, plus required `summary` and optional
+/// `confidence`. Provider schemas cannot express `oneOf` portably, so the
+/// either/or rule is enforced by the worker parser; this schema admits both
+/// keys and closes unknown fields. The
+/// `edit_schema_matches_current_parser_surface` test in `workers/edit.rs`
+/// pins the agreement and will fail if either side moves alone.
 #[must_use]
 pub fn edit_response_schema() -> JsonSchemaSpec {
     JsonSchemaSpec {
