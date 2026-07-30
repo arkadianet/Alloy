@@ -29,7 +29,7 @@ Fill the intentionally empty `alloy-index` crate with the **thin** ProjectGraph 
 2. A **`ProjectGraph` trait** matching V2 §7.2 verbatim, with a read-only `GraphViewHandle` for workers and an ingest-only write surface.
 3. A **SQLite store** under the already-reserved `<data_dir>/graph/` directory (`StorageLayout::graph_dir`), with its own migration ladder, following RFC-0002's storage conventions.
 4. A **deterministic, idempotent, offline ingest pipeline** built from a workspace filesystem walk plus `Cargo.toml` manifest facts — **no `syn`, no `cargo metadata` subprocess, no network**.
-5. **Query semantics** for the queries RFC-0012 actually consumes in MVP (`Symbol`, `Diagnostics`, `Subgraph`), with `Callers` / `SimilarFixes` / `Refs` / `Impls` specified as **Stub** returning empty views.
+5. **Query semantics** for the queries RFC-0012 actually consumes in MVP (`Symbol`, `Diagnostics`, `Subgraph`), with `Callers` / `SimilarFixes` / `Refs` / `Impls` specified as **Stub** returning empty views. *(All four have since been un-stubbed: `SimilarFixes` by A-0011-5, the other three by A-0011-6 — see §2.3c.)*
 6. **Version, snapshot, corruption and quarantine** semantics so a bad graph is always recoverable by rebuilding from source (V2 §5.6).
 
 ### 1.2 Problem statement
@@ -47,7 +47,7 @@ The failure mode to avoid is the opposite one: V2 explicitly classifies the "typ
 | SQLite store | Own DB file, own migration ladder, PRAGMAs, quarantine (§5, Appendix A) |
 | Ingest | Filesystem walk + manifest parse; determinism, idempotency, caps (§6) |
 | Incremental | `FileChange` application at crate / module-subtree granularity (§6.6) |
-| Queries | `Symbol`, `Diagnostics`, `Subgraph` live; `Refs`/`Impls`/`Callers`/`SimilarFixes` **Stub** (§7) |
+| Queries | `Symbol`, `Diagnostics`, `Subgraph` live; `Refs`/`Impls`/`Callers`/`SimilarFixes` **Stub** at MVP, all four live since A-0011-5/A-0011-6 (§7) |
 | Diagnostic / fix ingest | `record_diagnostic` / `record_fix` round-trip (§6.7) |
 | Versioning | `GraphVersion` monotonicity, content digest, snapshots (§4.6, §4.7) |
 | Concurrency | Single writer, `spawn_blocking` for SQLite, no `unsafe` (§8) |
@@ -66,10 +66,10 @@ Each deferral names the seam that will carry it, so nothing has to be redesigned
 | `LanguageBackend` integration | `LanguageBackend::index(root, &dyn ProjectGraph)` (V2 §15) — this RFC ships the `&dyn ProjectGraph` half | **RFC-0014**, Beta |
 | `cargo metadata` subprocess (resolved deps, features, workspace inheritance) | `IngestSource::CargoMetadata` variant reserved on `IngestReport` | Beta; needs `Exec` grant + sandbox |
 | Typed `Calls` / `HasLifetime` edges | `graph_edges.confidence` column reserved; `GraphEdgeKind` is `#[non_exhaustive]` | Deferred (V2 §7.2 "Deferred") |
-| `SimilarFixes` auto-retrieve | `GraphQuery::SimilarFixes` exists and returns empty | Deferred until precision measured (V2 §7.2 upgrade path) |
+| `SimilarFixes` auto-retrieve beyond the A-0011-5c advisory note | `GraphQuery::SimilarFixes` reads recorded fixes back since A-0011-5a; `RepairWorker` renders one bounded note (≤ 4 codes, ≤ 8 rows, ≤ 1 KiB, never patch bodies) | Wider injection deferred until precision measured (V2 §7.2 upgrade path) |
 | Embedding index / External Memory | none — explicitly absent | Deferred (ADR F-23) |
 | Worker-facing `graph_query` MCP tool | **none, permanently** | **Eliminated** (ADR F-04) — see §11 |
-| rust-analyzer passthrough for `Refs` / `Impls` | `GraphQuery::Refs` / `Impls` return empty + `GraphFidelity::Manifest` | Beta / M3, gated on RA being wired by RFC-0006 |
+| rust-analyzer passthrough for `Refs` / `Impls` (rustc-grade answers; the syntactic subset shipped via A-0011-6) | `GraphFidelity::Analyzer` reserved | Beta / M3, gated on RA being wired by RFC-0006 |
 | Merkle multi-layer incremental | `graph_files.digest` + crate-granular invalidation | Deferred (V2 §7.2) |
 | Background `alloyd` indexer | none | Deferred (ADR F-27) |
 | PromptPack assembly | `GraphView` is the input; assembly is elsewhere | **RFC-0012** |
@@ -83,7 +83,7 @@ Each deferral names the seam that will carry it, so nothing has to be redesigned
 3. `SqliteProjectGraph` MUST persist to `<data_dir>/graph/graph.sqlite`, derived from the existing `StorageLayout::graph_dir`, with its own `graph_schema_migrations` ledger at code version 1. It MUST NOT add a migration to `alloy.sqlite` (rule **S1**).
 4. `rebuild` MUST be **deterministic** (same tree → same node ids, same edge set, same content digest) and **idempotent** (a second `rebuild` over an unchanged tree MUST NOT bump `GraphVersion`) — rules **IN5**, **IN6**.
 5. Ingest MUST be **offline and exec-free**: filesystem reads and `Cargo.toml` parsing only. No subprocess, no network, no symlink traversal (rules **IN3**, **IN4**, **SEC5**).
-6. MVP ingest MUST create zero `Item` nodes and zero `Imports` edges. Those are **Stub** surfaces reserved for the Beta `syn` pass (rules **IN8**, **IN9**).
+6. MVP (manifest) ingest MUST create zero `Item` nodes and zero `Imports` edges (rules **IN8**, **IN9**). Those were **Stub** surfaces reserved for the Beta `syn` pass; that pass has since landed under RFC-0014 and populates both (§2.3c).
 7. *(amended by A-0011-6, §2.3b)* `GraphQuery::Callers`, `Refs` and `Impls` answer from the `calls`/`references`/`impls` edges the deep pass records — never an error, never fabricated rows (rules **Q4**, **Q5** as amended). `GraphQuery::SimilarFixes` reads recorded fixes back since amendment A-0011-5a (§2.3a); it too never errors and never fabricates rows.
 8. `GraphViewHandle` MUST expose no mutation method and MUST NOT be constructible into a writer (rule **SEC1**).
 9. No `graph_query` MCP tool MUST exist for Alloy workers, in any crate (rule **SEC2**, CI-grepped).
@@ -122,7 +122,7 @@ Each deferral names the seam that will carry it, so nothing has to be redesigned
 | §7.1 purpose | Persistent, queryable, survives sessions, feeds bounded Context projections (§7) |
 | §7.2 architectural interface | Trait shape verbatim (§3.5); single writer (X1); read-only worker handle (SEC1); ingest-only writes (SEC3); **no worker `graph_query` MCP** (SEC2) |
 | §7.2 MVP implementation | Workspace/Crate/Module/Item + Diagnostic + FixEvent; structural `Defines`/`Imports` **as available**; file-digest invalidation of module subgraphs (§4.2, §6.6) |
-| §7.2 Stub | `Callers` / `SimilarFixes` empty; edge `confidence` reserved (Q5, Q6, S6) |
+| §7.2 Stub | Shipped as: `Callers` / `SimilarFixes` empty; edge `confidence` reserved. Superseded: both live since A-0011-6 / A-0011-5; `confidence` remains reserved (Q5, Q6, S6) |
 | §7.2 Deferred | Typed call/lifetime edges; SimilarFixes auto-retrieve; Merkle incremental; alloyd; embeddings (§1.4) |
 | §7.2 Evolution | "Add layers behind the same query enum" — `GraphQuery` is frozen to V2's seven variants (Q1) |
 | §7.3 persistence | `.alloy/graph/` (or XDG) — satisfied by `StorageLayout::graph_dir` (S1) |
@@ -166,7 +166,7 @@ RFC-0002's `sessions.graph_version INTEGER NULL` column is the **only** cross-da
 
 | # | Amendment | Rule amended | Statement |
 | --- | --- | --- | --- |
-| **A-0011-5a** | `SimilarFixes` is no longer a Stub | **Q6** | `SimilarFixes` MUST return the recorded `graph_fixes` rows whose `diagnostic_code` matches, most recent first (`recorded_at DESC`, insertion order as tie-break), capped by the query's own `limit` and by the store's query cap, setting `truncated` only when rows were left behind. It remains a read-only query (Q10) and still returns an empty view — never an error — when nothing matches. `Callers`, `Refs` and `Impls` stay Stub (Q4, Q5). |
+| **A-0011-5a** | `SimilarFixes` is no longer a Stub | **Q6** | `SimilarFixes` MUST return the recorded `graph_fixes` rows whose `diagnostic_code` matches, most recent first (`recorded_at DESC`, insertion order as tie-break), capped by the query's own `limit` and by the store's query cap, setting `truncated` only when rows were left behind. It remains a read-only query (Q10) and still returns an empty view — never an error — when nothing matches. `Callers`, `Refs` and `Impls` stayed Stub at this amendment (Q4, Q5) and were un-stubbed by A-0011-6 (§2.3b). |
 | **A-0011-5b** | The verify path records fixes | **IN1**, **IN14** | The runtime host's verify path MAY call `record_fix` as well as `record_diagnostic`. The permitted implementation is a `Verifier` decorator (`alloy-runtime::adapters::FixRecordingVerifier`) composed at the composition root: it records one `FixEvent` per diagnostic code that a failing verification reported, once a later verification of the same run passes *after a new `EditApplied`*. Ingest is bookkeeping — a graph error is logged and dropped, never returned as a verdict. |
 | **A-0011-5c** | Past fixes may reach a repair prompt | **SEC4**, RFC-0013 **RW4** | `RepairWorker` MAY issue `SimilarFixes` for the diagnostic codes it already holds and render the result as one bounded, fenced, User-role advisory note (≤ 4 codes, ≤ 8 rows, ≤ 1 KiB). It reads through `GraphViewHandle` exactly as it reads `Diagnostics`; **SEC4** is unchanged — no capability may write the graph, and no worker is handed an `Arc<dyn ProjectGraph>`. Patch *bodies* are still never injected: the note carries codes, packages, dates and artifact ids only. |
 
@@ -185,7 +185,15 @@ Q4 and Q5 shipped as Stubs because the MVP graph had no edges that could answer 
 | **A-0011-6e** | Reporting | `IngestReport` doc contract | `IngestReport` gains `references`, `calls`, `impls` counters (same authorisation as A-0014-3). The workspace `syn` pin gains the `visit` feature and the pass walks item bodies for reference collection — both sanctioned on the RFC-0014 side by amendments A-0014-5/A-0014-6 (the T20 forbidden-feature list is untouched). |
 | **A-0011-6f** | `Subgraph` traversal stays structural | **Q7** | `Subgraph` BFS traverses the **structural** kinds only — `Defines`, and `Imports` since the RFC-0014 deep pass (whose Appendix B one-hop-to-an-imported-node projection this codifies). The semantic kinds (`References`/`Calls`/`Impls`) are **never traversed**: a call graph is asked for explicitly via `Callers`/`Refs`/`Impls`, not pulled into a neighbourhood prompt. Semantic edges whose endpoints both land in the view are still **returned**, per the §5 edge-inclusion rule (edges whose endpoints are both in `nodes`). |
 
-Reversal is deleting the three query arms, the collector/resolver in the pass, and bumping the model version again. Consumers that relied on the stub `truncated = true` marker (none were found in-tree; RFC-0012's D14 grep forbids constructing these queries in the context engine) must treat `truncated` literally.
+Reversal is deleting the three query arms, the collector/resolver in the pass, and bumping the model version again. Consumers that relied on the stub `truncated = true` marker (none were found in-tree; at the time RFC-0012's D14 grep forbade constructing these queries in the context engine — since amended by A-0012-1a to permit bounded `Callers`/`Refs` impact reads) must treat `truncated` literally.
+
+### 2.3c Status of the "deep" remainder (post-merge audit, 2026-07-30)
+
+Where the Beta deepening stands against this RFC's deferred list (§1.4, §14.2):
+
+- **Deep-done, via #61 (A-0011-5) and #62 (A-0011-6), both merged on `main`:** `SimilarFixes` reads recorded fixes back (Q6, `query.rs::similar_fixes`) and the verify path records them (`FixRecordingVerifier`); `Refs` / `Impls` / `Callers` answer from recorded `References` / `Calls` / `Impls` edges (Q4, Q5, `query.rs::neighbours`); `truncated` is literal; `GRAPH_SCHEMA_VERSION = 2`, `GRAPH_MODEL_VERSION = 3` (S3, S4 as amended); `Subgraph` traverses the structural kinds only (Q7). `RepairWorker` renders the bounded A-0011-5c advisory note, and RFC-0012's engine issues bounded `Callers`/`Refs` impact reads (A-0012-1, #63).
+- **Owned by RFC-0014 (the `syn` deep pass, on `main` under `crates/alloy-index/src/lang/`):** `Item` nodes, `Imports` edges, `GraphFidelity::SynDeep`, `GRAPH_MODEL_VERSION = 2` (later 3 per A-0011-6d), the `IngestReport.items`/`imports` counters (A-0014-3), and the `RustBackend` `LanguageBackend` seam. RFC-0011 keeps the *query* semantics and the store invariants; the population pass is theirs.
+- **Still deferred (unchanged):** rust-analyzer passthrough for rustc-grade `Refs`/`Impls` (`GraphFidelity::Analyzer`), Merkle multi-layer incremental, the background `alloyd` indexer (ADR F-27), embedding recall (ADR F-23), `cargo metadata` facts, sub-1.0 edge confidence, and wider `SimilarFixes` auto-injection pending precision measurement (V2 §7.2 upgrade path).
 
 ### 2.4 Crate placement decision (normative)
 
@@ -215,7 +223,7 @@ Wiring: `alloy-cli` constructs `SqliteProjectGraph`, wraps it in `Arc<dyn Projec
 | Already on `main` | Added here | Deferred |
 | --- | --- | --- |
 | `GraphNodeId`, `GraphVersion` | `CrateId` (A2), `GraphSnapshotId` | — |
-| `StorageLayout::graph_dir` (created, unused) | `GraphLayout`, `graph.sqlite`, migrations v1 | schema v2+ |
+| `StorageLayout::graph_dir` (created, unused) | `GraphLayout`, `graph.sqlite`, migrations v1 (v2 since A-0011-6d) | schema v3+ |
 | `sessions.graph_version` column (never written) | Value produced by `rebuild` for the host to store | Session-pinned historical queries |
 | `DiagnosticEvent` + `VerifyOutcome.diagnostics` seam | `record_diagnostic` persistence + `Diagnostics` query | cargo-JSON→`DiagnosticEvent` parser (RFC-0013/0014); diagnostic clustering |
 | `alloy-index` empty crate | Whole crate | `syn` pass, RA passthrough |
@@ -225,7 +233,7 @@ Wiring: `alloy-cli` constructs `SqliteProjectGraph`, wraps it in `Arc<dyn Projec
 
 | RFC | May rely on | MUST NOT rely on |
 | --- | --- | --- |
-| **0012** Context Engine | `GraphViewHandle::query`, `Symbol` / `Diagnostics` / `Subgraph`, `GraphView.fidelity`, deterministic ordering (Q8) | `Callers`, `SimilarFixes`, `Refs`, `Impls` returning anything (they are empty) |
+| **0012** Context Engine | `GraphViewHandle::query`, `Symbol` / `Diagnostics` / `Subgraph`, bounded `Callers` / `Refs` impact reads (A-0012-1), `GraphView.fidelity`, deterministic ordering (Q8) | `Impls` / `SimilarFixes` (grep-forbidden in `context/**`); rustc-grade completeness — resolution is syntactic and best-effort (G7) |
 | **0013** Workers | `CapabilityContext.graph: GraphViewHandle` | Any write method; any MCP graph tool |
 | **0014** LanguageBackend | `&dyn ProjectGraph` with `record_diagnostic` and a Beta-added deep-ingest path | Changing the trait signature |
 | **0015** CLI | `SqliteProjectGraph::open`, `rebuild`, `close`, `GraphMetricsSnapshot` | Bypassing `rebuild` to write rows |
@@ -274,19 +282,29 @@ pub enum GraphNodeKind {
     Crate,
     /// A Rust module inferred from source-file layout.
     Module,
-    /// A named item (fn/struct/trait/impl). **Stub** in MVP: never ingested (IN9).
+    /// A named module-level item (fn/struct/enum/union/trait/type/const/
+    /// static). Ingested by the RFC-0014 `syn` deep pass (SY3); `impl`
+    /// blocks stay deferred (SY5). Zero written by the MVP manifest pass (IN9).
     Item,
 }
 
-/// Kind of a project-graph edge (Architecture V2 §7.2).
+/// Kind of a project-graph edge (Architecture V2 §7.2, extended by A-0011-6a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum GraphEdgeKind {
     /// Structural containment: workspace→crate, crate→module, module→module, module→item.
     Defines,
-    /// `use` relationship. **Stub** in MVP: never ingested (IN8).
+    /// `use` relationship, written only for in-workspace targets. Ingested
+    /// by the RFC-0014 `syn` deep pass (SY11–SY13). Zero written by the MVP
+    /// manifest pass (IN8).
     Imports,
+    /// Path or type usage resolving to an in-workspace item (A-0011-6a).
+    References,
+    /// Function call whose callee resolves to an in-workspace `fn` item (A-0011-6a).
+    Calls,
+    /// Trait implementation: self-type item → trait item, both sides resolved (A-0011-6a).
+    Impls,
 }
 
 /// How much of the graph is derived from real parsing (V2 §20 R16 degraded mode).
@@ -296,7 +314,7 @@ pub enum GraphEdgeKind {
 pub enum GraphFidelity {
     /// Manifest + file-layout facts only. The MVP value.
     Manifest,
-    /// Reserved: `syn` item-level parse (Beta).
+    /// `syn` item-level parse (RFC-0014 deep pass, `model_version >= 2`).
     SynDeep,
     /// Reserved: rust-analyzer passthrough (Beta/M3).
     Analyzer,
@@ -328,7 +346,8 @@ pub struct GraphEdge {
     pub to: GraphNodeId,
     /// Edge kind.
     pub kind: GraphEdgeKind,
-    /// Reserved confidence; MVP always `1.0` (S6).
+    /// Reserved confidence; `1.0` for every ingested edge (S6, G11) —
+    /// edges below the bar are not written rather than written down-weighted.
     pub confidence: f32,
 }
 ```
@@ -342,15 +361,23 @@ pub struct GraphEdge {
 pub enum GraphQuery {
     /// Resolve a Rust path (`my_crate::io`) or a workspace-relative file path (Q2).
     Symbol { path: String },
-    /// References to a node. **Stub**: empty until RA passthrough (Q4).
+    /// Who references this node: the anchor plus incoming `References` and
+    /// `Imports` edges. Live since amendment A-0011-6 (Q4); an unknown
+    /// anchor is an empty view, never an error.
     Refs { node: GraphNodeId },
-    /// Impls of a trait node. **Stub**: empty until RA passthrough (Q4).
+    /// `Impls` edges touching this node in either direction: anchored at a
+    /// trait it answers "who implements it"; anchored at a type it answers
+    /// "which traits does it implement". Live since amendment A-0011-6
+    /// (Q4); an unknown anchor is an empty view, never an error.
     Impls { trait_node: GraphNodeId },
-    /// Callers of a fn node. **Stub**: always empty (Q5).
+    /// Who calls this fn node: the anchor plus incoming `Calls` edges. Live
+    /// since amendment A-0011-6 (Q5); an unknown anchor is an empty view,
+    /// never an error.
     Callers { fn_node: GraphNodeId },
     /// Recorded diagnostics, optionally scoped and time-filtered (Q3).
     Diagnostics { crate_id: Option<CrateId>, since: Option<Timestamp> },
-    /// Similar historical fixes. **Stub**: always empty (Q6).
+    /// Fixes recorded for a diagnostic code, most recent first. Live since
+    /// amendment A-0011-5; empty until something has been recorded (Q6).
     SimilarFixes { diagnostic_code: String, limit: usize },
     /// Breadth-first neighbourhood around seeds (Q7).
     Subgraph { seeds: Vec<GraphNodeId>, radius: u8 },
@@ -372,11 +399,15 @@ pub struct GraphView {
     pub edges: Vec<GraphEdge>,
     /// Diagnostics, populated only by `GraphQuery::Diagnostics`.
     pub diagnostics: Vec<DiagnosticEvent>,
-    /// Fix records, populated only by `GraphQuery::SimilarFixes` (always empty in MVP).
+    /// Fix records, populated only by `GraphQuery::SimilarFixes`.
     pub fixes: Vec<FixEvent>,
-    /// Fidelity of the data backing this view (MVP: always `Manifest`).
+    /// Fidelity of the data backing this view, computed from
+    /// `graph_meta.model_version` (`Manifest` at model 1, `SynDeep` at
+    /// model ≥ 2 — the one seam function, RS4/A-0014-4).
     pub fidelity: GraphFidelity,
-    /// `true` when the query kind is a Stub or the result was capped (Q9).
+    /// `true` when the result was capped (Q9). Since amendment A-0011-6
+    /// this flag is literal: an empty answer that withheld nothing is not
+    /// truncated.
     pub truncated: bool,
 }
 
@@ -448,7 +479,8 @@ pub enum FileChangeKind {
     Deleted,
 }
 
-/// A successfully applied fix, recorded for later (deferred) retrieval.
+/// A successfully applied fix, recorded for `SimilarFixes` retrieval
+/// (read back since amendment A-0011-5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FixEvent {
     /// Diagnostic this fix addressed, when known.
@@ -480,13 +512,23 @@ pub struct IngestReport {
     pub crates: u32,
     /// Module nodes written.
     pub modules: u32,
+    /// Item nodes written (RFC-0014 amendment A-0014-3).
+    pub items: u32,
+    /// Imports edges written (RFC-0014 amendment A-0014-3).
+    pub imports: u32,
+    /// References edges written (RFC-0011 amendment A-0011-6).
+    pub references: u32,
+    /// Calls edges written (RFC-0011 amendment A-0011-6).
+    pub calls: u32,
+    /// Impls edges written (RFC-0011 amendment A-0011-6).
+    pub impls: u32,
     /// Files tracked for digest invalidation.
     pub files: u32,
     /// Files skipped by a cap or a skip rule (IN3).
     pub skipped: u32,
     /// Manifest-level problems that did not abort the pass (IN12).
     pub warnings: Vec<String>,
-    /// Where the facts came from (MVP: `Manifest`).
+    /// Where the facts came from (MVP: `Manifest`; `SynDeep` at model ≥ 2).
     pub source: GraphFidelity,
 }
 ```
@@ -720,7 +762,7 @@ impl ProjectGraph for SqliteProjectGraph { /* §6, §7 */ }
 | `Workspace` | Yes, exactly one | `"."` | root `Cargo.toml` | Manifest |
 | `Crate` | Yes, one per workspace member | package name, e.g. `alloy-index` | member `Cargo.toml` | Manifest |
 | `Module` | Yes, one per inferred module | `crate_ident::a::b` | the `.rs` file | File layout |
-| `Item` | **No — Stub (IN9)** | `crate_ident::a::b::Name` | the `.rs` file | Beta `syn` |
+| `Item` | No from the manifest pass (IN9); populated by the RFC-0014 deep pass (SY3) | `crate_ident::a::b::Name` | the `.rs` file | `syn` |
 
 `crate_ident` is the package name with `-` replaced by `_` (the Rust identifier), so `alloy-index`'s root module path is `alloy_index`.
 
@@ -740,7 +782,7 @@ impl ProjectGraph for SqliteProjectGraph { /* §6, §7 */ }
 
 ### 4.5 Fix records
 
-`record_fix` persists the `FixEvent` fields as columns. `diagnostic_code` is indexed because it is the `SimilarFixes` key that Beta will use. MVP never reads the table back through `query` (Q6).
+`record_fix` persists the `FixEvent` fields as columns. `diagnostic_code` is indexed because it is the `SimilarFixes` key. The table shipped write-only at MVP and is read back through `query` since amendment A-0011-5a (Q6).
 
 ### 4.6 Versioning
 
@@ -762,8 +804,8 @@ Diagnostic and fix ingest do **not** bump `GraphVersion` (rule **IN15**) — the
 | --- | --- |
 | **S1** | The graph MUST live in its **own** SQLite file at `<data_dir>/graph/graph.sqlite`, derived from `StorageLayout::graph_dir`. It MUST NOT add a migration to `alloy.sqlite`. |
 | **S2** | `alloy-index` MUST NOT open, read, or write `alloy.sqlite`. The only cross-DB link is the `GraphVersion` integer the host stores in `sessions.graph_version`. |
-| **S3** | The database carries an integer `graph_schema_version` in `graph_schema_migrations`; code version is `GRAPH_SCHEMA_VERSION = 1`. Opening a DB with a higher version MUST fail `GraphError::Migration` when `refuse_newer_schema` is set. |
-| **S4** | The database also carries a **model version** (`GRAPH_MODEL_VERSION = 1`) in `graph_meta`. A model-version mismatch MUST cause the graph tables to be **truncated and re-ingested**, not migrated — the graph is a derived cache (G1). |
+| **S3** | *(amended by A-0011-6d, §2.3b)* The database carries an integer `graph_schema_version` in `graph_schema_migrations`; code version is `GRAPH_SCHEMA_VERSION = 2` (v1 shipped at `1`; v2 recreates `graph_edges` with the expanded kind `CHECK`). Opening a DB with a higher version MUST fail `GraphError::Migration` when `refuse_newer_schema` is set. |
+| **S4** | *(amended by A-0011-6d, §2.3b)* The database also carries a **model version** (`GRAPH_MODEL_VERSION = 3`: `1` at MVP, `2` since the RFC-0014 `syn` deep pass, `3` since A-0011-6 records the semantic edge kinds) in `graph_meta`. A model-version mismatch MUST cause the graph tables to be **truncated and re-ingested**, not migrated — the graph is a derived cache (G1). |
 | **S5** | Migrations MUST follow RFC-0002's shape: `const V1_SQL: &str`, sequential `if current < N` blocks inside `conn.unchecked_transaction()`, an `INSERT INTO graph_schema_migrations` row, and `current_version = SELECT MAX(version)`. |
 | **S6** | `graph_edges.confidence REAL NOT NULL DEFAULT 1.0` is created in v1 and MUST be `1.0` in every MVP row (G11). |
 | **S7** | PRAGMAs MUST be applied in RFC-0002's order: `foreign_keys = ON` → `busy_timeout` → `journal_mode = WAL` → `synchronous`. Open flags are `READ_WRITE \| CREATE \| NO_MUTEX`. |
@@ -787,8 +829,8 @@ Full DDL in **Appendix A**. Summary:
 | --- | --- | --- |
 | `graph_schema_migrations` | Migration ledger (RFC-0002 shape) | `version` |
 | `graph_meta` | `model_version`, `graph_version`, `content_digest`, `workspace_root_rule`, `updated_at` | single row, `id = 1` |
-| `graph_nodes` | Workspace/Crate/Module/(Item) | `id`; `UNIQUE(kind, path)` |
-| `graph_edges` | `Defines`/(`Imports`) with reserved `confidence` | `PRIMARY KEY(from_id, to_id, kind)` |
+| `graph_nodes` | Workspace/Crate/Module/Item (Item via the RFC-0014 deep pass) | `id`; `UNIQUE(kind, path)` |
+| `graph_edges` | `Defines`/`Imports` plus `References`/`Calls`/`Impls` (A-0011-6a), with reserved `confidence` | `PRIMARY KEY(from_id, to_id, kind)` |
 | `graph_files` | Workspace-relative file → digest, owning crate/module | `path` |
 | `graph_diagnostics` | `record_diagnostic` sink | `diagnostic_id` |
 | `graph_fixes` | `record_fix` sink | `fix_id` |
@@ -796,7 +838,7 @@ Full DDL in **Appendix A**. Summary:
 
 ### 5.4 Model-version discipline
 
-`graph_meta.model_version` records the semantics of the ingest, independent of table shape. When Beta's `syn` pass starts writing `Item` nodes it bumps `GRAPH_MODEL_VERSION` to `2`; every existing database is then truncated and re-ingested on next open, so a half-manifest/half-syn graph can never exist. Rule S4 makes the merge case unreachable by construction, which is the cheapest correct answer for a derived cache.
+`graph_meta.model_version` records the semantics of the ingest, independent of table shape. This mechanism has fired twice as designed: the RFC-0014 `syn` pass bumped `GRAPH_MODEL_VERSION` to `2` when it started writing `Item` nodes, and A-0011-6d bumped it to `3` for the semantic edge kinds — each time truncating every existing database for re-ingest on next open, so a half-manifest/half-syn graph can never exist. Rule S4 makes the merge case unreachable by construction, which is the cheapest correct answer for a derived cache.
 
 ### 5.5 Connection management
 
@@ -843,8 +885,8 @@ After quarantine the graph is empty at `GraphVersion(0)`; the caller's next `reb
 | **IN5** | Ingest MUST be **deterministic**: directory entries are visited in sorted-by-filename-bytes order; the emitted node set, edge set, and content digest depend only on file paths and contents. |
 | **IN6** | Ingest MUST be **idempotent**: `rebuild` over an unchanged tree MUST produce an identical content digest and MUST NOT bump `GraphVersion`. |
 | **IN7** | Module inference is **file-layout-derived** (§6.4) and MUST NOT parse Rust source. |
-| **IN8** | MVP ingest MUST write zero `Imports` edges. **Stub** — reserved for the Beta `syn` pass. |
-| **IN9** | MVP ingest MUST write zero `Item` nodes. **Stub** — reserved for the Beta `syn` pass. |
+| **IN8** | MVP (manifest) ingest MUST write zero `Imports` edges. Shipped as a **Stub** reserved for the Beta `syn` pass; that pass has since landed under RFC-0014 and populates `Imports` (SY11–SY13). |
+| **IN9** | MVP (manifest) ingest MUST write zero `Item` nodes. Shipped as a **Stub** reserved for the Beta `syn` pass; the RFC-0014 deep pass now constructs `Item` nodes (SY3) and is their only producer (amended T14 grep). |
 | **IN10** | `apply_incremental` MUST be equivalent to, or a conservative superset of, the effect of a full `rebuild` on the same resulting tree; when the two disagree it is a bug, and a test asserts equality of digests (T5). |
 | **IN11** | `FileChange.path` MUST be workspace-relative with `/` separators. An absolute or escaping path MUST be rejected with `GraphError::InvalidQuery`. |
 | **IN12** | A malformed member manifest MUST NOT abort the pass. The member is skipped, a warning string is pushed to `IngestReport.warnings`, and the pass completes. A malformed **root** manifest is fatal (`GraphError::Manifest`). |
@@ -1055,7 +1097,8 @@ pub struct GraphMetricsSnapshot {
     pub incrementals: u64,
     /// Queries served, all kinds.
     pub queries: u64,
-    /// Queries that returned an empty Stub view (Q4–Q6).
+    /// Queries answered by an empty-but-truncated view (Q9 over an
+    /// empty result; formerly the Q4–Q6 Stub marker).
     pub queries_stub: u64,
     /// Views truncated by `max_query_nodes` (Q9).
     pub queries_truncated: u64,
@@ -1177,7 +1220,7 @@ Lint attributes added to `crates/alloy-index/src/lib.rs`:
 | T3j | `malformed_root_manifest_is_fatal` | IN12 |
 | T3k | `duplicate_package_names_are_rejected` | §6.3 |
 | T3l | `exceeding_max_files_leaves_previous_version_intact` | IN3 + S10 |
-| T3m | `no_item_nodes_and_no_imports_edges_are_written` | IN8, IN9 |
+| T3m | *(superseded by RFC-0014 SY3/SY11)* `deep_pass_writes_item_nodes_and_imports_edges` — the deep pass fills the reserved `item`/`imports` seams; the manifest pass still writes none | IN8, IN9 |
 | T3n | `stored_paths_are_workspace_relative_only` | G12/SEC6 |
 | T3o | `non_workspace_root_is_workspace_error` | §6.3 |
 
@@ -1213,7 +1256,7 @@ Lint attributes added to `crates/alloy-index/src/lib.rs`:
 | T6m | `subgraph_traverses_structural_edges_only` | Q7 as amended (A-0011-6f) |
 | T6n | `high_degree_anchor_stays_under_the_sqlite_variable_limit` | Q4/Q5 robustness |
 | T6o | `generic_parameter_heads_never_resolve_to_workspace_items` | A-0011-6b, G7 |
-| T6m | `query_sweep_does_not_change_version_or_digest` | Q10 |
+| T6p | `query_sweep_does_not_change_version_or_digest` + `unstubbed_query_sweep_changes_neither_version_nor_digest` | Q10 |
 
 ### 13.6 Ingest-record tests
 
@@ -1247,7 +1290,7 @@ Implemented as ordinary `#[test]`s using the `rfc0010_ci_greps.rs` harness shape
 | **T11** | `sec1_graph_view_handle_exposes_no_write_method` | SEC1 — `graph/handle.rs` contains no `fn rebuild`/`fn record_`/`fn apply_`/`fn snapshot`/`fn inner` |
 | **T12** | `sec5_alloy_index_has_no_network_or_exec` | SEC5 — no `reqwest`/`rustls`/`landlock`/`rustix`/`libc` in the manifest; no `std::process::Command` in sources |
 | **T13** | `sec8_alloy_index_never_writes_dot_env` | SEC8 — no `".env"` literal in `alloy-index` sources |
-| **T14** | `in9_no_item_node_construction_in_ingest` | IN9 — `GraphNodeKind::Item` appears in `alloy-index/src` only in the seam-mapping `match` arms, never in an insert path |
+| **T14** | *(amended by RFC-0014 SY3)* `in9_item_node_construction_only_in_the_lang_pass` | IN9 — outside `src/lang/` (the one legal producer), `GraphNodeKind::Item` appears in `alloy-index/src` only in seam-mapping `match`/rank code |
 
 CI wiring: none needed. `cargo test --workspace` already runs in `.github/workflows/ci.yml`'s "Tests" step, and `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS: -D warnings` already enforces the `#![deny(missing_docs)]` documentation gate.
 
@@ -1261,17 +1304,17 @@ CI wiring: none needed. `cargo test --workspace` already runs in `.github/workfl
 
 ### 14.1 MVP (this RFC, M7)
 
-Trait seam · SQLite store with own migration ladder · manifest+layout ingest · Workspace/Crate/Module nodes · `Defines` edges · file digest tracking · crate/module-subtree incremental · `Symbol`/`Diagnostics`/`Subgraph` queries · `Callers`/`SimilarFixes`/`Refs`/`Impls` Stubs · diagnostic/fix ingest · versions, snapshots, quarantine · read-only worker handle · metrics + spans.
+Trait seam · SQLite store with own migration ladder · manifest+layout ingest · Workspace/Crate/Module nodes · `Defines` edges · file digest tracking · crate/module-subtree incremental · `Symbol`/`Diagnostics`/`Subgraph` queries · `Callers`/`SimilarFixes`/`Refs`/`Impls` Stubs (all four since un-stubbed — A-0011-5/A-0011-6, §2.3c) · diagnostic/fix ingest · versions, snapshots, quarantine · read-only worker handle · metrics + spans.
 
 ### 14.2 Deferred (with the seam that carries it)
 
 | Item | Seam | Milestone |
 | --- | --- | --- |
-| `Item` nodes, `Imports` edges | `GraphNodeKind::Item`, `GraphEdgeKind::Imports`, `GRAPH_MODEL_VERSION = 2` | Beta |
+| ~~`Item` nodes, `Imports` edges~~ (landed via the RFC-0014 `syn` deep pass; `GRAPH_MODEL_VERSION = 2` at landing, `3` since A-0011-6d) | `GraphNodeKind::Item`, `GraphEdgeKind::Imports` | Beta |
 | `cargo metadata` facts (deps, features) | `IngestReport.source`, `GraphFidelity` | Beta |
 | RA passthrough for `Refs`/`Impls` (rustc-grade answers; syn-grade shipped by A-0011-6) | `GraphFidelity::Analyzer` | Beta / M3 |
 | ~~Typed `Calls` edges~~ (landed via A-0011-6a at `confidence = 1.0`; sub-1.0 confidence weighting stays deferred) | `graph_edges.confidence` | Post-Beta |
-| `SimilarFixes` retrieval | `graph_fixes` table already populated | After precision measured |
+| ~~`SimilarFixes` retrieval~~ (landed via A-0011-5a; the A-0011-5c prompt note is bounded to codes/packages/dates/artifact ids — wider auto-injection stays deferred until precision is measured) | `graph_fixes` table already populated | After precision measured |
 | Merkle multi-layer incremental | `graph_files.digest` | Deferred |
 | Background indexer | — | Deferred (ADR F-27) |
 | Embedding recall | — | Deferred (ADR F-23) |
@@ -1318,7 +1361,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 33. Module inference follows IN7a–IN7g exactly, including the `foo.rs` vs `foo/mod.rs` tie-break with a warning (**T3g**) and the no-`mod.rs` directory rule (**T3h**).
 - [ ] 34. A malformed member manifest warns and continues; a malformed root manifest is fatal (**IN12**, T3i, T3j).
 - [ ] 35. Duplicate package names are rejected with `GraphError::Manifest` (T3k).
-- [ ] 36. MVP ingest writes zero `Item` nodes and zero `Imports` edges (**IN8/IN9**, T3m, T14).
+- [x] 36. *(superseded by RFC-0014 SY3/SY11)* MVP **manifest** ingest writes zero `Item` nodes and zero `Imports` edges; the deep pass populates both (**IN8/IN9** as amended, T3m superseded by `deep_pass_writes_item_nodes_and_imports_edges`, T14 as amended).
 - [ ] 37. No absolute host path is persisted in any graph row (**G12/SEC6**, T3n).
 - [ ] 38. `apply_incremental` on an unchanged-digest `Modified` file is a no-op (**T4a**).
 - [ ] 39. `Created` / `Deleted` `.rs` changes add / remove the module node and its `Defines` subtree (**T4c**, T4d).
@@ -1334,7 +1377,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 49. `Subgraph` honours `radius = 0`, clamps to 3, traverses only the structural edges (`Defines`/`Imports`) in both directions — never the semantic kinds — and ignores unknown seeds (**Q7** as amended by A-0011-6f, T6h–T6j, T6m).
 - [ ] 50. Two identical queries over an unchanged graph produce byte-identical JSON (**Q8**, T6k).
 - [ ] 51. Over-cap results set `truncated = true` (**Q9**, T6l).
-- [ ] 52. A full query sweep leaves `GraphVersion` and the content digest unchanged (**Q10**, T6m).
+- [ ] 52. A full query sweep leaves `GraphVersion` and the content digest unchanged (**Q10**, T6p).
 - [ ] 53. `record_diagnostic` round-trips through the `Diagnostics` query and is idempotent on `DiagnosticEvent.id` (**IN13**, T7a, T7b).
 - [ ] 54. `record_diagnostic` / `record_fix` do not bump `GraphVersion` (**IN15**, T7d).
 - [ ] 55. `snapshot()` records version, counts and digest, and repeated snapshots at one version are distinct ids (**G10**, T7e).
@@ -1366,7 +1409,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 | 4 | Architecture compliance: **PASS** — trait matches V2 §7.2; thin MVP nodes only; deferred items stay deferred. |
 | 5 | `#![forbid(unsafe_code)]` and `#![deny(missing_docs)]` hold in `alloy-index`; **no new external dependency**. |
 | 6 | Amendments A1–A3 have landed additively with their own tests; no merged field shape changed. |
-| 7 | The only "not implemented yet" behaviours are the ones this RFC marks **Stub** (IN8, IN9, Q4, Q5, Q6, Q10 writes). No `TODO`, `todo!()`, `unimplemented!()`, or placeholder in scope. |
+| 7 | The only "not implemented yet" behaviours are the ones this RFC marks **Stub**. Since A-0011-5/A-0011-6 no Stub *queries* remain (Q4–Q6 un-stubbed); IN8/IN9's zero-population holds of the manifest pass only, the RFC-0014 deep pass having landed; `NullProjectGraph` writes still fail `Disabled` (Q10). No `TODO`, `todo!()`, `unimplemented!()`, or placeholder in scope. |
 | 8 | Public APIs reviewed and stable: §3 signatures match the implementation with no silent drift. |
 | 9 | Security rules SEC1–SEC8 each have a passing grep or unit test. |
 | 10 | The V2 obligation mapping in Appendix D is complete — every V2 §7 clause traces to a section here. |
@@ -1383,7 +1426,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 | Q2 | Should `GraphQuery` gain a `ModulesForPaths` variant for RFC-0012? | No — `Symbol` with a file path (Q2) covers it without widening a V2-frozen enum. Revisit if 0012 needs batch resolution and N round-trips measure badly. | RFC-0012 |
 | Q3 | Should `apply_incremental` be driven by a filesystem watcher? | No for MVP — no watcher, no `alloyd`. Changes are supplied by the caller (CLI / EditEngine post-commit). | Deferred (ADR F-27) |
 | Q4 | Should `record_diagnostic` bump `GraphVersion`? | No (IN15). Structure and observations version independently so `sessions.graph_version` is stable across a repair loop. | Closed |
-| Q5 | Should the module walk parse `mod` declarations to avoid IN7f's blind spots? | No for MVP — that is `syn`, i.e. the Beta pass. Missing modules are acceptable; invented ones are not. | Beta |
+| Q5 | Should the module walk parse `mod` declarations to avoid IN7f's blind spots? | No for the manifest walk (IN7) — that is `syn`, and the `syn` pass has since landed under RFC-0014 (item-level facts on top of the layout-derived modules). Missing modules are acceptable; invented ones are not. | Closed (RFC-0014 deep pass on `main`) |
 | Q6 | Should `Symbol` support fuzzy/prefix matching for LLM-supplied paths? | No (Q2). Fuzzy resolution invents relationships the graph cannot justify; RFC-0012 should retry with a corrected path instead. | RFC-0012 |
 | Q7 | Should snapshots copy rows so historical versions are queryable? | No (G10) — markers only. Row-level history needs a retention policy nobody has specified. | Later |
 | Q8 | Is `globset` the right expander for `[workspace] members`? | Yes — already a workspace dependency (RFC-0005/0006 use it), and cargo's member globs are shallow. Revisit if a fixture exposes a cargo-glob semantic we do not match. | Open |
@@ -1411,7 +1454,9 @@ Critical path: A → B → D → E. F depends only on A and B and can proceed in
 
 ---
 
-## Appendix A — SQL schema (normative, `graph_schema_version = 1`)
+## Appendix A — SQL schema (normative, `graph_schema_version = 2`)
+
+The DDL below is **v1** as shipped. **v2** (amendment A-0011-6d) recreates `graph_edges` with the kind `CHECK` expanded to `('defines','imports','references','calls','impls')`, carrying rows over (`CREATE TABLE graph_edges_v2 … INSERT … SELECT … DROP … RENAME`), because SQLite cannot alter a `CHECK`. No other table changed shape; refuse-newer is unchanged.
 
 ```sql
 -- Ledger, bootstrapped before v1 (RFC-0002 shape).
@@ -1430,7 +1475,7 @@ CREATE TABLE graph_meta (
   updated_at          TEXT NOT NULL
 );
 
--- Workspace / Crate / Module / (Item, Beta).
+-- Workspace / Crate / Module / Item (Item populated by the RFC-0014 deep pass).
 CREATE TABLE graph_nodes (
   id       TEXT PRIMARY KEY,
   kind     TEXT NOT NULL CHECK (kind IN ('workspace','crate','module','item')),
@@ -1444,11 +1489,12 @@ CREATE TABLE graph_nodes (
 CREATE INDEX idx_graph_nodes_crate ON graph_nodes(crate_id);
 CREATE INDEX idx_graph_nodes_file  ON graph_nodes(file);
 
--- Defines / (Imports, Beta). `confidence` reserved, always 1.0 in MVP (S6).
+-- Defines / Imports (+ References/Calls/Impls at schema v2, A-0011-6d).
+-- `confidence` reserved, 1.0 in every row (S6, G11).
 CREATE TABLE graph_edges (
   from_id    TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
   to_id      TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
-  kind       TEXT NOT NULL CHECK (kind IN ('defines','imports')),
+  kind       TEXT NOT NULL CHECK (kind IN ('defines','imports')),  -- v2: +'references','calls','impls'
   confidence REAL NOT NULL DEFAULT 1.0,
   PRIMARY KEY (from_id, to_id, kind)
 );
@@ -1483,7 +1529,8 @@ CREATE INDEX idx_graph_diagnostics_pkg_time ON graph_diagnostics(package, record
 CREATE INDEX idx_graph_diagnostics_code     ON graph_diagnostics(code);
 CREATE INDEX idx_graph_diagnostics_fp       ON graph_diagnostics(fingerprint);
 
--- record_fix sink. Append-only (IN14). Not read by MVP queries (Q6).
+-- record_fix sink. Append-only (IN14). Write-only at MVP; read back by
+-- `SimilarFixes` since amendment A-0011-5a (Q6).
 CREATE TABLE graph_fixes (
   fix_id          TEXT PRIMARY KEY,
   diagnostic_id   TEXT NULL,
@@ -1554,7 +1601,7 @@ Applying IN7a–IN7e to `toy-core`: root module `toy_core` at `src/lib.rs`; `src
 | `module` | `toy_core::io::reader` | `toy-core` | `crates/toy-core/src/io/reader.rs` |
 | `module` | `toy_core::util` | `toy-core` | `crates/toy-core/src/util/mod.rs` |
 
-Eight nodes. Zero `item` nodes (IN9).
+Eight nodes. Zero `item` nodes from the manifest pass (IN9) — the RFC-0014 deep pass adds one `item` per module-level item in these files on top of this projection.
 
 ### B.3 Resulting `graph_edges`
 
@@ -1568,11 +1615,13 @@ Eight nodes. Zero `item` nodes (IN9).
 | `toy_core` | `toy_core::util` | `defines` | 1.0 |
 | `toy_core::io` | `toy_core::io::reader` | `defines` | 1.0 |
 
-Seven edges. Zero `imports` edges (IN8).
+Seven edges. Zero `imports` edges from the manifest pass (IN8) — again, the deep pass adds the `use`-derived `imports` (and, since A-0011-6, any resolvable `references`/`calls`/`impls`).
 
 ### B.4 Example query results
 
 `rebuild` returns `GraphVersion(1)`; a second `rebuild` returns `GraphVersion(1)` with `IngestReport.unchanged = true` (IN6).
+
+*The JSON below shows the MVP thin (model-1) projection: `"fidelity": "manifest"` and no item rows. Current builds ingest at model 3, so the same queries report `"fidelity": "syn_deep"` and their node/edge sets include the deep-pass rows noted in B.2/B.3.*
 
 ```jsonc
 // query(Symbol { path: "crates/toy-core/src/io.rs" })   — Q2 branch (2)
@@ -1653,15 +1702,15 @@ Rule **E1**: a graph failure MUST NEVER fail a DAG node. The graph is an acceler
 | §7.2 interface | Optional later: external-only MCP mirror | §17 Q9 (deferred) |
 | §7.2 MVP | Nodes: Workspace / Crate / Module / Item + Diagnostic + FixEvent | §4.2, §4.4, §4.5 |
 | §7.2 MVP | Edges: structural Defines/Imports **as available** | §4.3, IN8 (Imports not available in MVP) |
-| §7.2 MVP | **No** Calls / HasLifetime / SimilarFixes auto-retrieve | §1.4, Q6 |
-| §7.2 MVP | Live RA queries for refs/impls **may** passthrough behind `query()` | Q4 (empty until wired; `GraphFidelity::Analyzer` reserved) |
+| §7.2 MVP | **No** Calls / HasLifetime / SimilarFixes auto-retrieve | Shipped so at MVP; syntactic `Calls` edges (confidence 1.0) recorded since A-0011-6a, `SimilarFixes` read-back + bounded advisory note since A-0011-5 — `HasLifetime` and wider auto-injection stay deferred (§1.4, Q6) |
+| §7.2 MVP | Live RA queries for refs/impls **may** passthrough behind `query()` | Q4 answers syntactically since A-0011-6c; RA passthrough (`GraphFidelity::Analyzer`) remains the deferred rustc-grade path |
 | §7.2 MVP | File digest invalidation of module subgraphs, not Merkle multi-layer | §6.6, `graph_files` |
 | §7.2 Deferred | Typed call/lifetime edges; SimilarFixes; Merkle; alloyd; embeddings | §1.4, §14.2 |
 | §7.2 Evolution | Raise edge confidence; add layers behind the same query enum; never dual MCP+direct mutation | S6 (confidence column), Q1 (frozen enum), SEC2+SEC3 |
 | §7.2 GraphQuery | Seven variants, exact fields | §3.3 |
 | §7.2 Internal | `alloy-index` SQLite; ingest from cargo metadata + syn; diagnostics from check JSON | §5 (SQLite), §6.2 (manifest subset now, metadata+syn at Beta), §6.7 (check JSON) |
-| §7.2 Stub | `Callers` / `SimilarFixes` return empty; confidence reserved | Q5, Q6, S6 |
-| §7.2 Upgrade path | Fixes go to eval fixtures / curated notes first, not auto prompt injection | Q6 (stored but never surfaced) |
+| §7.2 Stub | `Callers` / `SimilarFixes` return empty; confidence reserved | Superseded — both live since A-0011-6/A-0011-5 (Q5, Q6); confidence still reserved (S6) |
+| §7.2 Upgrade path | Fixes go to eval fixtures / curated notes first, not auto prompt injection | Q6: stored at MVP; read back since A-0011-5a and surfaced only as the bounded A-0011-5c advisory note (codes/packages/dates/artifact ids — never patch bodies); wider injection still gated on precision |
 | §7.3 | `.alloy/graph/` (or XDG); sessions reference `GraphVersion` | S1 (`StorageLayout::graph_dir`, which honours the XDG fallback), S2 (`sessions.graph_version`) |
 | §9 `CapabilityContext` | `graph: GraphViewHandle` — "read-only query handle, not a mutation API" | §3.8, SEC1 |
 | §9 `CapabilityOutput` | `graph_mutations` removed from workers | SEC3 |
