@@ -214,20 +214,13 @@ impl PlanningWorker {
         } else {
             PLANNING_SYSTEM_NO_REVIEW
         };
-        let (reply, _pack) = llm_exchange(
-            ctx,
-            attempt,
-            &self.config,
-            system,
-            &inputs,
-            &[],
-            |value| {
+        let (reply, _pack) =
+            llm_exchange(ctx, attempt, &self.config, system, &inputs, &[], |value| {
                 let reply: PlanningReply =
                     serde_json::from_value(value.clone()).map_err(|e| format!("schema: {e}"))?;
                 Ok(reply)
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         // RW7 semantics: model confidence clamped; absent ⇒ 0.5.
         let confidence = reply.confidence.unwrap_or(0.5).clamp(0.0, 1.0);

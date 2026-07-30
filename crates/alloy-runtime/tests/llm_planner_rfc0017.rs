@@ -677,7 +677,10 @@ async fn ac14b_proposer_builds_complete_context_on_the_runs_meter() {
     assert_eq!(captured.capability.as_str(), "planning");
     assert_eq!(captured.effective_tier, alloy_runtime::ModelTier::Standard);
     assert_eq!(captured.budget, PlannerConfig::new().planning_budget);
-    assert_eq!(captured.timeout, Duration::from_millis(PlannerConfig::new().planning_timeout_ms));
+    assert_eq!(
+        captured.timeout,
+        Duration::from_millis(PlannerConfig::new().planning_timeout_ms)
+    );
     assert!(matches!(
         captured.input.payload,
         NodeInputPayload::Goal(ref g) if g.text == "fix E0308"

@@ -822,8 +822,14 @@ async fn ac25b_absolute_deadline_shrinks_and_refuses() {
     let sched = Scripted::new(
         &h.storage,
         [
-            Step::SleepThenFailCompile { ms: sleep, diags: 1 },
-            Step::SleepThenFailCompile { ms: sleep, diags: 1 },
+            Step::SleepThenFailCompile {
+                ms: sleep,
+                diags: 1,
+            },
+            Step::SleepThenFailCompile {
+                ms: sleep,
+                diags: 1,
+            },
         ],
     );
     sched.track(run);

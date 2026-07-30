@@ -387,7 +387,9 @@ fn ac43_no_dotenv_writes_and_no_sixth_crate() {
     let crates_dir = manifest.join("..");
     let crate_count = match std::fs::read_dir(&crates_dir) {
         Ok(entries) => entries
-            .filter_map(|e| e.ok())
+            .map(|e| {
+                e.unwrap_or_else(|err| panic!("read entry in {}: {err}", crates_dir.display()))
+            })
             .filter(|e| e.path().join("Cargo.toml").is_file())
             .count(),
         Err(e) => panic!("read {}: {e}", crates_dir.display()),

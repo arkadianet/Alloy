@@ -94,7 +94,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut rt = AlloyRuntime::new();
             rt.configure(RuntimeConfig::test_defaults(dir.path()))
-            .unwrap();
+                .unwrap();
             let handle = rt.start().await.unwrap();
             let storage = install_sqlite_event_sink(
                 &handle,

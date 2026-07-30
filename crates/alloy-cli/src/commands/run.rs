@@ -79,7 +79,8 @@ pub async fn exec(ctx: Ctx, args: RunArgs) -> Result<Exit, CliError> {
 
     // §6.2 steps 1–12.
     let base = assembly::assemble_read(ctx.cfg.clone()).await?;
-    let mut full = assembly::assemble_full(base, &ctx.workspace_abs, ctx.readonly(), &ctx.profile).await?;
+    let mut full =
+        assembly::assemble_full(base, &ctx.workspace_abs, ctx.readonly(), &ctx.profile).await?;
 
     tracing::debug!(
         edit_engine_assembled = full.edit_engine.is_some(),
