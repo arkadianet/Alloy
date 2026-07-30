@@ -19,7 +19,8 @@ use crate::context::{AssembleInputs, AssembleRequest};
 use crate::dag::{NodeInputPayload, NodeOutputEnvelope};
 use crate::obs::{truncate_utf8_bytes, DecisionKind, DecisionRecord};
 use crate::router::{
-    classify_router_error, Citation, ModelResponse, PromptPack, RouterError, RoutingRequest,
+    classify_router_error, Citation, JsonSchemaSpec, ModelResponse, PromptPack, RouterError,
+    RoutingRequest,
 };
 use crate::types::budget::ModelTier;
 use crate::types::diagnostic::{DiagnosticEvent, ErrorClass, FailureIr, RetryDisposition};
@@ -265,6 +266,7 @@ pub(crate) async fn route_and_complete(
     ctx: &CapabilityContext<'_>,
     attempt: &mut Attempt,
     pack: PromptPack,
+    response_schema: Option<&JsonSchemaSpec>,
 ) -> Result<ModelResponse, WorkerError> {
     // CW4 before each model call.
     if ctx.is_cancelled() {
@@ -295,6 +297,14 @@ pub(crate) async fn route_and_complete(
         budget_remaining: ctx.cost_meter.to_budget_snapshot(),
         requires_tools: false, // provider-native tool calling is deferred (§1.4).
         requires_structured_output: structured,
+        // Best-effort schema-constrained decoding (A-0007-2): the router
+        // sends it only to endpoints with `supports_json_schema = true` and
+        // degrades to plain JSON-object everywhere else.
+        response_schema: if structured {
+            response_schema.cloned()
+        } else {
+            None
+        },
     };
 
     // PR9: structured-output-first; PR10: one fallback on a structured-only
@@ -480,11 +490,13 @@ pub(crate) fn map_tool_result_error(result: &ToolResult) -> WorkerError {
 ///
 /// `validate` maps the extracted object into the worker's typed proposal; an
 /// `Err(reason)` is a PS5 schema violation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn llm_exchange<T>(
     ctx: &CapabilityContext<'_>,
     attempt: &mut Attempt,
     config: &WorkerConfig,
     system_instruction: &'static str,
+    response_schema: Option<&JsonSchemaSpec>,
     inputs: &AssembleInputs,
     feedback: &[String],
     validate: impl Fn(&Value) -> Result<T, String>,
@@ -524,7 +536,7 @@ pub(crate) async fn llm_exchange<T>(
         // PR4/OC4: the final turn's citations flow through unmodified.
         attempt.citations = pack.citations.clone();
 
-        let response = route_and_complete(ctx, attempt, pack.clone()).await?;
+        let response = route_and_complete(ctx, attempt, pack.clone(), response_schema).await?;
 
         let violation = match extract_json(&response) {
             Ok(extracted) => {

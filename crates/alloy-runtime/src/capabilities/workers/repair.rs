@@ -23,7 +23,7 @@ use super::super::parse::is_jail_relative;
 use super::super::payload::{
     clamp_string, RepairPlanPayload, RepairStep, MAX_PAYLOAD_STRING_BYTES, PAYLOAD_SCHEMA_VERSION,
 };
-use super::super::prompt::{fence_tool, REPAIR_SYSTEM};
+use super::super::prompt::{fence_tool, repair_response_schema, REPAIR_SYSTEM};
 use super::super::traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
 use super::{
     diagnostics_from_payloads, finish_attempt, llm_exchange, load_pred_payloads, worker_span,
@@ -219,6 +219,7 @@ impl RepairWorker {
             attempt,
             &self.config,
             REPAIR_SYSTEM,
+            Some(&repair_response_schema()),
             &inputs,
             &notes,
             |value| {

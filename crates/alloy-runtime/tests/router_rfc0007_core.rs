@@ -71,6 +71,7 @@ fn route_request(run: RunId) -> RoutingRequest {
         },
         requires_tools: false,
         requires_structured_output: true,
+        response_schema: None,
     }
 }
 

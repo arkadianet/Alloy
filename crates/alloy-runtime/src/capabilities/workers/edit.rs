@@ -28,7 +28,7 @@ use super::super::payload::{
     clamp_string, EditAppliedPayload, MAX_PAYLOAD_STRING_BYTES, PAYLOAD_SCHEMA_VERSION,
 };
 use super::super::perms::WorkerToolClass;
-use super::super::prompt::{fence_tool, EDIT_SYSTEM};
+use super::super::prompt::{edit_response_schema, fence_tool, EDIT_SYSTEM};
 use super::super::traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
 use super::{
     call_tool, finish_attempt, llm_exchange, load_pred_payloads, map_tool_result_error,
@@ -318,6 +318,7 @@ impl EditWorker {
             attempt,
             &self.config,
             EDIT_SYSTEM,
+            Some(&edit_response_schema()),
             inputs,
             feedback,
             |value| {
@@ -403,5 +404,61 @@ impl EditWorker {
                     format!("patch artifact store failed: {e}"),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A-0007-2 × AM-0013-1 reconciliation guard: the declared edit schema
+    /// and the live `PatchProposal` parser must accept and reject the same
+    /// surface. PR #64 widens the parser to exactly-one-of `patch` / `ops`;
+    /// whichever change lands second must regenerate
+    /// `edit_response_schema()` and update this test in the same commit.
+    #[test]
+    fn edit_schema_matches_current_parser_surface() {
+        let schema = edit_response_schema().schema;
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required list")
+            .iter()
+            .map(|v| v.as_str().expect("required entry"))
+            .collect();
+        let properties: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        // The parser requires `patch` + `summary` and knows nothing else
+        // beyond optional `confidence` (deny_unknown_fields). serde_json
+        // maps iterate sorted, so compare property sets order-insensitively.
+        assert_eq!(required, ["patch", "summary"]);
+        assert_eq!(properties, ["confidence", "patch", "summary"]);
+
+        // Parser accepts what the schema admits...
+        let accepted = json!({ "patch": "--- a\n+++ b\n", "summary": "s" });
+        assert!(serde_json::from_value::<PatchProposal>(accepted).is_ok());
+
+        // ...and rejects `ops` (the #64 shape) exactly as the schema does:
+        // `additionalProperties: false` mirrors `deny_unknown_fields`. If
+        // this assertion starts failing, the parser learned `ops` — the
+        // schema above MUST be regenerated in the same change.
+        let ops_shape = json!({
+            "ops": [{ "op": "replace", "line": 1, "expect": "x", "with": "y" }],
+            "summary": "s"
+        });
+        assert!(
+            serde_json::from_value::<PatchProposal>(ops_shape).is_err(),
+            "parser now accepts `ops`; regenerate edit_response_schema() (AM-0013-1)"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "schema must stay closed while the parser is deny_unknown_fields"
+        );
     }
 }

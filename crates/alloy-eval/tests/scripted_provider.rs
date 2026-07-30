@@ -17,6 +17,8 @@ fn endpoint(provider: ProviderId) -> ModelEndpoint {
         tiers: vec![ModelTier::Standard],
         supports_tools: false,
         supports_structured_output: false,
+        supports_json_schema: false,
+        json_schema_strict: false,
         max_context: 8192,
         input_usd_per_mtok: None,
         output_usd_per_mtok: None,

@@ -125,10 +125,11 @@ pub use planner::{
 pub use router::{
     classify_provider_error, classify_router_error, ChatMessage, ChatRole, Citation,
     ClassifiedRouterFailure, CompletionRequest, ComplexityScore, EndpointConfig, Health,
-    ModelEndpoint, ModelProvider, ModelResponse, ModelRouter, PromptPack, ProviderConfig,
-    ProviderError, ProviderKind, RecordingModelProvider, ResponseFormat, RoutedModel, RouterConfig,
-    RouterError, RouterMetricsSnapshot, RouterPolicy, RouterShutdownReport, RoutingRequest,
-    ScoringWeights, SecretString, TomlModelRouter, TomlModelRouterParts, ToolChoice, Usage,
+    JsonSchemaSpec, ModelEndpoint, ModelProvider, ModelResponse, ModelRouter, PromptPack,
+    ProviderConfig, ProviderError, ProviderKind, RecordingModelProvider, ResponseFormat,
+    RoutedModel, RouterConfig, RouterError, RouterMetricsSnapshot, RouterPolicy,
+    RouterShutdownReport, RoutingRequest, ScoringWeights, SecretString, TomlModelRouter,
+    TomlModelRouterParts, ToolChoice, Usage,
 };
 #[cfg(feature = "http-provider")]
 pub use router::{OpenAiCompatibleProvider, OpenAiCompatibleSpec};

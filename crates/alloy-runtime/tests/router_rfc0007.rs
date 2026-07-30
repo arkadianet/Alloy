@@ -64,6 +64,7 @@ fn route_request(run: RunId) -> RoutingRequest {
         },
         requires_tools: false,
         requires_structured_output: true,
+        response_schema: None,
     }
 }
 
@@ -87,6 +88,8 @@ fn endpoint() -> ModelEndpoint {
         tiers: vec![ModelTier::Standard],
         supports_tools: false,
         supports_structured_output: true,
+        supports_json_schema: false,
+        json_schema_strict: false,
         max_context: 4096,
         input_usd_per_mtok: Some(2.0),
         output_usd_per_mtok: Some(4.0),

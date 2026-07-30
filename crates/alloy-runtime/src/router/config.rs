@@ -92,6 +92,24 @@ pub struct EndpointConfig {
     pub supports_tools: bool,
     /// Whether JSON-object output may select this endpoint.
     pub supports_structured_output: bool,
+    /// Whether completions may carry a full JSON Schema `response_format`
+    /// (the OpenAI `json_schema` wire shape). Defaults to `false`; endpoints
+    /// that did not opt in receive plain `json_object` instead. Requires
+    /// `supports_structured_output = true` (validated at load).
+    ///
+    /// Enforcement is server-dependent: grammar-constraining servers
+    /// (vLLM, Ollama ≥ 0.5, llama.cpp) constrain decoding to the schema;
+    /// other servers treat it as a best-effort request. See
+    /// `json_schema_strict` for OpenAI-style strict enforcement.
+    pub supports_json_schema: bool,
+    /// Whether the serialized `json_schema` response format carries
+    /// `"strict": true` (OpenAI strict structured outputs). Defaults to
+    /// `false`: grammar-constraining local servers ignore the field, while
+    /// OpenAI strict mode rejects schemas outside its supported subset
+    /// (for example a `required` list narrower than `properties`), so the
+    /// operator opts in per endpoint. Requires `supports_json_schema = true`
+    /// (validated at load).
+    pub json_schema_strict: bool,
     /// Advisory context-window size.
     pub max_context: u32,
     /// Operator price per million input tokens.
@@ -157,6 +175,10 @@ struct EndpointFile {
     supports_tools: bool,
     #[serde(default)]
     supports_structured_output: bool,
+    #[serde(default)]
+    supports_json_schema: bool,
+    #[serde(default)]
+    json_schema_strict: bool,
     max_context: u32,
     input_usd_per_mtok: Option<f64>,
     output_usd_per_mtok: Option<f64>,
@@ -329,6 +351,8 @@ impl TryFrom<EndpointFile> for EndpointConfig {
             tiers: file.tiers,
             supports_tools: file.supports_tools,
             supports_structured_output: file.supports_structured_output,
+            supports_json_schema: file.supports_json_schema,
+            json_schema_strict: file.json_schema_strict,
             max_context: file.max_context,
             input_usd_per_mtok: file.input_usd_per_mtok,
             output_usd_per_mtok: file.output_usd_per_mtok,
@@ -347,6 +371,8 @@ impl EndpointConfig {
             tiers: self.tiers.clone(),
             supports_tools: self.supports_tools,
             supports_structured_output: self.supports_structured_output,
+            supports_json_schema: self.supports_json_schema,
+            json_schema_strict: self.json_schema_strict,
             max_context: self.max_context,
             input_usd_per_mtok: self.input_usd_per_mtok,
             output_usd_per_mtok: self.output_usd_per_mtok,
@@ -405,6 +431,20 @@ fn validate_endpoint(endpoint: &EndpointConfig) -> Result<(), RouterError> {
     }
     if endpoint.tiers.is_empty() {
         return Err(config_error("endpoint tiers must not be empty"));
+    }
+    // A-0007-2 fail-closed contradictions: the schema is only ever sent on
+    // structured completions, and §5.3 gates structured work on
+    // `supports_structured_output`, so a schema flag that could never take
+    // effect is a config error rather than a silently dead knob.
+    if endpoint.supports_json_schema && !endpoint.supports_structured_output {
+        return Err(config_error(
+            "endpoint supports_json_schema requires supports_structured_output = true",
+        ));
+    }
+    if endpoint.json_schema_strict && !endpoint.supports_json_schema {
+        return Err(config_error(
+            "endpoint json_schema_strict requires supports_json_schema = true",
+        ));
     }
     if endpoint.max_context == 0 {
         return Err(config_error(
@@ -525,6 +565,62 @@ Repair = "standard"
                 "{bad} must be rejected"
             );
         }
+    }
+
+    /// A-0007-2 round 2 — `supports_json_schema` implies
+    /// `supports_structured_output`. The schema is only ever sent on
+    /// structured completions, and §5.3 selection gates structured work on
+    /// `supports_structured_output`, so a schema-capable endpoint that
+    /// cannot do structured output is a contradiction: the flag could never
+    /// take effect. Fail closed at config load instead of shipping a dead
+    /// knob the operator believes is on.
+    #[test]
+    fn rejects_json_schema_without_structured_output() {
+        let contradictory = sample("https://example.com").replace(
+            "max_context = 1024",
+            "max_context = 1024\nsupports_json_schema = true",
+        );
+        let error = RouterConfig::from_str("test", &contradictory).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("supports_json_schema requires supports_structured_output"),
+            "unexpected error: {error}"
+        );
+
+        let coherent = sample("https://example.com").replace(
+            "max_context = 1024",
+            "max_context = 1024\nsupports_structured_output = true\nsupports_json_schema = true",
+        );
+        assert!(RouterConfig::from_str("test", &coherent).is_ok());
+    }
+
+    /// A-0007-2 round 2 — `json_schema_strict` parses, defaults to `false`,
+    /// and implies `supports_json_schema` (strict enforcement of a schema
+    /// the endpoint never receives is a contradiction; fail closed).
+    #[test]
+    fn json_schema_strict_parses_defaults_and_requires_json_schema() {
+        let with = sample("https://example.com").replace(
+            "max_context = 1024",
+            "max_context = 1024\nsupports_structured_output = true\nsupports_json_schema = true\njson_schema_strict = true",
+        );
+        let config = RouterConfig::from_str("test", &with).unwrap();
+        assert!(config.providers[0].endpoints[0].json_schema_strict);
+
+        let config = RouterConfig::from_str("test", &sample("https://example.com")).unwrap();
+        assert!(!config.providers[0].endpoints[0].json_schema_strict);
+
+        let contradictory = sample("https://example.com").replace(
+            "max_context = 1024",
+            "max_context = 1024\nsupports_structured_output = true\njson_schema_strict = true",
+        );
+        let error = RouterConfig::from_str("test", &contradictory).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("json_schema_strict requires supports_json_schema"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

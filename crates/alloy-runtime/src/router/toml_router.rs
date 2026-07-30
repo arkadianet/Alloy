@@ -518,7 +518,27 @@ impl TomlModelRouter {
                 tools: vec![],
                 tool_choice: ToolChoice::None,
                 response_format: if routed.requires_structured_output() {
-                    ResponseFormat::JsonObject
+                    match routed.response_schema() {
+                        // Schema-constrained decoding is endpoint-gated:
+                        // only opted-in endpoints receive the full schema.
+                        Some(spec) if routed.endpoint().supports_json_schema => {
+                            ResponseFormat::JsonSchema {
+                                name: spec.name.clone(),
+                                schema: spec.schema.clone(),
+                            }
+                        }
+                        // Honest degrade: a requested schema the endpoint
+                        // cannot take falls back to plain JSON-object.
+                        Some(spec) => {
+                            tracing::debug!(
+                                endpoint_id = %routed.endpoint().id,
+                                schema = %spec.name,
+                                "endpoint lacks supports_json_schema; degrading to json_object"
+                            );
+                            ResponseFormat::JsonObject
+                        }
+                        None => ResponseFormat::JsonObject,
+                    }
                 } else {
                     ResponseFormat::Text
                 },
@@ -901,6 +921,7 @@ output_usd_per_mtok = 1.0
             },
             requires_tools: false,
             requires_structured_output: false,
+            response_schema: None,
         }
     }
 
