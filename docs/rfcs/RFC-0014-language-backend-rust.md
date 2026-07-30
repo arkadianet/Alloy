@@ -157,10 +157,17 @@ Small, additive, and recorded here so no reviewer treats them as drift.
 | **A-0014-2** | RFC-0011 IN7 ("module inference MUST NOT parse Rust source") is amended for `model_version = 2`: declaration-driven inference replaces sibling-guessing | RFC-0011 §6.4 | The prohibition exists because MVP has no parser; SY7 states the superseding rule and keeps IN7f's "invent nothing" |
 | **A-0014-3** | `IngestReport` gains `items: u32`, `imports: u32` | `alloy-runtime::graph` | Its own doc comment authorises field additions as deliberate API changes |
 | **A-0014-4** | `GraphView.fidelity` becomes a computed value from `graph_meta.model_version` instead of the `GraphView::empty` default | `alloy-index::query` | RS4 — one function decides fidelity, so it cannot silently lie |
-| **A-0014-5** *(pending — lands with RFC-0011 A-0011-6 / PR #62)* | SY10's no-body-descent rule is scoped to the **node-emitting item walker**, which still never descends. A dedicated *reference collector* (RFC-0011 §2.3b) MAY walk the bodies and signatures of already-emitted module-level items **and of impl blocks**, attributing an impl block's semantic edges to the emitted self-type item, to record `References`/`Calls`/`Impls` edges. It emits **no nodes** — neither impl nor method nodes (SY5 holds) — never enters macro invocations or attributes, and blanks items nested inside bodies. SC3 is not weakened: `syn::parse_file` already recursed over the full token tree to build the AST the walker holds, so visiting that AST introduces no recursion a parse bomb could not already trigger, and the `max_file_bytes` gate runs before either. | §5 SY10, SC3 | A-0011-6a needs body-level facts; the rule's purpose (bounded recursion, linear node emission) survives intact |
-| **A-0014-6** *(pending — lands with RFC-0011 A-0011-6 / PR #62)* | LC7's `syn` feature list gains `visit` (read-only AST traversal), becoming `["full", "parsing", "clone-impls", "visit"]`. Still non-macro: `printing`, `fold`, `visit-mut`, `quote` and the proc-macro bridge remain forbidden, and the T20 placement rule (workspace pin, `alloy-index` alone) is untouched. | §9 LC7, T20 | The collector uses `syn::visit::Visit`; `visit` generates no code and links no compiler machinery |
+| **A-0014-5** *(landed with RFC-0011 A-0011-6 / PR #62)* | SY10's no-body-descent rule is scoped to the **node-emitting item walker**, which still never descends. A dedicated *reference collector* (RFC-0011 §2.3b) MAY walk the bodies and signatures of already-emitted module-level items **and of impl blocks**, attributing an impl block's semantic edges to the emitted self-type item, to record `References`/`Calls`/`Impls` edges. It emits **no nodes** — neither impl nor method nodes (SY5 holds) — never enters macro invocations or attributes, and blanks items nested inside bodies. SC3 is not weakened: `syn::parse_file` already recursed over the full token tree to build the AST the walker holds, so visiting that AST introduces no recursion a parse bomb could not already trigger, and the `max_file_bytes` gate runs before either. | §5 SY10, SC3 | A-0011-6a needs body-level facts; the rule's purpose (bounded recursion, linear node emission) survives intact |
+| **A-0014-6** *(landed with RFC-0011 A-0011-6 / PR #62)* | LC7's `syn` feature list gains `visit` (read-only AST traversal), becoming `["full", "parsing", "clone-impls", "visit"]`. Still non-macro: `printing`, `fold`, `visit-mut`, `quote` and the proc-macro bridge remain forbidden, and the T20 placement rule (workspace pin, `alloy-index` alone) is untouched. | §9 LC7, T20 | The collector uses `syn::visit::Visit`; `visit` generates no code and links no compiler machinery |
 
 No amendment touches the `ProjectGraph` trait, the `GraphQuery` enum, or an Appendix A table shape — RFC-0011 E.3.3 holds.
+
+**Landed-state reconciliation (PR #62, RFC-0011 A-0011-6).** Where this text predates that merge, the merged code is newer and governs:
+
+1. **Version numerals.** `GRAPH_MODEL_VERSION` is `3` (SY1's `1 → 2` for items/imports, then `2 → 3` for the A-0011-6 semantic edges) and `GRAPH_SCHEMA_VERSION` is `2`: the `references`/`calls`/`impls` edge kinds needed the `graph_edges` `CHECK` list expanded, which SQLite cannot alter, so the table was recreated in a ledgered migration. SY1's mechanics are unchanged — a model mismatch still truncates and re-ingests, never merges — and SY2's "no DDL" held for this RFC's own rows: the v1 `CHECK` lists admitted `'item'`/`'imports'` exactly as designed.
+2. **Fidelity threshold.** `fidelity_for_model_version` (A-0014-4) returns `SynDeep` for `model_version >= 2`; model `3` is a deeper population of the same syn parse, not a new fidelity. T17 landed as `fidelity_is_syn_deep_from_model_version_two`.
+3. **Appendix B totals.** The toy workspace's 13 nodes and the item/import counts are as written; the edge total is now 18 (12 `Defines` + 3 `Imports` + 3 `References` — see the Appendix B note) and `IngestReport` gained `references`/`calls`/`impls` counters alongside `items`/`imports`. T18 pins the current totals.
+4. **T15 coverage.** SY15's byte-cap arm landed with its own test, `oversized_file_is_tracked_skipped_and_never_parsed`, beside the two `max_items` arms the table names.
 
 ### 2.5 What downstream may rely on
 
@@ -565,14 +572,14 @@ uuid          = { workspace = true }
 | **T12** | `import_groups_globs_and_renames_expand_as_specified` | SY12 |
 | **T13** | `null_project_graph_still_answers_with_a_backend_registered` | RS13 |
 | **T14** | `syn_pass_is_deterministic_across_two_processes` — extends RFC-0011's T3c harness; identical digest, identical `IngestReport` | SY14 |
-| **T15** | `max_items_cap_returns_limit_exceeded_and_leaves_version_intact`; `max_items_zero_is_rejected_at_open` | SY15 |
+| **T15** | `max_items_cap_returns_limit_exceeded_and_leaves_version_intact`; `max_items_zero_is_rejected_at_open`; `oversized_file_is_tracked_skipped_and_never_parsed` (the byte-cap arm, added with the landed state — §2.4) | SY15 |
 
 ### 12.3 Integration — model-version transition
 
 | # | Test | Rule |
 | --- | --- | --- |
-| **T16** | `model_version_bump_truncates_and_reingests` — build a graph with `GRAPH_MODEL_VERSION = 1` fixtures, open with the Beta build, assert nodes/edges/files were wiped, `graph_version` reset, and the re-ingest produced `Item` rows; assert **no** SQL migration ran (`GRAPH_SCHEMA_VERSION` still `1`) | SY1, SY2 |
-| **T17** | `fidelity_is_syn_deep_exactly_when_model_version_is_two` — over a fresh store and a truncated-and-reingested store | A-0014-4, RS4 |
+| **T16** | `model_version_bump_truncates_and_reingests` — build a graph with `GRAPH_MODEL_VERSION = 1` fixtures, open with the Beta build, assert nodes/edges/files were wiped, `graph_version` reset, and the re-ingest produced `Item` rows; assert **no** SQL migration ran for the model transition (`GRAPH_SCHEMA_VERSION` still `1`; landed: `2` with its own ledgered migration — §2.4) | SY1, SY2 |
+| **T17** | `fidelity_is_syn_deep_from_model_version_two` — over a fresh store and a truncated-and-reingested store (`SynDeep` for `model_version >= 2`; renamed post-A-0011-6 since model `3` is the same fidelity — §2.4) | A-0014-4, RS4 |
 | **T18** | `toy_workspace_gains_items_and_imports` — the Appendix B tree; exact node/edge counts | Appendix B |
 | **T19** | `diagnostics_entry_point_matches_verify_adapter_output` — same recorded cargo JSON through `McpVerifyCompileAdapter` and `RustBackend::diagnostics`; assert equal length, order, and **every field except `id`** (code, level, message, spans, children, package, `fingerprint`, `raw_json`). `DiagnosticId` is a fresh UUID per parse by RFC-0010's design (`DiagnosticId::new()` in `build_diagnostic_event`), so whole-struct equality is unsatisfiable; the **fingerprint** is the stable identity and is compared | DN1, DN7 |
 
@@ -825,6 +832,8 @@ Five item nodes → **13 nodes**. Five new `Defines` edges (module → item) →
 **3 `Imports` edges**. `use std::io::Read` produces **nothing**: `std` is not in this graph, and SY11 forbids inventing the node.
 
 Totals: 13 nodes, 15 edges, `fidelity = syn_deep`, `IngestReport { items: 5, imports: 3, source: syn_deep, … }`. A second `rebuild` returns `unchanged = true` (IN6 via SY15).
+
+*Landed state (A-0011-6, §2.4):* the same tree additionally records 3 `References` edges (`open → Config`, `open → Reader`, `toy_cli::main::main → open`), bringing the edge total to **18**; the node total, item/import counts and fidelity are unchanged.
 
 `query(Subgraph { seeds: [id("toy_core::io")], radius: 1 })` now returns the module, its parent, its child module, its item `open`, and — across the `Imports` edge — `toy_core::Config`: the projection RFC-0012's WorkingSet has been reserving space for.
 
