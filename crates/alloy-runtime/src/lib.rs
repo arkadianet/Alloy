@@ -77,7 +77,8 @@ pub use context::{
     AssembleInputs, AssembleRequest, BytesPerTokenEstimator, CompactStrategy, ContextEngine,
     ContextError, ContextHandle, ContextMetricsSnapshot, ContextProfile, DefaultContextEngine,
     Degradation, DegradationReason, DomainId, DomainWeights, EvictPolicy, EvictReport, FileExcerpt,
-    GraphProjection, NullContextEngine, StaleReason, TokenEstimator, WorkingSet,
+    GraphProjection, ImpactEntry, ImpactRelation, NullContextEngine, StaleReason, TokenEstimator,
+    WorkingSet,
 };
 pub use dag::{
     allocate_ids, build_topology, compiler_fingerprint_digest, compute_cache_key,

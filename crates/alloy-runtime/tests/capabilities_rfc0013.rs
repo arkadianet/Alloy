@@ -12,11 +12,14 @@ use std::time::Duration;
 
 use alloy_runtime::adapters::{NodeExecRef, ToolCaller, ToolCallerError};
 use alloy_runtime::capabilities::EditAppliedPayload;
-use alloy_runtime::graph::{FileChange, FixEvent, GraphError, GraphQuery, GraphView, ProjectGraph};
+use alloy_runtime::graph::{
+    derive_node_id, FileChange, FixEvent, GraphEdge, GraphEdgeKind, GraphError, GraphNode,
+    GraphNodeKind, GraphQuery, GraphView, ProjectGraph,
+};
 use alloy_runtime::storage::{
     ArtifactBlob, ArtifactMeta, ArtifactPut, ArtifactStore, SessionRows, StoreError,
 };
-use alloy_runtime::types::ids::{GraphSnapshotId, GraphVersion};
+use alloy_runtime::types::ids::{GraphNodeId, GraphSnapshotId, GraphVersion};
 use alloy_runtime::{
     AdapterError, ArtifactId, ArtifactKind, BudgetPolicy, CapabilityExecContext,
     CapabilityExecError, CapabilityExecutor, CapabilityId, CapabilityRegistry, ChatRole,
@@ -124,12 +127,28 @@ impl ToolCaller for QueueToolCaller {
     }
 }
 
-/// Read-only `ProjectGraph` double: answers `SimilarFixes` from a canned
-/// table and records the queries it saw. Every write is `Disabled`, so a
-/// worker that tried to write would fail loudly (SEC4).
+/// Read-only `ProjectGraph` double: answers `SimilarFixes`, `Symbol`,
+/// `Subgraph` and `Callers` from canned tables and records the queries it
+/// saw. Every write is `Disabled`, so a worker that tried to write would
+/// fail loudly (SEC4).
+///
+/// The query shapes mirror the real `alloy-index` store (verified on both
+/// main and `feat/graph-refs-impls-callers`): a file-path `Symbol` resolves
+/// through `graph_files.module_id` to the file's **Module** node only
+/// (`query.rs::symbol`); `Subgraph` exposes the module's item children via
+/// `Defines` edges; and `Callers` answers only for **Item** anchors,
+/// because the deep pass anchors `Calls` edges exclusively on module-level
+/// `fn` item nodes (`pass.rs`) and the read is `to_id = anchor`
+/// (`query.rs::neighbours`).
 #[derive(Default)]
 struct FixesGraph {
     fixes: HashMap<String, Vec<FixEvent>>,
+    /// Nodes known to the graph, served by `Symbol` and `Subgraph`.
+    nodes: Vec<GraphNode>,
+    /// `Defines` edges served by `Subgraph`.
+    edges: Vec<GraphEdge>,
+    /// Caller nodes served by `Callers`, keyed by the callee node id.
+    callers: HashMap<GraphNodeId, Vec<GraphNode>>,
     seen: Mutex<Vec<GraphQuery>>,
 }
 
@@ -137,7 +156,20 @@ impl FixesGraph {
     fn with(fixes: HashMap<String, Vec<FixEvent>>) -> Self {
         Self {
             fixes,
-            seen: Mutex::new(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    fn with_callers(
+        nodes: Vec<GraphNode>,
+        edges: Vec<GraphEdge>,
+        callers: HashMap<GraphNodeId, Vec<GraphNode>>,
+    ) -> Self {
+        Self {
+            nodes,
+            edges,
+            callers,
+            ..Self::default()
         }
     }
 
@@ -157,14 +189,46 @@ impl ProjectGraph for FixesGraph {
     async fn query(&self, q: GraphQuery) -> Result<GraphView, GraphError> {
         self.seen.lock().unwrap().push(q.clone());
         let mut view = GraphView::empty(GraphVersion(1));
-        if let GraphQuery::SimilarFixes {
-            diagnostic_code,
-            limit,
-        } = &q
-        {
-            if let Some(rows) = self.fixes.get(diagnostic_code) {
-                view.fixes = rows.iter().take(*limit).cloned().collect();
+        match &q {
+            GraphQuery::SimilarFixes {
+                diagnostic_code,
+                limit,
+            } => {
+                if let Some(rows) = self.fixes.get(diagnostic_code) {
+                    view.fixes = rows.iter().take(*limit).cloned().collect();
+                }
             }
+            GraphQuery::Symbol { path } => {
+                // Exact rust-path match, else the file-path fallback that
+                // yields the file's Module node only (`query.rs::symbol`).
+                view.nodes = self
+                    .nodes
+                    .iter()
+                    .filter(|n| n.path == *path)
+                    .cloned()
+                    .collect();
+                if view.nodes.is_empty() {
+                    view.nodes = self
+                        .nodes
+                        .iter()
+                        .filter(|n| {
+                            n.kind == GraphNodeKind::Module
+                                && n.file.as_deref() == Some(path.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                }
+            }
+            GraphQuery::Subgraph { seeds, .. } => {
+                if self.nodes.iter().any(|n| seeds.contains(&n.id)) {
+                    view.nodes = self.nodes.clone();
+                    view.edges = self.edges.clone();
+                }
+            }
+            GraphQuery::Callers { fn_node } => {
+                view.nodes = self.callers.get(fn_node).cloned().unwrap_or_default();
+            }
+            _ => {}
         }
         Ok(view)
     }
@@ -864,6 +928,161 @@ async fn repair_worker_omits_the_similar_fixes_note_when_the_graph_has_none() {
             .messages
             .iter()
             .any(|m| m.content.contains("similar_fixes")),
+        "no fence when there is nothing to show"
+    );
+}
+
+/// The canned graph shape for the caller-hint tests, mirroring the real
+/// store's resolution chain: `src/main.rs` resolves to the `app` **Module**
+/// node, which `Defines` the `app::main` **Item**, whose recorded caller
+/// lives in `src/startup.rs`. A worker that anchored `Callers` on the
+/// module node would get an honest empty view here, exactly as it would in
+/// production.
+fn callers_graph() -> Arc<FixesGraph> {
+    let module = GraphNode {
+        id: derive_node_id(GraphNodeKind::Module, "app\0app"),
+        kind: GraphNodeKind::Module,
+        path: "app".into(),
+        crate_id: alloy_runtime::CrateId::new("app").ok(),
+        file: Some("src/main.rs".into()),
+        digest: None,
+    };
+    let callee = GraphNode {
+        id: derive_node_id(GraphNodeKind::Item, "app\0app::main"),
+        kind: GraphNodeKind::Item,
+        path: "app::main".into(),
+        crate_id: alloy_runtime::CrateId::new("app").ok(),
+        file: Some("src/main.rs".into()),
+        digest: None,
+    };
+    let caller = GraphNode {
+        id: derive_node_id(GraphNodeKind::Item, "app\0app::startup"),
+        kind: GraphNodeKind::Item,
+        path: "app::startup".into(),
+        crate_id: alloy_runtime::CrateId::new("app").ok(),
+        file: Some("src/startup.rs".into()),
+        digest: None,
+    };
+    let defines = GraphEdge {
+        from: module.id,
+        to: callee.id,
+        kind: GraphEdgeKind::Defines,
+        confidence: 1.0,
+    };
+    let mut callers = HashMap::new();
+    callers.insert(callee.id, vec![caller]);
+    Arc::new(FixesGraph::with_callers(
+        vec![module, callee],
+        vec![defines],
+        callers,
+    ))
+}
+
+#[tokio::test]
+async fn repair_worker_asks_for_callers_and_fences_them_into_the_prompt() {
+    // A-0012-1 (worker side, mirroring A-0011-5c): the diagnosed paths
+    // drive bounded Symbol + Callers reads, and what comes back rides one
+    // compact User-role fence naming who calls into the change.
+    let graph = callers_graph();
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+
+    // Bounded reads: one Symbol per distinct diagnosed path, one Subgraph
+    // to expand the resolved module to its Defines'd items (the only nodes
+    // the real store anchors Calls edges on), one Callers per item.
+    let symbols = graph
+        .seen()
+        .iter()
+        .filter(|q| matches!(q, GraphQuery::Symbol { .. }))
+        .count();
+    let subgraphs = graph
+        .seen()
+        .iter()
+        .filter(|q| matches!(q, GraphQuery::Subgraph { .. }))
+        .count();
+    let callers: Vec<GraphNodeId> = graph
+        .seen()
+        .iter()
+        .filter_map(|q| match q {
+            GraphQuery::Callers { fn_node } => Some(*fn_node),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(symbols, 1, "one Symbol read for the one diagnosed path");
+    assert_eq!(subgraphs, 1, "one Subgraph read to expand the module");
+    assert_eq!(callers.len(), 1, "one Callers read for the one item");
+    assert_eq!(
+        callers[0],
+        derive_node_id(GraphNodeKind::Item, "app\0app::main"),
+        "Callers anchors on the item node, never the module: a module \
+         anchor returns empty against the real store"
+    );
+
+    // The fence reaches the model as User content, compact and honest.
+    let requests = fx.provider.requests();
+    assert_eq!(requests.len(), 1);
+    let note = requests[0]
+        .messages
+        .iter()
+        .find(|m| m.role == ChatRole::User && m.content.contains("<tool name=\"callers\">"))
+        .expect("callers note present");
+    assert!(note.content.contains("app::startup"));
+    assert!(note.content.contains("src/startup.rs"), "target-file hint");
+    assert!(
+        note.content.len() < 2048,
+        "the note stays compact: {} bytes",
+        note.content.len()
+    );
+}
+
+#[tokio::test]
+async fn repair_worker_accepts_caller_files_as_targets() {
+    // A caller-named file is a legitimate impact target (RW6 widened by the
+    // graph observation): the plan may point at src/startup.rs even though
+    // no diagnostic and no goal names it.
+    let graph = callers_graph();
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(
+            &["src/main.rs", "src/startup.rs"],
+            false,
+        ))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let plan: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+    assert_eq!(plan.target_files, vec!["src/main.rs", "src/startup.rs"]);
+}
+
+#[tokio::test]
+async fn repair_worker_omits_the_callers_note_when_the_graph_has_none() {
+    // The M7 store: Callers is a stub returning empty. Honest absence — no
+    // fence, no error (the empty-store degradation contract).
+    let graph = Arc::new(FixesGraph::default());
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+    let requests = fx.provider.requests();
+    assert!(
+        !requests[0]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("<tool name=\"callers\">")),
         "no fence when there is nothing to show"
     );
 }

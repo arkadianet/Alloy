@@ -167,6 +167,25 @@ fn profile_v2_defaults_match_appendix_b() {
     assert_eq!(p.max_conversation_events, 200);
     assert_eq!(p.graph_radius, 1);
     assert_eq!(p.cache_capacity, 32);
+    assert_eq!(p.max_impact_seeds, 4);
+    assert_eq!(p.max_impact_nodes, 8);
+}
+
+#[test]
+fn profile_is_constructible_and_extensible_from_outside_the_crate() {
+    // Compat convention for additive knobs (A-0012-1d and future ones):
+    // `ContextProfile` is `#[non_exhaustive]`, so external code constructs
+    // via `Default`/`v2_defaults` and mutates — this test *is* external
+    // code, so it proves the pattern compiles. A `[context]` table without
+    // the new keys keeps parsing (missing keys default).
+    let mut p = ContextProfile::default();
+    p.max_impact_seeds = 2;
+    assert_eq!(p.max_impact_seeds, 2);
+    assert_eq!(ContextProfile::default(), ContextProfile::v2_defaults());
+    let table: toml::Table = toml::from_str("total_token_budget = 1000").unwrap();
+    let parsed = ContextProfile::from_toml_table(&table).unwrap();
+    assert_eq!(parsed.max_impact_seeds, 4);
+    assert_eq!(parsed.max_impact_nodes, 8);
 }
 
 #[test]
@@ -841,7 +860,10 @@ async fn graph_corrupt_maps_to_graph_unavailable() {
 }
 
 #[tokio::test]
-async fn only_symbol_diagnostics_and_subgraph_are_queried() {
+async fn only_the_read_path_query_kinds_are_queried() {
+    // D14 as amended by A-0012-1a: Symbol / Diagnostics / Subgraph plus the
+    // bounded impact reads (Callers / Refs). Impls and SimilarFixes stay
+    // forbidden in context/**.
     let fx = Fx::new(GraphMode::Toy);
     let engine = fx.engine();
     // No caller diagnostics → the Diagnostics fallback is also exercised.
@@ -871,8 +893,10 @@ async fn only_symbol_diagnostics_and_subgraph_are_queried() {
                 GraphQuery::Symbol { .. }
                     | GraphQuery::Diagnostics { .. }
                     | GraphQuery::Subgraph { .. }
+                    | GraphQuery::Callers { .. }
+                    | GraphQuery::Refs { .. }
             ),
-            "D14 violation: {q:?}"
+            "D14 (as amended by A-0012-1a) violation: {q:?}"
         );
     }
 }
@@ -1774,4 +1798,240 @@ async fn null_engine_with_goal_assembles_goal_only_default_is_empty_prompt() {
         .compact(DomainId::Conversation, CompactStrategy::DropCache)
         .await
         .unwrap();
+}
+
+// ---------------------------------------------------------------------
+// A-0012-1 — cross-file impact (bounded Callers/Refs) in the WorkingSet
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn impact_callers_and_refs_render_inside_the_graph_fence() {
+    // A-0012-1b: impact rides the existing `working_set:graph` fence — a
+    // node line (with the standard citation grammar) for out-of-view
+    // nodes, plus one relation line per impact fact.
+    let fx = Fx::new(GraphMode::Toy);
+    fx.graph.set_impact(true);
+    let pack = fx
+        .engine()
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let text = pack_text(&pack);
+    assert!(text.contains("working_set:graph"));
+    assert!(
+        text.contains("calls toy_cli::main -> toy_core::io::read_all"),
+        "caller relation line missing:\n{text}"
+    );
+    assert!(
+        text.contains("refs toy_core::io::reader -> toy_core::io::read_all"),
+        "reference relation line missing:\n{text}"
+    );
+    // The caller node itself is listed with its file so the model can see
+    // where the impact lives.
+    assert!(text.contains("crates/toy-cli/src/main.rs"));
+    assert!(pack
+        .citations
+        .iter()
+        .any(|c| c.source == "alloy://working_set/graph/1/toy_cli::main"));
+    // The reader node is already in the subgraph: exactly one node line.
+    assert_eq!(
+        text.matches("module  toy_core::io::reader").count(),
+        1,
+        "an in-view impact node must not get a duplicate node line"
+    );
+    // No new fence kind: impact is part of the graph section.
+    assert!(!text.contains("working_set:impact"));
+}
+
+#[tokio::test]
+async fn impact_anchors_are_item_nodes_expanded_from_module_seeds() {
+    // The production shape (verified against alloy-index on both main and
+    // feat/graph-refs-impls-callers): a file-path `Symbol` resolves to the
+    // file's **Module** node (`query.rs::symbol` falls back through
+    // `graph_files.module_id`), while `Calls`/`References` edges anchor
+    // exclusively on **Item** nodes (`pass.rs`: module-level `fn` items are
+    // "the only admissible `Calls` targets"; `query.rs::neighbours` answers
+    // with `to_id = anchor`). The engine must therefore expand a module
+    // seed to its `Defines`d item children before issuing `Callers`/`Refs`
+    // — a module-anchored impact query can only ever return empty.
+    let fx = Fx::new(GraphMode::Toy);
+    fx.graph.set_impact(true);
+    let pack = fx
+        .engine()
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let item_id = ScriptedGraph::read_all_node().id;
+    let module_id = ScriptedGraph::io_node_id();
+    let anchors: Vec<_> = fx
+        .graph
+        .recorded()
+        .iter()
+        .filter_map(|q| match q {
+            GraphQuery::Callers { fn_node } => Some(*fn_node),
+            GraphQuery::Refs { node } => Some(*node),
+            _ => None,
+        })
+        .collect();
+    assert!(!anchors.is_empty(), "impact queries were issued");
+    assert!(
+        anchors.iter().all(|a| *a == item_id),
+        "every impact query anchors on the item node"
+    );
+    assert!(
+        !anchors.contains(&module_id),
+        "no impact query anchors on the module node: it would return empty \
+         against the real store"
+    );
+    // And the expansion produced real impact content.
+    assert!(pack_text(&pack).contains("calls toy_cli::main -> toy_core::io::read_all"));
+}
+
+#[tokio::test]
+async fn impact_queries_are_bounded_and_disabled_by_a_zero_profile_cap() {
+    // A-0012-1d: `max_impact_seeds = 0` issues no Callers/Refs at all.
+    let fx = Fx::new(GraphMode::Toy);
+    fx.graph.set_impact(true);
+    let mut profile = ContextProfile::v2_defaults();
+    profile.max_impact_seeds = 0;
+    let pack = fx
+        .engine_with(profile)
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    assert!(fx
+        .graph
+        .recorded()
+        .iter()
+        .all(|q| !matches!(q, GraphQuery::Callers { .. } | GraphQuery::Refs { .. })));
+    assert!(!pack_text(&pack).contains("calls toy_cli::main"));
+
+    // And with a cap of 1 seed, at most 2 impact queries are issued.
+    let fx2 = Fx::new(GraphMode::Toy);
+    fx2.graph.set_impact(true);
+    let mut profile2 = ContextProfile::v2_defaults();
+    profile2.max_impact_seeds = 1;
+    fx2.engine_with(profile2)
+        .assemble_with(repair_request(32_000, vec![]), fx2.goal_inputs())
+        .await
+        .unwrap();
+    let impact_queries = fx2
+        .graph
+        .recorded()
+        .iter()
+        .filter(|q| matches!(q, GraphQuery::Callers { .. } | GraphQuery::Refs { .. }))
+        .count();
+    assert!(
+        (1..=2).contains(&impact_queries),
+        "bounded to 2 per seed, got {impact_queries}"
+    );
+}
+
+#[tokio::test]
+async fn empty_impact_views_are_honest_absence_not_a_degradation() {
+    // A-0012-1c: the M7 store returns empty Callers/Refs views. The graph
+    // section still renders, carries no relation lines, no impact marker,
+    // and the pack reports no degradation for the absent impact.
+    let fx = Fx::new(GraphMode::Toy); // impact flag off = today's store
+    let pack = fx
+        .engine()
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let text = pack_text(&pack);
+    assert!(
+        text.contains("working_set:graph"),
+        "projection still renders"
+    );
+    assert!(!text.contains("\ncalls "));
+    assert!(!text.contains("\nrefs "));
+    assert!(!text.contains("impact items"));
+    let m = manifest(&pack);
+    assert!(
+        m["degradations"].as_array().unwrap().is_empty(),
+        "empty impact on a populated projection is not a degradation: {m}"
+    );
+}
+
+#[tokio::test]
+async fn empty_store_still_yields_no_graph_fence_and_no_error() {
+    // E2 unchanged by A-0012-1: an entirely empty store degrades exactly as
+    // before — no graph fence, honest `graph_empty`, `assemble` returns Ok,
+    // and no impact query is issued without a resolved seed.
+    let fx = Fx::new(GraphMode::Empty);
+    let pack = fx
+        .engine()
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let text = pack_text(&pack);
+    assert!(
+        !text.contains("working_set:graph"),
+        "no fence on empty store"
+    );
+    assert!(!text.contains("calls "));
+    let m = manifest(&pack);
+    let reasons: Vec<&str> = m["degradations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["reason"].as_str().unwrap())
+        .collect();
+    assert!(reasons.contains(&"graph_empty"), "honest absence: {m}");
+    assert!(fx
+        .graph
+        .recorded()
+        .iter()
+        .all(|q| !matches!(q, GraphQuery::Callers { .. } | GraphQuery::Refs { .. })));
+}
+
+#[tokio::test]
+async fn impact_entries_are_capped_with_an_omitted_marker() {
+    // B7/B8 for impact: the `max_impact_nodes` cap leaves a visible marker
+    // and a mirrored manifest counter; ordering keeps callers before refs.
+    let fx = Fx::new(GraphMode::Toy);
+    fx.graph.set_impact(true);
+    let mut profile = ContextProfile::v2_defaults();
+    profile.max_impact_nodes = 1;
+    let pack = fx
+        .engine_with(profile)
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let text = pack_text(&pack);
+    assert!(text.contains("calls toy_cli::main -> toy_core::io"));
+    assert!(!text.contains("refs toy_core::io::reader"));
+    assert!(
+        text.contains("[alloy: omitted — 1 more impact items not shown]"),
+        "B7 marker missing:\n{text}"
+    );
+    let m = manifest(&pack);
+    let omitted = domain_entry(&m, "working_set")["omitted"].as_u64().unwrap();
+    assert!(omitted >= 1, "B8 counter mirrors the marker: {m}");
+}
+
+#[tokio::test]
+async fn impact_query_failure_degrades_and_keeps_the_projection() {
+    // E2 applied to impact reads: a failing Callers/Refs query records a
+    // degradation and stops the impact fetch — never the projection, never
+    // the assembly.
+    let fx = Fx::new(GraphMode::Toy);
+    fx.graph.set_impact(true);
+    fx.graph.set_fail_impact(true);
+    let pack = fx
+        .engine()
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let text = pack_text(&pack);
+    assert!(text.contains("working_set:graph"), "projection survives");
+    assert!(!text.contains("calls toy_cli::main"));
+    let m = manifest(&pack);
+    let reasons: Vec<&str> = m["degradations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["reason"].as_str().unwrap())
+        .collect();
+    assert!(reasons.contains(&"graph_unavailable"), "{m}");
 }

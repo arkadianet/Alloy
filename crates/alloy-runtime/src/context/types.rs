@@ -233,6 +233,50 @@ pub struct GraphProjection {
     pub edges: Vec<GraphEdge>,
     /// `true` when RFC-0011 capped the view (`GraphView.truncated`) (B8).
     pub truncated: bool,
+    /// Cross-file impact facts from bounded `Callers`/`Refs` queries
+    /// (amendment A-0012-1b). Empty while the store's stubs return empty.
+    pub impact: Vec<ImpactEntry>,
+    /// Impact entries dropped by the `max_impact_nodes` cap; mirrored by a
+    /// marker and a manifest counter (B7/B8).
+    pub impact_omitted: usize,
+}
+
+/// One cross-file impact fact: a node that calls or references a seed
+/// (amendment A-0012-1b).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ImpactEntry {
+    /// Canonical path of the anchor node the impact was queried for: the
+    /// seed itself when the seed is an item, else an item node the seed
+    /// module `Defines` (A-0012-1a — `Calls`/`References` edges anchor on
+    /// item nodes, so module seeds are expanded before querying).
+    pub seed_path: String,
+    /// How [`ImpactEntry::node`] relates to the seed.
+    pub relation: ImpactRelation,
+    /// The impacting node, exactly as the graph returned it.
+    pub node: GraphNode,
+}
+
+/// How an impact node relates to its seed (amendment A-0012-1b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ImpactRelation {
+    /// The node calls the seed (`GraphQuery::Callers`).
+    Caller,
+    /// The node references the seed (`GraphQuery::Refs`).
+    Reference,
+}
+
+impl ImpactRelation {
+    /// Stable relation-line verb rendered in the graph fence (A-0012-1b).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Caller => "calls",
+            Self::Reference => "refs",
+        }
+    }
 }
 
 /// A named, honest degradation of a domain (E3).

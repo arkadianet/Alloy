@@ -159,18 +159,15 @@ fn sec7_no_embedding_index_identifiers() {
     );
 }
 
-// T-CI6 — D14: only Symbol / Diagnostics / Subgraph are constructed.
+// T-CI6 — D14 as amended by A-0012-1a: Symbol / Diagnostics / Subgraph plus
+// the bounded impact reads (Callers / Refs). Impls and SimilarFixes remain
+// forbidden in context/**.
 #[test]
-fn d14_only_three_graph_query_kinds_are_constructed() {
+fn d14_only_the_amended_graph_query_kinds_are_constructed() {
     assert_absent(
         &context_files(),
-        &[
-            "GraphQuery::Callers",
-            "GraphQuery::Refs",
-            "GraphQuery::Impls",
-            "GraphQuery::SimilarFixes",
-        ],
-        "D14",
+        &["GraphQuery::Impls", "GraphQuery::SimilarFixes"],
+        "D14 (A-0012-1a)",
     );
 }
 

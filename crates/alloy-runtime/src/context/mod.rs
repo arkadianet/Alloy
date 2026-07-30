@@ -37,7 +37,7 @@ pub use profile::{ContextProfile, DomainWeights};
 pub use types::{
     AssembleInputs, AssembleRequest, CompactStrategy, ContextHandle, Degradation,
     DegradationReason, DomainId, EvictPolicy, EvictReport, FileExcerpt, GraphProjection,
-    StaleReason, WorkingSet,
+    ImpactEntry, ImpactRelation, StaleReason, WorkingSet,
 };
 
 /// Section-grammar and manifest schema version (rules A5, CIT9).
