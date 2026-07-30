@@ -202,12 +202,23 @@ impl Default for AssemblyOptions {
 ///
 /// `readonly` applies PF10 structurally: no `GitEditEngine`, a refusing
 /// patch backend, and no test-class or worker-write grants.
+///
+/// `profile_id` is the reconciled catalog id from resolve (same source
+/// `plan_fingerprints` uses) so the driver's `policy_hash` stays consistent.
 pub async fn assemble_full(
     base: ReadAssembly,
     workspace_root: &Path,
     readonly: bool,
+    profile_id: &str,
 ) -> Result<FullAssembly, CliError> {
-    assemble_full_with(base, workspace_root, readonly, AssemblyOptions::default()).await
+    assemble_full_with(
+        base,
+        workspace_root,
+        readonly,
+        profile_id,
+        AssemblyOptions::default(),
+    )
+    .await
 }
 
 /// [`assemble_full`] with explicit host affirmations (CR1).
@@ -215,12 +226,23 @@ pub async fn assemble_full_with(
     base: ReadAssembly,
     workspace_root: &Path,
     readonly: bool,
+    profile_id: &str,
     options: AssemblyOptions,
 ) -> Result<FullAssembly, CliError> {
     let cfg = base.cfg.clone();
     let storage = Arc::clone(&base.storage);
     let handle = base.handle.clone();
     let plane = base.plane.clone();
+
+    // RFC-0017 AM-0013-1 / §7.1: fail closed before any sandbox probe so the
+    // exit code is EX_CONFIG, not EX_SANDBOX (§5.5 ordering).
+    let llm_planning = cfg.planner.mode == PlannerMode::Llm;
+    if readonly && llm_planning {
+        return Err(CliError::new(
+            Exit::Config,
+            "planner.mode = \"llm\" is forbidden for a read-only assembly (RFC-0017 §7.1)",
+        ));
+    }
 
     // Step 4 — project graph.
     let graph = open_graph(&base).await?;
@@ -387,15 +409,7 @@ pub async fn assemble_full_with(
     ));
     // RFC-0017 AM-0013-1: the planning worker's model branch is registered
     // iff the profile opts into LLM planning.
-    let llm_planning = cfg.planner.mode == PlannerMode::Llm;
-    if readonly && llm_planning {
-        // Defense in depth: RuntimeConfig::load already rejects the shipped
-        // readonly profile; a custom read-only assembly fails closed too.
-        return Err(CliError::new(
-            Exit::Config,
-            "planner.mode = \"llm\" is forbidden for a read-only assembly (RFC-0017 §7.1)",
-        ));
-    }
+    let worker_config = WorkerConfig::default();
     let registry = CapabilityRegistry::mvp_with(
         WorkerDeps {
             routers: Arc::clone(&routers) as _,
@@ -406,7 +420,7 @@ pub async fn assemble_full_with(
             artifacts: storage.artifacts() as _,
             decisions: Arc::clone(&decisions) as _,
             sessions: storage.sessions() as _,
-            config: WorkerConfig::default(),
+            config: worker_config.clone(),
         },
         llm_planning,
     )
@@ -448,38 +462,38 @@ pub async fn assemble_full_with(
     // `LlmPlanService` wraps the template service fail-closed, driving the
     // planning capability through the production executor with the run's
     // meter source (PP4) and the runtime cancellation token.
-    let build_plan_service = || -> Arc<dyn PlanService> {
-        let template = TemplatePlanService::from_storage(&storage);
-        if llm_planning {
-            let proposer = CapabilityPlanProposer::new(
-                Arc::clone(&capabilities),
-                ProposerDeps {
-                    workspace_root: workspace_root.to_path_buf(),
-                    cancellation: handle.cancellation(),
-                    cost_meters: Arc::clone(&cost_meters) as _,
-                    budget_policy: cfg.budget_policy.clone(),
-                },
-                cfg.planner.clone(),
-            );
-            Arc::new(LlmPlanService::new(
-                template,
-                Arc::new(proposer),
-                storage.artifacts() as _,
-                Arc::clone(&decisions) as _,
-                cfg.planner.clone(),
-            ))
-        } else {
-            Arc::new(template)
-        }
+    let template = TemplatePlanService::from_storage(&storage);
+    let plan: Arc<dyn PlanService> = if llm_planning {
+        let proposer = CapabilityPlanProposer::new(
+            Arc::clone(&capabilities),
+            ProposerDeps {
+                workspace_root: workspace_root.to_path_buf(),
+                cancellation: handle.cancellation(),
+                cost_meters: Arc::clone(&cost_meters) as _,
+                budget_policy: cfg.budget_policy.clone(),
+            },
+            cfg.planner.clone(),
+        );
+        Arc::new(LlmPlanService::new(
+            template,
+            Arc::new(proposer),
+            storage.artifacts() as _,
+            Arc::clone(&decisions) as _,
+            cfg.planner.clone(),
+            worker_config.enable_review,
+        ))
+    } else {
+        Arc::new(template)
     };
-    let plan = build_plan_service();
 
     // RFC-0017 MG1 — construct the `GenerationDriver` and inject it as the
     // §6.3 step-8 executor (AM-0003-2). Construct-and-inject only: the CLI
     // call sequence is unchanged (B1/SQ2 — it still calls `runs.start`).
     // The fingerprints are the same composition-root capture generation 1's
     // plan uses; the driver reuses them for the rebuilt replan context.
-    let profile = ProfileId::new(cfg.profile_id.clone().unwrap_or_else(|| "default".into()))
+    // Prefer the reconciled catalog id (same source as `plan_fingerprints`)
+    // over a bare `cfg.profile_id` fallback.
+    let profile = ProfileId::new(profile_id.to_owned())
         .map_err(|e| CliError::new(Exit::Config, format!("profile id: {e}")))?;
     let toolchain = alloy_tools::toolchain::capture_toolchain();
     let target = alloy_tools::toolchain::host_triple();
@@ -647,7 +661,7 @@ mod tests {
             write_workspace(ws.path());
             let cfg = load_cfg(ws.path());
             let base = assemble_read(cfg).await.unwrap();
-            match assemble_full(base, ws.path(), readonly).await {
+            match assemble_full(base, ws.path(), readonly, "default").await {
                 Ok(full) => {
                     // The scheduler was built and installed (CR1/step 12).
                     assert!(Arc::strong_count(&full.scheduler) >= 2);

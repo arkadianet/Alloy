@@ -60,6 +60,9 @@ pub struct LlmPlanService {
     artifacts: Arc<dyn ArtifactStore>,
     decisions: Arc<dyn DecisionLog>,
     cfg: PlannerConfig,
+    /// Mirrors `WorkerConfig.enable_review` so Review proposals fall back
+    /// when the capability is not registered (RG7).
+    enable_review: bool,
     metrics: AtomicPlannerMetrics,
 }
 
@@ -72,6 +75,7 @@ impl LlmPlanService {
         artifacts: Arc<dyn ArtifactStore>,
         decisions: Arc<dyn DecisionLog>,
         cfg: PlannerConfig,
+        enable_review: bool,
     ) -> Self {
         Self {
             inner,
@@ -79,6 +83,7 @@ impl LlmPlanService {
             artifacts,
             decisions,
             cfg,
+            enable_review,
             metrics: AtomicPlannerMetrics::default(),
         }
     }
@@ -224,12 +229,13 @@ impl LlmPlanService {
                 ids: &ids,
                 input_refs: &ephemeral,
                 cfg: &self.cfg,
+                enable_review: self.enable_review,
             },
         ) {
             compile_span.record("rejection_variant", tracing::field::debug(&rej));
             return Ok(Err(rej));
         }
-        let (specs, edges) = match resolve_proposal(manifest, &self.cfg) {
+        let (specs, edges) = match resolve_proposal(manifest, &self.cfg, self.enable_review) {
             Ok(pair) => pair,
             Err(rej) => {
                 compile_span.record("rejection_variant", tracing::field::debug(&rej));

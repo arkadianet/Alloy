@@ -147,6 +147,9 @@ pub struct CompileArgs<'a> {
     pub input_refs: &'a BTreeMap<NodeId, ArtifactId>,
     /// Validated planner knobs.
     pub cfg: &'a PlannerConfig,
+    /// Whether the `review` capability is registered. When false, proposals
+    /// carrying `NodeKind::Review` are rejected before dispatch (RG7).
+    pub enable_review: bool,
 }
 
 /// Allocate `NodeId`s / `GateId`s for a proposal (name-keyed, mirrors
@@ -193,6 +196,7 @@ const fn is_verify(kind: NodeKind) -> bool {
 pub(crate) fn resolve_proposal(
     manifest: &ProposedDagManifest,
     cfg: &PlannerConfig,
+    enable_review: bool,
 ) -> Result<(Vec<TemplateNodeSpec>, Vec<TemplateEdgeSpec>), ProposalRejection> {
     // PC1.
     if manifest.schema_version != PROPOSAL_SCHEMA_VERSION {
@@ -212,17 +216,19 @@ pub(crate) fn resolve_proposal(
         });
     }
     // PC3 — closed kind allowlist; `Plan` (no recursive planning, SEC4) and
-    // `Aggregate` (no structural nodes) are forbidden.
+    // `Aggregate` (no structural nodes) are forbidden. Review is only
+    // admitted when the review capability is registered (RG7).
     for spec in &manifest.nodes {
-        if !matches!(
-            spec.kind,
+        let allowed = match spec.kind {
             NodeKind::Analyze
-                | NodeKind::Edit
-                | NodeKind::Review
-                | NodeKind::VerifyCompile
-                | NodeKind::VerifyTest
-                | NodeKind::GateHuman
-        ) {
+            | NodeKind::Edit
+            | NodeKind::VerifyCompile
+            | NodeKind::VerifyTest
+            | NodeKind::GateHuman => true,
+            NodeKind::Review => enable_review,
+            _ => false,
+        };
+        if !allowed {
             return Err(ProposalRejection::KindForbidden { kind: spec.kind });
         }
     }
@@ -391,7 +397,7 @@ pub fn compile_proposal(
     manifest: &ProposedDagManifest,
     args: CompileArgs<'_>,
 ) -> Result<TaskDag, ProposalRejection> {
-    let (specs, edges) = resolve_proposal(manifest, args.cfg)?;
+    let (specs, edges) = resolve_proposal(manifest, args.cfg, args.enable_review)?;
     // The manifest carrier exists only for `build_topology`; the id is the
     // day-1 fallback identity (LP5) and the description is never consumed.
     let carrier = TemplateManifest {
@@ -436,6 +442,11 @@ fn check_built_chain(dag: &TaskDag) -> Result<(), ProposalRejection> {
             return Ok(()); // dangling edge — validator's jurisdiction.
         };
         chain.push((cur, node.kind));
+        // Bound by node count so a cyclic Sequence walk cannot grow forever
+        // before PC12's validator sees it.
+        if chain.len() > dag.nodes.len() {
+            return Ok(());
+        }
         match succ.get(&cur) {
             Some(next) => cur = *next,
             None => break,
@@ -497,6 +508,7 @@ mod tests {
                 ids: &ids,
                 input_refs: &input_refs,
                 cfg: &cfg,
+                enable_review: true,
             },
         )
     }
@@ -540,7 +552,7 @@ mod tests {
         let mut m = repair_shape();
         m.schema_version = 2;
         assert_eq!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::SchemaVersion { got: 2 }
         );
 
@@ -550,14 +562,14 @@ mod tests {
         m.rationale = "x".repeat(64 * 1024);
         m.nodes[0].kind = NodeKind::Plan;
         assert_eq!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::TooLarge { max: 16_384 }
         );
 
         // PC3 before PC4: a 1-node Plan proposal names the kind, not the count.
         let m = manifest(vec![node("p", NodeKind::Plan)]);
         assert_eq!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::KindForbidden {
                 kind: NodeKind::Plan
             }
@@ -566,7 +578,7 @@ mod tests {
         // PC4 low and high.
         let m = manifest(vec![node("gate", NodeKind::GateHuman)]);
         assert_eq!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::NodeCount { got: 1, max: 8 }
         );
         let mut many: Vec<ProposedNodeSpec> = (0..9)
@@ -574,7 +586,7 @@ mod tests {
             .collect();
         many.push(node("gate", NodeKind::GateHuman));
         assert!(matches!(
-            resolve_proposal(&manifest(many), &cfg()).unwrap_err(),
+            resolve_proposal(&manifest(many), &cfg(), true).unwrap_err(),
             ProposalRejection::NodeCount { got: 10, max: 8 }
         ));
 
@@ -584,14 +596,14 @@ mod tests {
             let mut m = repair_shape();
             m.nodes[0].name = bad.into();
             assert!(matches!(
-                resolve_proposal(&m, &cfg()).unwrap_err(),
+                resolve_proposal(&m, &cfg(), true).unwrap_err(),
                 ProposalRejection::BadName { .. }
             ));
         }
         let mut m = repair_shape();
         m.nodes[1].name = "analyze".into();
         assert!(matches!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::BadName { .. }
         ));
 
@@ -599,25 +611,25 @@ mod tests {
         let mut m = repair_shape();
         m.nodes[3].approval_reason = None;
         assert!(matches!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::BadApproval { .. }
         ));
         let mut m = repair_shape();
         m.nodes[3].approval_reason = Some("   ".into());
         assert!(matches!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::BadApproval { .. }
         ));
         let mut m = repair_shape();
         m.nodes[3].approval_reason = Some("x".repeat(501));
         assert!(matches!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::BadApproval { .. }
         ));
         let mut m = repair_shape();
         m.nodes[0].approval_reason = Some("why".into());
         assert!(matches!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::BadApproval { .. }
         ));
 
@@ -627,7 +639,7 @@ mod tests {
             ("verify", NodeKind::VerifyCompile),
         ]);
         assert_eq!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::NoTerminalGate
         );
 
@@ -637,7 +649,7 @@ mod tests {
             ("gate", NodeKind::GateHuman),
         ]);
         assert_eq!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::NoVerify
         );
     }
@@ -650,7 +662,7 @@ mod tests {
             m.nodes[0].kind = kind;
             m.nodes[0].approval_reason = None;
             assert_eq!(
-                resolve_proposal(&m, &cfg()).unwrap_err(),
+                resolve_proposal(&m, &cfg(), true).unwrap_err(),
                 ProposalRejection::KindForbidden { kind }
             );
         }
@@ -721,7 +733,7 @@ mod tests {
             ("gate", NodeKind::GateHuman),
         ]);
         assert_eq!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::UnverifiedEdit {
                 name: "edit".into()
             }
@@ -734,7 +746,7 @@ mod tests {
             ("gate", NodeKind::GateHuman),
         ]);
         assert_eq!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::UnverifiedEdit {
                 name: "edit2".into()
             }
@@ -768,7 +780,7 @@ mod tests {
             ("gate", NodeKind::GateHuman),
         ]);
         assert_eq!(
-            resolve_proposal(&m, &cfg()).unwrap_err(),
+            resolve_proposal(&m, &cfg(), true).unwrap_err(),
             ProposalRejection::UngroundedEdit {
                 name: "edit".into()
             }

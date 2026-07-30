@@ -7,6 +7,7 @@
 //!
 //! Author: arkadianet
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,16 +30,16 @@ use alloy_runtime::{
 
 // ---------- doubles ----------
 
-/// Scripted proposer: pops one queued result per call.
+/// Scripted proposer: consumes one queued result per call in declaration order.
 struct ScriptedProposer {
-    queue: Mutex<Vec<Result<ProposedDagManifest, ProposeError>>>,
+    queue: Mutex<VecDeque<Result<ProposedDagManifest, ProposeError>>>,
     calls: AtomicUsize,
 }
 
 impl ScriptedProposer {
     fn new(results: Vec<Result<ProposedDagManifest, ProposeError>>) -> Arc<Self> {
         Arc::new(Self {
-            queue: Mutex::new(results),
+            queue: Mutex::new(VecDeque::from(results)),
             calls: AtomicUsize::new(0),
         })
     }
@@ -51,7 +52,7 @@ impl PlanProposer for ScriptedProposer {
         self.queue
             .lock()
             .unwrap()
-            .pop()
+            .pop_front()
             .unwrap_or(Err(ProposeError::Unavailable("script exhausted".into())))
     }
 }
@@ -183,6 +184,7 @@ impl Harness {
             self.storage.artifacts() as Arc<dyn ArtifactStore>,
             Arc::clone(&self.decisions) as Arc<dyn alloy_runtime::DecisionLog>,
             cfg,
+            true,
         )
     }
 
@@ -437,12 +439,13 @@ async fn ac45_failing_decision_log_never_fails_a_plan() {
     });
     let svc = LlmPlanService::new(
         template,
-        ScriptedProposer::new(vec![Ok(manifest()), Err(ProposeError::Model("x".into()))]),
+        ScriptedProposer::new(vec![Err(ProposeError::Model("x".into())), Ok(manifest())]),
         storage.artifacts() as Arc<dyn ArtifactStore>,
         failing as Arc<dyn alloy_runtime::DecisionLog>,
         Harness::llm_cfg(),
+        true,
     );
-    // Rejected path first (queue pops from the back), then accepted.
+    // Rejected path first (queue is FIFO), then accepted.
     let a = svc
         .plan(plan_ctx(SessionId::new(), RunId::new(), DagId::new()))
         .await
@@ -674,7 +677,7 @@ async fn ac14b_proposer_builds_complete_context_on_the_runs_meter() {
     assert_eq!(captured.capability.as_str(), "planning");
     assert_eq!(captured.effective_tier, alloy_runtime::ModelTier::Standard);
     assert_eq!(captured.budget, PlannerConfig::new().planning_budget);
-    assert_eq!(captured.timeout, Duration::from_millis(120_000));
+    assert_eq!(captured.timeout, Duration::from_millis(PlannerConfig::new().planning_timeout_ms));
     assert!(matches!(
         captured.input.payload,
         NodeInputPayload::Goal(ref g) if g.text == "fix E0308"
@@ -793,12 +796,6 @@ async fn fb6_budget_precheck_denies_before_the_call() {
         None,
     );
     let executor = CapturingExecutor::ok_with(worker_payload(Some(manifest())));
-    let mut proposer = proposer_with(
-        Arc::clone(&executor) as _,
-        &meters,
-        CancellationToken::new(),
-    );
-    let _ = &mut proposer;
     let tight = alloy_runtime::BudgetPolicy {
         max_tokens_per_run: 1,
         ..alloy_runtime::BudgetPolicy::default()

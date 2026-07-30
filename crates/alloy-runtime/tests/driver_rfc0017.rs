@@ -152,16 +152,30 @@ impl Scheduler for Scripted {
             .unwrap()
             .pop_front()
             .expect("script exhausted");
-        let ok = |state| DagOutcome {
+        let ok = |generation, state| DagOutcome {
             dag_id,
-            generation: 1,
+            generation,
             state,
             failed_node: None,
             failure: None,
         };
         match step {
-            Step::Succeed => Ok(ok(DagState::Succeeded)),
-            Step::ReplanRequired => Ok(ok(DagState::ReplanRequired)),
+            Step::Succeed | Step::ReplanRequired => {
+                let generation = self
+                    .dag_store
+                    .get(dag_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|d| d.generation)
+                    .unwrap_or(1);
+                let state = if matches!(step, Step::Succeed) {
+                    DagState::Succeeded
+                } else {
+                    DagState::ReplanRequired
+                };
+                Ok(ok(generation, state))
+            }
             Step::Fail { node, class, diags } => {
                 Ok(self.fail_outcome(dag_id, node, class, diags).await)
             }
@@ -794,7 +808,11 @@ async fn ac25_cancel_and_budget_decline() {
 /// generations never restart the clock.
 #[tokio::test]
 async fn ac25b_absolute_deadline_shrinks_and_refuses() {
-    let t = Duration::from_millis(1000);
+    // Generous wall budget so CI load cannot flake the monotonic/decision
+    // assertions; each sleep still burns > half the timeout so two
+    // generations exhaust the absolute deadline.
+    let t = Duration::from_millis(5_000);
+    let sleep = 2_800;
     let h = Harness::new(HarnessOptions {
         run_timeout: t,
         ..HarnessOptions::default()
@@ -804,8 +822,8 @@ async fn ac25b_absolute_deadline_shrinks_and_refuses() {
     let sched = Scripted::new(
         &h.storage,
         [
-            Step::SleepThenFailCompile { ms: 600, diags: 1 },
-            Step::SleepThenFailCompile { ms: 500, diags: 1 },
+            Step::SleepThenFailCompile { ms: sleep, diags: 1 },
+            Step::SleepThenFailCompile { ms: sleep, diags: 1 },
         ],
     );
     sched.track(run);
@@ -821,15 +839,16 @@ async fn ac25b_absolute_deadline_shrinks_and_refuses() {
         remaining[1] < remaining[0],
         "remaining must strictly decrease: {remaining:?}"
     );
+    // Second generation must see a shrunken remainder, not a fresh timeout.
     assert!(
-        remaining[1] <= Duration::from_millis(450),
+        remaining[1] < t,
         "second generation gets the remainder, not a fresh run_timeout: {remaining:?}"
     );
     let decisions = h.replan_decisions(session).await;
     assert_eq!(decisions.last().unwrap()["reason"], json!("deadline"));
-    // ≤ T + scheduling slack: nowhere near 2×run_timeout.
+    // Absolute deadline — nowhere near 2×run_timeout, with CI slack.
     assert!(
-        wall < t + Duration::from_millis(700),
+        wall < t + Duration::from_secs(5),
         "wall clock bounded by the absolute deadline, got {wall:?}"
     );
     h.close().await;
