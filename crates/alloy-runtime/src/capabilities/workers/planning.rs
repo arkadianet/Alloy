@@ -33,7 +33,7 @@ use super::super::payload::{
     clamp_string, exceeds_total_bound, PlanningProposalPayload, MAX_PAYLOAD_STRING_BYTES,
     PAYLOAD_SCHEMA_VERSION,
 };
-use super::super::prompt::PLANNING_SYSTEM;
+use super::super::prompt::{PLANNING_SYSTEM, PLANNING_SYSTEM_NO_REVIEW};
 use super::super::traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
 use super::{finish_attempt, llm_exchange, worker_span, Attempt, WorkerError, WorkerSuccess};
 
@@ -209,11 +209,16 @@ impl PlanningWorker {
             budget: Some(ctx.budget.clone()),
             focus_paths: vec![],
         };
+        let system = if self.config.enable_review {
+            PLANNING_SYSTEM
+        } else {
+            PLANNING_SYSTEM_NO_REVIEW
+        };
         let (reply, _pack) = llm_exchange(
             ctx,
             attempt,
             &self.config,
-            PLANNING_SYSTEM,
+            system,
             &inputs,
             &[],
             |value| {

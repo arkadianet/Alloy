@@ -55,6 +55,7 @@ pub async fn exec(ctx: Ctx, args: ReviewArgs) -> Result<Exit, CliError> {
         base,
         &ctx.workspace_abs,
         ctx.readonly(),
+        &ctx.profile,
         AssemblyOptions {
             require_gates: false,
         },

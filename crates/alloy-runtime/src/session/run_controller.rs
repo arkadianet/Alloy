@@ -814,7 +814,11 @@ impl RunController for RunControllerView {
                 run_id: run,
                 session_id: row.session_id,
                 dag_id,
-                deadline: std::time::Instant::now() + run_timeout,
+                deadline: {
+                    let now = std::time::Instant::now();
+                    now.checked_add(run_timeout)
+                        .unwrap_or_else(std::time::Instant::far_future)
+                },
             })
             .await;
         let lock = ticket.relock().await;

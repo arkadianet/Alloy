@@ -88,11 +88,22 @@ fn ac46_plan_writes_only_through_plan_persistence() {
         let text = std::fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         let mut in_tests = false;
+        let mut test_depth = 0i32;
         for (idx, line) in text.lines().enumerate() {
-            if line.trim_start().starts_with("mod tests") {
+            let trimmed = line.trim_start();
+            if !in_tests && trimmed.starts_with("mod tests") {
                 in_tests = true;
+                test_depth = 0;
             }
-            if in_tests || is_comment_line(line) {
+            if in_tests {
+                test_depth += line.chars().filter(|&c| c == '{').count() as i32;
+                test_depth -= line.chars().filter(|&c| c == '}').count() as i32;
+                if test_depth <= 0 && trimmed.starts_with('}') {
+                    in_tests = false;
+                }
+                continue;
+            }
+            if is_comment_line(line) {
                 continue;
             }
             for needle in write_calls {
@@ -127,11 +138,22 @@ fn ac48_driver_never_touches_run_lifecycle() {
         let text = std::fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         let mut in_tests = false;
+        let mut test_depth = 0i32;
         for (idx, line) in text.lines().enumerate() {
-            if line.trim_start().starts_with("mod tests") {
+            let trimmed = line.trim_start();
+            if !in_tests && trimmed.starts_with("mod tests") {
                 in_tests = true;
+                test_depth = 0;
             }
-            if in_tests || is_comment_line(line) {
+            if in_tests {
+                test_depth += line.chars().filter(|&c| c == '{').count() as i32;
+                test_depth -= line.chars().filter(|&c| c == '}').count() as i32;
+                if test_depth <= 0 && trimmed.starts_with('}') {
+                    in_tests = false;
+                }
+                continue;
+            }
+            if is_comment_line(line) {
                 continue;
             }
             for needle in needles {
@@ -363,10 +385,13 @@ fn ac43_no_dotenv_writes_and_no_sixth_crate() {
         }
     }
     let crates_dir = manifest.join("..");
-    let crate_count = std::fs::read_dir(&crates_dir)
-        .unwrap()
-        .filter(|e| e.as_ref().unwrap().path().is_dir())
-        .count();
+    let crate_count = match std::fs::read_dir(&crates_dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().join("Cargo.toml").is_file())
+            .count(),
+        Err(e) => panic!("read {}: {e}", crates_dir.display()),
+    };
     assert_eq!(
         crate_count, 5,
         "the five-crate map is frozen (no sixth crate)"
