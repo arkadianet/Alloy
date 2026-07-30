@@ -490,6 +490,111 @@ fn yes_auto_approves_and_completes() {
     assert!(main_rs.contains("let x: i32 = 42;"));
 }
 
+/// AM-0013-1: the line-ops form of `edit_response_json` — no hunk headers,
+/// just the 1-based line numbers of the fixture's `src/main.rs` with the
+/// replaced line repeated in `expect` as the honesty guard. The
+/// `after_line: 0` insert exercises the top-of-file compile shape (V8b:
+/// the backend only accepts a context-anchored prepend hunk) through the
+/// real sandboxed apply.
+fn edit_ops_response_json() -> serde_json::Value {
+    serde_json::json!({
+        "ops": [
+            {
+                "op": "insert_lines",
+                "path": "src/main.rs",
+                "after_line": 0,
+                "new": ["// fixed by alloy"],
+            },
+            {
+                "op": "replace_lines",
+                "path": "src/main.rs",
+                "start": 2,
+                "end": 2,
+                "expect": ["    let x: i32 = \"not a number\";"],
+                "new": ["    let x: i32 = 42;"],
+            },
+        ],
+        "summary": "replace the string literal with 42 and mark the fix",
+        "confidence": 0.85,
+    })
+}
+
+/// Scripted server that answers the edit capability with line ops instead
+/// of a unified diff (same shape as `start_scripted_server` otherwise).
+fn start_ops_scripted_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+            let Some(body) = read_http_request(&mut stream) else {
+                continue;
+            };
+            let content = if body.contains("You analyse Rust compiler diagnostics") {
+                repair_response_json()
+            } else if body.contains("You produce a minimal unified diff") {
+                edit_ops_response_json()
+            } else {
+                serde_json::json!({"unexpected": true})
+            };
+            let doc = serde_json::json!({
+                "id": "scripted-1",
+                "choices": [{
+                    "message": { "content": content.to_string() },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 200, "completion_tokens": 60 },
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{doc}",
+                doc.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
+/// AM-0013-1 through the real binary: the model answers the edit turn with
+/// a line-ops array; the worker reads the current file, compiles the ops to
+/// the canonical `PatchSet`, and the run completes with the fix applied —
+/// same downstream machinery as the unified-diff walkthrough.
+#[test]
+fn ops_edit_response_completes_the_run_with_the_fix_applied() {
+    let Some(e2e) = setup_with(start_ops_scripted_server()) else {
+        return;
+    };
+    let out = e2e
+        .alloy()
+        .args(["run", "fix the compile error in src/main.rs", "--yes"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if is_environment_skip(out.status.code(), &stderr) {
+        return;
+    }
+    assert_eq!(out.status.code(), Some(0), "ops run failed: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("succeeded"), "stdout: {stdout}");
+    let main_rs = std::fs::read_to_string(e2e.ws.path().join("src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains("let x: i32 = 42;"),
+        "ops patch not applied: {main_rs}"
+    );
+    assert!(
+        !main_rs.contains("not a number"),
+        "original line survived: {main_rs}"
+    );
+    // The after_line 0 insert landed as the first line of the file.
+    assert_eq!(
+        main_rs.lines().next(),
+        Some("// fixed by alloy"),
+        "top-of-file insert missing: {main_rs}"
+    );
+}
+
 /// A server whose *first* edit response is a wrong fix (it introduces a
 /// fresh type error); every later edit response patches the *original*
 /// broken line — which only applies if the retry loop rolled the wrong

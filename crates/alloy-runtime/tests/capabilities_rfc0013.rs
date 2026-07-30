@@ -1370,6 +1370,152 @@ async fn edit_worker_oversize_patch_is_internal_non_retryable() {
     assert!(failure.notes.contains("MAX_ARGUMENT_BYTES"));
 }
 
+/// The line-ops equivalent of [`GOOD_DIFF`] (AM-0013-1), addressed at the
+/// numbered excerpt of a one-line `src/main.rs`.
+fn ops_response(expect: &str) -> serde_json::Value {
+    json!({
+        "ops": [{
+            "op": "replace_lines",
+            "path": "src/main.rs",
+            "start": 1,
+            "end": 1,
+            "expect": [expect],
+            "new": ["    let x: i32 = 42;"],
+        }],
+        "summary": "fix the annotation",
+        "confidence": 0.8,
+    })
+}
+
+fn fs_read_ok(path: &str, text: &str, truncated: bool) -> ToolResult {
+    ToolResult::ok(
+        ToolName::new("fs_read").unwrap(),
+        json!({ "path": path, "bytes": text.len(), "truncated": truncated, "text": text }),
+        1,
+    )
+}
+
+#[tokio::test]
+async fn edit_worker_ops_response_ends_in_the_same_apply_patch_call_as_a_diff() {
+    // AM-0013-1: an ops response reads the file once, compiles locally, and
+    // reaches apply_patch with byte-identical arguments to the diff form.
+    let diff_fx = fixture(FixtureSpec {
+        responses: vec![structured(patch_response(GOOD_DIFF))],
+        tool_results: vec![apply_ok(true, false), apply_ok(false, true)],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&diff_fx, "edit", NodeKind::Edit, goal());
+    let _ = success(diff_fx.executor.execute(&ctx).await.unwrap());
+    let diff_calls = diff_fx.tools.calls();
+
+    let current = "    let x: &str = 42;\n";
+    let ops_fx = fixture(FixtureSpec {
+        responses: vec![structured(ops_response("    let x: &str = 42;"))],
+        tool_results: vec![
+            fs_read_ok("src/main.rs", current, false),
+            apply_ok(true, false),
+            apply_ok(false, true),
+        ],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&ops_fx, "edit", NodeKind::Edit, goal());
+    let outcome = ops_fx.executor.execute(&ctx).await.unwrap();
+    let applied: EditAppliedPayload = serde_json::from_value(success(outcome)).unwrap();
+    assert_eq!(applied.files_touched, vec!["src/main.rs"]);
+    assert_eq!(applied.hunk_count, 1);
+    assert!(!applied.dry_run, "EW7");
+
+    let ops_calls = ops_fx.tools.calls();
+    assert_eq!(ops_calls.len(), 3);
+    // One read per distinct path, before any apply.
+    assert_eq!(ops_calls[0].0.name.as_str(), "fs_read");
+    assert_eq!(ops_calls[0].0.arguments, json!({ "path": "src/main.rs" }));
+    // EW6 dry run then EW7 apply, with the SAME canonical patch the
+    // unified-diff response produced.
+    assert_eq!(ops_calls[1].0.name.as_str(), "apply_patch");
+    assert_eq!(ops_calls[1].0.arguments, diff_calls[0].0.arguments);
+    assert_eq!(ops_calls[2].0.arguments, diff_calls[1].0.arguments);
+    // EW9 held for the ops path too: patch artifact persisted before apply.
+    let meta = ops_fx.artifacts.meta(applied.patch_artifact).await.unwrap();
+    assert_eq!(meta.kind, ArtifactKind::Patch);
+}
+
+#[tokio::test]
+async fn edit_worker_stale_ops_expect_gets_one_repair_turn() {
+    // AM-0013-1 honesty guard: expect lines that do not match the CURRENT
+    // file are fed back for one repair turn (mirrors EW6), and the repaired
+    // response may switch to the diff form.
+    let fx = fixture(FixtureSpec {
+        responses: vec![
+            structured(ops_response("    let x: &str = 43;")), // stale memory
+            structured(patch_response(GOOD_DIFF)),
+        ],
+        tool_results: vec![
+            fs_read_ok("src/main.rs", "    let x: &str = 42;\n", false),
+            apply_ok(true, false),
+            apply_ok(false, true),
+        ],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "edit", NodeKind::Edit, goal());
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let applied: EditAppliedPayload = serde_json::from_value(success(outcome)).unwrap();
+    assert_eq!(applied.files_touched, vec!["src/main.rs"]);
+    // The repair turn consumed the second model turn and carried the
+    // mismatch back inside a fence.
+    assert_eq!(fx.provider.requests().len(), 2);
+    let followup = prompt_text(&fx);
+    assert!(followup.contains("stale op"), "{followup}");
+    assert!(followup.contains("src/main.rs:1"), "{followup}");
+}
+
+#[tokio::test]
+async fn edit_worker_truncated_read_redirects_ops_to_the_diff_form() {
+    // A partial fs_read cannot anchor line ops; the feedback says so and
+    // the model answers with a unified diff.
+    let fx = fixture(FixtureSpec {
+        responses: vec![
+            structured(ops_response("    let x: &str = 42;")),
+            structured(patch_response(GOOD_DIFF)),
+        ],
+        tool_results: vec![
+            fs_read_ok("src/main.rs", "    let x: &str = 42;\n", true),
+            apply_ok(true, false),
+            apply_ok(false, true),
+        ],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "edit", NodeKind::Edit, goal());
+    let _ = success(fx.executor.execute(&ctx).await.unwrap());
+    assert_eq!(fx.provider.requests().len(), 2);
+    assert!(prompt_text(&fx).contains("unified diff patch instead"));
+}
+
+#[tokio::test]
+async fn edit_worker_requires_exactly_one_of_patch_and_ops() {
+    // Strict either/or (AM-0013-1): both present is a PS5 violation handled
+    // by the PS6 repair turn; a second violation fails Model/Retryable.
+    let both = json!({
+        "patch": GOOD_DIFF,
+        "ops": [],
+        "summary": "greedy",
+        "confidence": 0.5,
+    });
+    let neither = json!({ "summary": "empty", "confidence": 0.5 });
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(both), structured(neither)],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "edit", NodeKind::Edit, goal());
+    let failure = soft_failure(fx.executor.execute(&ctx).await.unwrap());
+    assert_eq!(failure.error_class, ErrorClass::Model);
+    assert_eq!(failure.retry, RetryDisposition::Retryable);
+    assert_eq!(fx.provider.requests().len(), 2);
+    let followup = prompt_text(&fx);
+    assert!(followup.contains("never both"), "{followup}");
+    assert!(fx.tools.calls().is_empty(), "no tool call for invalid wire");
+}
+
 #[tokio::test]
 async fn review_worker_request_changes_is_a_success() {
     // VW2/VW4.
