@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Draft |
+| **Status** | Implemented |
 | **Author** | arkadianet |
 | **Architecture** | [Alloy Architecture V2](../architecture/alloy-architecture-v2.md) (frozen) — §9, §10, §12 |
 | **Depends on** | [0006](./RFC-0006-mcp-host-builtins.md) tools · [0007](./RFC-0007-model-router-provider.md) router · [0008](./RFC-0008-edit-engine.md) patch IR · [0011](./RFC-0011-project-graph.md) read-only graph · [0012](./RFC-0012-context-engine.md) PromptPack |
