@@ -147,10 +147,26 @@ pub fn edit_response_schema() -> JsonSchemaSpec {
             "type": "object",
             "properties": {
                 "patch": { "type": "string" },
+                "ops": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {
+                                "type": "string",
+                                "enum": ["replace_lines", "insert_lines", "delete_lines"]
+                            }
+                        },
+                        "required": ["op"]
+                    }
+                },
                 "summary": { "type": "string" },
                 "confidence": { "type": ["number", "null"] }
             },
-            "required": ["patch", "summary"],
+            // Exactly one of `patch` / `ops` is enforced by the worker parser
+            // (`deny_unknown_fields` + both/neither rejected); provider
+            // schemas cannot express `oneOf` portably.
+            "required": ["summary"],
             "additionalProperties": false
         }),
     }
