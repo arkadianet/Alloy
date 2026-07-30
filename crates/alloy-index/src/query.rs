@@ -283,12 +283,6 @@ fn fix_from_row(row: &rusqlite::Row<'_>) -> Result<FixEvent, GraphError> {
     })
 }
 
-/// Q4/Q5 as amended by A-0011-6: the anchor node plus the edges of `kinds`
-/// touching it — incoming only (`Refs`, `Callers`) or both directions
-/// (`Impls`, so one query answers "implementers of this trait" and "traits
-/// this type implements"). An unknown anchor returns an empty view with
-/// `truncated = false`: nothing was withheld, and fabricating a row for an
-/// id the graph never minted would violate G7.
 /// Which incident edges a neighbourhood query admits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
@@ -298,6 +292,12 @@ enum Direction {
     Both,
 }
 
+/// Q4/Q5 as amended by A-0011-6: the anchor node plus the edges of `kinds`
+/// touching it — incoming only (`Refs`, `Callers`) or both directions
+/// (`Impls`, so one query answers "implementers of this trait" and "traits
+/// this type implements"). An unknown anchor returns an empty view with
+/// `truncated = false`: nothing was withheld, and fabricating a row for an
+/// id the graph never minted would violate G7.
 fn neighbours(
     conn: &Connection,
     anchor: &GraphNodeId,
