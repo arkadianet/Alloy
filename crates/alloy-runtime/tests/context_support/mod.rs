@@ -334,18 +334,20 @@ pub struct ScriptedGraph {
     pub diagnostics: Mutex<Vec<DiagnosticEvent>>,
     /// When set, every served view reports `truncated = true` (Q9).
     pub truncated: Mutex<bool>,
-    /// When set, the double serves the post-A-0011-6 store shape (the
-    /// `feat/graph-refs-impls-callers` branch): the `Subgraph` view carries
-    /// the `toy_core::io::read_all` **Item** node via a `Defines` edge, and
-    /// `Callers`/`Refs` serve populated views **only when anchored on that
-    /// item node's id** — never on a module id, because the real deep pass
-    /// anchors `Calls`/`References` edges exclusively on item nodes
-    /// (`alloy-index/src/lang/rust/pass.rs`: module-level `fn` items are
-    /// "the only admissible `Calls` targets"), and the real read path
-    /// answers `Callers`/`Refs` with `to_id = anchor` edge lookups
-    /// (`alloy-index/src/query.rs::neighbours`). Unset mirrors the M7
-    /// store, whose `Callers`/`Refs` stubs return empty and whose manifest
-    /// pass emits no item nodes.
+    /// When set, the double serves the deep store shape merged on `main`
+    /// (#62, `GRAPH_MODEL_VERSION = 3`): every view is labelled
+    /// [`GraphFidelity::SynDeep`] (`migrate::fidelity_for_model_version`),
+    /// the `Subgraph` view carries the `toy_core::io::read_all` **Item**
+    /// node via a `Defines` edge plus an `Imports` edge from the importing
+    /// module, and `Callers`/`Refs` serve populated views **only when
+    /// anchored on that item node's id** — never on a module id, because
+    /// the real deep pass anchors `Calls`/`References` edges exclusively on
+    /// item nodes (`alloy-index/src/lang/rust/pass.rs`: module-level `fn`
+    /// items are "the only admissible `Calls` targets"), and the real read
+    /// path answers `Callers`/`Refs` with the anchor plus `to_id = anchor`
+    /// edge lookups (`alloy-index/src/query.rs::neighbours`). Unset mirrors
+    /// the M7 store, whose `Callers`/`Refs` stubs return empty and whose
+    /// manifest pass emits no item nodes.
     pub impact: Mutex<bool>,
     /// When set, every `Callers`/`Refs` query fails with `Io`.
     pub fail_impact: Mutex<bool>,
@@ -441,9 +443,15 @@ impl ScriptedGraph {
         let version = GraphVersion(*self.version.lock().unwrap());
         let nodes = Self::toy_nodes();
         let mut view = GraphView::empty(version);
-        view.fidelity = GraphFidelity::Manifest;
-        view.truncated = *self.truncated.lock().unwrap();
         let impact = *self.impact.lock().unwrap();
+        // Fidelity is a pure function of the store's model version (RS4):
+        // the deep shape cannot exist under a Manifest label on main.
+        view.fidelity = if impact {
+            GraphFidelity::SynDeep
+        } else {
+            GraphFidelity::Manifest
+        };
+        view.truncated = *self.truncated.lock().unwrap();
         match q {
             GraphQuery::Symbol { path } => {
                 // Faithful to `alloy-index/src/query.rs::symbol` (identical
@@ -468,6 +476,7 @@ impl ScriptedGraph {
                 }
             }
             GraphQuery::Subgraph { .. } => {
+                let reader_id = nodes[2].id;
                 let mut edges = vec![
                     GraphEdge {
                         from: nodes[0].id,
@@ -477,7 +486,7 @@ impl ScriptedGraph {
                     },
                     GraphEdge {
                         from: nodes[1].id,
-                        to: nodes[2].id,
+                        to: reader_id,
                         kind: GraphEdgeKind::Defines,
                         confidence: 1.0,
                     },
@@ -486,12 +495,21 @@ impl ScriptedGraph {
                 if impact {
                     // The deep-pass store shape: the module Defines its
                     // item child, which is how a module seed is expanded
-                    // to `Calls`/`References`-anchorable item nodes.
+                    // to `Calls`/`References`-anchorable item nodes, and
+                    // the importing module carries an `Imports` edge to the
+                    // item (SY11–SY13) — the edge the `Refs` answer below
+                    // corresponds to.
                     let item = Self::read_all_node();
                     edges.push(GraphEdge {
                         from: Self::io_node_id(),
                         to: item.id,
                         kind: GraphEdgeKind::Defines,
+                        confidence: 1.0,
+                    });
+                    edges.push(GraphEdge {
+                        from: reader_id,
+                        to: item.id,
+                        kind: GraphEdgeKind::Imports,
                         confidence: 1.0,
                     });
                     view.nodes.push(item);
@@ -502,18 +520,21 @@ impl ScriptedGraph {
                 view.diagnostics = self.diagnostics.lock().unwrap().clone();
             }
             // `Callers`/`Refs` answer only for the **item** anchor: the
-            // real `neighbours()` read is `to_id = anchor` over edges the
-            // deep pass anchors on item nodes exclusively, so a module
-            // anchor honestly returns empty even on the semantic store.
+            // real `neighbours()` read is the anchor plus `to_id = anchor`
+            // edge lookups over edges the deep pass anchors on item nodes
+            // exclusively, so a module anchor honestly returns empty even
+            // on the semantic store. The anchor rides the view (the engine
+            // drops that self-row as noise).
             GraphQuery::Callers { fn_node } if impact && *fn_node == Self::read_all_node().id => {
-                view.nodes = vec![Self::caller_node()];
+                view.nodes = vec![Self::read_all_node(), Self::caller_node()];
             }
             GraphQuery::Refs { node } if impact && *node == Self::read_all_node().id => {
-                // A node already present in the subgraph: exercises the
-                // "relation line only, no duplicate node line" path. A
-                // module *source* is real: `Refs` includes incoming
-                // `Imports` edges, whose `from` is the importing module.
-                view.nodes = vec![nodes[2].clone()];
+                // The referencing module is already present in the
+                // subgraph: exercises the "relation line only, no
+                // duplicate node line" path. A module *source* is real:
+                // `Refs` includes incoming `Imports` edges, whose `from`
+                // is the importing module.
+                view.nodes = vec![Self::read_all_node(), nodes[2].clone()];
             }
             _ => {}
         }

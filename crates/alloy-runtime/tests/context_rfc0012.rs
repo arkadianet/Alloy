@@ -108,6 +108,71 @@ async fn assemble_over_a_recorded_toy_workspace_graph_view() {
     }
 }
 
+// T8i — the Beta acceptance criterion, integration-level: over the deep
+// store shape (syn-deep fidelity, item-level nodes, import edges — what
+// alloy-index serves on main at GRAPH_MODEL_VERSION = 3), the WorkingSet
+// includes the rich projection with per-node citations, and the reserved
+// domains stay inert.
+#[tokio::test]
+async fn assemble_over_the_deep_store_shape() {
+    let ws = ToyWs::new();
+    let (engine, graph) = repair_engine(&ws.root);
+    graph.set_impact(true);
+    let mut inputs = make_inputs(
+        Some("fix the borrow error in toy-core"),
+        vec![e0502_diagnostic()],
+        vec!["crates/toy-core/src/io.rs"],
+    );
+    inputs.run = Some(fixed_run());
+    let pack = engine
+        .assemble_with(
+            repair_request(
+                32_000,
+                vec![ContextHandle::File {
+                    path: "crates/toy-core/src/io.rs".into(),
+                    lines: Some((10, 40)),
+                }],
+            ),
+            inputs,
+        )
+        .await
+        .expect("deep repair pack assembles");
+    let text: String = pack
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    for line in [
+        "fidelity=syn_deep",
+        "item  toy_core::io::read_all  crates/toy-core/src/io.rs",
+        "imports toy_core::io::reader -> toy_core::io::read_all",
+        "calls toy_cli::main -> toy_core::io::read_all",
+    ] {
+        assert!(text.contains(line), "deep projection missing: {line}");
+    }
+    for source in [
+        "alloy://working_set/graph/1/toy_core::io::read_all",
+        "alloy://working_set/graph/1/toy_cli::main",
+    ] {
+        assert!(
+            pack.citations.iter().any(|c| c.source == source),
+            "missing citation {source}"
+        );
+    }
+    let m = pack.domains.unwrap();
+    assert_eq!(m["graph"]["fidelity"], "syn_deep");
+    let live: Vec<bool> = alloy_runtime::context::DomainId::ALL
+        .iter()
+        .map(|d| m["domains"][d.label()]["live"].as_bool().unwrap())
+        .collect();
+    assert_eq!(
+        live,
+        vec![true, true, true, false, false, false, false, false],
+        "still exactly three live domains"
+    );
+}
+
 // T8c — the draft's original integration criterion.
 #[tokio::test]
 async fn assemble_after_diagnostic_ingest_includes_a_diagnostics_citation() {
