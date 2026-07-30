@@ -93,6 +93,7 @@ fn request(run: RunId) -> RoutingRequest {
         },
         requires_tools: false,
         requires_structured_output: false,
+        response_schema: None,
     }
 }
 

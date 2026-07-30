@@ -12,11 +12,14 @@ use std::time::Duration;
 
 use alloy_runtime::adapters::{NodeExecRef, ToolCaller, ToolCallerError};
 use alloy_runtime::capabilities::EditAppliedPayload;
-use alloy_runtime::graph::{FileChange, FixEvent, GraphError, GraphQuery, GraphView, ProjectGraph};
+use alloy_runtime::graph::{
+    derive_node_id, FileChange, FixEvent, GraphEdge, GraphEdgeKind, GraphError, GraphNode,
+    GraphNodeKind, GraphQuery, GraphView, ProjectGraph,
+};
 use alloy_runtime::storage::{
     ArtifactBlob, ArtifactMeta, ArtifactPut, ArtifactStore, SessionRows, StoreError,
 };
-use alloy_runtime::types::ids::{GraphSnapshotId, GraphVersion};
+use alloy_runtime::types::ids::{GraphNodeId, GraphSnapshotId, GraphVersion};
 use alloy_runtime::{
     AdapterError, ArtifactId, ArtifactKind, BudgetPolicy, CapabilityExecContext,
     CapabilityExecError, CapabilityExecutor, CapabilityId, CapabilityRegistry, ChatRole,
@@ -124,12 +127,28 @@ impl ToolCaller for QueueToolCaller {
     }
 }
 
-/// Read-only `ProjectGraph` double: answers `SimilarFixes` from a canned
-/// table and records the queries it saw. Every write is `Disabled`, so a
-/// worker that tried to write would fail loudly (SEC4).
+/// Read-only `ProjectGraph` double: answers `SimilarFixes`, `Symbol`,
+/// `Subgraph` and `Callers` from canned tables and records the queries it
+/// saw. Every write is `Disabled`, so a worker that tried to write would
+/// fail loudly (SEC4).
+///
+/// The query shapes mirror the real `alloy-index` store (verified on both
+/// main and `feat/graph-refs-impls-callers`): a file-path `Symbol` resolves
+/// through `graph_files.module_id` to the file's **Module** node only
+/// (`query.rs::symbol`); `Subgraph` exposes the module's item children via
+/// `Defines` edges; and `Callers` answers only for **Item** anchors,
+/// because the deep pass anchors `Calls` edges exclusively on module-level
+/// `fn` item nodes (`pass.rs`) and the read is `to_id = anchor`
+/// (`query.rs::neighbours`).
 #[derive(Default)]
 struct FixesGraph {
     fixes: HashMap<String, Vec<FixEvent>>,
+    /// Nodes known to the graph, served by `Symbol` and `Subgraph`.
+    nodes: Vec<GraphNode>,
+    /// `Defines` edges served by `Subgraph`.
+    edges: Vec<GraphEdge>,
+    /// Caller nodes served by `Callers`, keyed by the callee node id.
+    callers: HashMap<GraphNodeId, Vec<GraphNode>>,
     seen: Mutex<Vec<GraphQuery>>,
 }
 
@@ -137,7 +156,20 @@ impl FixesGraph {
     fn with(fixes: HashMap<String, Vec<FixEvent>>) -> Self {
         Self {
             fixes,
-            seen: Mutex::new(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    fn with_callers(
+        nodes: Vec<GraphNode>,
+        edges: Vec<GraphEdge>,
+        callers: HashMap<GraphNodeId, Vec<GraphNode>>,
+    ) -> Self {
+        Self {
+            nodes,
+            edges,
+            callers,
+            ..Self::default()
         }
     }
 
@@ -157,14 +189,46 @@ impl ProjectGraph for FixesGraph {
     async fn query(&self, q: GraphQuery) -> Result<GraphView, GraphError> {
         self.seen.lock().unwrap().push(q.clone());
         let mut view = GraphView::empty(GraphVersion(1));
-        if let GraphQuery::SimilarFixes {
-            diagnostic_code,
-            limit,
-        } = &q
-        {
-            if let Some(rows) = self.fixes.get(diagnostic_code) {
-                view.fixes = rows.iter().take(*limit).cloned().collect();
+        match &q {
+            GraphQuery::SimilarFixes {
+                diagnostic_code,
+                limit,
+            } => {
+                if let Some(rows) = self.fixes.get(diagnostic_code) {
+                    view.fixes = rows.iter().take(*limit).cloned().collect();
+                }
             }
+            GraphQuery::Symbol { path } => {
+                // Exact rust-path match, else the file-path fallback that
+                // yields the file's Module node only (`query.rs::symbol`).
+                view.nodes = self
+                    .nodes
+                    .iter()
+                    .filter(|n| n.path == *path)
+                    .cloned()
+                    .collect();
+                if view.nodes.is_empty() {
+                    view.nodes = self
+                        .nodes
+                        .iter()
+                        .filter(|n| {
+                            n.kind == GraphNodeKind::Module
+                                && n.file.as_deref() == Some(path.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                }
+            }
+            GraphQuery::Subgraph { seeds, .. } => {
+                if self.nodes.iter().any(|n| seeds.contains(&n.id)) {
+                    view.nodes = self.nodes.clone();
+                    view.edges = self.edges.clone();
+                }
+            }
+            GraphQuery::Callers { fn_node } => {
+                view.nodes = self.callers.get(fn_node).cloned().unwrap_or_default();
+            }
+            _ => {}
         }
         Ok(view)
     }
@@ -316,7 +380,7 @@ impl WorkerPermissions for StaticPerms {
 
 // --- fixture ------------------------------------------------------------
 
-fn router_toml(supports_structured: bool) -> String {
+fn router_toml(supports_structured: bool, supports_json_schema: bool) -> String {
     format!(
         r#"
 [policy]
@@ -336,6 +400,7 @@ display_name = "Endpoint"
 model = "operator-configured"
 tiers = ["standard", "economy"]
 supports_structured_output = {supports_structured}
+supports_json_schema = {supports_json_schema}
 max_context = 65536
 input_usd_per_mtok = 2.0
 output_usd_per_mtok = 4.0
@@ -349,6 +414,7 @@ display_name = "Premium"
 model = "operator-premium"
 tiers = ["premium"]
 supports_structured_output = {supports_structured}
+supports_json_schema = {supports_json_schema}
 max_context = 65536
 input_usd_per_mtok = 8.0
 output_usd_per_mtok = 16.0
@@ -377,6 +443,7 @@ struct FixtureSpec {
     responses: Vec<Result<ModelResponse, ProviderError>>,
     tool_results: Vec<ToolResult>,
     supports_structured: bool,
+    supports_json_schema: bool,
     budget_policy: BudgetPolicy,
     config: WorkerConfig,
     /// Read-only graph behind the worker handle; `None` ⇒ the null graph.
@@ -391,6 +458,7 @@ impl Default for FixtureSpec {
             responses: vec![],
             tool_results: vec![],
             supports_structured: true,
+            supports_json_schema: false,
             budget_policy: BudgetPolicy::default(),
             config: WorkerConfig::default(),
             graph: None,
@@ -408,8 +476,11 @@ fn fixture(spec: FixtureSpec) -> Fixture {
     ));
     let perms = Arc::new(StaticPerms::new());
     let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
-    let config = RouterConfig::from_str("rfc0013 tests", &router_toml(spec.supports_structured))
-        .expect("valid router config");
+    let config = RouterConfig::from_str(
+        "rfc0013 tests",
+        &router_toml(spec.supports_structured, spec.supports_json_schema),
+    )
+    .expect("valid router config");
     let routers = Arc::new(ProcessRunRouterProvider::new(
         config,
         Arc::clone(&provider) as Arc<dyn ModelProvider>,
@@ -871,6 +942,161 @@ async fn repair_worker_omits_the_similar_fixes_note_when_the_graph_has_none() {
     );
 }
 
+/// The canned graph shape for the caller-hint tests, mirroring the real
+/// store's resolution chain: `src/main.rs` resolves to the `app` **Module**
+/// node, which `Defines` the `app::main` **Item**, whose recorded caller
+/// lives in `src/startup.rs`. A worker that anchored `Callers` on the
+/// module node would get an honest empty view here, exactly as it would in
+/// production.
+fn callers_graph() -> Arc<FixesGraph> {
+    let module = GraphNode {
+        id: derive_node_id(GraphNodeKind::Module, "app\0app"),
+        kind: GraphNodeKind::Module,
+        path: "app".into(),
+        crate_id: alloy_runtime::CrateId::new("app").ok(),
+        file: Some("src/main.rs".into()),
+        digest: None,
+    };
+    let callee = GraphNode {
+        id: derive_node_id(GraphNodeKind::Item, "app\0app::main"),
+        kind: GraphNodeKind::Item,
+        path: "app::main".into(),
+        crate_id: alloy_runtime::CrateId::new("app").ok(),
+        file: Some("src/main.rs".into()),
+        digest: None,
+    };
+    let caller = GraphNode {
+        id: derive_node_id(GraphNodeKind::Item, "app\0app::startup"),
+        kind: GraphNodeKind::Item,
+        path: "app::startup".into(),
+        crate_id: alloy_runtime::CrateId::new("app").ok(),
+        file: Some("src/startup.rs".into()),
+        digest: None,
+    };
+    let defines = GraphEdge {
+        from: module.id,
+        to: callee.id,
+        kind: GraphEdgeKind::Defines,
+        confidence: 1.0,
+    };
+    let mut callers = HashMap::new();
+    callers.insert(callee.id, vec![caller]);
+    Arc::new(FixesGraph::with_callers(
+        vec![module, callee],
+        vec![defines],
+        callers,
+    ))
+}
+
+#[tokio::test]
+async fn repair_worker_asks_for_callers_and_fences_them_into_the_prompt() {
+    // A-0012-1 (worker side, mirroring A-0011-5c): the diagnosed paths
+    // drive bounded Symbol + Callers reads, and what comes back rides one
+    // compact User-role fence naming who calls into the change.
+    let graph = callers_graph();
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+
+    // Bounded reads: one Symbol per distinct diagnosed path, one Subgraph
+    // to expand the resolved module to its Defines'd items (the only nodes
+    // the real store anchors Calls edges on), one Callers per item.
+    let symbols = graph
+        .seen()
+        .iter()
+        .filter(|q| matches!(q, GraphQuery::Symbol { .. }))
+        .count();
+    let subgraphs = graph
+        .seen()
+        .iter()
+        .filter(|q| matches!(q, GraphQuery::Subgraph { .. }))
+        .count();
+    let callers: Vec<GraphNodeId> = graph
+        .seen()
+        .iter()
+        .filter_map(|q| match q {
+            GraphQuery::Callers { fn_node } => Some(*fn_node),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(symbols, 1, "one Symbol read for the one diagnosed path");
+    assert_eq!(subgraphs, 1, "one Subgraph read to expand the module");
+    assert_eq!(callers.len(), 1, "one Callers read for the one item");
+    assert_eq!(
+        callers[0],
+        derive_node_id(GraphNodeKind::Item, "app\0app::main"),
+        "Callers anchors on the item node, never the module: a module \
+         anchor returns empty against the real store"
+    );
+
+    // The fence reaches the model as User content, compact and honest.
+    let requests = fx.provider.requests();
+    assert_eq!(requests.len(), 1);
+    let note = requests[0]
+        .messages
+        .iter()
+        .find(|m| m.role == ChatRole::User && m.content.contains("<tool name=\"callers\">"))
+        .expect("callers note present");
+    assert!(note.content.contains("app::startup"));
+    assert!(note.content.contains("src/startup.rs"), "target-file hint");
+    assert!(
+        note.content.len() < 2048,
+        "the note stays compact: {} bytes",
+        note.content.len()
+    );
+}
+
+#[tokio::test]
+async fn repair_worker_accepts_caller_files_as_targets() {
+    // A caller-named file is a legitimate impact target (RW6 widened by the
+    // graph observation): the plan may point at src/startup.rs even though
+    // no diagnostic and no goal names it.
+    let graph = callers_graph();
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(
+            &["src/main.rs", "src/startup.rs"],
+            false,
+        ))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let plan: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+    assert_eq!(plan.target_files, vec!["src/main.rs", "src/startup.rs"]);
+}
+
+#[tokio::test]
+async fn repair_worker_omits_the_callers_note_when_the_graph_has_none() {
+    // The M7 store: Callers is a stub returning empty. Honest absence — no
+    // fence, no error (the empty-store degradation contract).
+    let graph = Arc::new(FixesGraph::default());
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        graph: Some(Arc::clone(&graph)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+    let requests = fx.provider.requests();
+    assert!(
+        !requests[0]
+            .messages
+            .iter()
+            .any(|m| m.content.contains("<tool name=\"callers\">")),
+        "no fence when there is nothing to show"
+    );
+}
+
 #[tokio::test]
 async fn repair_worker_tolerates_empty_graph_view() {
     // RW4/CX7: GraphViewHandle::null() everywhere; a goal-rooted analyze
@@ -1145,6 +1371,152 @@ async fn edit_worker_oversize_patch_is_internal_non_retryable() {
     assert_eq!(failure.error_class, ErrorClass::Internal);
     assert_eq!(failure.retry, RetryDisposition::NonRetryable);
     assert!(failure.notes.contains("MAX_ARGUMENT_BYTES"));
+}
+
+/// The line-ops equivalent of [`GOOD_DIFF`] (AM-0013-1), addressed at the
+/// numbered excerpt of a one-line `src/main.rs`.
+fn ops_response(expect: &str) -> serde_json::Value {
+    json!({
+        "ops": [{
+            "op": "replace_lines",
+            "path": "src/main.rs",
+            "start": 1,
+            "end": 1,
+            "expect": [expect],
+            "new": ["    let x: i32 = 42;"],
+        }],
+        "summary": "fix the annotation",
+        "confidence": 0.8,
+    })
+}
+
+fn fs_read_ok(path: &str, text: &str, truncated: bool) -> ToolResult {
+    ToolResult::ok(
+        ToolName::new("fs_read").unwrap(),
+        json!({ "path": path, "bytes": text.len(), "truncated": truncated, "text": text }),
+        1,
+    )
+}
+
+#[tokio::test]
+async fn edit_worker_ops_response_ends_in_the_same_apply_patch_call_as_a_diff() {
+    // AM-0013-1: an ops response reads the file once, compiles locally, and
+    // reaches apply_patch with byte-identical arguments to the diff form.
+    let diff_fx = fixture(FixtureSpec {
+        responses: vec![structured(patch_response(GOOD_DIFF))],
+        tool_results: vec![apply_ok(true, false), apply_ok(false, true)],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&diff_fx, "edit", NodeKind::Edit, goal());
+    let _ = success(diff_fx.executor.execute(&ctx).await.unwrap());
+    let diff_calls = diff_fx.tools.calls();
+
+    let current = "    let x: &str = 42;\n";
+    let ops_fx = fixture(FixtureSpec {
+        responses: vec![structured(ops_response("    let x: &str = 42;"))],
+        tool_results: vec![
+            fs_read_ok("src/main.rs", current, false),
+            apply_ok(true, false),
+            apply_ok(false, true),
+        ],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&ops_fx, "edit", NodeKind::Edit, goal());
+    let outcome = ops_fx.executor.execute(&ctx).await.unwrap();
+    let applied: EditAppliedPayload = serde_json::from_value(success(outcome)).unwrap();
+    assert_eq!(applied.files_touched, vec!["src/main.rs"]);
+    assert_eq!(applied.hunk_count, 1);
+    assert!(!applied.dry_run, "EW7");
+
+    let ops_calls = ops_fx.tools.calls();
+    assert_eq!(ops_calls.len(), 3);
+    // One read per distinct path, before any apply.
+    assert_eq!(ops_calls[0].0.name.as_str(), "fs_read");
+    assert_eq!(ops_calls[0].0.arguments, json!({ "path": "src/main.rs" }));
+    // EW6 dry run then EW7 apply, with the SAME canonical patch the
+    // unified-diff response produced.
+    assert_eq!(ops_calls[1].0.name.as_str(), "apply_patch");
+    assert_eq!(ops_calls[1].0.arguments, diff_calls[0].0.arguments);
+    assert_eq!(ops_calls[2].0.arguments, diff_calls[1].0.arguments);
+    // EW9 held for the ops path too: patch artifact persisted before apply.
+    let meta = ops_fx.artifacts.meta(applied.patch_artifact).await.unwrap();
+    assert_eq!(meta.kind, ArtifactKind::Patch);
+}
+
+#[tokio::test]
+async fn edit_worker_stale_ops_expect_gets_one_repair_turn() {
+    // AM-0013-1 honesty guard: expect lines that do not match the CURRENT
+    // file are fed back for one repair turn (mirrors EW6), and the repaired
+    // response may switch to the diff form.
+    let fx = fixture(FixtureSpec {
+        responses: vec![
+            structured(ops_response("    let x: &str = 43;")), // stale memory
+            structured(patch_response(GOOD_DIFF)),
+        ],
+        tool_results: vec![
+            fs_read_ok("src/main.rs", "    let x: &str = 42;\n", false),
+            apply_ok(true, false),
+            apply_ok(false, true),
+        ],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "edit", NodeKind::Edit, goal());
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let applied: EditAppliedPayload = serde_json::from_value(success(outcome)).unwrap();
+    assert_eq!(applied.files_touched, vec!["src/main.rs"]);
+    // The repair turn consumed the second model turn and carried the
+    // mismatch back inside a fence.
+    assert_eq!(fx.provider.requests().len(), 2);
+    let followup = prompt_text(&fx);
+    assert!(followup.contains("stale op"), "{followup}");
+    assert!(followup.contains("src/main.rs:1"), "{followup}");
+}
+
+#[tokio::test]
+async fn edit_worker_truncated_read_redirects_ops_to_the_diff_form() {
+    // A partial fs_read cannot anchor line ops; the feedback says so and
+    // the model answers with a unified diff.
+    let fx = fixture(FixtureSpec {
+        responses: vec![
+            structured(ops_response("    let x: &str = 42;")),
+            structured(patch_response(GOOD_DIFF)),
+        ],
+        tool_results: vec![
+            fs_read_ok("src/main.rs", "    let x: &str = 42;\n", true),
+            apply_ok(true, false),
+            apply_ok(false, true),
+        ],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "edit", NodeKind::Edit, goal());
+    let _ = success(fx.executor.execute(&ctx).await.unwrap());
+    assert_eq!(fx.provider.requests().len(), 2);
+    assert!(prompt_text(&fx).contains("unified diff patch instead"));
+}
+
+#[tokio::test]
+async fn edit_worker_requires_exactly_one_of_patch_and_ops() {
+    // Strict either/or (AM-0013-1): both present is a PS5 violation handled
+    // by the PS6 repair turn; a second violation fails Model/Retryable.
+    let both = json!({
+        "patch": GOOD_DIFF,
+        "ops": [],
+        "summary": "greedy",
+        "confidence": 0.5,
+    });
+    let neither = json!({ "summary": "empty", "confidence": 0.5 });
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(both), structured(neither)],
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "edit", NodeKind::Edit, goal());
+    let failure = soft_failure(fx.executor.execute(&ctx).await.unwrap());
+    assert_eq!(failure.error_class, ErrorClass::Model);
+    assert_eq!(failure.retry, RetryDisposition::Retryable);
+    assert_eq!(fx.provider.requests().len(), 2);
+    let followup = prompt_text(&fx);
+    assert!(followup.contains("never both"), "{followup}");
+    assert!(fx.tools.calls().is_empty(), "no tool call for invalid wire");
 }
 
 #[tokio::test]
@@ -1432,6 +1804,54 @@ async fn structured_fallback_on_no_endpoint_is_recorded() {
         .find(|d| d.kind == DecisionKind::Custom("worker_attempt".into()))
         .expect("worker_attempt record");
     assert_eq!(attempt.metadata["structured_fallback"], json!(true));
+}
+
+#[tokio::test]
+async fn worker_attaches_response_schema_when_endpoint_supports_it() {
+    // A-0007-2: repair declares its response schema next to REPAIR_SYSTEM,
+    // and an opted-in endpoint receives it on the completion request.
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        supports_json_schema: true,
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, goal());
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _plan: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+
+    let requests = fx.provider.requests();
+    assert_eq!(requests.len(), 1);
+    let expected = alloy_runtime::capabilities::repair_response_schema();
+    let alloy_runtime::ResponseFormat::JsonSchema { name, schema } = &requests[0].response_format
+    else {
+        panic!(
+            "expected JsonSchema response format, got {:?}",
+            requests[0].response_format
+        );
+    };
+    assert_eq!(name, &expected.name);
+    assert_eq!(schema, &expected.schema);
+}
+
+#[tokio::test]
+async fn worker_schema_falls_back_to_json_object_when_unsupported() {
+    // A-0007-2 honest degrade: the endpoint never opted in, so the schema
+    // stays off the wire and the request is plain JSON-object.
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        supports_json_schema: false,
+        ..FixtureSpec::default()
+    });
+    let ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, goal());
+    let outcome = fx.executor.execute(&ctx).await.unwrap();
+    let _plan: RepairPlanPayload = serde_json::from_value(success(outcome)).unwrap();
+
+    let requests = fx.provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].response_format,
+        alloy_runtime::ResponseFormat::JsonObject
+    );
 }
 
 #[tokio::test]

@@ -1,10 +1,12 @@
 //! Deterministic, offline, exec-free ingest (RFC-0011 §6, RFC-0014 §5).
 //!
 //! Facts come from exactly three sources: `Cargo.toml` manifests parsed
-//! with `toml`, a bounded, sorted, symlink-free `std::fs` walk, and — at
+//! with `toml`, a bounded, sorted, symlink-free `std::fs` walk, and — since
 //! `model_version = 2` — a `syn` item/import parse (RFC-0014 amendment
 //! A-0014-2 supersedes IN7's layout-only module guessing with
-//! declaration-driven inference). No subprocess, no network.
+//! declaration-driven inference). `model_version = 3` (RFC-0011 amendment
+//! A-0011-6) extends the same parse with best-effort `references`/`calls`/
+//! `impls` edges. No subprocess, no network.
 
 use std::path::{Path, PathBuf};
 
@@ -56,6 +58,9 @@ pub(crate) struct ScanOutput {
     pub(crate) modules: u32,
     pub(crate) items: u32,
     pub(crate) imports: u32,
+    pub(crate) references: u32,
+    pub(crate) calls: u32,
+    pub(crate) impls: u32,
     pub(crate) skipped: u32,
     pub(crate) warnings: Vec<String>,
 }
@@ -411,7 +416,7 @@ pub(crate) fn scan_workspace(root: &Path, limits: &IngestLimits) -> Result<ScanO
             &mut out,
         )?;
     }
-    crate::lang::rust::pass::resolve_imports(&pass, &mut out);
+    crate::lang::rust::pass::resolve_semantics(&pass, &mut out);
 
     // Deterministic final order (Q8 / §4.6): nodes by (kind, path), edges by
     // (from_path, to_path, kind).
@@ -440,6 +445,9 @@ pub(crate) fn parse_edge_kind(s: &str) -> Result<GraphEdgeKind, GraphError> {
     match s {
         "defines" => Ok(GraphEdgeKind::Defines),
         "imports" => Ok(GraphEdgeKind::Imports),
+        "references" => Ok(GraphEdgeKind::References),
+        "calls" => Ok(GraphEdgeKind::Calls),
+        "impls" => Ok(GraphEdgeKind::Impls),
         other => Err(GraphError::Corrupt(format!("unknown edge kind {other:?}"))),
     }
 }

@@ -1,21 +1,26 @@
-//! `EditWorker` (id `edit`, kind `Edit`) — RFC-0013 §9.2, rules EW1–EW11.
+//! `EditWorker` (id `edit`, kind `Edit`) — RFC-0013 §9.2, rules EW1–EW11
+//! plus the AM-0013-1 line-ops response form.
 //!
-//! Obtains a unified diff from the model, converts it to a validated
-//! `PatchSet` **locally** (EW4), persists the canonical patch as
-//! `ArtifactKind::Patch` (EW9), and applies it through the `apply_patch`
-//! builtin only (EW1: never a second write stack, never a direct file
-//! write, never a checkpoint restore). Forward-only: no re-apply, no
-//! compensation of a partial apply (EW10) — RFC-0008's transaction is the
-//! unit of atomicity.
+//! Obtains either a unified diff or a line-ops array from the model,
+//! converts it to a validated `PatchSet` **locally** (EW4 / AM-0013-1 —
+//! ops are compiled against the CURRENT file content read via `fs_read`,
+//! with each op's `expect` lines verified verbatim), persists the
+//! canonical patch as `ArtifactKind::Patch` (EW9), and applies it through
+//! the `apply_patch` builtin only (EW1: never a second write stack, never
+//! a direct file write, never a checkpoint restore). Forward-only: no
+//! re-apply, no compensation of a partial apply (EW10) — RFC-0008's
+//! transaction is the unit of atomicity.
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use std::collections::HashMap;
+
 use crate::adapters::{CapabilityExecError, CapabilityOutcome};
 use crate::context::AssembleInputs;
 use crate::dag::{NodeInputPayload, NodeKind};
-use crate::edit::FilePatch;
+use crate::edit::{FilePatch, PatchSet};
 use crate::storage::{ArtifactKind, ArtifactPut};
 use crate::types::budget::ModelTier;
 use crate::types::diagnostic::{ErrorClass, RetryDisposition};
@@ -23,12 +28,14 @@ use crate::types::ids::{ArtifactId, CapabilityId, TransactionId};
 use crate::types::tools::{ToolName, ToolSelector};
 
 use super::super::deps::{CapabilityContext, WorkerConfig};
-use super::super::parse::parse_model_diff;
+use super::super::parse::{
+    ops_to_patchset, parse_line_op, parse_model_diff, screen_line_ops, LineOp,
+};
 use super::super::payload::{
     clamp_string, EditAppliedPayload, MAX_PAYLOAD_STRING_BYTES, PAYLOAD_SCHEMA_VERSION,
 };
 use super::super::perms::WorkerToolClass;
-use super::super::prompt::{fence_tool, EDIT_SYSTEM};
+use super::super::prompt::{edit_response_schema, fence_tool, EDIT_SYSTEM};
 use super::super::traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
 use super::{
     call_tool, finish_attempt, llm_exchange, load_pred_payloads, map_tool_result_error,
@@ -43,15 +50,28 @@ const MAX_PATCH_ARGUMENT_BYTES: usize = 64 * 1024;
 /// Tools this worker may call (TL5).
 const ALLOWED_TOOLS: [&str; 2] = ["fs_read", "apply_patch"];
 
-/// Model response schema (EW3, PS5: `deny_unknown_fields`): one wire form —
-/// a unified diff — keeps the parser small and matches the tool backend.
+/// Model response schema (EW3 + AM-0013-1, PS5: `deny_unknown_fields`):
+/// exactly one of `patch` (a unified diff) or `ops` (line operations
+/// against the numbered CURRENT file content) — never both, never neither.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchProposal {
-    patch: String,
+    #[serde(default)]
+    patch: Option<String>,
+    #[serde(default)]
+    ops: Option<Vec<serde_json::Value>>,
     summary: String,
     #[serde(default)]
     confidence: Option<f32>,
+}
+
+/// The locally validated body of one proposal: a parsed diff, or screened
+/// ops that still need the current file content to compile (AM-0013-1).
+enum ProposalBody {
+    /// EW4: unified diff already parsed into a `PatchSet`.
+    Patch(PatchSet),
+    /// AM-0013-1: statically screened ops, compiled by [`EditWorker::compile_ops`].
+    Ops(Vec<LineOp>),
 }
 
 /// Sanitized view of the patch builtin's success content (EW8: paths and
@@ -192,8 +212,35 @@ impl EditWorker {
         // model turn through `llm_exchange`.
         let mut feedback: Vec<String> = Vec::new();
         let mut dry_run_repaired = false;
+        let mut ops_repaired = false;
         let (candidate, patch_artifact) = loop {
-            let candidate = self.author_patch(ctx, attempt, &inputs, &feedback).await?;
+            let (proposal, body) = self.author(ctx, attempt, &inputs, &feedback).await?;
+            let patch_set = match body {
+                ProposalBody::Patch(set) => set,
+                // AM-0013-1: compile ops against the current files; a stale
+                // or misanchored op is model-repairable feedback, exactly
+                // like an EW6 dry-run failure.
+                ProposalBody::Ops(ops) => match self.compile_ops(ctx, attempt, &ops).await? {
+                    Ok(set) => set,
+                    Err(reason) => {
+                        if !ops_repaired && attempt.model_turns < self.config.max_model_turns {
+                            ops_repaired = true;
+                            feedback = vec![fence_tool(
+                                "line_ops",
+                                &reason,
+                                self.config.max_tool_result_bytes,
+                            )];
+                            continue;
+                        }
+                        return Err(WorkerError::soft(
+                            ErrorClass::Model,
+                            RetryDisposition::Retryable,
+                            format!("line ops rejected after repair turn: {reason}"),
+                        ));
+                    }
+                },
+            };
+            let candidate = Self::candidate(proposal, &patch_set)?;
 
             // EW9: persist the canonical PatchSet before the apply call.
             let patch_artifact = self.persist_patch(ctx, &candidate).await?;
@@ -305,33 +352,117 @@ impl EditWorker {
         })
     }
 
-    /// One model turn producing a locally validated patch (EW3/EW4/EW5).
-    async fn author_patch(
+    /// One model turn producing a locally validated proposal (EW3/EW4 plus
+    /// the AM-0013-1 ops form: strict either/or, static screen here, file
+    /// verification in [`Self::compile_ops`]).
+    async fn author(
         &self,
         ctx: &CapabilityContext<'_>,
         attempt: &mut Attempt,
         inputs: &AssembleInputs,
         feedback: &[String],
-    ) -> Result<Candidate, WorkerError> {
-        let ((proposal, patch_set), _pack) = llm_exchange(
+    ) -> Result<(PatchProposal, ProposalBody), WorkerError> {
+        let (authored, _pack) = llm_exchange(
             ctx,
             attempt,
             &self.config,
             EDIT_SYSTEM,
+            Some(&edit_response_schema()),
             inputs,
             feedback,
             |value| {
                 let proposal: PatchProposal =
                     serde_json::from_value(value.clone()).map_err(|e| format!("schema: {e}"))?;
-                // EW4: local parse before any tool call — an unusable diff
-                // never becomes a permission-denied tool error.
-                let patch_set = parse_model_diff(&proposal.patch)?;
-                Ok((proposal, patch_set))
+                let body = match (&proposal.patch, &proposal.ops) {
+                    (Some(_), Some(_)) => {
+                        return Err("reply with either patch or ops, never both".into());
+                    }
+                    (None, None) => {
+                        return Err("reply must carry a patch or an ops array".into());
+                    }
+                    // EW4: local parse before any tool call — an unusable
+                    // diff never becomes a permission-denied tool error.
+                    (Some(patch), None) => ProposalBody::Patch(parse_model_diff(patch)?),
+                    (None, Some(raw_ops)) => {
+                        let ops = raw_ops
+                            .iter()
+                            .map(parse_line_op)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        screen_line_ops(&ops)?;
+                        ProposalBody::Ops(ops)
+                    }
+                };
+                Ok((proposal, body))
             },
         )
         .await?;
+        Ok(authored)
+    }
 
-        let canonical = serde_json::to_value(&patch_set).map_err(|e| {
+    /// AM-0013-1: read each distinct target file once through `fs_read` and
+    /// compile the ops into a context-correct `PatchSet`. The outer `Err` is
+    /// a host/tool fault; the inner `Err` is model-repairable feedback (a
+    /// stale `expect`, an unreadable or truncated file, a bad range).
+    async fn compile_ops(
+        &self,
+        ctx: &CapabilityContext<'_>,
+        attempt: &mut Attempt,
+        ops: &[LineOp],
+    ) -> Result<Result<PatchSet, String>, WorkerError> {
+        let mut files: HashMap<String, String> = HashMap::new();
+        for op in ops {
+            let path = op.path();
+            if files.contains_key(path) {
+                continue;
+            }
+            let result = call_tool(
+                ctx,
+                attempt,
+                &self.config,
+                WorkerToolClass::Read,
+                &ALLOWED_TOOLS,
+                "fs_read",
+                json!({ "path": path }),
+            )
+            .await?;
+            if result.is_error() {
+                // A path the model named but the jail cannot read is the
+                // model's mistake to repair, not a worker failure.
+                return Ok(Err(format!(
+                    "fs_read failed for {path}; check the path or emit a unified diff patch"
+                )));
+            }
+            let text = result
+                .content
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    WorkerError::soft(
+                        ErrorClass::Internal,
+                        RetryDisposition::NonRetryable,
+                        "fs_read content undecodable: no text field",
+                    )
+                })?;
+            if result
+                .content
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                // Compiling against a partial read would fabricate context;
+                // the honest fallback is the diff form.
+                return Ok(Err(format!(
+                    "{path} is too large to line-edit; reply with a unified diff patch instead"
+                )));
+            }
+            files.insert(path.to_owned(), text.to_owned());
+        }
+        Ok(ops_to_patchset(ops, &files))
+    }
+
+    /// EW5 bounds over the compiled `PatchSet`, shared by both wire forms.
+    fn candidate(proposal: PatchProposal, patch_set: &PatchSet) -> Result<Candidate, WorkerError> {
+        let canonical = serde_json::to_value(patch_set).map_err(|e| {
             WorkerError::Host(CapabilityExecError::Internal(format!(
                 "patch serialization failed: {e}"
             )))
@@ -403,5 +534,61 @@ impl EditWorker {
                     format!("patch artifact store failed: {e}"),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A-0007-2 × AM-0013-1 reconciliation guard: the declared edit schema
+    /// and the live `PatchProposal` parser must accept and reject the same
+    /// surface. PR #64 widens the parser to exactly-one-of `patch` / `ops`;
+    /// whichever change lands second must regenerate
+    /// `edit_response_schema()` and update this test in the same commit.
+    #[test]
+    fn edit_schema_matches_current_parser_surface() {
+        let schema = edit_response_schema().schema;
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required list")
+            .iter()
+            .map(|v| v.as_str().expect("required entry"))
+            .collect();
+        let properties: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        // The parser requires `patch` + `summary` and knows nothing else
+        // beyond optional `confidence` (deny_unknown_fields). serde_json
+        // maps iterate sorted, so compare property sets order-insensitively.
+        assert_eq!(required, ["patch", "summary"]);
+        assert_eq!(properties, ["confidence", "patch", "summary"]);
+
+        // Parser accepts what the schema admits...
+        let accepted = json!({ "patch": "--- a\n+++ b\n", "summary": "s" });
+        assert!(serde_json::from_value::<PatchProposal>(accepted).is_ok());
+
+        // ...and rejects `ops` (the #64 shape) exactly as the schema does:
+        // `additionalProperties: false` mirrors `deny_unknown_fields`. If
+        // this assertion starts failing, the parser learned `ops` — the
+        // schema above MUST be regenerated in the same change.
+        let ops_shape = json!({
+            "ops": [{ "op": "replace", "line": 1, "expect": "x", "with": "y" }],
+            "summary": "s"
+        });
+        assert!(
+            serde_json::from_value::<PatchProposal>(ops_shape).is_err(),
+            "parser now accepts `ops`; regenerate edit_response_schema() (AM-0013-1)"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "schema must stay closed while the parser is deny_unknown_fields"
+        );
     }
 }

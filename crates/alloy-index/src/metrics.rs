@@ -58,7 +58,8 @@ pub struct GraphMetricsSnapshot {
     pub incrementals: u64,
     /// Queries served, all kinds.
     pub queries: u64,
-    /// Queries that returned an empty Stub view (Q4–Q6).
+    /// Queries answered by an empty-but-truncated view (Q9 over an
+    /// empty result; formerly the Q4–Q6 Stub marker).
     pub queries_stub: u64,
     /// Views truncated by `max_query_nodes` (Q9).
     pub queries_truncated: u64,

@@ -74,7 +74,14 @@ impl DomainWeights {
 }
 
 /// Profile-driven configuration, parsed from `[context]` by RFC-0015.
+///
+/// `#[non_exhaustive]` per the crate's compat convention (as for the
+/// RFC-0012 `types` structs): construct via [`ContextProfile::v2_defaults`]
+/// / [`Default`] and mutate fields, so additive knobs (like A-0012-1d's
+/// impact caps) never break downstream construction. Missing `[context]`
+/// keys already default via [`ContextProfile::from_toml_table`].
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ContextProfile {
     /// V2 Appendix B default: `32_000`.
     pub total_token_budget: usize,
@@ -94,6 +101,19 @@ pub struct ContextProfile {
     pub graph_radius: u8,
     /// Memo capacity (default `32`).
     pub cache_capacity: usize,
+    /// Seeds asked for `Callers`/`Refs` impact, in seed order (default `4`;
+    /// `0` disables the impact reads entirely) (A-0012-1d).
+    pub max_impact_seeds: usize,
+    /// Total impact entries admitted to the projection (default `8`)
+    /// (A-0012-1d).
+    pub max_impact_nodes: usize,
+}
+
+impl Default for ContextProfile {
+    /// The V2 Appendix B defaults ([`ContextProfile::v2_defaults`]).
+    fn default() -> Self {
+        Self::v2_defaults()
+    }
 }
 
 impl ContextProfile {
@@ -110,6 +130,8 @@ impl ContextProfile {
             max_conversation_events: 200,
             graph_radius: 1,
             cache_capacity: 32,
+            max_impact_seeds: 4,
+            max_impact_nodes: 8,
         }
     }
 
@@ -138,6 +160,8 @@ impl ContextProfile {
                     profile.graph_radius = u8::try_from(raw.min(3)).expect("clamped to 3");
                 }
                 "cache_capacity" => profile.cache_capacity = usize_key(key, value)?,
+                "max_impact_seeds" => profile.max_impact_seeds = usize_key(key, value)?,
+                "max_impact_nodes" => profile.max_impact_nodes = usize_key(key, value)?,
                 other => {
                     return Err(ContextError::InvalidProfile(format!(
                         "unknown [context] key: {other}"

@@ -33,6 +33,20 @@ model = "REPLACE_ME"
 tiers = ["standard"]
 supports_tools = true
 supports_structured_output = true
+# JSON-Schema response format (RFC-0007 A-0007-2): opt in only if the server
+# accepts response_format = {type = "json_schema", ...} (OpenAI, vLLM,
+# Ollama >= 0.5, llama.cpp). Default false: workers' JSON Schemas are then
+# withheld and requests degrade to plain json_object.
+# Enforcement is server-dependent: grammar-constraining servers (vLLM,
+# Ollama, llama.cpp) decode against the schema; OpenAI-style servers treat
+# it as best-effort unless json_schema_strict is also set.
+# Requires supports_structured_output = true.
+supports_json_schema = false
+# Serialize "strict": true (OpenAI strict structured outputs). Default
+# false: local servers ignore it, and OpenAI strict mode rejects schemas
+# outside its subset (e.g. required narrower than properties). Requires
+# supports_json_schema = true.
+json_schema_strict = false
 max_context = 200000
 # Optional sampling temperature (0.0..=2.0); omit for the provider default.
 # Low values suit mechanical repair/edit work (issue #53).

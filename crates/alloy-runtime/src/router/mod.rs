@@ -37,6 +37,7 @@ pub use secret::SecretString;
 pub use toml_router::{RouterShutdownReport, TomlModelRouter, TomlModelRouterParts};
 pub use traits::{ModelProvider, ModelRouter};
 pub use types::{
-    ChatMessage, ChatRole, Citation, CompletionRequest, ComplexityScore, Health, ModelEndpoint,
-    ModelResponse, PromptPack, ResponseFormat, RoutedModel, RoutingRequest, ToolChoice, Usage,
+    ChatMessage, ChatRole, Citation, CompletionRequest, ComplexityScore, Health, JsonSchemaSpec,
+    ModelEndpoint, ModelResponse, PromptPack, ResponseFormat, RoutedModel, RoutingRequest,
+    ToolChoice, Usage,
 };

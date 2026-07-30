@@ -78,7 +78,8 @@ pub use context::{
     AssembleInputs, AssembleRequest, BytesPerTokenEstimator, CompactStrategy, ContextEngine,
     ContextError, ContextHandle, ContextMetricsSnapshot, ContextProfile, DefaultContextEngine,
     Degradation, DegradationReason, DomainId, DomainWeights, EvictPolicy, EvictReport, FileExcerpt,
-    GraphProjection, NullContextEngine, StaleReason, TokenEstimator, WorkingSet,
+    GraphProjection, ImpactEntry, ImpactRelation, NullContextEngine, StaleReason, TokenEstimator,
+    WorkingSet,
 };
 pub use dag::{
     allocate_ids, build_topology, compiler_fingerprint_digest, compute_cache_key,
@@ -134,10 +135,11 @@ pub use planner::{
 pub use router::{
     classify_provider_error, classify_router_error, ChatMessage, ChatRole, Citation,
     ClassifiedRouterFailure, CompletionRequest, ComplexityScore, EndpointConfig, Health,
-    ModelEndpoint, ModelProvider, ModelResponse, ModelRouter, PromptPack, ProviderConfig,
-    ProviderError, ProviderKind, RecordingModelProvider, ResponseFormat, RoutedModel, RouterConfig,
-    RouterError, RouterMetricsSnapshot, RouterPolicy, RouterShutdownReport, RoutingRequest,
-    ScoringWeights, SecretString, TomlModelRouter, TomlModelRouterParts, ToolChoice, Usage,
+    JsonSchemaSpec, ModelEndpoint, ModelProvider, ModelResponse, ModelRouter, PromptPack,
+    ProviderConfig, ProviderError, ProviderKind, RecordingModelProvider, ResponseFormat,
+    RoutedModel, RouterConfig, RouterError, RouterMetricsSnapshot, RouterPolicy,
+    RouterShutdownReport, RoutingRequest, ScoringWeights, SecretString, TomlModelRouter,
+    TomlModelRouterParts, ToolChoice, Usage,
 };
 #[cfg(feature = "http-provider")]
 pub use router::{OpenAiCompatibleProvider, OpenAiCompatibleSpec};

@@ -20,7 +20,7 @@ use super::super::payload::{
     MAX_PAYLOAD_STRING_BYTES, PAYLOAD_SCHEMA_VERSION,
 };
 use super::super::perms::WorkerToolClass;
-use super::super::prompt::{fence_tool, REVIEW_SYSTEM};
+use super::super::prompt::{fence_tool, review_response_schema, REVIEW_SYSTEM};
 use super::super::traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
 use super::{
     call_tool, finish_attempt, llm_exchange, load_pred_payloads, worker_span, Attempt, WorkerError,
@@ -274,6 +274,7 @@ impl ReviewWorker {
             attempt,
             &self.config,
             REVIEW_SYSTEM,
+            Some(&review_response_schema()),
             &inputs,
             &feedback,
             |value| {

@@ -238,6 +238,7 @@ mod tests {
             },
             requires_tools: false,
             requires_structured_output: false,
+            response_schema: None,
         };
         let record = budget_decision_for_route(
             &request,
