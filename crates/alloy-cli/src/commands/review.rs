@@ -55,6 +55,7 @@ pub async fn exec(ctx: Ctx, args: ReviewArgs) -> Result<Exit, CliError> {
         base,
         &ctx.workspace_abs,
         ctx.readonly(),
+        &ctx.profile,
         AssemblyOptions {
             require_gates: false,
         },
@@ -227,7 +228,7 @@ async fn review_after_assembly(
     let toolchain = alloy_tools::toolchain::capture_toolchain();
     let target = alloy_tools::toolchain::host_triple();
     PlanService::plan(
-        &full.plan,
+        &*full.plan,
         PlanContext {
             session_id: session,
             run_id: run,
@@ -237,6 +238,8 @@ async fn review_after_assembly(
             policy_hash: alloy_runtime::policy_hash_digest(&profile, &ctx.cfg.budget_policy),
             tool_versions: alloy_runtime::tool_versions_digest(&toolchain),
             compiler_fingerprint: alloy_runtime::compiler_fingerprint_digest(&toolchain, &target),
+            prior_source: None,
+            prior_proposal_artifact: None,
         },
     )
     .await?;

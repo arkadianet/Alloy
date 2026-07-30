@@ -11,12 +11,10 @@
 //! 2. The module's item children are reachable via `Defines` edges in a
 //!    radius-1 `Subgraph` — the expansion route the consumers use to reach
 //!    `Calls`/`References`-anchorable **Item** nodes.
-//! 3. On this branch (main's store), `Callers`/`Refs` are stubs: even a
-//!    correctly item-anchored query returns an **honest empty** view, not
-//!    an error. Populated views arrive with the A-0011-6 deep pass
-//!    (`feat/graph-refs-impls-callers`), whose `Calls`/`References` edges
-//!    anchor exclusively on item nodes; the cross-branch engine+store
-//!    integration test lands as a follow-up once that branch merges.
+//! 3. Since A-0011-6 (PR #62), a correctly item-anchored `Callers`/`Refs`
+//!    query answers from the recorded `Calls`/`References` edges —
+//!    populated views, never an error. This is the cross-branch
+//!    engine+store integration this suite's third test reserved.
 
 use std::path::Path;
 
@@ -119,10 +117,11 @@ async fn module_seeds_expand_to_item_anchors_via_defines_in_a_radius_1_subgraph(
 }
 
 #[tokio::test]
-async fn item_anchored_callers_and_refs_are_honest_empty_on_the_m7_store() {
-    // Today's store: the Callers/Refs stubs. A correctly item-anchored
-    // query returns an empty view — no rows, no error — so the context
-    // engine renders no relation lines and records no degradation.
+async fn item_anchored_callers_and_refs_answer_from_recorded_edges() {
+    // Since A-0011-6 (PR #62): the item anchor found through the file →
+    // module → Defines expansion above is exactly the anchor shape the
+    // `calls`/`references` edges record, so the queries return populated
+    // views — the engine renders relation lines, never a degradation.
     let (_dir, g) = ingested().await;
     let module = g
         .query(GraphQuery::Symbol {
@@ -145,16 +144,36 @@ async fn item_anchored_callers_and_refs_are_honest_empty_on_the_m7_store() {
         .find(|n| n.kind == GraphNodeKind::Item && n.path == "toy_core::io::read_all")
         .expect("item ingested")
         .clone();
+
+    // `toy_cli::main::main` calls `io::read_all` through its
+    // `use toy_core::io;` binding — the one incoming Calls edge.
     let callers = g
         .query(GraphQuery::Callers { fn_node: item.id })
         .await
         .unwrap();
-    assert!(callers.nodes.is_empty() && callers.edges.is_empty());
-    // The stub marks the empty view truncated (Q5: knowledge is withheld,
-    // not absent). The engine's impact fetch must not propagate a marker
-    // for it: it only honours `truncated` on non-empty views.
-    assert!(callers.truncated, "the Q5 stub is a truncated empty view");
+    let caller_paths: Vec<&str> = callers.nodes.iter().map(|n| n.path.as_str()).collect();
+    assert_eq!(
+        caller_paths,
+        vec!["toy_cli::main::main", "toy_core::io::read_all"],
+        "Q8 order: the caller item plus the anchor"
+    );
+    let caller_id = callers.nodes[0].id;
+    assert_eq!(callers.edges.len(), 1);
+    let edge = &callers.edges[0];
+    assert!(
+        edge.kind == GraphEdgeKind::Calls && edge.from == caller_id && edge.to == item.id,
+        "one incoming Calls edge from the cli main: {edge:?}"
+    );
+    assert!(!callers.truncated, "nothing was withheld");
+
+    // Nothing references `read_all` as a value/type, and `Vec`/`usize` in
+    // its signature resolve outside the workspace — the view is the
+    // anchor alone, honestly empty of edges, and not marked truncated
+    // (Q5's stub marker died with the stub).
     let refs = g.query(GraphQuery::Refs { node: item.id }).await.unwrap();
-    assert!(refs.nodes.is_empty() && refs.edges.is_empty());
+    assert_eq!(refs.nodes.len(), 1, "the anchor node only: {refs:?}");
+    assert_eq!(refs.nodes[0].id, item.id);
+    assert!(refs.edges.is_empty());
+    assert!(!refs.truncated);
     g.close().await.unwrap();
 }

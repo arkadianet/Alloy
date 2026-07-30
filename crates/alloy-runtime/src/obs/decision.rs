@@ -35,6 +35,10 @@ pub enum DecisionKind {
     Gate,
     /// Budget-related decision.
     Budget,
+    /// Repair-generation admission decision (RFC-0017 AM-0004-1).
+    Replan,
+    /// Plan-proposal accept/reject decision (RFC-0017 AM-0004-1).
+    PlanProposal,
     /// Extension point.
     Custom(String),
 }
@@ -721,6 +725,19 @@ mod tests {
         assert_eq!(
             serde_json::to_value(DecisionKind::Budget).unwrap(),
             serde_json::json!("budget")
+        );
+        // AC 36 (RFC-0017 AM-0004-1): repair-generation decision kinds.
+        assert_eq!(
+            serde_json::to_value(DecisionKind::Replan).unwrap(),
+            serde_json::json!("replan")
+        );
+        assert_eq!(
+            serde_json::to_value(DecisionKind::PlanProposal).unwrap(),
+            serde_json::json!("plan_proposal")
+        );
+        assert_eq!(
+            serde_json::from_value::<DecisionKind>(serde_json::json!("plan_proposal")).unwrap(),
+            DecisionKind::PlanProposal
         );
         assert_eq!(
             serde_json::to_value(DecisionKind::Custom("x".into())).unwrap(),

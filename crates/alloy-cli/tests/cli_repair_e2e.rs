@@ -596,9 +596,11 @@ fn ops_edit_response_completes_the_run_with_the_fix_applied() {
 }
 
 /// A server whose *first* edit response is a wrong fix (it introduces a
-/// fresh type error); every later edit response patches the *original*
-/// broken line — which only applies if the retry loop rolled the wrong
-/// patch back first. Analyze responses are shared.
+/// fresh type error); every later edit response patches the *wrong-fixed*
+/// line — which only applies to the tree generation 1's edit left behind,
+/// because in-run repair generations change inputs, never the workspace
+/// (RFC-0017 MG6; the CLI retry loop and its rollback are gone per MG4).
+/// Analyze responses are shared.
 fn start_wrong_first_server() -> u16 {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -651,16 +653,19 @@ fn start_wrong_first_server() -> u16 {
 }
 
 const WRONG_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = \"not a number\";\n+    let x: i32 = true;\n     println!(\"{}\", x);\n }\n";
-/// Deliberately anchored on the *original* `"not a number"` line: it can
-/// only apply if the failed attempt's `let x: i32 = true;` was rolled back.
-const SECOND_FIX_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = \"not a number\";\n+    let x: i32 = 42;\n     println!(\"{}\", x);\n }\n";
+/// Deliberately anchored on the *wrong-fixed* `true` line: it can only
+/// apply to the tree generation 1's failed edit left behind — the in-run
+/// generation loop patches forward, it never rolls back (RFC-0017 MG6).
+const SECOND_FIX_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = true;\n+    let x: i32 = 42;\n     println!(\"{}\", x);\n }\n";
 
-/// The bounded retry loop: a wrong first patch fails verify, the driver
-/// rolls the failed attempt's edit transaction back so the workspace is the
-/// original broken tree again, re-checks it, seeds those diagnostics, and
-/// the second attempt patches the *original* content. Exit 0 overall.
+/// RFC-0017 in-run repair generations, end to end through the real CLI: a
+/// wrong first patch fails verify with a genuine E0308, the
+/// `GenerationDriver` admits the failure inside the *same*
+/// `RunController::start`, replans with the seeded diagnostics, and
+/// generation 2 patches the tree as generation 1 left it. One `alloy run`
+/// invocation, one run, exit 0 — no CLI retry, no rollback (MG3/MG4).
 #[test]
-fn retry_rolls_back_the_wrong_first_patch_before_retrying() {
+fn wrong_first_patch_is_repaired_by_a_second_generation() {
     let Some(e2e) = setup_with(start_wrong_first_server()) else {
         return;
     };
@@ -673,23 +678,25 @@ fn retry_rolls_back_the_wrong_first_patch_before_retrying() {
     if is_environment_skip(out.status.code(), &stderr) {
         return;
     }
-    assert_eq!(out.status.code(), Some(0), "retry run failed: {stderr}");
+    assert_eq!(out.status.code(), Some(0), "repair run failed: {stderr}");
+    // The in-run generation bump is visible in the rendered event stream:
+    // the driver's ReplanRequested/ReplanResumed audit events (AM-0003-3).
     assert!(
-        stderr.contains("retrying"),
-        "retry marker missing: {stderr}"
-    );
-    // The rollback is announced, not silent — and it undid the one
-    // transaction the failed attempt applied, with nothing refused.
-    assert!(
-        stderr.contains("rolled back 1/1 edit transaction(s)"),
-        "rollback marker missing: {stderr}"
+        stderr.contains("replan_requested"),
+        "in-run replan marker missing: {stderr}"
     );
     assert!(
-        !stderr.contains("was refused"),
-        "rollback should not have been refused: {stderr}"
+        stderr.contains("replan_resumed"),
+        "in-run resume marker missing: {stderr}"
     );
-    // Only reachable if the second attempt patched the restored original
-    // content: `SECOND_FIX_DIFF` does not apply to the wrong-patched tree.
+    // The CLI never announced a retry or a rollback — those paths are gone.
+    assert!(!stderr.contains("retrying"), "CLI retry survived: {stderr}");
+    assert!(
+        !stderr.contains("rolled back"),
+        "CLI rollback survived: {stderr}"
+    );
+    // Only reachable if generation 2 patched the wrong-fixed tree in place:
+    // `SECOND_FIX_DIFF` does not apply to the original content.
     let main_rs = std::fs::read_to_string(e2e.ws.path().join("src/main.rs")).unwrap();
     assert!(main_rs.contains("let x: i32 = 42;"), "{main_rs}");
     assert!(!main_rs.contains("true"), "wrong patch survived: {main_rs}");

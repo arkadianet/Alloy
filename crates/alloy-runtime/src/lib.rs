@@ -35,6 +35,7 @@ pub mod capabilities;
 pub mod config;
 pub mod context;
 pub mod dag;
+pub mod driver;
 pub mod edit;
 pub mod error;
 pub mod events;
@@ -89,6 +90,14 @@ pub use dag::{
     TemplateCatalog, TemplateEdgeSpec, TemplateId, TemplateIdMap, TemplateManifest,
     TemplateNodeSpec, ValidateOpts, ENVELOPE_SCHEMA_VERSION,
 };
+pub use dag::{
+    allocate_proposal_ids, compile_proposal, CompileArgs, ProposalRejection, ProposedDagManifest,
+    ProposedNodeSpec, PROPOSAL_SCHEMA_VERSION,
+};
+pub use driver::{
+    DriveError, DriverMetrics, GenerationDriver, GenerationDriverDeps, GenerationPolicy,
+    PlanFingerprints,
+};
 pub use edit::{
     rollback_run_edits, transactions_of_run, DeclinedRollback, EditAppliedPayload, EditContext,
     EditEngine, EditError, EditRequest, EditRequestKind, EditTransaction, EditValidation,
@@ -119,8 +128,9 @@ pub use obs::{
     RetentionPolicy, SharedCostMeter, TierCost, ToolCallRecord,
 };
 pub use planner::{
-    DisabledLlmPlanService, PlanContext, PlanError, PlanProducedPayload, PlanResult, PlanService,
-    TemplatePlanService,
+    CapabilityPlanProposer, DisabledLlmPlanService, LlmPlanService, PlanContext, PlanError,
+    PlanProducedPayload, PlanProposer, PlanResult, PlanService, PlanSource, PlannerConfig,
+    PlannerMetrics, PlannerMode, ProposeError, ProposerDeps, TemplatePlanService,
 };
 pub use router::{
     classify_provider_error, classify_router_error, ChatMessage, ChatRole, Citation,
@@ -140,9 +150,10 @@ pub use scheduler::{
     SchedulerMetrics,
 };
 pub use session::{
-    clamp_events_page_limit, validate_mvp_profile, ReplanReason, RunControlState, RunController,
-    RunGoalRecord, Session, SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE,
-    MVP_PROFILES, TRAJECTORY_SCHEMA_VERSION,
+    clamp_events_page_limit, validate_mvp_profile, DirectRunExecutor, ReplanReason,
+    RunControlState, RunController, RunExecCtx, RunExecutor, RunGoalRecord, Session,
+    SessionMetrics, SessionPlane, SessionService, MAX_EVENTS_PAGE, MVP_PROFILES,
+    TRAJECTORY_SCHEMA_VERSION,
 };
 pub use storage::{
     install_sqlite_event_sink, store_to_runtime, store_to_session, AlloyStorage, ArtifactBlob,

@@ -93,24 +93,8 @@ mod tests {
         async fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let mut rt = AlloyRuntime::new();
-            rt.configure(RuntimeConfig {
-                data_dir: dir.path().join("runtime"),
-                data_dir_rule: "test",
-                profile_path: dir.path().join("profiles/default.toml"),
-                router_path: dir.path().join("router.toml"),
-                env_file_hint: dir.path().join("example.env"),
-                retain_full_prompts: false,
-                retain_tool_bodies: false,
-                run_timeout: Duration::from_secs(30),
-                budget_policy: BudgetPolicy::default(),
-                context_profile: crate::context::ContextProfile::v2_defaults(),
-                profile_id: Some("default".into()),
-                gates: crate::config::GatesConfig::default(),
-                sandbox_echo: None,
-                gate_timeout: None,
-                capture: Default::default(),
-            })
-            .unwrap();
+            rt.configure(RuntimeConfig::test_defaults(dir.path()))
+                .unwrap();
             let handle = rt.start().await.unwrap();
             let storage = install_sqlite_event_sink(
                 &handle,

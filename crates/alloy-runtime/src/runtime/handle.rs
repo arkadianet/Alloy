@@ -236,10 +236,32 @@ impl RuntimeHandle {
     /// [`RuntimeError::SchedulerUnavailable`]. Does **not** emit
     /// `RunAccepted` / `RunFinished`.
     pub async fn run_dag(&self, dag_id: DagId) -> Result<DagOutcome, RuntimeError> {
+        self.dispatch_dag(dag_id, None).await
+    }
+
+    /// [`Self::run_dag`] with an explicit wall-clock budget for this
+    /// invocation, forwarded to [`Scheduler::run_within`] (RFC-0017
+    /// AM-0010-2). Keeps the same single-flight admission and error mapping.
+    pub async fn run_dag_within(
+        &self,
+        dag_id: DagId,
+        remaining: Duration,
+    ) -> Result<DagOutcome, RuntimeError> {
+        self.dispatch_dag(dag_id, Some(remaining)).await
+    }
+
+    async fn dispatch_dag(
+        &self,
+        dag_id: DagId,
+        remaining: Option<Duration>,
+    ) -> Result<DagOutcome, RuntimeError> {
         self.flush_pending_runtime_events().await?;
         let permit = self.inner.try_admit_run(dag_id)?;
         let sched = self.scheduler();
-        let result = sched.run(dag_id).await;
+        let result = match remaining {
+            Some(remaining) => sched.run_within(dag_id, remaining).await,
+            None => sched.run(dag_id).await,
+        };
         drop(permit);
 
         match result {

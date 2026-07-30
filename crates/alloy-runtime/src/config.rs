@@ -106,9 +106,20 @@ pub struct RuntimeConfig {
     /// Gate timeout from `[limits].gate_timeout_secs`; `None` waits
     /// indefinitely (RFC-0015 §5.2 `[limits]`).
     pub gate_timeout: Option<Duration>,
+    /// Maximum automatic repair-generation bumps per run (RFC-0017
+    /// AM-0015-2). Total generations ≤ 1 + this value; `0` disables
+    /// auto-replan. From `[limits].max_repair_generations`; default 2;
+    /// accepted `0..=8`. Deliberately **not** on `SchedConfig` — the
+    /// scheduler never reads it (RFC-0017 §3.7).
+    pub max_repair_generations: u32,
     /// Corpus-capture policy from the profile's `[capture]` table
     /// (research §7.11 item 1). Absent table = capture disabled.
     pub capture: crate::obs::CapturePolicy,
+    /// Parsed `[planner]` table, or [`crate::planner::PlannerConfig::new`]
+    /// defaults when absent (RFC-0017 §7.1 / AM-0015-2). Every shipped
+    /// profile keeps `mode = "template"`; `readonly` additionally rejects
+    /// `mode = "llm"` at load (fail closed).
+    pub planner: crate::planner::PlannerConfig,
 }
 
 /// Parsed `[gates]` table (RFC-0015 amendment A1).
@@ -189,6 +200,45 @@ struct ProfileFile {
     limits: Option<LimitsSection>,
     #[serde(default)]
     capture: CaptureSection,
+    #[serde(default)]
+    planner: Option<PlannerSection>,
+}
+
+/// `[planner]` table (RFC-0017 §7.1, AM-0015-2).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannerSection {
+    #[serde(default = "default_planner_mode")]
+    mode: String,
+    #[serde(default = "default_max_proposed_nodes")]
+    max_proposed_nodes: u32,
+    #[serde(default = "default_proposal_max_bytes")]
+    proposal_max_bytes: u32,
+    #[serde(default = "default_planning_max_input")]
+    planning_max_input: u64,
+    #[serde(default = "default_planning_max_output")]
+    planning_max_output: u64,
+    #[serde(default = "default_planning_timeout_ms")]
+    planning_timeout_ms: u64,
+}
+
+fn default_planner_mode() -> String {
+    "template".into()
+}
+fn default_max_proposed_nodes() -> u32 {
+    8
+}
+fn default_proposal_max_bytes() -> u32 {
+    16_384
+}
+fn default_planning_max_input() -> u64 {
+    16_384
+}
+fn default_planning_max_output() -> u64 {
+    4_096
+}
+fn default_planning_timeout_ms() -> u64 {
+    120_000
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,6 +281,8 @@ struct LimitsSection {
     run_timeout_secs: u64,
     #[serde(default)]
     gate_timeout_secs: Option<u64>,
+    #[serde(default = "default_max_repair_generations")]
+    max_repair_generations: u32,
 }
 
 /// `[capture]` — corpus capture, distinct from `[observability]` retention.
@@ -275,6 +327,9 @@ fn default_deny() -> String {
 }
 fn default_run_timeout_secs() -> u64 {
     60 * 30
+}
+fn default_max_repair_generations() -> u32 {
+    2
 }
 
 impl RuntimeConfig {
@@ -388,13 +443,65 @@ impl RuntimeConfig {
             }
         }
 
-        let (run_timeout, gate_timeout) = match &profile.limits {
+        let (run_timeout, gate_timeout, max_repair_generations) = match &profile.limits {
             Some(l) => (
                 Duration::from_secs(l.run_timeout_secs),
                 l.gate_timeout_secs.map(Duration::from_secs),
+                l.max_repair_generations,
             ),
-            None => (Duration::from_secs(default_run_timeout_secs()), None),
+            None => (
+                Duration::from_secs(default_run_timeout_secs()),
+                None,
+                default_max_repair_generations(),
+            ),
         };
+        // RFC-0017 AM-0015-2: fail closed on an out-of-range bound — no
+        // clamping-to-valid.
+        if max_repair_generations > 8 {
+            return Err(RuntimeError::Config(format!(
+                "profile {profile_display} [limits].max_repair_generations must be in 0..=8 (RFC-0017 AM-0015-2), got {max_repair_generations}"
+            )));
+        }
+
+        // RFC-0017 §7.1 / AM-0015-2 — the `[planner]` table. Fail closed on
+        // an unknown mode or an out-of-range knob; no clamping-to-valid.
+        let profile_id = profile.profile.map(|p| p.id);
+        let planner = match &profile.planner {
+            Some(section) => {
+                let mode = match section.mode.as_str() {
+                    "template" => crate::planner::PlannerMode::Template,
+                    "llm" => crate::planner::PlannerMode::Llm,
+                    other => {
+                        return Err(RuntimeError::Config(format!(
+                            "profile {profile_display} [planner].mode must be \"template\" or \"llm\", got {other:?}"
+                        )));
+                    }
+                };
+                crate::planner::PlannerConfig {
+                    mode,
+                    max_proposed_nodes: section.max_proposed_nodes,
+                    proposal_max_bytes: section.proposal_max_bytes,
+                    planning_budget: crate::types::budget::TokenBudget {
+                        max_input: section.planning_max_input,
+                        max_output: section.planning_max_output,
+                    },
+                    planning_timeout_ms: section.planning_timeout_ms,
+                }
+            }
+            None => crate::planner::PlannerConfig::new(),
+        };
+        planner
+            .validate()
+            .map_err(|e| RuntimeError::Config(format!("profile {profile_display} {e}")))?;
+        // A read-only profile has no business proposing edit chains —
+        // rejected at assembly, fail closed (RFC-0017 §7.1).
+        if planner.mode == crate::planner::PlannerMode::Llm
+            && profile_id.as_deref() == Some("readonly")
+        {
+            return Err(RuntimeError::Config(format!(
+                "profile {profile_display} [planner].mode = \"llm\" is forbidden in the readonly profile (RFC-0017 §7.1)"
+            )));
+        }
 
         Ok(Self {
             data_dir,
@@ -407,17 +514,49 @@ impl RuntimeConfig {
             run_timeout,
             budget_policy,
             context_profile,
-            profile_id: profile.profile.map(|p| p.id),
+            profile_id,
             gates,
             sandbox_echo: profile.sandbox,
             gate_timeout,
+            max_repair_generations,
             capture: crate::obs::CapturePolicy {
                 enabled: profile.capture.enabled,
                 prompts: profile.capture.prompts,
                 tool_bodies: profile.capture.tool_bodies,
                 require_consent: profile.capture.require_consent,
             },
+            planner,
         })
+    }
+}
+
+impl RuntimeConfig {
+    /// Crate-internal test fixture: the baseline config unit tests configure
+    /// runtimes with (30 s run timeout, default policies, `dir`-rooted
+    /// paths). Exists so test modules outside `config` — notably the
+    /// scheduler's, which must never name `max_repair_generations` (RFC-0017
+    /// AC 31) — need not spell out every field.
+    #[cfg(test)]
+    pub(crate) fn test_defaults(dir: &Path) -> Self {
+        Self {
+            data_dir: dir.join("runtime"),
+            data_dir_rule: "test",
+            profile_path: dir.join("profiles/default.toml"),
+            router_path: dir.join("router.toml"),
+            env_file_hint: dir.join("example.env"),
+            retain_full_prompts: false,
+            retain_tool_bodies: false,
+            run_timeout: Duration::from_secs(30),
+            budget_policy: BudgetPolicy::default(),
+            context_profile: crate::context::ContextProfile::v2_defaults(),
+            profile_id: Some("default".into()),
+            gates: GatesConfig::default(),
+            sandbox_echo: None,
+            gate_timeout: None,
+            max_repair_generations: default_max_repair_generations(),
+            capture: Default::default(),
+            planner: crate::planner::PlannerConfig::new(),
+        }
     }
 }
 
@@ -626,6 +765,181 @@ retain_full_prompts = false
         })
         .unwrap();
         assert_eq!(cfg.budget_policy, BudgetPolicy::default());
+    }
+
+    /// RFC-0017 AM-0015-2 / AC 31 (config half): `[limits]
+    /// max_repair_generations` maps to `RuntimeConfig`, defaulting to 2 when
+    /// absent (with or without a `[limits]` table).
+    #[test]
+    fn max_repair_generations_defaults_to_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
+        let load = |profile: PathBuf, router: PathBuf, example: PathBuf| {
+            RuntimeConfig::load(ConfigPaths {
+                profile,
+                router,
+                example_env: example,
+                data_dir: None,
+                workspace_root: Some(dir.path().to_path_buf()),
+            })
+        };
+        // No [limits] table at all.
+        let cfg = load(profile.clone(), router.clone(), example.clone()).unwrap();
+        assert_eq!(cfg.max_repair_generations, 2);
+
+        // [limits] present without the key.
+        fs::write(
+            &profile,
+            "[profile]\nid = \"default\"\n[limits]\nrun_timeout_secs = 60\n",
+        )
+        .unwrap();
+        let cfg = load(profile.clone(), router.clone(), example.clone()).unwrap();
+        assert_eq!(cfg.max_repair_generations, 2);
+        assert_eq!(cfg.run_timeout, Duration::from_secs(60));
+
+        // Explicit 0 (auto-replan disabled) and 8 (ceiling) are accepted.
+        for v in [0u32, 8] {
+            fs::write(
+                &profile,
+                format!("[profile]\nid = \"default\"\n[limits]\nmax_repair_generations = {v}\n"),
+            )
+            .unwrap();
+            let cfg = load(profile.clone(), router.clone(), example.clone()).unwrap();
+            assert_eq!(cfg.max_repair_generations, v);
+        }
+    }
+
+    /// RFC-0017 AM-0015-2: out-of-range `max_repair_generations` is an
+    /// assembly-time config error — fail closed, no clamping-to-valid.
+    #[test]
+    fn max_repair_generations_out_of_range_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
+        fs::write(
+            &profile,
+            "[profile]\nid = \"default\"\n[limits]\nmax_repair_generations = 9\n",
+        )
+        .unwrap();
+        let err = RuntimeConfig::load(ConfigPaths {
+            profile,
+            router,
+            example_env: example,
+            data_dir: None,
+            workspace_root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_repair_generations") && msg.contains("0..=8"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// RFC-0017 AC 33 (planner half): the `[planner]` table parses, defaults
+    /// apply when absent, and out-of-range knobs fail closed.
+    #[test]
+    fn planner_table_parses_defaults_and_range_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
+        let load = |profile: PathBuf| {
+            RuntimeConfig::load(ConfigPaths {
+                profile,
+                router: router.clone(),
+                example_env: example.clone(),
+                data_dir: None,
+                workspace_root: Some(dir.path().to_path_buf()),
+            })
+        };
+        // Absent table ⇒ §3.3 defaults, mode template.
+        let cfg = load(profile.clone()).unwrap();
+        assert_eq!(cfg.planner, crate::planner::PlannerConfig::new());
+        assert_eq!(cfg.planner.mode, crate::planner::PlannerMode::Template);
+
+        // Explicit llm parses (non-readonly profile).
+        fs::write(
+            &profile,
+            "[profile]\nid = \"default\"\n[planner]\nmode = \"llm\"\nproposal_max_bytes = 2048\n",
+        )
+        .unwrap();
+        let cfg = load(profile.clone()).unwrap();
+        assert_eq!(cfg.planner.mode, crate::planner::PlannerMode::Llm);
+        assert_eq!(cfg.planner.proposal_max_bytes, 2048);
+
+        // proposal_max_bytes above the OC7 headroom ceiling is rejected —
+        // no clamping-to-valid.
+        fs::write(
+            &profile,
+            "[profile]\nid = \"default\"\n[planner]\nproposal_max_bytes = 32769\n",
+        )
+        .unwrap();
+        let msg = load(profile.clone()).unwrap_err().to_string();
+        assert!(msg.contains("proposal_max_bytes"), "{msg}");
+
+        // Range rejections for the remaining knobs.
+        for bad in [
+            "max_proposed_nodes = 1",
+            "max_proposed_nodes = 17",
+            "proposal_max_bytes = 1023",
+            "planning_timeout_ms = 0",
+        ] {
+            fs::write(
+                &profile,
+                format!("[profile]\nid = \"default\"\n[planner]\n{bad}\n"),
+            )
+            .unwrap();
+            assert!(load(profile.clone()).is_err(), "accepted: {bad}");
+        }
+
+        // Unknown keys and unknown modes fail closed.
+        fs::write(
+            &profile,
+            "[profile]\nid = \"default\"\n[planner]\nmodel = \"gpt\"\n",
+        )
+        .unwrap();
+        assert!(load(profile.clone()).is_err());
+        fs::write(
+            &profile,
+            "[profile]\nid = \"default\"\n[planner]\nmode = \"auto\"\n",
+        )
+        .unwrap();
+        let msg = load(profile.clone()).unwrap_err().to_string();
+        assert!(msg.contains("mode"), "{msg}");
+    }
+
+    /// RFC-0017 AC 33 / §7.1: `readonly` + `mode = "llm"` fails assembly.
+    #[test]
+    fn readonly_profile_rejects_llm_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (profile, router, example) = write_fixtures(dir.path());
+        fs::write(
+            &profile,
+            "[profile]\nid = \"readonly\"\n[planner]\nmode = \"llm\"\n",
+        )
+        .unwrap();
+        let err = RuntimeConfig::load(ConfigPaths {
+            profile: profile.clone(),
+            router: router.clone(),
+            example_env: example.clone(),
+            data_dir: None,
+            workspace_root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("readonly"), "{err}");
+
+        // readonly + template stays fine.
+        fs::write(
+            &profile,
+            "[profile]\nid = \"readonly\"\n[planner]\nmode = \"template\"\n",
+        )
+        .unwrap();
+        RuntimeConfig::load(ConfigPaths {
+            profile,
+            router,
+            example_env: example,
+            data_dir: None,
+            workspace_root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap();
     }
 
     #[test]

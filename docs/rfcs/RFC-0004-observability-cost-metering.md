@@ -10,6 +10,7 @@
 | **Related RFCs** | [0003](./RFC-0003-session-manager-run-controller.md) budget warning hook (merged; in-crate call) · [0007](./RFC-0007-model-router-provider.md) route/complete attribution · [0010](./RFC-0010-scheduler-runtime-adapters.md) scheduler decision/node producers · [0013](./RFC-0013-capability-registry-workers.md) `WorkerMetrics` producers · [0015](./RFC-0015-cli-profiles-config.md) `alloy events` UX · [0016](./RFC-0016-eval-harness-holdout-gates.md) calibrated cost bands |
 | **Product** | Alloy — AI Engineering Runtime |
 | **Supersedes** | Draft outline of this filename (expanded to implementation grade) |
+| **Amended by** | [RFC-0017](./RFC-0017-dynamic-planning.md) §2.7 — **AM-0004-1** additive `DecisionKind::Replan` and `DecisionKind::PlanProposal` variants (payload shapes in RFC-0017 §9.2; `prompt_body` MUST be `None` for both) |
 
 **Mental model (V2 §15 / ADR F-17):** Always-on decision recording and cost metering. Default retention = metadata + content hashes + redacted decision records. Full prompts and tool bodies are opt-in. Persistence is the existing session event log — never a second database. Numeric savings claims are forbidden until Eval calibrates (V2 §18).
 

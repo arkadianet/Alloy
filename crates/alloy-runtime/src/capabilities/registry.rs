@@ -164,10 +164,23 @@ impl CapabilityRegistry {
     /// skipping `review` when `WorkerConfig.enable_review == false` (RG7).
     /// Returns the first error rather than a partially registered registry.
     pub fn mvp(deps: WorkerDeps) -> Result<Self, RegError> {
+        Self::mvp_with(deps, false)
+    }
+
+    /// [`Self::mvp`] with the `planning` worker's branch selected explicitly
+    /// (RFC-0017 AM-0013-1): `planning_uses_model = true` registers the
+    /// model branch — set only from `planner.mode = "llm"` by the
+    /// composition root, never from a worker-level flag (PW5).
+    pub fn mvp_with(deps: WorkerDeps, planning_uses_model: bool) -> Result<Self, RegError> {
         let config = deps.config.clone();
         let mut registry = Self::new().with_deps(deps);
         // CAPABILITY_CATALOG order: planning, repair, edit, review.
-        registry.register(Arc::new(PlanningWorker::new(config.clone())))?;
+        let planning = if planning_uses_model {
+            PlanningWorker::new_model(config.clone())
+        } else {
+            PlanningWorker::new(config.clone())
+        };
+        registry.register(Arc::new(planning))?;
         registry.register(Arc::new(RepairWorker::new(config.clone())))?;
         registry.register(Arc::new(EditWorker::new(config.clone())))?;
         if config.enable_review {

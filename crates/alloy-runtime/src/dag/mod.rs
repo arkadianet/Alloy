@@ -4,6 +4,7 @@
 
 mod cache;
 mod io;
+mod proposal;
 mod templates;
 mod types;
 mod validate;
@@ -16,6 +17,11 @@ pub(crate) use io::{encode_json, PendingPredPlaceholder};
 pub use io::{
     NodeInputEnvelope, NodeInputPayload, NodeOutputEnvelope, PredecessorOutput,
     ENVELOPE_SCHEMA_VERSION,
+};
+pub(crate) use proposal::resolve_proposal;
+pub use proposal::{
+    allocate_proposal_ids, compile_proposal, CompileArgs, ProposalRejection, ProposedDagManifest,
+    ProposedNodeSpec, PROPOSAL_SCHEMA_VERSION,
 };
 pub use templates::{
     allocate_ids, build_topology, BuildTopology, TemplateApprovalSpec, TemplateCatalog,

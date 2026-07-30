@@ -1,24 +1,30 @@
 //! Template-backed [`PlanService`] implementation (RFC-0009 §5.2 / §5.6).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::dag::{
-    allocate_ids, build_topology, encode_json, BuildTopology, DagValidationError, DagValidator,
-    EdgeKind, NodeInputEnvelope, NodeInputPayload, PendingPredPlaceholder, PredecessorOutput,
-    TaskDag, TemplateCatalog, TemplateId, TemplateIdMap, TemplateManifest, ValidateOpts,
-};
-use crate::events::{EventSink, EventSinkError, NewSessionEvent, SessionEventType};
+use crate::dag::{DagValidationError, NodeKind, TaskDag, TemplateCatalog, TemplateId};
+use crate::events::{EventSink, EventSinkError};
 use crate::scheduler::DagState;
 use crate::session::ReplanReason;
-use crate::storage::{
-    ArtifactKind, ArtifactPut, ArtifactStore, DagStore, ReplanReplaceError, StoreError,
-};
+use crate::storage::{ArtifactStore, DagStore, StoreError};
 use crate::types::budget::Goal;
 use crate::types::ids::{ArtifactId, DagId, Digest, NodeId, RunId, SessionId};
+
+use super::persist::{CasExpected, PersistRequest, PlanPersistence};
+
+/// Provenance of a persisted plan generation (RFC-0017 §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PlanSource {
+    /// Instantiated from the closed template catalog.
+    Template,
+    /// Compiled from an accepted `ProposedDagManifest`.
+    LlmProposed,
+}
 
 /// Planning context. `dag_id` is pre-minted by RFC-0003 `submit_goal`.
 #[derive(Debug, Clone)]
@@ -39,6 +45,13 @@ pub struct PlanContext {
     pub tool_versions: Digest,
     /// Compiler fingerprint.
     pub compiler_fingerprint: Digest,
+    /// Prior generation's plan source, carried into `replan` (RFC-0017
+    /// AM-0009-7). `None` for first plans and for callers without
+    /// provenance — behaviour is then exactly pre-RFC-0017.
+    pub prior_source: Option<PlanSource>,
+    /// Prior generation's raw proposal artifact when `prior_source` is
+    /// [`PlanSource::LlmProposed`] (RFC-0017 AM-0009-7 / GN10).
+    pub prior_proposal_artifact: Option<ArtifactId>,
 }
 
 /// Successful plan / replan result.
@@ -50,6 +63,11 @@ pub struct PlanResult {
     pub template_id: TemplateId,
     /// CAS snapshot of the DAG JSON.
     pub snapshot_artifact: ArtifactId,
+    /// Plan provenance (RFC-0017 AM-0009-4).
+    pub source: PlanSource,
+    /// Raw proposal artifact when `source` is [`PlanSource::LlmProposed`]
+    /// (RFC-0017 AM-0009-4).
+    pub proposal_artifact: Option<ArtifactId>,
 }
 
 /// Typed PlanProduced payload (session event wire shape).
@@ -69,6 +87,16 @@ pub struct PlanProducedPayload {
     pub replan: bool,
     /// Replan reason when `replan`.
     pub reason: Option<ReplanReason>,
+    /// Plan provenance; absent ⇒ `template` (RFC-0017 AM-0009-3, old-reader
+    /// back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PlanSource>,
+    /// Raw proposal artifact for compiled proposals (RFC-0017 AM-0009-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_artifact: Option<ArtifactId>,
+    /// Whether the replan root was seeded per SD1–SD10 (RFC-0017 AM-0009-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeded_root: Option<bool>,
 }
 
 /// PlanService errors.
@@ -179,8 +207,7 @@ pub trait PlanService: Send + Sync {
 /// [`PlanContext`] from [`crate::RunGoalRecord`] and call [`PlanService::plan`].
 pub struct TemplatePlanService {
     dags: Arc<dyn DagStore>,
-    artifacts: Arc<dyn ArtifactStore>,
-    events: Arc<dyn EventSink>,
+    persist: PlanPersistence,
 }
 
 impl TemplatePlanService {
@@ -192,9 +219,8 @@ impl TemplatePlanService {
         events: Arc<dyn EventSink>,
     ) -> Self {
         Self {
-            dags,
-            artifacts,
-            events,
+            dags: Arc::clone(&dags),
+            persist: PlanPersistence::new(dags, artifacts, events),
         }
     }
 
@@ -208,11 +234,26 @@ impl TemplatePlanService {
         )
     }
 
-    fn select(ctx: &PlanContext) -> TemplateId {
+    /// Day-1 selector (RFC-0009 MVP rule), shared with `LlmPlanService`'s
+    /// fallback-identity computation (RFC-0017 LP5).
+    pub(crate) fn select(ctx: &PlanContext) -> TemplateId {
         ctx.template_override
             .unwrap_or(TemplateId::RepairLocalDiagnostic)
     }
 
+    /// The single validated write path, shared with `LlmPlanService` (LP2 —
+    /// both services persist through the same `PlanPersistence`).
+    pub(crate) fn persistence(&self) -> &PlanPersistence {
+        &self.persist
+    }
+
+    /// Read-only DAG store handle for the replan probe (never a write path).
+    pub(crate) fn dag_store(&self) -> Arc<dyn DagStore> {
+        Arc::clone(&self.dags)
+    }
+
+    /// Thin caller of [`PlanPersistence::persist_validated`] (AM-0009-6):
+    /// template selection stays here, every write happens there.
     async fn instantiate_and_persist(
         &self,
         template_id: TemplateId,
@@ -220,278 +261,26 @@ impl TemplatePlanService {
         generation: u64,
         reason: Option<ReplanReason>,
         expected_for_cas: CasExpected,
+        probe_kinds: Option<&std::collections::BTreeMap<NodeId, NodeKind>>,
     ) -> Result<PlanResult, PlanError> {
-        let replan = matches!(expected_for_cas, CasExpected::Replan { .. });
         // Day-1 never enables cache; PlanContext fingerprints are reserved for RFC-0010
         // (see dag/cache.rs module docs). They are intentionally unread here.
         let manifest = TemplateCatalog::get(template_id);
-
-        // Phase A
-        let ids = allocate_ids(manifest);
-
-        // Pre-CAS validate with ephemeral placeholders
-        let mut placeholders = BTreeMap::new();
-        for nid in ids.nodes.values() {
-            placeholders.insert(*nid, ArtifactId::new());
-        }
-        let candidate = build_topology(BuildTopology {
-            manifest,
-            dag_id: ctx.dag_id,
-            session_id: ctx.session_id,
-            generation,
-            ids: &ids,
-            input_refs: &placeholders,
-        });
-        let opts = validate_opts_for(manifest);
-        if let Err(e) = DagValidator::validate(&candidate, opts) {
-            tracing::warn!(error = %e, "plan validation failed");
-            return Err(PlanError::Validation(e));
-        }
-
-        // Phase B — real CAS puts
-        let input_refs = self
-            .put_input_artifacts(manifest, &ids, ctx, generation)
-            .await?;
-
-        // Phase C
-        let dag = build_topology(BuildTopology {
-            manifest,
-            dag_id: ctx.dag_id,
-            session_id: ctx.session_id,
-            generation,
-            ids: &ids,
-            input_refs: &input_refs,
-        });
-        // Re-validate after real input_refs are bound. Validator does not inspect
-        // ArtifactId values, so this cannot fail if Phase A passed; kept as insurance.
-        DagValidator::validate(&dag, opts)?;
-
-        // Snapshot
-        let snapshot_bytes = serde_json::to_vec(&dag)
-            .map_err(|e| PlanError::Internal(format!("dag snapshot serde: {e}")))?;
-        let snapshot_artifact = self
-            .put_labeled(snapshot_bytes, ctx, "dag_snapshot")
-            .await?;
-
-        // Persist
-        // Reconciliation (deferred): a GC/retention sweep SHOULD reclaim
-        // node_input / pending_pred / dag_snapshot artifacts left unreferenced
-        // after failed or conflicting CAS attempts (blobs may already exist).
-        match expected_for_cas {
-            CasExpected::InsertOnly => match self.dags.put_if_generation(&dag, None).await {
-                Ok(()) => {}
-                Err(StoreError::Conflict(_)) => {
-                    let existing = self.dags.get(ctx.dag_id).await.map_err(PlanError::Store)?;
-                    match existing {
-                        Some(e) => {
-                            return Err(PlanError::GenerationMismatch {
-                                expected: 0,
-                                actual: e.generation,
-                            });
-                        }
-                        None => {
-                            return Err(PlanError::Internal(
-                                "conflict on insert but get returned None".into(),
-                            ));
-                        }
-                    }
-                }
-                Err(e) => return Err(PlanError::Store(e)),
-            },
-            CasExpected::Replan {
-                expected_generation,
-            } => {
-                match self
-                    .dags
-                    .replace_for_replan(&dag, expected_generation)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(ReplanReplaceError::NotFound) => {
-                        return Err(PlanError::DagNotFound(ctx.dag_id));
-                    }
-                    Err(ReplanReplaceError::GenerationMismatch { actual }) => {
-                        return Err(PlanError::GenerationMismatch {
-                            expected: expected_generation,
-                            actual,
-                        });
-                    }
-                    Err(ReplanReplaceError::DagBusy { state }) => {
-                        return Err(PlanError::DagBusy { state });
-                    }
-                    Err(ReplanReplaceError::Store(e)) => return Err(PlanError::Store(e)),
-                }
-            }
-        }
-
-        // PlanProduced event
-        // Reconciliation (deferred): an outbox / replay path SHOULD append a
-        // missing PlanProduced for an already-persisted DAG generation when
-        // append_session fails after a durable CAS write (row is retained).
-        let mut node_ids: Vec<NodeId> = dag.nodes.keys().copied().collect();
-        node_ids.sort();
-        let payload = PlanProducedPayload {
-            dag_id: dag.id,
-            generation: dag.generation,
-            template_id,
-            snapshot_artifact,
-            node_ids,
-            replan,
-            reason,
-        };
-        let payload_value = serde_json::to_value(&payload)
-            .map_err(|e| PlanError::Internal(format!("PlanProducedPayload serde: {e}")))?;
-
-        if let Err(e) = self
-            .events
-            .append_session(NewSessionEvent {
-                session_id: ctx.session_id,
-                run_id: Some(ctx.run_id),
-                type_: SessionEventType::PlanProduced,
-                payload: payload_value,
+        self.persist
+            .persist_validated(PersistRequest {
+                ctx,
+                specs: &manifest.nodes,
+                edges: &manifest.edges,
+                source: PlanSource::Template,
+                template_id,
+                proposal_artifact: None,
+                reason: reason.as_ref(),
+                generation,
+                expected_for_cas,
+                probe_kinds,
             })
             .await
-        {
-            tracing::warn!(error = %e, "PlanProduced append failed after durable DAG write");
-            return Err(PlanError::Event(e));
-        }
-
-        tracing::info!(
-            dag_id = %dag.id,
-            generation = dag.generation,
-            template = template_id.as_str(),
-            replan,
-            "plan produced"
-        );
-
-        Ok(PlanResult {
-            dag,
-            template_id,
-            snapshot_artifact,
-        })
     }
-
-    async fn put_labeled(
-        &self,
-        bytes: Vec<u8>,
-        ctx: &PlanContext,
-        envelope: &str,
-    ) -> Result<ArtifactId, PlanError> {
-        let mut labels = serde_json::Map::new();
-        labels.insert(
-            "alloy.envelope".into(),
-            serde_json::Value::String(envelope.into()),
-        );
-        labels.insert(
-            "alloy.dag_id".into(),
-            serde_json::Value::String(ctx.dag_id.to_string()),
-        );
-        self.artifacts
-            .put(ArtifactPut {
-                bytes,
-                kind: ArtifactKind::Blob,
-                content_type: Some("application/json".into()),
-                session_id: Some(ctx.session_id),
-                run_id: Some(ctx.run_id),
-                labels,
-            })
-            .await
-            .map_err(PlanError::Artifact)
-    }
-
-    async fn put_input_artifacts(
-        &self,
-        manifest: &TemplateManifest,
-        ids: &TemplateIdMap,
-        ctx: &PlanContext,
-        generation: u64,
-    ) -> Result<BTreeMap<NodeId, ArtifactId>, PlanError> {
-        // Collect Data predecessors per local name
-        let mut data_preds: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for e in &manifest.edges {
-            if e.kind == EdgeKind::Data {
-                data_preds
-                    .entry(e.to.as_str())
-                    .or_default()
-                    .push(e.from.as_str());
-            }
-        }
-
-        let mut input_refs = BTreeMap::new();
-        for spec in &manifest.nodes {
-            let node_id = *ids
-                .nodes
-                .get(&spec.name)
-                .ok_or_else(|| PlanError::Internal(format!("missing id for {}", spec.name)))?;
-            let preds = data_preds
-                .get(spec.name.as_str())
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-
-            let payload = if preds.is_empty() {
-                let has_sched_pred = manifest.edges.iter().any(|e| {
-                    e.to == spec.name && matches!(e.kind, EdgeKind::Data | EdgeKind::Sequence)
-                });
-                if has_sched_pred {
-                    NodeInputPayload::FromPredecessors { preds: vec![] }
-                } else {
-                    NodeInputPayload::Goal(ctx.goal.clone())
-                }
-            } else {
-                let mut pred_outs = Vec::with_capacity(preds.len());
-                for from_name in preds {
-                    let from_id = *ids.nodes.get(*from_name).ok_or_else(|| {
-                        PlanError::Internal(format!("missing pred id {from_name}"))
-                    })?;
-                    let from_kind = manifest
-                        .nodes
-                        .iter()
-                        .find(|n| n.name == *from_name)
-                        .map(|n| n.kind)
-                        .ok_or_else(|| {
-                            PlanError::Internal(format!("missing pred kind {from_name}"))
-                        })?;
-                    let pending_bytes = encode_json(&PendingPredPlaceholder::new())
-                        .map_err(|e| PlanError::Internal(e.to_string()))?;
-                    let pending_id = self.put_labeled(pending_bytes, ctx, "pending_pred").await?;
-                    pred_outs.push(PredecessorOutput {
-                        node_id: from_id,
-                        kind: from_kind,
-                        output_ref: pending_id,
-                    });
-                }
-                NodeInputPayload::FromPredecessors { preds: pred_outs }
-            };
-
-            let envelope =
-                NodeInputEnvelope::new(ctx.dag_id, node_id, spec.kind, generation, payload);
-            let bytes = encode_json(&envelope)
-                .map_err(|e| PlanError::Internal(format!("input envelope serde: {e}")))?;
-            let art_id = self.put_labeled(bytes, ctx, "node_input").await?;
-            input_refs.insert(node_id, art_id);
-        }
-
-        if input_refs.len() != ids.nodes.len() {
-            return Err(PlanError::Internal(
-                "Phase B input_refs missing coverage".into(),
-            ));
-        }
-        Ok(input_refs)
-    }
-}
-
-/// Validation options for a manifest: a read-only template carries no gate
-/// to require (see [`TemplateManifest::is_read_only`]).
-fn validate_opts_for(manifest: &TemplateManifest) -> ValidateOpts {
-    ValidateOpts {
-        enforce_linear_mvp: true,
-        require_gates: !manifest.is_read_only(),
-    }
-}
-
-enum CasExpected {
-    InsertOnly,
-    Replan { expected_generation: u64 },
 }
 
 #[async_trait]
@@ -509,7 +298,7 @@ impl PlanService for TemplatePlanService {
     async fn plan(&self, ctx: PlanContext) -> Result<PlanResult, PlanError> {
         let template_id = Self::select(&ctx);
         tracing::Span::current().record("template", template_id.as_str());
-        self.instantiate_and_persist(template_id, &ctx, 1, None, CasExpected::InsertOnly)
+        self.instantiate_and_persist(template_id, &ctx, 1, None, CasExpected::InsertOnly, None)
             .await
     }
 
@@ -529,7 +318,7 @@ impl PlanService for TemplatePlanService {
         ctx: PlanContext,
     ) -> Result<PlanResult, PlanError> {
         tracing::Span::current().record("template", id.as_str());
-        self.instantiate_and_persist(id, &ctx, 1, None, CasExpected::InsertOnly)
+        self.instantiate_and_persist(id, &ctx, 1, None, CasExpected::InsertOnly, None)
             .await
     }
 
@@ -591,6 +380,14 @@ impl PlanService for TemplatePlanService {
 
         let template_id = Self::select(&ctx);
 
+        // SD3: the seeder looks the failed node's kind up in the replan
+        // probe blob; an absent node defaults to `VerifyCompile`.
+        let probe_kinds: std::collections::BTreeMap<NodeId, NodeKind> = probe
+            .nodes
+            .iter()
+            .map(|(id, node)| (*id, node.kind))
+            .collect();
+
         self.instantiate_and_persist(
             template_id,
             &ctx,
@@ -599,6 +396,7 @@ impl PlanService for TemplatePlanService {
             CasExpected::Replan {
                 expected_generation: probe.generation,
             },
+            Some(&probe_kinds),
         )
         .await
     }
@@ -611,7 +409,7 @@ mod tests {
         compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, NodeInputEnvelope,
         NodeInputPayload, NodeKind, PendingPredPlaceholder,
     };
-    use crate::events::InMemoryEventSink;
+    use crate::events::{InMemoryEventSink, NewSessionEvent, SessionEventType};
     use crate::storage::{
         AlloyStorage, ArtifactKind, ArtifactStore, DagStore, EventStore, StorageOpenOptions,
     };
@@ -648,6 +446,8 @@ mod tests {
             policy_hash: policy,
             tool_versions: tools,
             compiler_fingerprint: compiler,
+            prior_source: None,
+            prior_proposal_artifact: None,
         }
     }
 
@@ -1058,5 +858,227 @@ mod tests {
         assert!(matches!(err, PlanError::Event(_)));
         assert!(storage.dags().get(dag_id).await.unwrap().is_some());
         storage.close().await.unwrap();
+    }
+
+    use crate::dag::NodeOutputEnvelope;
+    use crate::types::diagnostic::{
+        DiagnosticEvent, DiagnosticLevel, ErrorClass, FailureIr, SpanRef,
+    };
+    use crate::types::ids::DiagnosticId;
+
+    fn compile_failure(node: NodeId) -> FailureIr {
+        FailureIr {
+            node,
+            error_class: ErrorClass::Compile,
+            retry: Default::default(),
+            diagnostics: vec![DiagnosticEvent {
+                id: DiagnosticId::new(),
+                code: Some("E0308".into()),
+                level: DiagnosticLevel::Error,
+                message: "mismatched types: expected `u32`, found `String`".into(),
+                spans: vec![SpanRef {
+                    path: "src/lib.rs".into(),
+                    start_line: 42,
+                    start_col: 9,
+                    end_line: 42,
+                    end_col: 21,
+                }],
+                children: vec![],
+                package: Some("alloy-runtime".into()),
+                fingerprint: crate::obs::hash_prompt("e0308"),
+                raw_json: Some(serde_json::json!({ "sentinel": "RAWJSON_SENTINEL_AC39" })),
+            }],
+            notes: "cargo check failed".into(),
+        }
+    }
+
+    /// Plan generation 1, flip the DAG `Failed`, and return the verify node
+    /// id so a replan can name a real failed node.
+    async fn plan_and_fail(
+        storage: &AlloyStorage,
+        svc: &TemplatePlanService,
+        ctx: &PlanContext,
+    ) -> NodeId {
+        let first = svc.plan(ctx.clone()).await.unwrap();
+        let verify = first
+            .dag
+            .nodes
+            .values()
+            .find(|n| n.kind == NodeKind::VerifyCompile)
+            .unwrap()
+            .id;
+        let mut failed = first.dag.clone();
+        failed.state = DagState::Failed;
+        storage.dags().put(&failed).await.unwrap();
+        verify
+    }
+
+    async fn root_envelope(storage: &AlloyStorage, result: &PlanResult) -> NodeInputEnvelope {
+        let analyze = result
+            .dag
+            .nodes
+            .values()
+            .find(|n| n.kind == NodeKind::Analyze)
+            .unwrap();
+        let blob = storage.artifacts().get(analyze.input_ref).await.unwrap();
+        serde_json::from_slice(&blob.bytes).unwrap()
+    }
+
+    /// AC 17: a `FailureIr` replan seeds the root — `FromPredecessors` with
+    /// one synthetic pred whose `output_ref` decodes as the SD3 seed
+    /// envelope (`ok: false`, prior generation, failed node id/kind).
+    #[tokio::test]
+    async fn ac17_failure_ir_replan_seeds_root_envelope() {
+        let (_dir, storage, svc, events) = service().await;
+        let session = SessionId::new();
+        let ctx = plan_ctx(session, RunId::new(), DagId::new());
+        let verify = plan_and_fail(&storage, &svc, &ctx).await;
+
+        let mut replan_ctx = ctx.clone();
+        replan_ctx.template_override = Some(TemplateId::RepairLocalDiagnostic);
+        let second = svc
+            .replan(ReplanReason::FailureIr(compile_failure(verify)), replan_ctx)
+            .await
+            .unwrap();
+        assert_eq!(second.dag.generation, 2);
+
+        let env = root_envelope(&storage, &second).await;
+        assert_eq!(env.generation, 2);
+        let NodeInputPayload::FromPredecessors { preds } = env.payload else {
+            panic!("seeded root must be FromPredecessors");
+        };
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0].node_id, verify);
+        assert_eq!(preds[0].kind, NodeKind::VerifyCompile);
+
+        let seed_blob = storage.artifacts().get(preds[0].output_ref).await.unwrap();
+        assert_eq!(
+            seed_blob
+                .meta
+                .labels
+                .get("alloy.envelope")
+                .and_then(|v| v.as_str()),
+            Some("replan_seed")
+        );
+        let seed: NodeOutputEnvelope = serde_json::from_slice(&seed_blob.bytes).unwrap();
+        assert_eq!(seed.node_id, verify);
+        assert_eq!(seed.kind, NodeKind::VerifyCompile);
+        assert_eq!(seed.generation, 1);
+        assert_eq!(seed.attempt, 1);
+        assert_eq!(seed.payload["ok"], false);
+        assert_eq!(seed.payload["error_class"], "compile");
+        assert_eq!(seed.payload["diagnostics"][0]["code"], "E0308");
+
+        // AC 39 (seed half): serialized seed bytes carry no raw_json.
+        let text = String::from_utf8(seed_blob.bytes.clone()).unwrap();
+        assert!(!text.contains("RAWJSON_SENTINEL_AC39"));
+        assert!(!text.contains("raw_json"));
+
+        // AM-0009-3: PlanProduced carries seeded_root = true.
+        let evs = events.session_events(session);
+        let payload: PlanProducedPayload =
+            serde_json::from_value(evs.last().unwrap().payload.clone()).unwrap();
+        assert!(payload.replan);
+        assert_eq!(payload.seeded_root, Some(true));
+        assert_eq!(payload.source, Some(PlanSource::Template));
+        storage.close().await.unwrap();
+    }
+
+    /// AC 18: non-`FailureIr` replans leave the root envelope byte-identical
+    /// to the pre-RFC-0017 shape (bare `Goal`).
+    #[tokio::test]
+    async fn ac18_non_failure_replan_root_is_goal() {
+        for reason in [
+            ReplanReason::UserRequested,
+            ReplanReason::BudgetPolicy,
+            ReplanReason::Other("operator".into()),
+        ] {
+            let (_dir, storage, svc, _events) = service().await;
+            let ctx = plan_ctx(SessionId::new(), RunId::new(), DagId::new());
+            plan_and_fail(&storage, &svc, &ctx).await;
+            let second = svc.replan(reason, ctx.clone()).await.unwrap();
+            let env = root_envelope(&storage, &second).await;
+            match env.payload {
+                NodeInputPayload::Goal(goal) => assert_eq!(goal.text, ctx.goal.text),
+                other => panic!("non-FailureIr replan root must be Goal, got {other:?}"),
+            }
+            storage.close().await.unwrap();
+        }
+    }
+
+    /// AC 19: a failed node absent from the probe blob falls back to
+    /// `VerifyCompile`; the seed is still written.
+    #[tokio::test]
+    async fn ac19_kind_lookup_miss_defaults_verify_compile() {
+        let (_dir, storage, svc, _events) = service().await;
+        let ctx = plan_ctx(SessionId::new(), RunId::new(), DagId::new());
+        plan_and_fail(&storage, &svc, &ctx).await;
+
+        let phantom = NodeId::new(); // belongs to no generation
+        let second = svc
+            .replan(ReplanReason::FailureIr(compile_failure(phantom)), ctx)
+            .await
+            .unwrap();
+        let env = root_envelope(&storage, &second).await;
+        let NodeInputPayload::FromPredecessors { preds } = env.payload else {
+            panic!("seeded root must be FromPredecessors");
+        };
+        assert_eq!(preds[0].node_id, phantom);
+        assert_eq!(preds[0].kind, NodeKind::VerifyCompile);
+        let seed_blob = storage.artifacts().get(preds[0].output_ref).await.unwrap();
+        let seed: NodeOutputEnvelope = serde_json::from_slice(&seed_blob.bytes).unwrap();
+        assert_eq!(seed.kind, NodeKind::VerifyCompile);
+        storage.close().await.unwrap();
+    }
+
+    /// AC 20: every `input_ref` of a seeded generation resolves and the DAG
+    /// validates under default opts.
+    #[tokio::test]
+    async fn ac20_seeded_generation_input_refs_resolve_and_validate() {
+        let (_dir, storage, svc, _events) = service().await;
+        let ctx = plan_ctx(SessionId::new(), RunId::new(), DagId::new());
+        let verify = plan_and_fail(&storage, &svc, &ctx).await;
+        let second = svc
+            .replan(ReplanReason::FailureIr(compile_failure(verify)), ctx)
+            .await
+            .unwrap();
+        for node in second.dag.nodes.values() {
+            storage.artifacts().get(node.input_ref).await.unwrap();
+        }
+        crate::dag::DagValidator::validate(&second.dag, crate::dag::ValidateOpts::default())
+            .unwrap();
+        storage.close().await.unwrap();
+    }
+
+    /// AC 35: a pre-RFC-0017 `PlanProduced` payload (no `source` /
+    /// `proposal_artifact` / `seeded_root`) still decodes.
+    #[test]
+    fn ac35_old_plan_produced_payload_decodes() {
+        let old = serde_json::json!({
+            "dag_id": DagId::new(),
+            "generation": 1,
+            "template_id": "repair_local_diagnostic",
+            "snapshot_artifact": crate::types::ids::ArtifactId::new(),
+            "node_ids": [],
+            "replan": false,
+            "reason": null,
+        });
+        let payload: PlanProducedPayload = serde_json::from_value(old).unwrap();
+        assert!(payload.source.is_none());
+        assert!(payload.proposal_artifact.is_none());
+        assert!(payload.seeded_root.is_none());
+    }
+
+    /// AC 36 (planner half): `PlanSource` wire vocabulary.
+    #[test]
+    fn plan_source_serde_golden() {
+        assert_eq!(
+            serde_json::to_value(PlanSource::Template).unwrap(),
+            serde_json::json!("template")
+        );
+        assert_eq!(
+            serde_json::to_value(PlanSource::LlmProposed).unwrap(),
+            serde_json::json!("llm_proposed")
+        );
     }
 }

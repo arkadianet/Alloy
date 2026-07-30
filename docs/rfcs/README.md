@@ -56,6 +56,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | [RFC-0014](./RFC-0014-language-backend-rust.md) | LanguageBackend (Rust Module) | Draft | 3–5 pd | 0001, 0011 | M2 path |
 | [RFC-0015](./RFC-0015-cli-profiles-config.md) | CLI, Profiles & Config | Draft | 4–6 pd | 0003, 0004, 0010, 0013 | **Yes** |
 | [RFC-0016](./RFC-0016-eval-harness-holdout-gates.md) | Eval Harness & Holdout Gates | Implemented (Day-1 harness skeleton; ControlPlane driver deferred) | 5–8 pd | 0001, 0007 | **Yes** (skeleton early) |
+| [RFC-0017](./RFC-0017-dynamic-planning.md) | Dynamic Planning & Repair Generations | Implemented (LLM mode opt-in; default flip eval-gated) | 9–13 pd | 0003, 0004, 0009, 0010, 0013, 0015, 0016 | Post-MVP (in-run repair vertical) |
 
 **pd** = person-days. Honest ranges; parallelization shortens calendar time.
 
@@ -79,6 +80,7 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | 0014 | 0001, 0011 |
 | 0015 | 0003, 0004, 0010, 0013 |
 | 0016 | 0001, 0007 |
+| 0017 | 0003, 0004, 0009, 0010, 0013, 0015, 0016 |
 
 No cycles. **Critical path (M1 vertical slice):** 0001 → (0002∥0005) → (0003∥0004∥0006∥0009) → (0007∥0008) → 0010 → (0011∥0012 thin) → 0013 → 0015, with **0016 skeleton** starting as soon as 0007 exists. Note: 0010 depends on **0008** for the single-write-stack / no-scheduler-EditEngine constraint (forward-only repair, edit-tx vs DAG resume); it does **not** depend on 0007 in the dependency table (retry uses `ErrorClass` + adapters). 0007 and 0010 are still sequenced on the calendar path because the vertical slice needs both, while 0013 binds the router into workers.
 

@@ -17,7 +17,8 @@ use crate::resolve::Ctx;
 
 pub async fn exec(ctx: Ctx, args: ResumeArgs) -> Result<Exit, CliError> {
     let base = assembly::assemble_read(ctx.cfg.clone()).await?;
-    let mut full = assembly::assemble_full(base, &ctx.workspace_abs, ctx.readonly()).await?;
+    let mut full =
+        assembly::assemble_full(base, &ctx.workspace_abs, ctx.readonly(), &ctx.profile).await?;
 
     let cancel = full.base.handle.cancellation();
     let signal_task = crate::arm_signal_task(move || cancel.cancel());

@@ -153,7 +153,9 @@ impl Harness {
             gates: crate::config::GatesConfig::default(),
             sandbox_echo: None,
             gate_timeout: None,
+            max_repair_generations: 2,
             capture: Default::default(),
+            planner: crate::planner::PlannerConfig::new(),
         })
         .unwrap();
         let handle = rt.start().await.unwrap();
@@ -2044,5 +2046,241 @@ async fn register_gate_waiter_replaces_prior_waiter() {
     h.plane.approve(run, gate, Approval::Allow).await.unwrap();
     assert!(first.await.is_err(), "prior receiver errs on replacement");
     assert_eq!(second.await.unwrap(), Approval::Allow);
+    h.close().await;
+}
+
+// -------------------------------------------------- RFC-0017 AM-0003-1/2/3
+
+/// AC 29: `resume_after_replan` re-arms `ReplanRequested → Accepted`,
+/// appends `ReplanResumed`, is idempotent from `Accepted` (no second
+/// event), and rejects every other state.
+#[tokio::test]
+async fn ac29_resume_after_replan_state_machine() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await; // dag row (non-Running) with generation 0
+
+    // Not resumable before a replan was requested.
+    assert!(matches!(
+        h.runs().resume_after_replan(run).await.unwrap_err(),
+        RunError::InvalidPhase(_)
+    ));
+
+    h.set_run_state(run, RunControlState::ReplanRequested).await;
+    h.runs().resume_after_replan(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::Accepted);
+    let resumed = h
+        .events_of_type(session, SessionEventType::ReplanResumed)
+        .await;
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].payload["generation"], 0);
+    assert_eq!(resumed[0].run_id, Some(run));
+
+    // Idempotent from Accepted: Ok, no second event.
+    h.runs().resume_after_replan(run).await.unwrap();
+    assert_eq!(
+        h.events_of_type(session, SessionEventType::ReplanResumed)
+            .await
+            .len(),
+        1
+    );
+
+    // Every other state is InvalidPhase.
+    for state in [
+        RunControlState::Running,
+        RunControlState::WaitingApproval,
+        RunControlState::Cancelling,
+        RunControlState::Cancelled,
+        RunControlState::Succeeded,
+        RunControlState::Failed,
+    ] {
+        h.set_run_state(run, state).await;
+        assert!(
+            matches!(
+                h.runs().resume_after_replan(run).await.unwrap_err(),
+                RunError::InvalidPhase(_)
+            ),
+            "resume_after_replan must reject {state:?}"
+        );
+    }
+    h.close().await;
+}
+
+/// AC 29: `resume_after_replan` refuses while an execution lease is held,
+/// even from `ReplanRequested`.
+#[tokio::test]
+async fn ac29_resume_after_replan_rejects_held_lease() {
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(DagState::Succeeded)]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+
+    let runs = h.runs();
+    let start = tokio::spawn({
+        let runs = Arc::clone(&runs);
+        async move { runs.start(run).await }
+    });
+    sched.entered.notified().await;
+
+    // Lease held: a foreign replan_requested write plus resume must not race
+    // the in-flight dispatch.
+    h.set_run_state(run, RunControlState::ReplanRequested).await;
+    assert!(matches!(
+        h.runs().resume_after_replan(run).await.unwrap_err(),
+        RunError::InvalidPhase(_)
+    ));
+
+    sched.release.notify_one();
+    start.await.unwrap().unwrap();
+    h.close().await;
+}
+
+/// AC 29: after an external replan cycle, a following `start` emits no
+/// second `RunAccepted`.
+#[tokio::test]
+async fn ac29_resume_then_start_emits_no_second_run_accepted() {
+    let h = Harness::new().await;
+    h.install_scheduler(MockScheduler::new([
+        Plan::State(DagState::ReplanRequired),
+        Plan::State(DagState::Succeeded),
+    ]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+
+    h.runs().start(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::ReplanRequested);
+    assert_eq!(h.count_accepted(run).await, 1);
+
+    h.runs().resume_after_replan(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::Accepted);
+
+    h.runs().start(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, RunControlState::Succeeded);
+    assert_eq!(h.count_accepted(run).await, 1, "exactly one RunAccepted");
+    assert_eq!(h.count_finished(run).await, 1);
+    h.close().await;
+}
+
+/// AC 29b: the in-run generation methods are lease-gated — without a live
+/// dispatch both return `InvalidPhase` and write nothing.
+#[tokio::test]
+async fn ac29b_repair_generation_methods_require_lease() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.set_run_state(run, RunControlState::Running).await;
+
+    assert!(matches!(
+        h.runs()
+            .begin_repair_generation(run, &ReplanReason::UserRequested)
+            .await
+            .unwrap_err(),
+        RunError::InvalidPhase(_)
+    ));
+    assert!(matches!(
+        h.runs()
+            .complete_repair_generation(run, 2)
+            .await
+            .unwrap_err(),
+        RunError::InvalidPhase(_)
+    ));
+    assert!(h
+        .events_of_type(session, SessionEventType::ReplanRequested)
+        .await
+        .is_empty());
+    assert!(h
+        .events_of_type(session, SessionEventType::ReplanResumed)
+        .await
+        .is_empty());
+    assert_eq!(h.run_state(run).await, RunControlState::Running);
+    h.close().await;
+}
+
+/// AC 29b: inside a live dispatch, `begin_repair_generation` drops gate
+/// waiters and appends `ReplanRequested` **without** writing
+/// `replan_requested` to the row; `complete_repair_generation` appends
+/// `ReplanResumed`; the row state is never touched by either.
+#[tokio::test]
+async fn ac29b_begin_complete_repair_generation_inside_dispatch() {
+    let h = Harness::new().await;
+    let sched = h.install_scheduler(MockScheduler::new([Plan::BlockThen(DagState::Succeeded)]));
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+    h.seed_dag(run).await;
+
+    let runs = h.runs();
+    let start = tokio::spawn({
+        let runs = Arc::clone(&runs);
+        async move { runs.start(run).await }
+    });
+    sched.entered.notified().await;
+
+    // A waiter registered mid-dispatch (as a gate adapter would).
+    let gate = GateId::new();
+    let waiter = h.plane.register_gate_waiter(run, gate).await.unwrap();
+
+    h.runs()
+        .begin_repair_generation(run, &ReplanReason::UserRequested)
+        .await
+        .unwrap();
+    assert!(waiter.await.is_err(), "waiters dropped (SEC9b)");
+    let requested = h
+        .events_of_type(session, SessionEventType::ReplanRequested)
+        .await;
+    assert_eq!(requested.len(), 1);
+    assert_eq!(
+        requested[0].payload["reason"],
+        serde_json::json!("user_requested")
+    );
+    // RC1: the row reads `running` for the loop — never `replan_requested`.
+    assert_eq!(h.run_state(run).await, RunControlState::Running);
+
+    h.runs().complete_repair_generation(run, 2).await.unwrap();
+    let resumed = h
+        .events_of_type(session, SessionEventType::ReplanResumed)
+        .await;
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].payload["generation"], 2);
+    assert_eq!(h.run_state(run).await, RunControlState::Running);
+
+    sched.release.notify_one();
+    // The row is `waiting_approval` (the waiter registration wrote it), which
+    // control-protects against the Succeeded outcome — the merge is §6.3
+    // step 9(a)'s business, not this test's. What matters here: neither
+    // AM-0003-3 method wrote `replan_requested` at any point.
+    start.await.unwrap().unwrap();
+    assert_ne!(h.run_state(run).await, RunControlState::ReplanRequested);
+    h.close().await;
+}
+
+/// AC 29b: `control_state` reads the durable state without writing.
+#[tokio::test]
+async fn ac29b_control_state_reads_without_writing() {
+    let h = Harness::new().await;
+    let session = h.create_session().await;
+    let run = h.submit(session).await;
+
+    assert_eq!(
+        h.runs().control_state(run).await.unwrap(),
+        RunControlState::Created
+    );
+    let row_before = h.run_row(run).await;
+    h.set_run_state(run, RunControlState::Cancelling).await;
+    assert_eq!(
+        h.runs().control_state(run).await.unwrap(),
+        RunControlState::Cancelling
+    );
+    // No writes: only our own set_run_state touched the row.
+    let row_after = h.run_row(run).await;
+    assert_eq!(row_after.state, "cancelling");
+    assert_eq!(row_before.goal_json, row_after.goal_json);
+    assert!(matches!(
+        h.runs().control_state(RunId::new()).await.unwrap_err(),
+        RunError::NotFound(_)
+    ));
+    let _ = session;
     h.close().await;
 }

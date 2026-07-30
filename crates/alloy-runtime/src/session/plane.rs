@@ -73,6 +73,17 @@ impl SessionPlane {
         self.inner.metrics.snapshot()
     }
 
+    /// Inject the §6.3 step-8 executor (RFC-0017 AM-0003-2, rule RX4).
+    ///
+    /// The plane starts with [`crate::DirectRunExecutor`] — today's
+    /// single-generation dispatch. The composition root calls this once,
+    /// before dispatching runs, to install the repair-generation driver.
+    /// The CLI's own call sequence is unchanged (RFC-0015 B1/SQ2): this is
+    /// construct-and-inject, not a new execution entry point.
+    pub fn set_executor(&self, executor: Arc<dyn super::run_executor::RunExecutor>) {
+        self.inner.set_executor(executor);
+    }
+
     /// CLI convenience facade for [`RunController::approve`] (traits stay distinct).
     pub async fn approve(
         &self,

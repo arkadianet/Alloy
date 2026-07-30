@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::gates::GateWaiterRegistry;
 use super::metrics::AtomicSessionMetrics;
+use super::run_executor::{DirectRunExecutor, RunExecutor};
 use super::run_state::RunControlState;
 use crate::runtime::RuntimeHandle;
 use crate::storage::AlloyStorage;
@@ -27,6 +28,10 @@ pub(crate) struct SessionInner {
     accepted_emitted: StdMutex<HashSet<RunId>>,
     pub gates: GateWaiterRegistry,
     pub metrics: AtomicSessionMetrics,
+    /// RFC-0003 §6.3 step-8 execution seam (RFC-0017 AM-0003-2). Defaults to
+    /// [`DirectRunExecutor`]; the assembly may swap in a generation driver
+    /// via [`super::SessionPlane::set_executor`] before dispatching runs.
+    executor: StdMutex<Arc<dyn RunExecutor>>,
     /// Test-only: next `upsert_run` via control plane fails once.
     #[cfg(test)]
     pub(crate) fail_next_run_upsert: AtomicBool,
@@ -37,6 +42,7 @@ pub(crate) struct SessionInner {
 
 impl SessionInner {
     pub fn new(handle: RuntimeHandle, storage: Arc<AlloyStorage>) -> Self {
+        let executor: Arc<dyn RunExecutor> = Arc::new(DirectRunExecutor::new(handle.clone()));
         Self {
             handle,
             storage,
@@ -46,6 +52,7 @@ impl SessionInner {
             accepted_emitted: StdMutex::new(HashSet::new()),
             gates: GateWaiterRegistry::new(),
             metrics: AtomicSessionMetrics::new(),
+            executor: StdMutex::new(executor),
             #[cfg(test)]
             fail_next_run_upsert: AtomicBool::new(false),
             #[cfg(test)]
@@ -89,6 +96,22 @@ impl SessionInner {
             arc,
             guard: Some(guard),
         }
+    }
+
+    /// Current step-8 executor (AM-0003-2).
+    pub fn executor(&self) -> Arc<dyn RunExecutor> {
+        self.executor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the step-8 executor (assembly-time injection, rule RX4).
+    pub fn set_executor(&self, executor: Arc<dyn RunExecutor>) {
+        *self
+            .executor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = executor;
     }
 
     pub fn has_live(&self, id: RunId) -> bool {
