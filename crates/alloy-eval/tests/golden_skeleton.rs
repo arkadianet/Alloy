@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use alloy_eval::{
-    EvalHarness, EvalHarnessConfig, FixtureId, FixtureSet, FixtureStatus, MetricField,
-    UnmeasuredReason,
+    EvalHarness, EvalHarnessConfig, FixtureDriverKind, FixtureId, FixtureSet, FixtureStatus,
+    MetricField, UnmeasuredReason,
 };
 
 fn fixture_root() -> PathBuf {
@@ -38,6 +38,19 @@ async fn gate_skeleton_defaults_pass() {
 }
 
 #[tokio::test]
+async fn golden_holdout_control_plane_pass() {
+    let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
+    let id = FixtureId::new("e0502_holdout_01").unwrap();
+    let fixture = harness.load_fixture(FixtureSet::Holdout, &id).unwrap();
+    assert_eq!(fixture.manifest().driver, FixtureDriverKind::ControlPlane);
+    let mut fixture = harness.load_fixture(FixtureSet::Holdout, &id).unwrap();
+    let outcome = harness.run_fixture(&mut fixture).await;
+    assert_eq!(outcome.status, FixtureStatus::Pass, "{outcome:?}");
+    assert!(outcome.compile_clean == Some(true));
+    assert!(outcome.error.is_none());
+}
+
+#[tokio::test]
 async fn e2e_holdout_with_naive() {
     let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
     let report = harness.run_holdout_with_naive().await.unwrap();
@@ -52,11 +65,18 @@ async fn e2e_holdout_with_naive() {
             .unwrap()
             .control_meets_or_beats_naive
     );
-    for outcome in report
-        .fixtures
-        .iter()
-        .chain(report.naive_fixtures.as_ref().unwrap())
-    {
+    for outcome in &report.fixtures {
+        assert_eq!(outcome.status, FixtureStatus::Pass, "{outcome:?}");
+        let fixture = harness
+            .load_fixture(FixtureSet::Holdout, &outcome.fixture_id)
+            .unwrap();
+        assert_eq!(
+            fixture.manifest().driver,
+            FixtureDriverKind::ControlPlane,
+            "holdout control fixtures must use the control_plane driver at M7"
+        );
+    }
+    for outcome in report.naive_fixtures.as_ref().unwrap() {
         assert_eq!(outcome.status, FixtureStatus::Pass, "{outcome:?}");
     }
 }

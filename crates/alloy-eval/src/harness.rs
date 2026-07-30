@@ -469,7 +469,9 @@ impl EvalHarness {
             FixtureDriverKind::NaiveBaseline => {
                 driver::naive::run(fixture, provider, self.config.cancel.clone()).await
             }
-            FixtureDriverKind::ControlPlane => driver::control_plane::run(fixture).await,
+            FixtureDriverKind::ControlPlane => {
+                driver::control_plane::run(fixture, provider, self.config.cancel.clone()).await
+            }
         }
     }
 

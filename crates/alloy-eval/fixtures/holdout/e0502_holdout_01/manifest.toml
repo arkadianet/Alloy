@@ -5,7 +5,7 @@ naive_target_path = "src/lib.rs"
 naive_patch_mode = "full_file_replace"
 success_criteria = ["compile_clean", "expected_diagnostics_cleared", "script_turns_consumed", "no_new_unsafe"]
 require_consume_all = true
-driver = "skeleton_replay"
+driver = "control_plane"
 
 [license]
 class = "permitted"

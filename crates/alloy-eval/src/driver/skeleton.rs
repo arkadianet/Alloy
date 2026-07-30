@@ -39,6 +39,9 @@ thread_local! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScriptedDriverMode {
     SkeletonReplay,
+    /// Offline scripted control-plane path: all manifest turns, same oracle as
+    /// skeleton replay until the live scheduler/CLI stack driver lands (M7).
+    ControlPlane,
     NaiveBaseline,
 }
 
@@ -394,7 +397,7 @@ fn execution_plan(
     mode: ScriptedDriverMode,
 ) -> Result<ExecutionPlan, EvalError> {
     match mode {
-        ScriptedDriverMode::SkeletonReplay => Ok(ExecutionPlan {
+        ScriptedDriverMode::SkeletonReplay | ScriptedDriverMode::ControlPlane => Ok(ExecutionPlan {
             turns: fixture.manifest.turns.clone(),
             entries: fixture.script_entries.clone(),
         }),

@@ -3655,6 +3655,12 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 - [ ] No TODO or placeholder implementations left in this RFC's scope (explicit **Stub** / deferred only)
 - [ ] Code review: **approved**
 
+**M7 holdout / ControlPlane slice (2026-07-30, branch `cursor/rfc-0016-holdout-controlplane-7632`):**
+- [x] Offline scripted `ControlPlane` driver replays all manifest turns (replaces Day-1 `EvalError::Stub` path inside `alloy-eval`).
+- [x] Holdout golden `e0502_holdout_01` uses `driver = "control_plane"`; `run_holdout_with_naive` green path verified.
+- [ ] Live scheduler/CLI stack driver (`stack-driver` feature, `TomlModelRouter`, sandbox apply, live compile oracle) — blocked on RFCs 0008–0015 outside `alloy-eval`.
+- [ ] AC 38/78/79 supersession: scripted offline ControlPlane satisfies manifest/driver wiring and gate plumbing; thesis falsification still requires the live stack per §12.1–§12.2.
+
 ---
 
 ## 15. Open Questions
