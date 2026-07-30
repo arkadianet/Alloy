@@ -6,8 +6,8 @@
 //! (Cargo.toml workspace table; RFC-0015 T9 allow-list pattern), so instead
 //! of pulling a JSON-Schema crate this file hand-rolls the minimal
 //! structural subset the worker schemas actually use: `type`, `properties`,
-//! `required`, `items`, `enum`, `additionalProperties: false`, and nullable
-//! `type` arrays.
+//! `required`, `items`, `enum`, `oneOf`, `additionalProperties: false`, and
+//! nullable `type` arrays.
 //!
 //! Author: arkadianet
 
@@ -34,6 +34,11 @@ fn type_matches(ty: &str, value: &Value) -> bool {
 /// Validate `value` against the structural subset used by worker schemas.
 fn validates(schema: &Value, value: &Value) -> bool {
     let obj = schema.as_object().expect("schema must be an object");
+
+    if let Some(alts) = obj.get("oneOf") {
+        let alts = alts.as_array().expect("oneOf must be an array");
+        return alts.iter().any(|alt| validates(alt, value));
+    }
 
     if let Some(types) = obj.get("type") {
         let ok = match types {
@@ -210,12 +215,41 @@ fn edit_schema_validates_and_rejects() {
     ));
     // confidence omitted (serde default).
     assert!(validates(&schema, &json!({ "patch": "p", "summary": "s" })));
-    // Ops form (AM-0013-1 / PR #64) — schema admits both keys; either/or
-    // is enforced by the worker parser (provider schemas lack portable oneOf).
+    // Ops form (AM-0013-1 / PR #64) — closed replace_lines shape.
     assert!(validates(
         &schema,
         &json!({
+            "ops": [{
+                "op": "replace_lines",
+                "path": "a.rs",
+                "start": 1,
+                "end": 1,
+                "expect": ["x"],
+                "new": ["y"]
+            }],
+            "summary": "s"
+        })
+    ));
+    // Bare `{op}` is no longer schema-valid once shapes are closed.
+    assert!(!validates(
+        &schema,
+        &json!({
             "ops": [{ "op": "replace_lines" }],
+            "summary": "s"
+        })
+    ));
+    // Wrong op tag / fields.
+    assert!(!validates(
+        &schema,
+        &json!({
+            "ops": [{
+                "op": "replace",
+                "path": "a.rs",
+                "start": 1,
+                "end": 1,
+                "expect": ["x"],
+                "new": ["y"]
+            }],
             "summary": "s"
         })
     ));

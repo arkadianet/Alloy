@@ -147,15 +147,61 @@ pub fn edit_response_schema() -> JsonSchemaSpec {
                 "patch": { "type": "string" },
                 "ops": {
                     "type": "array",
+                    // Closed, op-tagged shapes matching `parse_line_op` /
+                    // EDIT_SYSTEM (AM-0013-1). Provider top-level patch/ops
+                    // either/or stays parser-enforced; items use oneOf so a
+                    // grammar-constrained model cannot emit a bare `{op}`.
                     "items": {
-                        "type": "object",
-                        "properties": {
-                            "op": {
-                                "type": "string",
-                                "enum": ["replace_lines", "insert_lines", "delete_lines"]
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": { "type": "string", "enum": ["replace_lines"] },
+                                    "path": { "type": "string" },
+                                    "start": { "type": "integer" },
+                                    "end": { "type": "integer" },
+                                    "expect": {
+                                        "type": "array",
+                                        "items": { "type": "string" }
+                                    },
+                                    "new": {
+                                        "type": "array",
+                                        "items": { "type": "string" }
+                                    }
+                                },
+                                "required": ["op", "path", "start", "end", "expect", "new"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": { "type": "string", "enum": ["insert_lines"] },
+                                    "path": { "type": "string" },
+                                    "after_line": { "type": "integer" },
+                                    "new": {
+                                        "type": "array",
+                                        "items": { "type": "string" }
+                                    }
+                                },
+                                "required": ["op", "path", "after_line", "new"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "op": { "type": "string", "enum": ["delete_lines"] },
+                                    "path": { "type": "string" },
+                                    "start": { "type": "integer" },
+                                    "end": { "type": "integer" },
+                                    "expect": {
+                                        "type": "array",
+                                        "items": { "type": "string" }
+                                    }
+                                },
+                                "required": ["op", "path", "start", "end", "expect"],
+                                "additionalProperties": false
                             }
-                        },
-                        "required": ["op"]
+                        ]
                     }
                 },
                 "summary": { "type": "string" },

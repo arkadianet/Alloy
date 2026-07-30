@@ -540,7 +540,78 @@ impl EditWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
+
+    /// Minimal structural check matching `tests/worker_schemas.rs` for the
+    /// subset `edit_response_schema` uses (incl. op-item `oneOf`).
+    fn schema_validates(schema: &Value, value: &Value) -> bool {
+        let obj = schema.as_object().expect("schema object");
+        if let Some(alts) = obj.get("oneOf") {
+            return alts
+                .as_array()
+                .expect("oneOf array")
+                .iter()
+                .any(|alt| schema_validates(alt, value));
+        }
+        if let Some(types) = obj.get("type") {
+            let ok = match types {
+                Value::String(ty) => match ty.as_str() {
+                    "object" => value.is_object(),
+                    "array" => value.is_array(),
+                    "string" => value.is_string(),
+                    "integer" => value.is_i64() || value.is_u64(),
+                    "number" => value.is_number(),
+                    "null" => value.is_null(),
+                    _ => false,
+                },
+                Value::Array(list) => list
+                    .iter()
+                    .any(|ty| schema_validates(&json!({ "type": ty.clone() }), value)),
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if let Some(allowed) = obj.get("enum") {
+            if !allowed.as_array().expect("enum").contains(value) {
+                return false;
+            }
+        }
+        if let Some(props) = obj.get("properties") {
+            let props = props.as_object().expect("properties");
+            let Some(map) = value.as_object() else {
+                return false;
+            };
+            for (key, sub) in props {
+                if let Some(v) = map.get(key) {
+                    if !schema_validates(sub, v) {
+                        return false;
+                    }
+                }
+            }
+            if obj.get("additionalProperties") == Some(&Value::Bool(false))
+                && map.keys().any(|k| !props.contains_key(k))
+            {
+                return false;
+            }
+            if let Some(required) = obj.get("required") {
+                for key in required.as_array().expect("required") {
+                    if !map.contains_key(key.as_str().expect("required key")) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if let Some(items) = obj.get("items") {
+            if let Some(list) = value.as_array() {
+                if !list.iter().all(|item| schema_validates(items, item)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 
     /// A-0007-2 × AM-0013-1 reconciliation guard: the declared edit schema
     /// and the live `PatchProposal` parser must accept and reject the same
@@ -570,26 +641,63 @@ mod tests {
         assert_eq!(required, ["summary"]);
         assert_eq!(properties, ["confidence", "ops", "patch", "summary"]);
 
-        // Parser accepts both admitted shapes...
-        let patch_shape = json!({ "patch": "--- a\n+++ b\n", "summary": "s" });
-        assert!(serde_json::from_value::<PatchProposal>(patch_shape).is_ok());
+        // Complete schema-valid replace_lines (not the bare `{op}` stub).
         let ops_shape = json!({
-            "ops": [{ "op": "replace", "line": 1, "expect": "x", "with": "y" }],
+            "ops": [{
+                "op": "replace_lines",
+                "path": "a.rs",
+                "start": 1,
+                "end": 1,
+                "expect": ["x"],
+                "new": ["y"]
+            }],
             "summary": "s"
         });
+        assert!(
+            schema_validates(&schema, &ops_shape),
+            "closed replace_lines shape must validate against edit_response_schema"
+        );
         assert!(serde_json::from_value::<PatchProposal>(ops_shape.clone()).is_ok());
 
-        // ...and rejects what the schema does not admit: unknown fields are
-        // closed off by `additionalProperties: false` / `deny_unknown_fields`.
+        let patch_shape = json!({ "patch": "--- a\n+++ b\n", "summary": "s" });
+        assert!(schema_validates(&schema, &patch_shape));
+        assert!(serde_json::from_value::<PatchProposal>(patch_shape).is_ok());
+
+        // Incomplete / wrong-tag ops are schema-invalid even when they still
+        // deserialize into the loose `Vec<Value>` ops field.
+        let bare_op = json!({
+            "ops": [{ "op": "replace_lines" }],
+            "summary": "s"
+        });
+        assert!(
+            !schema_validates(&schema, &bare_op),
+            "bare {{op}} must not satisfy the closed op oneOf"
+        );
+        let wrong_tag = json!({
+            "ops": [{
+                "op": "replace",
+                "path": "a.rs",
+                "start": 1,
+                "end": 1,
+                "expect": ["x"],
+                "new": ["y"]
+            }],
+            "summary": "s"
+        });
+        assert!(!schema_validates(&schema, &wrong_tag));
+
+        // Unknown top-level fields are closed off by
+        // `additionalProperties: false` / `deny_unknown_fields`.
         let mut unknown = ops_shape;
         unknown
             .as_object_mut()
             .expect("object")
             .insert("bogus".into(), json!(true));
         assert!(
-            serde_json::from_value::<PatchProposal>(unknown).is_err(),
+            serde_json::from_value::<PatchProposal>(unknown.clone()).is_err(),
             "parser admits an unknown field; regenerate edit_response_schema() (AM-0013-1)"
         );
+        assert!(!schema_validates(&schema, &unknown));
         assert_eq!(
             schema["additionalProperties"],
             json!(false),
