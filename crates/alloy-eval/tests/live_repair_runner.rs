@@ -1,8 +1,8 @@
 //! End-to-end plumbing for the live-repair operator benchmark.
 //!
 //! The real `alloy` binary is replaced by a stub shell script: these tests
-//! never contact a model endpoint, never run `cargo check`, and never touch
-//! the offline RFC-0016 fixture corpus.
+//! never contact a model endpoint, run only offline `cargo check` post-checks,
+//! and never touch the offline RFC-0016 fixture corpus.
 
 #![cfg(unix)]
 
