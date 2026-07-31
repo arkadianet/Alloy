@@ -3,6 +3,9 @@
 Operator tooling that runs the **real `alloy` binary** against the RFC-0016
 **holdout** fixture workspaces with a **live** OpenAI-compatible endpoint.
 
+The wrapper requires Python 3.11+ for standard-library TOML parsing and report
+validation.
+
 > **This is not the offline holdout gate.** Offline CI (`ScriptedProvider` /
 > committed `recordings/*`) stays the milestone falsification target. Results
 > here are live-BYOM evidence for MVP honesty and Beta measurement — they MUST

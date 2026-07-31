@@ -83,9 +83,14 @@ pub struct LiveRepairObservation {
     /// Process exit code of the real `alloy` binary.
     pub exit_code: i32,
     /// Result of the independent post-run `cargo check`, when it ran.
+    ///
+    /// `None` is a legacy observation without post-check evidence. It remains
+    /// parseable for compatibility but can never qualify as a pass.
     #[serde(default)]
     pub compile_clean: Option<bool>,
     /// Exit code from the independent post-run `cargo check`.
+    ///
+    /// A verified clean check carries `Some(0)`.
     #[serde(default)]
     pub cargo_check_exit: Option<i32>,
     /// Retry lines counted in the captured run log.

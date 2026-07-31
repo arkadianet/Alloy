@@ -25,6 +25,16 @@ SCORE_SCRIPT="${SCORE_SCRIPT:-$repo/eval/live-holdout/score.py}"
 
 die() { echo "live-holdout/run.sh: $1" >&2; exit 2; }
 
+if ! python3 - <<'PY'
+import sys
+
+if sys.version_info < (3, 11):
+    raise SystemExit("Python 3.11 or newer is required")
+PY
+then
+  die "Python 3.11 or newer is required"
+fi
+
 resolve_bin() {
   local name="$1"
   local override="${2:-}"
@@ -67,6 +77,7 @@ esac
 case "$TIMEOUT" in
   ''|*[!0-9]*) die "TIMEOUT must be a positive integer of seconds, got '$TIMEOUT'";;
 esac
+[ "$TIMEOUT" -ge 1 ] || die "TIMEOUT must be at least 1 second, got '$TIMEOUT'"
 case "$MODEL$BASEURL" in
   *[\"\\]*) die "MODEL and BASEURL must not contain quotes or backslashes";;
 esac
@@ -114,7 +125,7 @@ done
 mkdir -p "$(dirname -- "$out")"
 exec 9>"$out.lock" || die "could not open lock $out.lock"
 flock -n 9 || die "another live-holdout sweep holds $out.lock"
-: > "$out"
+: > "$out" || die "could not initialize observations file: $out"
 total=0
 process_passed=0
 oracle_passed=0
@@ -125,16 +136,21 @@ for id in "${ids[@]}"; do
   [ -d "$workspace" ] || die "fixture $id missing workspace/ at $workspace"
   target_path="$(fixture_target_path "$FIXTURES/$id/manifest.toml")"
   for rep in $(seq 1 "$REPS"); do
-    ws="$(mktemp -d)"
-    cp -a "$workspace"/. "$ws/"
+    ws="$(mktemp -d)" || die "could not create workspace for $id#$rep"
+    cp -a "$workspace"/. "$ws/" ||
+      die "fixture copy failed for $id#$rep"
     # The golden reference is an oracle input, never model-visible workspace
     # content.
     rm -f "$ws/$target_path.post"
-    cp -a "$repo/profiles" "$ws/profiles"
-    printf '%s' "$router" >"$ws/router.toml"
-    git -C "$ws" init -q
-    git -C "$ws" add -A
-    git -C "$ws" -c user.name=live-holdout -c user.email=live-holdout@localhost commit -qm fixture
+    cp -a "$repo/profiles" "$ws/profiles" ||
+      die "profile copy failed for $id#$rep"
+    printf '%s' "$router" >"$ws/router.toml" ||
+      die "router write failed for $id#$rep"
+    git -C "$ws" init -q || die "git init failed for $id#$rep"
+    git -C "$ws" add -A || die "git add failed for $id#$rep"
+    git -C "$ws" -c user.name=live-holdout \
+      -c user.email=live-holdout@localhost commit -qm fixture ||
+      die "git commit failed for $id#$rep"
     start_ms=$(date +%s%3N)
     if ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout "$TIMEOUT" \
       "$ALLOY" --workspace "$ws" run "$GOAL" --yes >"$ws/run.log" 2>&1; then

@@ -32,11 +32,13 @@ def classify_process(
     exit_code: int,
     log: str,
     compile_clean: bool,
+    cargo_check_exit: int | None,
     reference_match: bool,
 ) -> str:
-    if exit_code == 0 and compile_clean and reference_match:
+    postcheck_clean = compile_clean and cargo_check_exit == 0
+    if exit_code == 0 and postcheck_clean and reference_match:
         return "pass"
-    if exit_code == 0 and not compile_clean:
+    if exit_code == 0 and not postcheck_clean:
         return "process_claimed_success_but_compile_failed"
     if exit_code == 0 and not reference_match:
         return "reference_mismatch"
@@ -94,7 +96,13 @@ def inspect(
             compile_clean = result.returncode == 0
         except subprocess.TimeoutExpired:
             cargo_exit = TIMEOUT_EXIT_CODE
-    failure_class = classify_process(exit_code, log, compile_clean, reference_match)
+    failure_class = classify_process(
+        exit_code,
+        log,
+        compile_clean,
+        cargo_exit,
+        reference_match,
+    )
     return {
         "process_pass": exit_code == 0,
         "compile_clean": compile_clean,
@@ -108,11 +116,12 @@ def inspect(
 
 
 def self_test() -> None:
-    assert classify_process(0, "", True, True) == "pass"
-    assert classify_process(0, "", True, False) == "reference_mismatch"
-    assert classify_process(5, 'reason="kind"', False, False) == "replan_declined_kind"
-    assert classify_process(5, 'reason="exhausted"', False, False) == "repair_budget_exhausted"
-    assert classify_process(TIMEOUT_EXIT_CODE, "", False, False) == "timeout"
+    assert classify_process(0, "", True, 0, True) == "pass"
+    assert classify_process(0, "", True, 101, True) == "process_claimed_success_but_compile_failed"
+    assert classify_process(0, "", True, 0, False) == "reference_mismatch"
+    assert classify_process(5, 'reason="kind"', False, None, False) == "replan_declined_kind"
+    assert classify_process(5, 'reason="exhausted"', False, None, False) == "repair_budget_exhausted"
+    assert classify_process(TIMEOUT_EXIT_CODE, "", False, None, False) == "timeout"
 
 
 def main() -> int:

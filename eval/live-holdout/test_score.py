@@ -84,6 +84,32 @@ class ScoreTests(unittest.TestCase):
                     1,
                 )
 
+    def test_rejects_inconsistent_compile_and_failure_fields(self) -> None:
+        with self.fixture_root():
+            inconsistent_compile = row("fixture_a", 1, True)
+            inconsistent_compile["cargo_check_exit"] = 101
+            with self.assertRaisesRegex(ValueError, "cargo_check_exit"):
+                validate_rows(
+                    [inconsistent_compile],
+                    ["fixture_a"],
+                    MODEL,
+                    0.6,
+                    BASE_URL,
+                    1,
+                )
+
+            inconsistent_failure = row("fixture_a", 1, False)
+            inconsistent_failure["failure_class"] = "pass"
+            with self.assertRaisesRegex(ValueError, "failure_class"):
+                validate_rows(
+                    [inconsistent_failure],
+                    ["fixture_a"],
+                    MODEL,
+                    0.6,
+                    BASE_URL,
+                    1,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

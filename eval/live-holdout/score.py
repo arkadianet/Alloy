@@ -81,6 +81,8 @@ def validate_rows(
         if missing:
             raise ValueError(f"observation line {index} missing fields: {sorted(missing)}")
         fixture_id = row["fixture_id"]
+        if not isinstance(fixture_id, str):
+            raise ValueError(f"fixture_id must be a string on observation line {index}")
         if fixture_id not in grouped:
             raise ValueError(f"unknown fixture id {fixture_id!r} on observation line {index}")
         for field in ("process_pass", "compile_clean", "reference_match", "oracle_pass"):
@@ -88,18 +90,49 @@ def validate_rows(
                 raise ValueError(f"{field} must be boolean on observation line {index}")
         if not isinstance(row["repetition"], int) or isinstance(row["repetition"], bool):
             raise ValueError(f"repetition must be an integer on observation line {index}")
+        for field in ("exit_code", "repair_generations", "wall_ms"):
+            if not isinstance(row[field], int) or isinstance(row[field], bool):
+                raise ValueError(f"{field} must be an integer on observation line {index}")
+            if row[field] < 0 and field != "exit_code":
+                raise ValueError(f"{field} must be non-negative on observation line {index}")
+        cargo_exit = row["cargo_check_exit"]
+        if cargo_exit is not None and (
+            not isinstance(cargo_exit, int) or isinstance(cargo_exit, bool)
+        ):
+            raise ValueError(f"cargo_check_exit must be an integer or null on observation line {index}")
+        if not isinstance(row["failure_class"], str):
+            raise ValueError(f"failure_class must be a string on observation line {index}")
+        for field in ("model", "base_url", "corpus"):
+            if not isinstance(row[field], str):
+                raise ValueError(f"{field} must be a string on observation line {index}")
+        if not isinstance(row["temperature"], (int, float)) or isinstance(
+            row["temperature"], bool
+        ):
+            raise ValueError(f"temperature must be numeric on observation line {index}")
         if row["process_pass"] != (row["exit_code"] == 0):
             raise ValueError(f"inconsistent process fields on observation line {index}")
+        if row["compile_clean"] and cargo_exit != 0:
+            raise ValueError(f"compile_clean=true requires cargo_check_exit=0 on observation line {index}")
+        if not row["compile_clean"] and cargo_exit == 0:
+            raise ValueError(f"compile_clean=false forbids cargo_check_exit=0 on observation line {index}")
         if row["model"] != model or row["base_url"] != base_url:
             raise ValueError(f"endpoint mismatch on observation line {index}")
         if not math.isclose(float(row["temperature"]), temperature, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(f"temperature mismatch on observation line {index}")
         if row["corpus"] != "rfc0016-holdout-live":
             raise ValueError(f"wrong corpus on observation line {index}")
-        if row["oracle_pass"] != (
-            row["process_pass"] and row["compile_clean"] and row["reference_match"]
-        ):
+        derived_oracle = (
+            row["process_pass"]
+            and row["compile_clean"]
+            and cargo_exit == 0
+            and row["reference_match"]
+        )
+        if row["oracle_pass"] != derived_oracle:
             raise ValueError(f"inconsistent oracle fields on observation line {index}")
+        if (row["oracle_pass"] and row["failure_class"] != "pass") or (
+            not row["oracle_pass"] and row["failure_class"] == "pass"
+        ):
+            raise ValueError(f"inconsistent failure_class on observation line {index}")
         grouped[fixture_id].append(row)
 
     for fixture_id, fixture_rows in grouped.items():
