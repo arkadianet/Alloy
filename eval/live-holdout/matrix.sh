@@ -26,6 +26,7 @@ fi
 mkdir -p "$out_dir" || { echo "matrix.sh: cannot create $out_dir" >&2; exit 2; }
 
 arm_args=()
+declare -A seen_arms=()
 status=0
 while IFS=$'\t' read -r arm_id model temperature profile base_url reps; do
   case "$arm_id" in
@@ -38,6 +39,11 @@ while IFS=$'\t' read -r arm_id model temperature profile base_url reps; do
   case "$arm_id" in
     *[!A-Za-z0-9_.-]*) echo "matrix.sh: invalid arm id $arm_id" >&2; exit 2 ;;
   esac
+  if [ -n "${seen_arms[$arm_id]+x}" ]; then
+    echo "matrix.sh: duplicate arm id $arm_id" >&2
+    exit 2
+  fi
+  seen_arms[$arm_id]=1
   case "$profile" in
     default|autonomous) ;;
     *) echo "matrix.sh: invalid profile $profile" >&2; exit 2 ;;
@@ -52,7 +58,7 @@ while IFS=$'\t' read -r arm_id model temperature profile base_url reps; do
   echo "RUN $arm_id: model=$model profile=$profile temp=$temperature reps=$reps"
   if ! MODEL="$model" TEMP="$temperature" PROFILE="$profile" BASEURL="$base_url" \
     REPS="$reps" EVAL_HOLDOUT="$eval_holdout" \
-    "$repo/eval/live-holdout/run.sh" "$observations"; then
+    "$repo/eval/live-holdout/run.sh" "$observations" </dev/null; then
     status=1
   fi
   [ -f "$report" ] || {
@@ -63,7 +69,9 @@ while IFS=$'\t' read -r arm_id model temperature profile base_url reps; do
   arm_args+=(--arm "$arm_id=$report")
 done <"$arms"
 
-[ "${#arm_args[@]}" -ge 4 ] || {
+# Each complete arm contributes two array elements (--arm and id=report).
+arm_count=$((${#arm_args[@]} / 2))
+[ "$arm_count" -ge 2 ] || {
   echo "matrix.sh: at least two complete arms are required" >&2
   exit 2
 }

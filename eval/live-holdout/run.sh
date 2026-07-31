@@ -67,9 +67,7 @@ esac
 case "$MODEL$BASEURL" in
   *[\"\\]*) die "MODEL and BASEURL must not contain quotes or backslashes";;
 esac
-case "$TEMP" in
-  ''|*[!0-9.]*) die "TEMP must be a number, got '$TEMP'";;
-esac
+[[ "$TEMP" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "TEMP must be a number, got '$TEMP'"
 case "$PROFILE" in
   default|autonomous) ;;
   *) die "PROFILE must be default or autonomous, got '$PROFILE'";;
@@ -111,7 +109,8 @@ unexecutable=0
 for id in "${ids[@]}"; do
   workspace="$FIXTURES/$id/workspace"
   [ -d "$workspace" ] || die "fixture $id missing workspace/ at $workspace"
-  target_path="$(fixture_target_path "$FIXTURES/$id/manifest.toml")"
+  target_path="$(fixture_target_path "$FIXTURES/$id/manifest.toml")" ||
+    die "fixture $id manifest has no naive_target_path"
   for rep in $(seq 1 "$REPS"); do
     ws="$(mktemp -d)" || die "could not create workspace for $id#$rep"
     cp -a "$workspace"/. "$ws/" ||
@@ -153,16 +152,17 @@ for id in "${ids[@]}"; do
         fi
         ;;
     esac
+    oracle_out="$("$EVAL_HOLDOUT" oracle \
+      --fixture-dir "$FIXTURES/$id" \
+      --workspace "$ws" \
+      --run-log "$ws/run.log" \
+      --exit-code "$code" \
+      --compile-clean "$compile_clean" \
+      --cargo-check-exit "$cargo_check_exit")" ||
+      die "oracle failed for $id#$rep"
     read -r process_pass compile_clean reference_match oracle_pass failure_class \
-      cargo_check_exit generations <<<"$(
-      "$EVAL_HOLDOUT" oracle \
-        --fixture-dir "$FIXTURES/$id" \
-        --workspace "$ws" \
-        --run-log "$ws/run.log" \
-        --exit-code "$code" \
-        --compile-clean "$compile_clean" \
-        --cargo-check-exit "$cargo_check_exit"
-    )" || die "oracle failed for $id#$rep"
+      cargo_check_exit generations <<<"$oracle_out" ||
+      die "oracle parse failed for $id#$rep"
     total=$((total + 1))
     [ "$process_pass" = "true" ] && process_passed=$((process_passed + 1))
     [ "$oracle_pass" = "true" ] && oracle_passed=$((oracle_passed + 1))

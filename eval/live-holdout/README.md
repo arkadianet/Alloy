@@ -67,7 +67,7 @@ Exit codes:
 | Exit | Meaning |
 | --- | --- |
 | `0` | Sweep ran; fixture failures are a result |
-| `2` | Broken before start (bad config / missing binary) |
+| `2` | Startup failure (bad config / missing binary), or post-sweep report validation failure (inconsistent observations, repetition gaps) from `score` |
 | `3` | At least one repetition could not execute `alloy` |
 
 The strict-oracle score is still operator telemetry only — do not cite it as
