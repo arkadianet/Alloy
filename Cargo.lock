@@ -45,6 +45,7 @@ name = "alloy-eval"
 version = "0.1.0"
 dependencies = [
  "alloy-runtime",
+ "alloy-tools",
  "async-trait",
  "criterion",
  "regex",

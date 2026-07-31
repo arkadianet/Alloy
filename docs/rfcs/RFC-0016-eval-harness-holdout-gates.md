@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Implemented (Day-1 harness skeleton + offline scripted ControlPlane driver; live stack driver deferred to M7) |
+| **Status** | Implemented (Day-1 harness skeleton + offline scripted ControlPlane driver + optional live `stack-driver` ControlPlane path) |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0007](./RFC-0007-model-router-provider.md) (merged) |
@@ -58,7 +58,7 @@ RFC-0001 created the five-crate workspace including `alloy-eval` as an empty stu
 | Lifetime-heavy fixtures as P0 | Deferred (V2 §4.1 stretch) |
 | Alloy-on-Alloy dogfood | **Banned** until sandbox + holdout green (ADR F-07) |
 | Numeric cost marketing claims | **Forbidden** until calibrated (V2 §18 / ADR F-08) |
-| End-to-end live scheduler/CLI holdout loop | **Stub** here; activates when RFCs 0008–0015 land (M7) |
+| End-to-end live scheduler/CLI holdout loop | Optional feature `stack-driver` (§5.9); thesis citation requires it |
 | Sixth crate, OTLP, redesign of merged router APIs | Forbidden |
 | Writing or overwriting `.env` | Forbidden |
 
@@ -69,7 +69,7 @@ RFC-0001 created the five-crate workspace including `alloy-eval` as an empty stu
 3. `RecordingModelProvider` on `main` MUST remain unchanged (FIFO). This RFC MUST NOT dual-mode it.
 4. At least **one** train fixture and **one** holdout fixture MUST exist under the §7 layout, each with a valid manifest, workspace snapshot, scripted turns, and recorded cargo JSON for the pre-repair (failing) and post-repair (passing) states.
 5. `EvalHarness::run_fixture` / `run_batch` MUST be offline by construction, MUST aggregate `EvalMetrics`, and MUST classify each fixture as `Pass | Fail | Error` (§5). Day-1 exposes no offline toggle or live-provider mode.
-6. The pure `gate::evaluate_gate` function MUST apply validated thresholds and MUST implement the naive-baseline comparison semantics in §5.8. Skeleton builds MUST compile and unit-test the comparison; full control-plane execution against the live stack is **Stub** until §12.2 owners land.
+6. The pure `gate::evaluate_gate` function MUST apply validated thresholds and MUST implement the naive-baseline comparison semantics in §5.8. Skeleton builds MUST compile and unit-test the comparison; full control-plane execution against the live stack is behind feature `stack-driver` (§5.9 / §12.2).
 7. Cost fields MAY be computed internally as uncalibrated operator-price-table estimates. Reports MUST carry `CostClaimGrade::UncalibratedInternal` and MUST NOT emit marketing-grade cost claims (§3.8 / §9.3).
 8. CI MUST run `cargo test -p alloy-eval` with no `ALLOY_API_KEY` and with `alloy-runtime` consumed at `default-features = false` (§10).
 9. Alloy MUST NEVER write `.env`.
@@ -144,7 +144,7 @@ This RFC **exercises that MAY as MUST** for the eval harness (keyed mode is requ
 | --- | --- |
 | **Already implemented** | `ModelProvider` / `ModelRouter`; `RecordingModelProvider` (FIFO); router types; `CostMeter` / `CostSnapshot`; `Digest` / `hash_prompt`; `DiagnosticEvent`; MCP `cargo_check` with `--message-format=json` (RFC-0006); sandbox broker (RFC-0005); empty `alloy-eval` stub; toolchain pin `1.97.1` |
 | **Added by RFC-0016** | `ScriptedProvider`; TOML fixture manifest schema + set-aware loader; recorded cargo JSON types + replay; `EvalMetrics` / `MetricField` / serializable report envelope; eval-local trajectory types + optional bounded JSONL artifacts; batch runner; pure gate function + naive baseline types; holdout directory discipline + CI lint; offline-by-construction harness; ≥1 train + ≥1 holdout golden fixture; crate deps with `default-features = false` on `alloy-runtime` |
-| **Deferred / Stub** | Full control-plane fixture driver through scheduler/CLI (0008–0015); any live-provider eval API; calibrated cost grade emission; public leaderboard; lifetime-heavy fixtures; Alloy-on-Alloy dogfood |
+| **Deferred / Stub** | Live-provider eval API (BYOM dual-report); calibrated cost grade emission; public leaderboard; lifetime-heavy fixtures; Alloy-on-Alloy dogfood until Appendix B |
 
 ### 2.6 Dependency boundaries
 
@@ -155,13 +155,13 @@ alloy-eval
    │      └── router traits/types, RecordingModelProvider, CostMeter, Digest
    │      └── MUST NOT enable http-provider for default eval builds
    │
-   └── (M7 only, deferred feature `stack-driver`) alloy-tools
-          └── sandbox + MCP — Stub until M7; not required for Day-1 MVP
+   └── (optional feature `stack-driver`) alloy-tools
+          └── sandbox + MCP + EditEngine — required for thesis-grade live ControlPlane
 ```
 
 - `alloy-eval` remains one of ≤5 crates. **No sixth crate.**
-- Day-1 MUST NOT depend on `alloy-cli`, `alloy-index`, or default-on `http-provider`.
-- The M7 stack driver MAY depend on `alloy-tools` once RFCs 0008–0015 provide the vertical slice. Day-1 MUST NOT expose or enable it and retains the explicit **Stub** (§12).
+- Default builds MUST NOT depend on `alloy-cli`, `alloy-index`, or default-on `http-provider`.
+- Feature `stack-driver` MAY depend on `alloy-tools` (and `tempfile`) for the live ControlPlane path. Default features stay `[]` so offline CI never pulls tools.
 
 ### 2.7 Milestones this gates
 
@@ -1040,8 +1040,8 @@ pub enum SuccessCriterion {
 pub enum FixtureDriverKind {
     /// Day-1: apply scripted model text as a patch file replace + replay cargo JSON.
     SkeletonReplay,
-    /// Offline scripted replay of every manifest turn (§5.9); the live
-    /// scheduler/CLI stack driver remains **Stub** until §12.2.
+    /// Offline scripted replay of every manifest turn by default (§5.9);
+    /// with `--features stack-driver`, the live scheduler/sandbox stack.
     ControlPlane,
     /// Naive baseline driver (§5.8).
     NaiveBaseline,
@@ -2741,15 +2741,19 @@ silently substitute `FixtureSet::Holdout` for the configured set.
 Both successful assembly paths always attach `gate = Some(...)` as specified in
 §3.12.
 
-### 5.9 ControlPlane driver (offline scripted; live stack **Stub**)
+### 5.9 ControlPlane driver (offline scripted default; live `stack-driver`)
 
 **Amended 2026-07-30 (M7 holdout / ControlPlane slice).** The Day-1 rule —
 construct `EvalError::Stub("control_plane driver awaits RFCs 0008-0015")` and
 return an `Error` outcome with no trajectories — is replaced. `alloy-eval`
-now ships an offline scripted `ControlPlane` driver; only the **live** stack
-driver remains Stub.
+ships an offline scripted `ControlPlane` driver by default.
 
-For a fixture with `driver = ControlPlane`:
+**Amended 2026-07-31 (live stack-driver landing).** Feature `stack-driver`
+un-stubs the live scheduler / Landlock / MCP / EditEngine / GenerationDriver
+path behind `driver = ControlPlane`. Thesis citation and dogfood unlock
+require building with `--features stack-driver`.
+
+For a fixture with `driver = ControlPlane` **without** `stack-driver`:
 
 1. Complete §5.2 and §5.4 preflight exactly as `SkeletonReplay`; any failure
    terminates this fixture as `Error`.
@@ -2761,14 +2765,37 @@ For a fixture with `driver = ControlPlane`:
    criterion evaluation, and §5.3.1 carrier rules unchanged.
    `require_consume_all` therefore spans every installed key (§5.5.4).
 
-The **live** control-plane stack driver — scheduler/CLI vertical slice,
-`TomlModelRouter` routing, RFC-0008 sandbox `TextPatch` apply, RFC-0010 live
-compile oracle, RFC-0013 repair/edit workers, and the `stack-driver` feature —
-remains **Stub**: it has no API, feature, or dependency edge in `alloy-eval`
-and activates only when RFCs 0008–0015 land (§12.2). The scripted driver
-shares the golden byte oracle and the recording compile oracle with
-`SkeletonReplay`; it verifies manifest/driver wiring and gate plumbing and is
-not control-plane thesis evidence (§12.1, Appendix B).
+For a fixture with `driver = ControlPlane` **with** `--features stack-driver`:
+
+1. Copy the fixture workspace to a tempdir, init a git commit, and stage a
+   hermetic `CARGO_HOME` (see `alloy-tools` scheduler repair e2e).
+2. If Landlock is unavailable and `ALLOY_REQUIRE_LANDLOCK` is unset, return
+   fixture `Error` with kind `stack_driver_sandbox_unavailable` (never a
+   false-green thesis Pass). When `ALLOY_REQUIRE_LANDLOCK=1`, fail hard.
+3. Assemble the production path: `NativeSandboxBroker` + `GitEditEngine` +
+   `InProcessMcpHost` (`cargo_check` / `apply_patch`) + `CapabilityRegistry`
+   behind `GenerationSwitchCapabilities` (inert gen1 analyze/edit; real
+   registry gen2) + `TomlModelRouter` / `ScriptedProvider` with
+   `NullContextEngine` fingerprints + `TemplatePlanService` +
+   `GenerationDriver` / `RunController`.
+4. Synthesize repair/edit scripted JSON from the fixture golden `*.post`
+   (unified diff). Do not replay skeleton full-file text turns through live
+   workers.
+5. Auto-approve `GateHuman` when `WaitingApproval` so batch runs finish.
+6. Live compile oracle: final workspace source / `cargo_check` must be clean;
+   set `compile_clean` and criteria for `CompileClean` /
+   `ExpectedDiagnosticsCleared` / `NoNewUnsafe`. `ScriptTurnsConsumed` passes
+   when the synthesized scripted provider is exhausted under
+   `require_consume_all`.
+7. Populate `retry_count` from DAG generation when available.
+
+Under `stack-driver`, `NaiveBaseline` applies golden `full_file_replace` and
+runs live sandboxed `cargo_check` without the control-plane DAG — fair thesis
+comparison.
+
+The offline scripted driver remains available without the feature; it shares
+the golden byte oracle and recording compile oracle with `SkeletonReplay` and
+is **not** control-plane thesis evidence (§12.1, Appendix B).
 
 ---
 
@@ -3097,7 +3124,7 @@ eval sessions must not pollute production event stores.
 | `FixtureNotFound` | harness | Missing `<set>/<id>` directory or its `manifest.toml` | no | pub | `load_fixture` / batch `Err` |
 | `Io` | fs / trajectory artifact writer | OS I/O | no | pub | fixture `Error` or batch `Err` |
 | `Json` | serde | Parse or trajectory serialization | no | pub | `Error` |
-| `Stub` | reserved for deferred surfaces (e.g. the live stack driver, §5.9) | Deferred surface invoked | no | pub | fixture `Error` |
+| `Stub` | reserved for remaining deferred surfaces | Deferred surface invoked | no | pub | fixture `Error` |
 | `Internal` | miscellaneous | Invariant | no | pub | `Error` |
 
 Duplicate request fingerprints are not errors. They append to a per-key FIFO.
@@ -3284,10 +3311,10 @@ already exists in `[workspace.dependencies]` and is inherited unchanged.
 
 Feature posture:
 
-| Feature | Day-1 declaration | Purpose / rule |
+| Feature | Declaration | Purpose / rule |
 | --- | --- | --- |
-| `live-provider` | **must not exist** | Deferred to M7; forbidden Day-1 |
-| `stack-driver` | **must not exist** | Deferred to M7; the live `ControlPlane` stack driver remains **Stub** (§5.9) |
+| `live-provider` | **must not exist** | Forbidden; live HTTP BYOM is out of band for holdout gates |
+| `stack-driver` | **optional, default-off** | Live `ControlPlane` stack driver (§5.9); pulls optional `alloy-tools` + `tempfile`. Thesis citation requires `--features stack-driver`. Default `cargo test -p alloy-eval` stays offline. |
 
 ### 10.2 Offline guarantee
 
@@ -3538,33 +3565,34 @@ CI script fails when diff intersects holdout fixtures and prompt/template paths 
 - Offline-by-construction CI + exact license checks + holdout hygiene lint
 - Dogfood ban documentation pointer (ADR F-07)
 
-**Scope of the Day-1 naive comparison (normative).** Because both sides run
-against scripted turns and a golden byte oracle, the Day-1
+**Scope of the default (offline) naive comparison (normative).** Because both
+sides run against scripted turns and a golden byte oracle, the default
 `run_holdout_with_naive` path exercises the comparison and gate **arithmetic**
 only — it is plumbing verification, not evidence for or against the
-control-plane thesis, and no result from it may be cited as a falsification
-outcome until the live `ControlPlane` stack driver lands (§5.9 / §12.2) and
-drives the real scheduler/CLI slice. The offline scripted `ControlPlane`
-driver (§5.9, M7 slice) runs the same scripted turns and oracle under
-`driver = ControlPlane` manifests: it extends this plumbing verification to
-the exact M7 manifest/driver wiring, and it changes nothing about this scope
-rule.
+control-plane thesis. The offline scripted `ControlPlane` driver (§5.9) extends
+that plumbing to `driver = ControlPlane` manifests and still is not thesis
+evidence.
+
+**Thesis citation (normative).** A holdout falsification result may be cited
+only when the run was built with `--features stack-driver`, executed the live
+ControlPlane stack driver of §5.9, and compared against the live naive
+baseline (golden apply + live `cargo_check`) on the same fixtures.
 
 ### 12.2 Deferred / Stub (reference only — no design here)
 
 | Item | Owner | Stub behaviour |
 | --- | --- | --- |
-| Real TextPatch apply under sandbox | **RFC-0008** | Golden byte oracle |
-| VerifyCompile live adapter | **RFC-0010** | Recording oracle |
-| Repair/Edit workers | **RFC-0013** | Scripted turns only |
-| CLI `alloy eval` UX | **RFC-0015** | `cargo test -p alloy-eval` |
-| Live ControlPlane stack driver execution | 0008–0015 (M7) | Offline scripted replay per §5.9; no live API or feature |
-| Live BYOM dual-report vs scripted | **RFC-0007** + M7 | no Day-1 API or feature |
+| Real TextPatch apply under sandbox | **RFC-0008** | Landed; live path via `stack-driver` |
+| VerifyCompile live adapter | **RFC-0010** | Landed; live path via `stack-driver` |
+| Repair/Edit workers | **RFC-0013** | Landed; live path via `stack-driver` (scripted worker JSON from golden) |
+| CLI `alloy eval` UX | **RFC-0015** | `cargo test -p alloy-eval` (+ `--features stack-driver` for thesis) |
+| Live ControlPlane stack driver execution | 0008–0015 | **Landed** behind `stack-driver` (§5.9); default build stays offline scripted |
+| Live BYOM dual-report vs scripted | **RFC-0007** + follow-up | no holdout API; operator live-repair corpus is separate |
 | Developer recording utility | Eval follow-up | optional non-default `recapture` feature; separate binary only, no public `EvalHarness::recapture_cargo` |
 | Calibrated marketing cost | Post-holdout calibration RFC | enum reserved; emission locked Uncalibrated |
 | Lifetime-heavy fixtures | V2 stretch | absent |
 | Public leaderboard | V2 deferred | absent |
-| Alloy-on-Alloy dogfood | ADR F-07 | banned |
+| Alloy-on-Alloy dogfood | ADR F-07 | banned until Appendix B conditions (including live stack) |
 
 ---
 
@@ -3611,7 +3639,7 @@ Every criterion is independently testable.
 | 35 | Cost grade emission is only `UncalibratedInternal`; numeric marketing claim remains absent and public Day-1 cost is unmeasured | cost tests |
 | 36 | ≥1 train and ≥1 holdout golden pass schema/recording/criteria requirements | golden fixture tests |
 | 37 | Holdout hygiene lint and owner discipline are present at exactly `.github/workflows/eval-holdout-hygiene.yml` and CODEOWNERS line `crates/alloy-eval/fixtures/holdout/ @arkadianet` | workflow/CODEOWNERS review |
-| 38 | ControlPlane driver is an offline scripted replay of every manifest turn; the live stack driver remains a documented Stub; dogfood ban remains | control-plane driver unit tests; crate rustdoc; Appendix B |
+| 38 | Default ControlPlane driver is an offline scripted replay of every manifest turn; live stack driver is available behind `stack-driver`; dogfood ban remains until Appendix B live-stack conditions | control-plane driver unit tests; `tests/stack_driver_holdout.rs`; Appendix B |
 | 39 | `#![forbid(unsafe_code)]` and `#![deny(missing_docs)]` are both present on `alloy-eval`’s crate root, ≤5 crates, and no `.env` writes remain invariant; a missing rustdoc on any public §3 item fails the build | crate attrs, `cargo doc`/`cargo clippy` clean, workspace review, CI scan |
 | 40 | `ScriptedProvider::new` is fallible and requires `endpoint.provider == id` with the exact Manifest error; endpoint construction creates the id first | `scripted_constructor_provider_match`; §6.3 compile test |
 | 41 | `FixtureId::new` rejects `"."`/`".."` and all invalid forms with Manifest; fingerprint bad hex also uses Manifest | constructor validation tests |
@@ -3685,8 +3713,14 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 - [x] `driver = "control_plane"` golden coverage in both sets: holdout `e0502_holdout_01` (single-turn) and `e0502_holdout_02` (multi-turn), train `e0502_train_control_01` (multi-turn).
 - [x] Holdout gate plumbing green via `run_holdout_with_naive`: gate passes with `require_beat_naive = true`, every control fixture uses `control_plane` and replays all of its turns, the naive side invokes only the ordinal-0 repair turn, and the comparison control copy equals the report metrics (`e2e_holdout_with_naive`).
 - [x] AC 38/78 supersession documented (§5.9, §12.1–§12.2, Appendix B): the scripted offline ControlPlane satisfies manifest/driver wiring and gate plumbing only.
-- [ ] Live scheduler/CLI stack driver (`stack-driver` feature, `TomlModelRouter`, sandbox apply, live compile oracle) — blocked on RFCs 0008–0015 outside `alloy-eval`; remains the documented **Stub** (§5.9, §12.2).
-- [ ] Thesis falsification and dogfood unlock — still require the live stack per §12.1–§12.2 and Appendix B.
+
+**Live stack-driver landing (2026-07-31, branch `cursor/mvp-live-holdout-beta-7632`):**
+- [x] Feature `stack-driver` (default-off) depends on optional `alloy-tools` + `tempfile`; default `cargo test -p alloy-eval` stays offline.
+- [x] Live ControlPlane path ports the scheduler repair e2e assembly (`NullContextEngine` fingerprints, `GenerationSwitchCapabilities`, hermetic `CARGO_HOME`, Landlock, auto-approve gate) and synthesizes repair/edit JSON from golden `*.post`.
+- [x] Live naive path under `stack-driver`: golden `full_file_replace` + live sandboxed `cargo_check`.
+- [x] Integration test `tests/stack_driver_holdout.rs` covers `e0502_holdout_01` (+ naive); skips without Landlock unless `ALLOY_REQUIRE_LANDLOCK=1`.
+- [x] RFC §5.9 / §10.1 / §12.1–§12.2 / Appendix B updated: thesis citation requires `--features stack-driver`.
+- [ ] Full holdout suite thesis green under Landlock CI (`ALLOY_REQUIRE_LANDLOCK=1`) and dogfood unlock review per Appendix B.
 
 ---
 
@@ -3700,11 +3734,10 @@ notes, not permission to vary this RFC:
    `RecordingModelProvider` in `alloy-runtime`. **Code wins** for what exists,
    and this RFC supplies the distinct eval type. No runtime rename or extension
    is contemplated.
-2. **M7 stack-driver location:** Whether M7 links a future `stack-driver` in
-   `alloy-eval` or invokes `alloy-cli` as a process is decided by the M7
-   integration RFC after RFCs 0010/0015 stabilize. The crate exposes neither
-   feature nor live API; the offline scripted `ControlPlane` driver (§5.9)
-   covers manifest/driver wiring until that decision lands.
+2. **stack-driver location (settled):** Live ControlPlane assembles inside
+   `alloy-eval` behind feature `stack-driver` (optional `alloy-tools` edge).
+   Thesis runs use `cargo test -p alloy-eval --features stack-driver`. The
+   offline scripted `ControlPlane` driver remains the default.
 
 ---
 
@@ -3781,16 +3814,13 @@ unlock it on evidence the thesis was never tested.
 
 Mechanically, the unlock reviewer MUST confirm that for the green run every
 outcome in `EvalReport.fixtures` came from a manifest whose `driver` is
-`control_plane`, and that the run executed through the **live** scheduler/CLI
-stack driver — not the offline scripted driver of §5.9. Day-1 enforced this
-vacuously: its `ControlPlane` always returned an `EvalError::Stub` outcome,
-and any `Error` outcome fires `GateFailure::FixtureErrorsPresent`, so no
-Day-1 build could satisfy conditions 2 and 3 together. The M7 scripted driver
-can now produce an all-`control_plane` green holdout run as gate plumbing
-(§12.1), so the manifest check alone no longer separates plumbing from thesis
-evidence; the reviewer MUST additionally verify the run used the live stack
-driver, which remains Stub until RFCs 0008–0015 land (§12.2). The ban
-therefore stays in force.
+`control_plane`, and that the run was built with `--features stack-driver`
+and executed the **live** scheduler/sandbox/MCP stack driver of §5.9 — not
+the offline scripted driver. The default/scripted ControlPlane can produce an
+all-`control_plane` green holdout run as gate plumbing (§12.1); that alone is
+not thesis evidence. Scripted ControlPlane remains not thesis-citable;
+`stack-driver` is. The ban stays in force until a reviewed live-stack green
+holdout satisfies all three conditions.
 
 ## Appendix C — Minimal train fixture intent (informative)
 

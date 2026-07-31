@@ -4,6 +4,10 @@
 //! without network access, aggregates eval metrics, evaluates gates, and can
 //! compare holdout control runs against the naive single-turn baseline.
 //!
+//! Optional feature `stack-driver` enables the live ControlPlane path
+//! (scheduler + Landlock sandbox + MCP + EditEngine). Thesis citation requires
+//! that feature; the default build stays offline.
+//!
 //! It additionally hosts the `live_repair` module, the **operator**
 //! live-endpoint repair benchmark rooted at [`LiveRepairCorpus`] and
 //! [`LiveRepairReport`]. That surface is deliberately disjoint from the holdout gates: a

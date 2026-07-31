@@ -1,15 +1,18 @@
-//! Offline scripted control-plane driver for RFC-0016 holdout control runs.
+//! Control-plane driver for RFC-0016 holdout control runs.
 //!
-//! M7 wires this path through the scheduler/CLI vertical slice (RFCs
-//! 0008–0015). Until that stack is available inside `alloy-eval`, the driver
-//! replays every manifest turn via [`ScriptedProvider`] with the same golden
-//! byte oracle as [`super::skeleton`]. Live DAG execution, sandbox apply, and
-//! `TomlModelRouter` integration remain blocked on those RFCs.
+//! Default (offline) build: scripted replay of every manifest turn via
+//! [`ScriptedProvider`] with the golden byte oracle ([`super::skeleton`]).
+//!
+//! With `--features stack-driver`: live scheduler / Landlock / MCP /
+//! EditEngine / GenerationDriver path ([`super::stack`]). Thesis citation
+//! requires the live feature; offline scripted ControlPlane remains gate
+//! plumbing only (RFC-0016 §5.9 / Appendix B).
 
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+#[cfg(not(feature = "stack-driver"))]
 use crate::driver::skeleton::{run_scripted, ScriptedDriverMode};
 use crate::harness::{FixtureRunOutput, LoadedFixture};
 use crate::scripted::ScriptedProvider;
@@ -19,18 +22,37 @@ pub(crate) async fn run(
     provider: Arc<ScriptedProvider>,
     cancel: Option<CancellationToken>,
 ) -> FixtureRunOutput {
-    run_scripted(fixture, provider, cancel, ScriptedDriverMode::ControlPlane).await
+    #[cfg(feature = "stack-driver")]
+    {
+        let _ = provider;
+        return crate::driver::stack::run_live(fixture, cancel).await;
+    }
+    #[cfg(not(feature = "stack-driver"))]
+    {
+        run_scripted(fixture, provider, cancel, ScriptedDriverMode::ControlPlane).await
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "stack-driver")))]
 mod tests {
     use super::*;
+    use crate::driver::skeleton::{run_scripted, ScriptedDriverMode};
     use crate::fingerprint::RequestFingerprint;
     use crate::harness::tests::{loaded_fixture_for_tests, response_outcome};
     use crate::manifest::{FixtureDriverKind, ScriptTurnOutcome};
     use crate::report::FixtureStatus;
     use crate::scripted::ScriptOutcome;
     use alloy_runtime::Usage;
+
+    /// Offline scripted semantics — exercised directly so
+    /// `--features stack-driver` does not rewrite these unit tests onto the
+    /// live path.
+    async fn run_offline(
+        fixture: &LoadedFixture,
+        provider: Arc<ScriptedProvider>,
+    ) -> FixtureRunOutput {
+        run_scripted(fixture, provider, None, ScriptedDriverMode::ControlPlane).await
+    }
 
     #[tokio::test]
     async fn control_plane_replays_all_turns_offline() {
@@ -42,7 +64,7 @@ mod tests {
         fixture.paths.golden = golden;
         let provider = fixture.scripts.as_ref().unwrap().clone();
 
-        let output = run(&fixture, provider, None).await;
+        let output = run_offline(&fixture, provider).await;
 
         assert_eq!(
             output.outcome.status,
@@ -87,7 +109,7 @@ mod tests {
         ));
         let provider = fixture.scripts.as_ref().unwrap().clone();
 
-        let output = run(&fixture, Arc::clone(&provider), None).await;
+        let output = run_offline(&fixture, Arc::clone(&provider)).await;
 
         assert_eq!(
             output.outcome.status,
@@ -131,7 +153,7 @@ mod tests {
         ));
         let provider = fixture.scripts.as_ref().unwrap().clone();
 
-        let output = run(&fixture, Arc::clone(&provider), None).await;
+        let output = run_offline(&fixture, Arc::clone(&provider)).await;
 
         assert_eq!(
             output.outcome.status,

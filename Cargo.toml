@@ -20,9 +20,13 @@ rust-version = "1.97"
 # Dependents opt into `http-provider` explicitly so offline crates (alloy-eval)
 # never link reqwest (RFC-0016 §10.1).
 alloy-runtime = { path = "crates/alloy-runtime", default-features = false }
-# RFC-0013 T20: `alloy-tools` takes this as a dev-dependency only (rule C2 —
-# no cycle: alloy-eval depends on alloy-runtime alone).
+# RFC-0013 T20 / RFC-0016 §2.6: `alloy-tools` takes `alloy-eval` as a
+# **dev-dependency** only. `alloy-eval` may take `alloy-tools` as an optional
+# normal dependency behind feature `stack-driver` (default-off) — no cycle in
+# the default offline graph.
 alloy-eval = { path = "crates/alloy-eval", default-features = false }
+alloy-tools = { path = "crates/alloy-tools" }
+alloy-index = { path = "crates/alloy-index" }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
