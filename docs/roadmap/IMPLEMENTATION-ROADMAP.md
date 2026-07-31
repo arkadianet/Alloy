@@ -382,7 +382,7 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 **Theme:** V2 §19.2 thesis: graph projections + Repair/Edit/Review improve holdout success/cost **or** clearly measure why not. Still linear cargo/edits; still git checkpoints; still no redesign.
 
 **RFCs completed:**
-- [RFC-0011](../rfcs/RFC-0011-project-graph.md) **deep** (syn symbols + diagnostics/fix ingest + un-stubbed Callers/Refs/Impls/SimilarFixes; cargo metadata / RA passthrough still deferred)
+- [RFC-0011](../rfcs/RFC-0011-project-graph.md) **deep** (syn symbols + diagnostics/fix ingest + un-stubbed Callers/Refs/Impls/SimilarFixes; **cargo metadata deferred post-Beta** — needs host sandboxed Exec; SEC5 keeps index exec-free; RA passthrough still deferred as available)
 - [RFC-0012](../rfcs/RFC-0012-context-engine.md) **deep** (WorkingSet graph projections; weight hygiene landed — measured re-derivation deferred to holdout)
 - [RFC-0014](../rfcs/RFC-0014-language-backend-rust.md) (Rust-only internal module)
 - Review worker polish (already in 0013 optional—quality bar, not new RFC)

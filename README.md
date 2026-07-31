@@ -103,7 +103,7 @@ clippy/fmt clean, no in-scope TODOs, review approved).
 | [0008](docs/rfcs/RFC-0008-edit-engine.md) | EditEngine (TextPatch + git checkpoint) | ✅ Implemented |
 | [0009](docs/rfcs/RFC-0009-task-dag-templates-planner.md) | Task DAG, templates & planner | ✅ Implemented |
 | [0010](docs/rfcs/RFC-0010-scheduler-runtime-adapters.md) | Scheduler & runtime adapters | ✅ Implemented |
-| [0011](docs/rfcs/RFC-0011-project-graph.md) | ProjectGraph (`alloy-index`) | ✅ Implemented (cargo metadata / RA deferred) |
+| [0011](docs/rfcs/RFC-0011-project-graph.md) | ProjectGraph (`alloy-index`) | ✅ Implemented (cargo metadata **post-Beta**; RA deferred) |
 | [0012](docs/rfcs/RFC-0012-context-engine.md) | Context engine | ✅ Implemented (measured weights → holdout) |
 | [0013](docs/rfcs/RFC-0013-capability-registry-workers.md) | Capability workers | ✅ Implemented |
 | [0014](docs/rfcs/RFC-0014-language-backend-rust.md) | LanguageBackend (Rust) | ✅ Implemented (RA / SemanticEditOp deferred) |

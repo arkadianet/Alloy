@@ -774,7 +774,7 @@ The §12.4 greps are ~0.25 pd and are the portion worth spending during **M7**.
 | Second language after ≥ 6 months dogfood; freeze then | §18 | — |
 | Scheduler / MCP unchanged on upgrade | Control plane stays language-free | RS10, T27 |
 | ADR F-15: do not delete the trait | The whole RFC | RS1, RS9 |
-| V2 §7.2 "ingest from cargo metadata + syn" | §5 (the syn half; `cargo metadata` remains out of scope per RFC-0011 §6.2) | SY1–SY15 |
+| V2 §7.2 "ingest from cargo metadata + syn" | §5 (the syn half; `cargo metadata` deferred **post-Beta** per RFC-0011 §1.4 / §6.2 / §14.2) | SY1–SY15 |
 | V2 §20 R16 degraded mode | Fidelity is truthful; failures degrade, never fail | A-0014-4, SC7 |
 
 ---
