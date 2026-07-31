@@ -170,13 +170,20 @@ def compare_reports(named_reports: list[tuple[str, dict[str, Any]]]) -> dict[str
 def render_summary(comparison: dict[str, Any]) -> str:
     lines = [
         f"baseline={comparison['baseline']} repetitions={comparison['repetitions']}",
-        "arm\toracle\tprocess\tcompile\treference",
+        "arm\toracle\toracle_wilson95\tprocess\tcompile\treference",
     ]
     for arm in comparison["arms"]:
         overall = arm["overall"]
+        interval = overall["oracle"]["wilson95"]
+        interval_text = (
+            "unmeasured"
+            if interval is None
+            else f"[{interval['low']:.6f},{interval['high']:.6f}]"
+        )
         lines.append(
             f"{arm['arm_id']}\t"
             f"{overall['oracle']['passes']}/{overall['oracle']['attempts']}\t"
+            f"{interval_text}\t"
             f"{overall['process']['passes']}/{overall['process']['attempts']}\t"
             f"{overall['compile_clean']['passes']}/{overall['compile_clean']['attempts']}\t"
             f"{overall['reference_match']['passes']}/{overall['reference_match']['attempts']}"
