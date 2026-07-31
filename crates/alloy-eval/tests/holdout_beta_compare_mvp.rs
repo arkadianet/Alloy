@@ -5,8 +5,11 @@
 //! [`RecordingModelProvider`] (NullContextEngine fingerprints do not apply).
 //! Prints a small metrics table — no marketing cost claims.
 //!
-//! Why-not (no DomainWeights / profile TOML change): with golden-derived /
-//! committed-recording repair/edit JSON, success and compile rates are
+//! Live arms open + rebuild `SqliteProjectGraph` over the fixture workspace
+//! (CLI assembly parity). Empty-seed WorkingSet assemblies may still log
+//! honest `graph_empty` (no file pins / diagnostic seed paths) — that is not
+//! a null-handle bug. Why-not (no DomainWeights / profile TOML change): with
+//! committed-recording repair/edit JSON, success and compile rates are still
 //! identical across weight arms (provider outputs ignore PromptPack shape).
 //! This harness is measurement prep only; keep `DomainWeights::v2_defaults()`
 //! until independent model outputs produce a real signal (RFC-0012 §14.2).

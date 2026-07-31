@@ -63,7 +63,8 @@ jobs:
         env:
           ALLOY_EVAL_LIVE_STACK: "1"
         run: |
-          cargo test -p alloy-eval --features stack-driver --locked --test stack_driver_holdout -- --nocapture
+          cargo test -p alloy-eval --features stack-driver --locked \
+            --test stack_driver_holdout --test holdout_beta_compare_mvp -- --nocapture
       - name: Clippy (deny warnings)
         run: cargo clippy -p alloy-tools --locked --all-targets -- -D warnings
       - name: Fmt

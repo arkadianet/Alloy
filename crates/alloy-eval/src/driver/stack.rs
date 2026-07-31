@@ -3,11 +3,12 @@
 //! Ports the production assembly proven by
 //! `alloy-tools/tests/scheduler_repair_e2e.rs`: Landlock jail, hermetic
 //! `CARGO_HOME`, `GitEditEngine`, MCP `cargo_check` / `apply_patch`,
-//! `CapabilityRegistry`, `TomlModelRouter` + [`ScriptedProvider`],
-//! `GenerationDriver`, `TemplatePlanService` / `LlmPlanService` +
-//! [`CapabilityPlanProposer`] (LLM-arm smoke), and
-//! [`GenerationSwitchCapabilities`] (inert gen1 analyze/edit so the real
-//! `cargo_check` soft-fails and harvests diagnostics; real registry on gen2).
+//! `SqliteProjectGraph` ingest (syn-deep), `CapabilityRegistry`,
+//! `TomlModelRouter` + [`ScriptedProvider`], `GenerationDriver`,
+//! `TemplatePlanService` / `LlmPlanService` + [`CapabilityPlanProposer`]
+//! (LLM-arm smoke), and [`GenerationSwitchCapabilities`] (inert gen1
+//! analyze/edit so the real `cargo_check` soft-fails and harvests
+//! diagnostics; real registry on gen2).
 //!
 //! Activated only when [`live_stack_requested`] is true (`ALLOY_EVAL_LIVE_STACK=1`
 //! plus this feature). Control-plane repair/edit/planning turns load committed
@@ -22,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloy_index::{GraphOpenOptions, SqliteProjectGraph};
 use alloy_runtime::adapters::SessionGateHumanAdapter;
 use alloy_runtime::context::AssembleRequest;
 use alloy_runtime::runtime::AlloyRuntime;
@@ -40,7 +42,7 @@ use alloy_runtime::{
     GraphViewHandle, LinearScheduler, LinearSchedulerDeps, LlmPlanService, McpVerifyCompileAdapter,
     ModelEndpoint, ModelProvider, ModelResponse, ModelTier, NodeKind, NullContextEngine,
     PlanContext, PlanFingerprints, PlanService, PlannerConfig, PlannerMode,
-    ProcessCostMeterFactory, ProcessRunRouterProvider, ProposerDeps, ProviderId,
+    ProcessCostMeterFactory, ProcessRunRouterProvider, ProjectGraph, ProposerDeps, ProviderId,
     RecordingDecisionLog, RecordingModelProvider, RegistryCapabilityExecutor, ResponseFormat,
     RetentionPolicy, RouterConfig, RunControlState, RunGoalRecord, RunRow, RuntimeConfig,
     SchedConfig, Session, SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService,
@@ -381,10 +383,33 @@ async fn run_live_inner(
             Some(Arc::clone(&decisions) as _),
         ));
         let worker_config = WorkerConfig::default();
+        // Production parity with CLI assembly: open + rebuild SqliteProjectGraph
+        // so WorkerDeps / DefaultContextEngine can resolve Symbol/Callers when
+        // AssembleRequest carries file pins or diagnostic seed paths. Edit turns
+        // with empty seeds still honestly degrade as graph_empty (no seeds ≠
+        // null handle). Committed-recording smoke still ignores PromptPack shape.
+        let graph_store = Arc::new(
+            SqliteProjectGraph::open(GraphOpenOptions::for_data_dir(
+                runtime_dir.path().join("graph"),
+            ))
+            .await
+            .map_err(|e| EvalError::Internal(bound_message(format!("graph open: {e}"))))?,
+        );
+        let ingest = graph_store
+            .rebuild_reported(&workspace_root)
+            .await
+            .map_err(|e| EvalError::Internal(bound_message(format!("graph rebuild: {e}"))))?;
+        if ingest.items == 0 {
+            return Err(EvalError::Internal(bound_message(format!(
+                "graph rebuild ingested 0 items under {}",
+                workspace_root.display()
+            ))));
+        }
+        let graph_handle = GraphViewHandle::new(Arc::clone(&graph_store) as Arc<dyn ProjectGraph>);
         let context: Arc<dyn ContextEngine> = match &options.context_profile {
             Some(profile) => Arc::new(DefaultContextEngine::new(
                 profile.clone(),
-                GraphViewHandle::null(),
+                graph_handle.clone(),
                 storage.events() as _,
                 storage.artifacts() as _,
                 workspace_root.clone(),
@@ -400,7 +425,7 @@ async fn run_live_inner(
                 Some("**".into()),
                 Some("**".into()),
             )),
-            graph: GraphViewHandle::null(),
+            graph: graph_handle,
             artifacts: storage.artifacts(),
             decisions: Arc::clone(&decisions) as _,
             sessions: storage.sessions(),
