@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Draft |
+| **Status** | Implemented (RustBackend + syn deep pass; RA / SemanticEditOp lowering deferred) |
 | **Author** | arkadianet |
 | **Architecture** | [Alloy Architecture V2](../architecture/alloy-architecture-v2.md) (**frozen**) |
 | **Milestone** | **Beta** — explicitly **not required for MVP** ([roadmap](../roadmap/IMPLEMENTATION-ROADMAP.md): "0014 not required for MVP") |
@@ -31,7 +31,7 @@ The [implementation roadmap](../roadmap/IMPLEMENTATION-ROADMAP.md) places RFC-00
 
 Its **near-term value is therefore not code — it is §4, the reserved-seam list.** Six merged RFCs already carry seams that exist only because this backend is coming: `GraphNodeKind::Item`, `GraphEdgeKind::Imports`, the `'item'`/`'imports'` SQL `CHECK` values, `GraphFidelity::SynDeep`, `Session.language_backends: Vec<LanguageId>`, `LanguageId`'s catalog-id shape, and the `SemanticEditOp` envelope. Every one of them looks like dead code to a reviewer sweeping for MVP simplification. §4 names them, states what M7 must not do to them, and pins the statements to CI greps so the answer to "can we delete this?" is a failing test rather than an argument.
 
-Writing that list is worth doing now. Writing the backend is not.
+Writing that list was worth doing before the backend existed. The RustBackend + syn deep pass have since landed (see Status); the historical point of §1.2 remains: M7 must not delete the reserved seams while waiting on Beta.
 
 ### 1.3 Problem statement
 
@@ -56,7 +56,7 @@ Either those seams get an owner with a normative spec, or M7 deletes them and Be
 | --- | --- |
 | Python / TypeScript backends, `cdylib`, dynamic loading, trait-freeze ceremony | Deferred ≥ 6 months of Rust dogfood (V2 §16.1 Evolution) |
 | `SemanticEditOp` lowering beyond fail-closed | RFC-0008 future extension / M3 (one RA-backed op, e.g. `RenameType`) |
-| rust-analyzer passthrough, `GraphFidelity::Analyzer`, `Refs`/`Impls`/`Callers` answers | Deferred; the query variants stay Stub (RFC-0011 Q4–Q6) |
+| rust-analyzer passthrough, `GraphFidelity::Analyzer`, rustc-grade `Refs`/`Impls`/`Callers` | Deferred; syn-grade answers live since A-0011-6 (RFC-0011 Q4–Q6 as amended) |
 | Any Scheduler, MCP-host, or `CapabilityContext` change | **None required** — that is the point of the trait |
 | Replacing RFC-0010's `VerifyCompileAdapter` | Never; see RS7 |
 | New `GraphQuery` variants, new SQL tables | Forbidden by RFC-0011 E.3.3 / Q1 |
@@ -135,7 +135,7 @@ Beta acceptance criterion "LanguageBackend Rust-only; no PY/TS/cdylib" is discha
 | `GraphFidelity::SynDeep` | same file, "Reserved: `syn` item-level parse (Beta)" | Becomes reachable (A-0014-4, RS4) |
 | `derive_node_id` | same file (G3/G4) | Reused unchanged for `Item` ids (SY4) |
 | `GRAPH_MODEL_VERSION = 1` | `crates/alloy-index/src/migrate.rs:17` | Becomes `2` (SY1); `check_model_version` already truncates and re-ingests |
-| `GRAPH_SCHEMA_VERSION = 1` | same file | **Unchanged** — the `CHECK (kind IN (…'item'))` / `CHECK (kind IN (…'imports'))` constraints already admit the Beta rows (SY2) |
+| `GRAPH_SCHEMA_VERSION = 1` | same file | Becomes **`2`** with ledgered table recreation for semantic-edge `CHECK` kinds (SY2 as landed; §2.4) |
 | `IngestReport` | `graph/mod.rs`, doc: "adding a field is an API change by design" | Gains `items` / `imports` counters (amendment A-0014-3) |
 | `IngestLimits` | `crates/alloy-index/src/layout.rs` | Gains `max_items` (amendment A-0014-1) |
 | `parse_rustc_diagnostics` | `crates/alloy-runtime/src/adapters/diagnostics.rs`, re-exported at the crate root | **Reused**, not reimplemented (DN1) |
@@ -392,11 +392,11 @@ This is the section that pays for itself before a line of Beta code is written. 
 
 | # | Rule |
 | --- | --- |
-| **SY1** | Emitting `Item` nodes or `Imports` edges MUST accompany `GRAPH_MODEL_VERSION: 1 → 2` (RFC-0011 S4, E.3.2). `check_model_version` then truncates `graph_edges` / `graph_nodes` / `graph_files` and resets `graph_meta`, so a manifest-only database is **re-ingested, never merged**. |
-| **SY2** | `GRAPH_SCHEMA_VERSION` stays `1`. **No DDL, no migration.** The v1 `CHECK (kind IN ('workspace','crate','module','item'))` and `CHECK (kind IN ('defines','imports'))` constraints already admit the new rows; `graph_nodes.file` / `digest` already carry what an item needs. |
+| **SY1** | Emitting `Item` nodes or `Imports` edges accompanied `GRAPH_MODEL_VERSION: 1 → 2`; A-0011-6 then bumped model version to **`3`** for semantic edges. `check_model_version` truncates `graph_edges` / `graph_nodes` / `graph_files` and resets `graph_meta` on mismatch, so older databases are **re-ingested, never merged**. |
+| **SY2** | `GRAPH_SCHEMA_VERSION` is **`2`**. Semantic-edge kinds (`references` / `calls` / `impls`) required expanding the `graph_edges` `CHECK` list; SQLite cannot alter that constraint in place, so migration recreates the table (ledgered DDL). The original v1 `CHECK` lists already admitted `'item'` / `'imports'`; schema v2 is the landed A-0011-6 state. |
 | **SY3** | Item kinds emitted: `fn`, `struct`, `enum`, `union`, `trait`, `type` alias, `const`, `static` — at module level, any visibility. |
 | **SY4** | Item ids use `derive_node_id(GraphNodeKind::Item, stable_key)` with `stable_key = "<crate_id>\0<module_path>::<ident>"`, mirroring the module key shape already asserted in `graph/mod.rs`'s tests (`"toy-core\0toy_core::io"`). `GraphNodeId::new()` MUST NOT be called (G3). `GraphNode.path` is the Rust path (`toy_core::io::Reader`); `file` is the declaring file; `digest` is that file's SHA-256. |
-| **SY5** | `impl` blocks and associated items are **deferred**. They have no unambiguous path under `UNIQUE (kind, path)` without a name-resolution model the graph does not have. V2 §7.2's mention of `impl` is discharged by the `Impls` query, which stays Stub until RA passthrough. |
+| **SY5** | `impl` blocks and associated items are **deferred** as nodes. They have no unambiguous path under `UNIQUE (kind, path)` without a name-resolution model the graph does not have. V2 §7.2's mention of `impl` is discharged by the `Impls` query: a syn-grade subset answers since A-0011-6; rustc-grade answers stay deferred to RA passthrough. |
 
 ### 5.2 Items
 
@@ -613,8 +613,8 @@ Trait + value types; `RustBackend` with all eight methods; syn item/import pass 
 | --- | --- |
 | Second language (Python/TS) | `LanguageRegistry` keyed by `LanguageId`; `Session.language_backends` is a `Vec` |
 | Dynamic loading / `cdylib` | None, deliberately — rejected by ADR F-15 and RS9 |
-| `impl` blocks / associated items as nodes | `GraphQuery::Impls` (Stub) |
-| Call graph, references | `GraphQuery::Callers` / `Refs` (Stub, Q4–Q6) |
+| `impl` blocks / associated items as nodes | Deferred (SY5); `GraphQuery::Impls` answers the syn-grade subset via A-0011-6 (no impl/method nodes) |
+| Call graph, references (RA-grade) | Syn-grade `Callers` / `Refs` / `Impls` live since A-0011-6; RA passthrough remains for rustc-grade answers |
 | rust-analyzer passthrough | `GraphFidelity::Analyzer` |
 | Graded edge confidence for glob imports | `GraphEdge.confidence` (S6, always 1.0) |
 | `RenameType` lowering | `LanguageManifest.lowerable_ops` + `SemanticEditOp::op_tag()` |
@@ -671,8 +671,8 @@ Trait + value types; `RustBackend` with all eight methods; syn item/import pass 
 
 ### Deep index
 
-- [ ] 24. `GRAPH_MODEL_VERSION` is `2`; `GRAPH_SCHEMA_VERSION` is still `1`; no migration SQL was added (SY1, SY2, T16).
-- [ ] 25. Opening a `model_version = 1` database truncates `graph_nodes`/`graph_edges`/`graph_files`, resets `graph_meta`, and re-ingests deeply (SY1, T16).
+- [x] 24. `GRAPH_MODEL_VERSION` is `3` and `GRAPH_SCHEMA_VERSION` is `2` in `migrate.rs` (SY1's `1→2` for items/imports, then A-0011-6d's `2→3` / schema `1→2` for semantic edges — §2.4); model mismatch still truncates and re-ingests, never merges (T16).
+- [x] 25. Opening a `model_version = 1` database truncates `graph_nodes`/`graph_edges`/`graph_files`, resets `graph_meta`, and re-ingests deeply (SY1, T16).
 - [ ] 26. `Item` nodes exist for module-level `fn`, `struct`, `enum`, `union`, `trait`, `type`, `const`, `static` (SY3).
 - [ ] 27. Item ids come from `derive_node_id(GraphNodeKind::Item, "<crate>\0<module>::<ident>")`; `GraphNodeId::new()` is never called in the ingest path (SY4, T7).
 - [ ] 28. `impl` blocks and associated items produce no nodes (SY5).
@@ -685,9 +685,9 @@ Trait + value types; `RustBackend` with all eight methods; syn item/import pass 
 - [ ] 35. Groups, globs, renames and `pub use` behave as SY12 specifies (T12).
 - [ ] 36. Two ingests of an unchanged tree in separate processes produce identical digests and `IngestReport`s (SY14, T14).
 - [ ] 37. The content digest incorporates items and imports, so IN6's no-bump-when-unchanged still holds (SY15).
-- [ ] 38. `max_items` exists on `IngestLimits`, is enforced, leaves the previous version intact when exceeded, and rejects `0` at open (SY15, T15).
+- [x] 38. `max_items` exists on `IngestLimits`, is enforced, leaves the previous version intact when exceeded, and rejects `0` at open; files above `max_file_bytes` are tracked, skipped, and never parsed (SY15, T15 — incl. `oversized_file_is_tracked_skipped_and_never_parsed`).
 - [ ] 39. `IngestReport` reports `items`, `imports`, and `source: SynDeep` (LO2).
-- [ ] 40. `GraphView.fidelity` is `SynDeep` exactly when `model_version == 2` (T17).
+- [x] 40. `GraphView.fidelity` is `SynDeep` for `model_version >= 2` (T17 — `fidelity_is_syn_deep_from_model_version_two`).
 - [ ] 41. Ingest is still triggered only by the CLI or the runtime host — never a worker, tool or scheduler node (IN1).
 
 ### Diagnostics, test, toolchain, edits
@@ -728,7 +728,7 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 | 6 | Amendments A-0014-1 … A-0014-4 have landed additively with their own tests; no merged field shape changed. | 6 |
 | 7 | Integration tests T16–T19 pass, including the `model_version` 1→2 truncate-and-re-ingest transition over a pre-existing database. | 4 |
 | 8 | Reserved-seam greps T20–T28 pass; §4's negative list is mechanically enforced, not merely written down. | 2 |
-| 9 | The only "not implemented yet" behaviours are the ones this RFC marks **Stub** (`lower_edit`, `impl`-block items, `Refs`/`Impls`/`Callers`). No `TODO`, `todo!()`, `unimplemented!()`, or placeholder in scope. | 9 |
+| 9 | The only "not implemented yet" behaviours are the ones this RFC marks **Stub** / deferred (`lower_edit`, `impl`-block items as nodes, RA-grade answers). Syn-grade `Callers`/`Refs`/`Impls` are live since A-0011-6 — no longer Stub. No `TODO`, `todo!()`, `unimplemented!()`, or placeholder in scope. | 9 |
 | 10 | Public APIs reviewed and stable: §3 signatures match the implementation with no silent drift. | 6 |
 | 11 | RFC text, module docs, and `alloy-index`'s crate docs are up to date — the "Stub / never ingested" language for items and imports is removed where it is no longer true. | 5 |
 | 12 | Code review: **approved**. | 10 |
@@ -774,7 +774,7 @@ The §12.4 greps are ~0.25 pd and are the portion worth spending during **M7**.
 | Second language after ≥ 6 months dogfood; freeze then | §18 | — |
 | Scheduler / MCP unchanged on upgrade | Control plane stays language-free | RS10, T27 |
 | ADR F-15: do not delete the trait | The whole RFC | RS1, RS9 |
-| V2 §7.2 "ingest from cargo metadata + syn" | §5 (the syn half; `cargo metadata` remains out of scope per RFC-0011 §6.2) | SY1–SY15 |
+| V2 §7.2 "ingest from cargo metadata + syn" | §5 (the syn half; `cargo metadata` deferred **post-Beta** per RFC-0011 §1.4 / §6.2 / §14.2) | SY1–SY15 |
 | V2 §20 R16 degraded mode | Fidelity is truthful; failures degrade, never fail | A-0014-4, SC7 |
 
 ---

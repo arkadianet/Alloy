@@ -12,8 +12,9 @@ use crate::types::budget::TokenBudget;
 pub enum PlannerMode {
     /// Closed template catalog (default; every shipped profile).
     Template,
-    /// LLM proposal path, fail-closed onto templates. Opt-in and eval-gated
-    /// (RFC-0017 §12.4); `readonly` profiles reject it at assembly.
+    /// LLM proposal path, fail-closed onto templates. Opt-in until a
+    /// production CapabilityPlanProposer/PlanningWorker holdout (§12.4)
+    /// passes; `readonly` profiles reject it at assembly.
     Llm,
 }
 

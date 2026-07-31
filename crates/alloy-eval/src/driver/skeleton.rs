@@ -40,8 +40,11 @@ thread_local! {
 pub(crate) enum ScriptedDriverMode {
     SkeletonReplay,
     /// Offline scripted control-plane path: all manifest turns, same oracle as
-    /// skeleton replay until the live scheduler/CLI stack driver lands (M7).
+    /// skeleton replay. Live stack requires `ALLOY_EVAL_LIVE_STACK=1` in addition
+    /// to `--features stack-driver`; otherwise this variant is used.
     ControlPlane,
+    /// Offline scripted naive baseline. Live naive requires
+    /// `ALLOY_EVAL_LIVE_STACK=1` plus `--features stack-driver`.
     NaiveBaseline,
 }
 

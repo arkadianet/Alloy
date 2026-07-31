@@ -36,6 +36,11 @@ pub enum EvalError {
     /// Explicit deferred surface invoked.
     #[error("stub: {0}")]
     Stub(String),
+    /// Live stack-driver could not obtain a usable sandbox backend.
+    ///
+    /// Report kind is always `stack_driver_sandbox_unavailable`.
+    #[error("stack_driver_sandbox_unavailable: {0}")]
+    SandboxUnavailable(String),
     /// Internal invariant failure.
     #[error("internal: {0}")]
     Internal(String),
@@ -70,6 +75,10 @@ impl ReportError {
             EvalError::Io(err) => ("io", err.to_string()),
             EvalError::Json(_) => ("json", error.to_string()),
             EvalError::Stub(_) => ("stub", error.to_string()),
+            EvalError::SandboxUnavailable(detail) => (
+                "stack_driver_sandbox_unavailable",
+                format!("stack_driver_sandbox_unavailable: {detail}"),
+            ),
             EvalError::Internal(_) => ("internal", error.to_string()),
         };
         Self {

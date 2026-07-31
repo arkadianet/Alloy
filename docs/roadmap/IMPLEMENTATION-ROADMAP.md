@@ -382,8 +382,8 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 **Theme:** V2 §19.2 thesis: graph projections + Repair/Edit/Review improve holdout success/cost **or** clearly measure why not. Still linear cargo/edits; still git checkpoints; still no redesign.
 
 **RFCs completed:**
-- [RFC-0011](../rfcs/RFC-0011-project-graph.md) **deep** (cargo metadata + syn symbols + diagnostics/fix ingest; RA passthrough as available)
-- [RFC-0012](../rfcs/RFC-0012-context-engine.md) **deep** (WorkingSet graph projections; weight hygiene)
+- [RFC-0011](../rfcs/RFC-0011-project-graph.md) **deep** (syn symbols + diagnostics/fix ingest + un-stubbed Callers/Refs/Impls/SimilarFixes; **cargo metadata deferred post-Beta** — needs host sandboxed Exec; SEC5 keeps index exec-free; RA passthrough still deferred as available)
+- [RFC-0012](../rfcs/RFC-0012-context-engine.md) **deep** (WorkingSet graph projections; weight hygiene landed — measured re-derivation deferred/unmeasured; V2 0.20/0.55/0.25 retained)
 - [RFC-0014](../rfcs/RFC-0014-language-backend-rust.md) (Rust-only internal module)
 - Review worker polish (already in 0013 optional—quality bar, not new RFC)
 
@@ -394,10 +394,10 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 - Updated holdout metrics: success, compile, cost, retries—**measure**, don’t market
 
 **Acceptance criteria:**
-- [ ] ProjectGraph thin→deep without changing trait; stubs still empty for Callers/SimilarFixes auto-retrieve
-- [ ] Context WorkingSet includes graph projections; still exactly three live domains
-- [ ] LanguageBackend Rust-only; no PY/TS/cdylib
-- [ ] Holdout re-run shows improvement **or** written “why not” with metrics
+- [x] ProjectGraph thin→deep without changing trait; Callers/Refs/Impls live at syn-grade (A-0011-6); SimilarFixes reads recorded fixes (A-0011-5) — wider auto-retrieve still deferred pending precision
+- [x] Context WorkingSet includes graph projections; still exactly three live domains
+- [x] LanguageBackend Rust-only; no PY/TS/cdylib
+- [ ] Holdout re-run shows improvement **or** written “why not” with metrics — **deferred/unmeasured for context weights:** prep harness (`holdout_beta_compare_mvp`) compares weight arms under `DefaultContextEngine` with live `SqliteProjectGraph` ingest + diagnostic seed (CLI bootstrap parity), but committed-recording outputs yield no differential signal (RFC-0012 §14.2 why-not). Keep `DomainWeights::v2_defaults()` until independent model outputs produce a real measurement.
 - [ ] Still `max_parallel=1`; still git-only checkpoints
 - [ ] No External Memory auto-retrieve; no typed call/lifetime layers
 

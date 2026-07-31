@@ -1,10 +1,16 @@
-//! Offline scripted control-plane driver for RFC-0016 holdout control runs.
+//! Control-plane driver for RFC-0016 holdout control runs.
 //!
-//! M7 wires this path through the scheduler/CLI vertical slice (RFCs
-//! 0008–0015). Until that stack is available inside `alloy-eval`, the driver
-//! replays every manifest turn via [`ScriptedProvider`] with the same golden
-//! byte oracle as [`super::skeleton`]. Live DAG execution, sandbox apply, and
-//! `TomlModelRouter` integration remain blocked on those RFCs.
+//! Default: scripted replay of every manifest turn via [`ScriptedProvider`]
+//! with the golden byte oracle ([`super::skeleton`]).
+//!
+//! Live stack path (scheduler / Landlock / MCP / EditEngine /
+//! GenerationDriver) requires **both** `--features stack-driver` and
+//! `ALLOY_EVAL_LIVE_STACK=1`. Without the env flag, the feature only compiles
+//! the live module so clippy/CI can check it; holdout goldens stay scripted.
+//! Golden-derived live runs are integration smoke, not thesis evidence
+//! (RFC-0016 §5.9 / Appendix B).
+//!
+//! Author: arkadianet
 
 use std::sync::Arc;
 
@@ -19,18 +25,33 @@ pub(crate) async fn run(
     provider: Arc<ScriptedProvider>,
     cancel: Option<CancellationToken>,
 ) -> FixtureRunOutput {
+    #[cfg(feature = "stack-driver")]
+    if crate::driver::stack::live_stack_requested() {
+        let _ = provider;
+        return crate::driver::stack::run_live(fixture, cancel).await;
+    }
     run_scripted(fixture, provider, cancel, ScriptedDriverMode::ControlPlane).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::skeleton::{run_scripted, ScriptedDriverMode};
     use crate::fingerprint::RequestFingerprint;
     use crate::harness::tests::{loaded_fixture_for_tests, response_outcome};
     use crate::manifest::{FixtureDriverKind, ScriptTurnOutcome};
     use crate::report::FixtureStatus;
     use crate::scripted::ScriptOutcome;
     use alloy_runtime::Usage;
+
+    /// Offline scripted semantics — exercised directly so a live-stack env
+    /// cannot rewrite these unit tests onto the Landlock path.
+    async fn run_offline(
+        fixture: &LoadedFixture,
+        provider: Arc<ScriptedProvider>,
+    ) -> FixtureRunOutput {
+        run_scripted(fixture, provider, None, ScriptedDriverMode::ControlPlane).await
+    }
 
     #[tokio::test]
     async fn control_plane_replays_all_turns_offline() {
@@ -42,7 +63,7 @@ mod tests {
         fixture.paths.golden = golden;
         let provider = fixture.scripts.as_ref().unwrap().clone();
 
-        let output = run(&fixture, provider, None).await;
+        let output = run_offline(&fixture, provider).await;
 
         assert_eq!(
             output.outcome.status,
@@ -87,7 +108,7 @@ mod tests {
         ));
         let provider = fixture.scripts.as_ref().unwrap().clone();
 
-        let output = run(&fixture, Arc::clone(&provider), None).await;
+        let output = run_offline(&fixture, Arc::clone(&provider)).await;
 
         assert_eq!(
             output.outcome.status,
@@ -131,7 +152,7 @@ mod tests {
         ));
         let provider = fixture.scripts.as_ref().unwrap().clone();
 
-        let output = run(&fixture, Arc::clone(&provider), None).await;
+        let output = run_offline(&fixture, Arc::clone(&provider)).await;
 
         assert_eq!(
             output.outcome.status,

@@ -104,6 +104,24 @@ fn harness_driver_public_path_has_no_toolchain_spawn() {
         {
             continue;
         }
+        // Live stack-driver (compiled only under `--features stack-driver`) may
+        // orchestrate sandbox/`cargo check` via alloy-tools. It must still never
+        // shell out with std::process::Command — the broker owns process spawn.
+        if relative == Path::new("src/driver/stack.rs") {
+            assert!(
+                source.contains("feature `stack-driver`"),
+                "stack.rs must document the stack-driver feature gate"
+            );
+            for forbidden in ["Command::new(\"cargo\")", "std::process::Command"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{} must not use {}; sandbox broker owns process spawn",
+                    path.display(),
+                    forbidden
+                );
+            }
+            continue;
+        }
         for forbidden in ["Command::new(\"cargo\")", "std::process::Command"] {
             assert!(
                 !source.contains(forbidden),
@@ -123,6 +141,20 @@ fn alloy_eval_src_has_no_process_command() {
             path.display()
         );
     }
+}
+
+#[test]
+fn stack_driver_feature_is_optional_and_default_off() {
+    let manifest =
+        std::fs::read_to_string(crate_root().join("Cargo.toml")).expect("read Cargo.toml");
+    assert!(
+        manifest.contains("stack-driver"),
+        "stack-driver feature must be declared for live stack integration smoke"
+    );
+    assert!(
+        manifest.contains("default = []"),
+        "default features must stay empty so offline CI never pulls alloy-tools"
+    );
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Draft |
+| **Status** | Implemented (syn-deep + un-stubbed Callers/Refs/Impls/SimilarFixes; **cargo metadata deferred post-Beta**; RA passthrough still deferred) |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0002](./RFC-0002-storage-artifacts-session-events.md) (merged) |
@@ -62,9 +62,9 @@ Each deferral names the seam that will carry it, so nothing has to be redesigned
 
 | Deferred item | Seam that already exists for it | Owner / when |
 | --- | --- | --- |
-| `syn`-deep AST index (real `Item` nodes, `Imports` edges) | `GraphNodeKind::Item`, `GraphEdgeKind::Imports`, `GraphFidelity::SynDeep` | **Beta** (roadmap "0011 deep") |
+| `syn`-deep AST index (real `Item` nodes, `Imports` edges) | `GraphNodeKind::Item`, `GraphEdgeKind::Imports`, `GraphFidelity::SynDeep` | **Landed** (Beta deep / A-0011-6); remaining deferred work is cargo metadata + RA passthrough below |
 | `LanguageBackend` integration | `LanguageBackend::index(root, &dyn ProjectGraph)` (V2 §15) — this RFC ships the `&dyn ProjectGraph` half | **RFC-0014**, Beta |
-| `cargo metadata` subprocess (resolved deps, features, workspace inheritance) | `IngestSource::CargoMetadata` variant reserved on `IngestReport` | Beta; needs `Exec` grant + sandbox |
+| `cargo metadata` subprocess (resolved deps, features, workspace inheritance) | `IngestReport.source: GraphFidelity` (no separate `IngestSource` type); would need a new fidelity or report field when wired | **Post-Beta** — requires sandbox-mediated `Exec` (SEC5 forbids bare `Command` in `alloy-index`; `SqliteProjectGraph::open` / rebuild has no `SandboxBroker` / Exec grant today). Wiring that without a host-side callback redesign is out of Beta scope. |
 | Typed `Calls` / `HasLifetime` edges | `graph_edges.confidence` column reserved; `GraphEdgeKind` is `#[non_exhaustive]` | Deferred (V2 §7.2 "Deferred") |
 | `SimilarFixes` auto-retrieve beyond the A-0011-5c advisory note | `GraphQuery::SimilarFixes` reads recorded fixes back since A-0011-5a; `RepairWorker` renders one bounded note (≤ 4 codes, ≤ 8 rows, ≤ 1 KiB, never patch bodies) | Wider injection deferred until precision measured (V2 §7.2 upgrade path) |
 | Embedding index / External Memory | none — explicitly absent | Deferred (ADR F-23) |
@@ -131,7 +131,7 @@ Each deferral names the seam that will carry it, so nothing has to be redesigned
 | §9 `CapabilityOutput` | `graph_mutations` **removed from workers** — no path re-introduces it (SEC3) |
 | §12.2 | "Deleted for Alloy workers: `graph_query` MCP (ADR F-04)" (SEC2) |
 | §15 LanguageBackend | `index(&self, root, graph: &dyn ProjectGraph)` — this RFC ships the trait object (§3.5) |
-| §19.2 M2 / roadmap Beta | metadata+syn+diagnostics/fix ingest — MVP ships metadata + ingest; syn is Beta (§1.4) |
+| §19.2 M2 / roadmap Beta | metadata+syn+diagnostics/fix ingest — MVP ships manifest ingest; syn landed at Beta (RFC-0014); `cargo metadata` deferred **post-Beta** (§1.4, §14.2) |
 | §20 R6 | "Graph incorrect edges" → thin MVP, confidence reserved, rebuild path (G7, S6, §5.7) |
 | §20 R16 | "rust-analyzer skew" → optional RA; syn/cargo degraded mode required (Q4, `GraphFidelity`) |
 | §21.1 checklist | "Graph: in-process read; ingest-only writes; no worker graph_query MCP — Pass" (§11) |
@@ -193,7 +193,8 @@ Where the Beta deepening stands against this RFC's deferred list (§1.4, §14.2)
 
 - **Deep-done, via #61 (A-0011-5) and #62 (A-0011-6), both merged on `main`:** `SimilarFixes` reads recorded fixes back (Q6, `query.rs::similar_fixes`) and the verify path records them (`FixRecordingVerifier`); `Refs` / `Impls` / `Callers` answer from recorded `References` / `Calls` / `Impls` edges (Q4, Q5, `query.rs::neighbours`); `truncated` is literal; `GRAPH_SCHEMA_VERSION = 2`, `GRAPH_MODEL_VERSION = 3` (S3, S4 as amended); `Subgraph` traverses the structural kinds only (Q7). `RepairWorker` renders the bounded A-0011-5c advisory note, and RFC-0012's engine issues bounded `Callers`/`Refs` impact reads (A-0012-1, #63).
 - **Owned by RFC-0014 (the `syn` deep pass, on `main` under `crates/alloy-index/src/lang/`):** `Item` nodes, `Imports` edges, `GraphFidelity::SynDeep`, `GRAPH_MODEL_VERSION = 2` (later 3 per A-0011-6d), the `IngestReport.items`/`imports` counters (A-0014-3), and the `RustBackend` `LanguageBackend` seam. RFC-0011 keeps the *query* semantics and the store invariants; the population pass is theirs.
-- **Still deferred (unchanged):** rust-analyzer passthrough for rustc-grade `Refs`/`Impls` (`GraphFidelity::Analyzer`), Merkle multi-layer incremental, the background `alloyd` indexer (ADR F-27), embedding recall (ADR F-23), `cargo metadata` facts, sub-1.0 edge confidence, and wider `SimilarFixes` auto-injection pending precision measurement (V2 §7.2 upgrade path).
+- **Still deferred:** rust-analyzer passthrough for rustc-grade `Refs`/`Impls` (`GraphFidelity::Analyzer`, Beta/M3 as available), Merkle multi-layer incremental, the background `alloyd` indexer (ADR F-27), embedding recall (ADR F-23), sub-1.0 edge confidence, and wider `SimilarFixes` auto-injection pending precision measurement (V2 §7.2 upgrade path).
+- **`cargo metadata` facts — deferred past Beta (explicit):** resolved deps, features, and workspace inheritance stay out of the Beta deep remainder. Reason: V2 / this RFC require sandbox-first Exec (no bare process from the index); **SEC5** forbids `std::process::Command` and network deps in `alloy-index`; `GraphOpenOptions` / `rebuild` take no `SandboxBroker` or Exec grant. Implementing metadata ingest would need a host-injected sandboxed Exec seam (composition-root / CLI assembly), not a moderate in-crate change. `IngestReport.source` remains `GraphFidelity` (Manifest / SynDeep today); there is no `IngestSource::CargoMetadata` type. See §1.4, §6.2, §14.2.
 
 ### 2.4 Crate placement decision (normative)
 
@@ -903,7 +904,7 @@ MVP facts come from exactly two sources, both offline:
    - member manifests: `[package] name`, `[lib] path`, `[[bin]] path`, `[package] autobins`-independent conventional targets.
 2. **The source tree**, via a bounded `std::fs` walk.
 
-Explicitly **not** used in MVP: `cargo metadata` (requires `Exec`, sandbox mediation and — for unresolved dependencies — network), `syn`, rustdoc JSON, rust-analyzer. V2 §7.2's "ingest from cargo metadata + syn" describes the M2/Beta target; the M7 thin scope is a strict subset of it, which is what the roadmap authorises.
+Explicitly **not** used in MVP: `cargo metadata` (requires sandboxed `Exec` and — for unresolved dependencies — network), `syn`, rustdoc JSON, rust-analyzer. V2 §7.2's "ingest from cargo metadata + syn" split across milestones: the **`syn` half landed at Beta** (RFC-0014); **`cargo metadata` is deferred post-Beta** because SEC5 keeps the index exec-free and graph open/rebuild has no Sandbox/Exec grant path yet (§1.4, §14.2). The M7 thin scope remains a strict subset of the V2 target.
 
 ### 6.3 Crate discovery
 
@@ -1311,8 +1312,8 @@ Trait seam · SQLite store with own migration ladder · manifest+layout ingest �
 | Item | Seam | Milestone |
 | --- | --- | --- |
 | ~~`Item` nodes, `Imports` edges~~ (landed via the RFC-0014 `syn` deep pass; `GRAPH_MODEL_VERSION = 2` at landing, `3` since A-0011-6d) | `GraphNodeKind::Item`, `GraphEdgeKind::Imports` | Beta |
-| `cargo metadata` facts (deps, features) | `IngestReport.source`, `GraphFidelity` | Beta |
-| RA passthrough for `Refs`/`Impls` (rustc-grade answers; syn-grade shipped by A-0011-6) | `GraphFidelity::Analyzer` | Beta / M3 |
+| `cargo metadata` facts (deps, features) | `IngestReport.source: GraphFidelity` (no `IngestSource` enum); needs host sandboxed Exec — see §1.4 reason | **Post-Beta** |
+| RA passthrough for `Refs`/`Impls` (rustc-grade answers; syn-grade shipped by A-0011-6) | `GraphFidelity::Analyzer` | Beta / M3 (as available) |
 | ~~Typed `Calls` edges~~ (landed via A-0011-6a at `confidence = 1.0`; sub-1.0 confidence weighting stays deferred) | `graph_edges.confidence` | Post-Beta |
 | ~~`SimilarFixes` retrieval~~ (landed via A-0011-5a; the A-0011-5c prompt note is bounded to codes/packages/dates/artifact ids — wider auto-injection stays deferred until precision is measured) | `graph_fixes` table already populated | After precision measured |
 | Merkle multi-layer incremental | `graph_files.digest` | Deferred |
@@ -1708,7 +1709,7 @@ Rule **E1**: a graph failure MUST NEVER fail a DAG node. The graph is an acceler
 | §7.2 Deferred | Typed call/lifetime edges; SimilarFixes; Merkle; alloyd; embeddings | §1.4, §14.2 |
 | §7.2 Evolution | Raise edge confidence; add layers behind the same query enum; never dual MCP+direct mutation | S6 (confidence column), Q1 (frozen enum), SEC2+SEC3 |
 | §7.2 GraphQuery | Seven variants, exact fields | §3.3 |
-| §7.2 Internal | `alloy-index` SQLite; ingest from cargo metadata + syn; diagnostics from check JSON | §5 (SQLite), §6.2 (manifest subset now, metadata+syn at Beta), §6.7 (check JSON) |
+| §7.2 Internal | `alloy-index` SQLite; ingest from cargo metadata + syn; diagnostics from check JSON | §5 (SQLite), §6.2 (manifest + syn at Beta; **cargo metadata post-Beta**), §6.7 (check JSON) |
 | §7.2 Stub | `Callers` / `SimilarFixes` return empty; confidence reserved | Superseded — both live since A-0011-6/A-0011-5 (Q5, Q6); confidence still reserved (S6) |
 | §7.2 Upgrade path | Fixes go to eval fixtures / curated notes first, not auto prompt injection | Q6: stored at MVP; read back since A-0011-5a and surfaced only as the bounded A-0011-5c advisory note (codes/packages/dates/artifact ids — never patch bodies); wider injection still gated on precision |
 | §7.3 | `.alloy/graph/` (or XDG); sessions reference `GraphVersion` | S1 (`StorageLayout::graph_dir`, which honours the XDG fallback), S2 (`sessions.graph_version`) |

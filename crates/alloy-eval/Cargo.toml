@@ -7,6 +7,14 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Live ControlPlane stack driver (RFC-0016 §5.9): scheduler + Landlock sandbox +
+# MCP cargo_check + GitEditEngine + GenerationDriver. Integration smoke over
+# committed recordings/* worker JSON (not thesis citation — needs independent
+# model outputs). Default `cargo test -p alloy-eval` stays offline (no alloy-tools).
+stack-driver = ["dep:alloy-tools", "dep:tempfile", "dep:alloy-index"]
+
 [dependencies]
 alloy-runtime = { workspace = true, default-features = false }
 async-trait = { workspace = true }
@@ -19,6 +27,12 @@ tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+alloy-tools = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+# Live stack-driver opens SqliteProjectGraph for DefaultContextEngine weight
+# arms and WorkerDeps (parity with CLI assembly). Offline alloy-eval stays free
+# of alloy-index.
+alloy-index = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

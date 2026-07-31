@@ -71,7 +71,7 @@ pub use capabilities::{
     ReviewFinding, ReviewPayload, ReviewSeverity, ReviewVerdict, ReviewWorker, RunRouterProvider,
     SessionWorkerPermissions, SideEffectClass, WorkerConfig, WorkerDeps, WorkerPermissions,
     WorkerToolClass, CAPABILITY_CATALOG, EDIT_SYSTEM, MAX_LLM_CAPABILITIES, PAYLOAD_SCHEMA_VERSION,
-    REPAIR_SYSTEM, REVIEW_SYSTEM,
+    PLANNING_SYSTEM, REPAIR_SYSTEM, REVIEW_SYSTEM,
 };
 pub use config::{default_router_toml, ConfigPaths, GatesConfig, RuntimeConfig, SandboxEcho};
 pub use context::{

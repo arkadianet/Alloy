@@ -71,7 +71,7 @@ The 2026-07-29 live-model dogfood data (issue #53; commits `443bf16` #52 and `18
 
 ### 1.5 Day-1 MVP (normative)
 
-1. `LlmPlanService` MUST implement `PlanService` and MUST be constructed only when profile `planner.mode = "llm"`; every profile shipped in this repo keeps `mode = "template"` until the RFC-0016 holdout gate in §12.4 passes (eval-gated, V2 §19.3).
+1. `LlmPlanService` MUST implement `PlanService` and MUST be constructed only when profile `planner.mode = "llm"`; every profile shipped in this repo keeps `mode = "template"` until a production CapabilityPlanProposer/PlanningWorker holdout in §12.4 passes (eval-gated, V2 §19.3). ScriptedProposer stack-driver smoke is **not** that gate.
 2. A model proposal MUST pass the compiler clamps PC1–PC14 **and** `DagValidator::validate` with `ValidateOpts::default()` (linear + gates) before persistence; any rejection MUST fall back to `TemplatePlanService` with a `PlanProposal` decision record naming the reason (FB1–FB7). Fallback MUST NOT fail the run.
 3. The proposal is **shape-only**: the model chooses node names, kinds, order, and gate reasons. Capabilities, budgets, tiers, retries, timeouts, and cache flags are assigned by the compiler from the fixed table in §5.2.3, whose values are byte-identical to `crates/alloy-runtime/src/dag/templates.rs` on `main`. A proposal has no syntax with which to escape a capability allowlist or a budget ceiling (SEC1–SEC3).
 4. **Verification is terminal, not incidental.** Every compiled proposal that contains an `Edit` node MUST place a verify node after the **last** `Edit` and before the terminal `GateHuman`, with no `Edit` between them (PC8). A human gate MUST NOT be reachable over an unverified edit — that is the `Constraint::RequireCargoCheck` / `[gates].require_cargo_check` posture (RFC-0015 PF7, `crates/alloy-runtime/src/config.rs:361`) expressed in topology.
@@ -118,7 +118,7 @@ The 2026-07-29 live-model dogfood data (issue #53; commits `443bf16` #52 and `18
 | --- | --- |
 | **Already implemented** | `PlanService::replan` + `replace_for_replan` generation CAS; `ReplanReason::FailureIr`; `request_replan`; `DeriveFlags.replan_requested` + D1 + RP1–RP5 + C10; `PlanningWorker` (deterministic) + `PlanningProposalPayload`; `FailureIr` with diagnostics (F2/F3); verdict honesty split Fail vs Inconclusive (#52); `scheduler_repair_e2e` proving seeded generation 2 converts a real `E0308`. **Not** implemented on `main`: pre-plan `seed_graph_diagnostics` / `bootstrap_diagnostics` ship on the **unmerged** PR #54 — see §2.6 |
 | **Added by RFC-0017** | `ProposedDagManifest` + proposal compiler; `PlanProposer` seam + `CapabilityPlanProposer`; `LlmPlanService`; the shared `PlanPersistence` API and its replan seeding; `GenerationDriver` behind the `RunExecutor` seam; `resume_after_replan` / `begin_repair_generation` / `complete_repair_generation` / `control_state`; `Scheduler::run_within`; config knobs; decision records; amendments §2.7 |
-| **Deferred** | Non-linear proposals; seeded re-proposal; LLM default-on; durable generation loop; cache on proposed DAGs |
+| **Deferred** | Non-linear proposals; seeded re-proposal; durable generation loop; cache on proposed DAGs |
 
 ### 2.4 Dependency boundaries
 
@@ -1003,7 +1003,7 @@ max_repair_generations = 2   # 0..=8; 0 disables auto-replan.
                              # Maps to RuntimeConfig.max_repair_generations — NOT SchedConfig
 ```
 
-All three shipped profiles (`default`, `autonomous`, `readonly`) keep `mode = "template"`. `readonly` MUST additionally reject `mode = "llm"` at assembly (a read-only profile has no business proposing edit chains — fail closed at config validation).
+All three shipped profiles (`default`, `autonomous`, `readonly`) keep `mode = "template"`. `readonly` MUST additionally reject `mode = "llm"` at assembly (a read-only profile has no business proposing edit chains — fail closed at config validation). The §12.4 flip is **not** satisfied: ScriptedProposer stack-driver smoke is non-gating prep only.
 
 `[gates].require_cargo_check` stays `true` in every profile and PF7 is untouched; PC8 is its topological counterpart for proposed chains (§5.2.2).
 
@@ -1150,18 +1150,22 @@ Additive counters on the existing metrics surfaces: `planner.proposals_accepted`
 
 ### 12.4 Eval gate (RFC-0016; blocking for default-on only)
 
-Holdout comparison on the local-diagnostic fixture set: `planner.mode = "llm"` vs `"template"` under identical budgets, plus `max_repair_generations ∈ {0, 2}` ablation. Flipping any shipped profile to `mode = "llm"` requires the holdout gate green with LLM-mode pass-rate ≥ template-mode (non-inferiority) — V2 §19.3's eval bar, mechanized.
+Holdout comparison on the local-diagnostic fixture set: `planner.mode = "llm"` vs `"template"` under identical budgets, plus `max_repair_generations ∈ {0, 2}` ablation. Flipping any shipped profile to `mode = "llm"` requires a **production** CapabilityPlanProposer/PlanningWorker holdout green with LLM-mode pass-rate ≥ template-mode (non-inferiority) — V2 §19.3's eval bar, mechanized. ScriptedProposer stack-driver smoke is **not** flip evidence.
+
+**Status (2026-07-31, branch `cursor/mvp-live-holdout-beta-7632`):** gate **not satisfied**. Shipped profiles remain `mode = "template"` (AC 34). A non-gating ScriptedProposer LLM-arm smoke exists under `stack-driver` (`holdout_scripted_proposer_llm_arm_smoke_non_gating`) as wiring prep only — golden-derived repair/edit patches and a scripted catalog proposal are integration smoke, not the §12.4 production holdout.
 
 **Scope of the gate, stated unambiguously.** V2 §19.3 says "LLM Planner behind eval bar"; §0.4/§9.3 say "LLM planner off until eval bar". Both are satisfied by this RFC as written, and the two things being gated are distinct:
 
 | Action | Gated by §12.4? |
 | --- | --- |
 | Merging this RFC's code with `mode = "template"` in every shipped profile | **No.** The planner is *off*; V2's requirement is that it not run, not that it not exist. AC 34's CI grep is what keeps it off |
-| Setting `mode = "llm"` in any shipped profile | **Yes** — holdout green, non-inferiority, one-line PR citing the eval run |
+| Setting `mode = "llm"` in any shipped profile | **Yes** — production CapabilityPlanProposer/PlanningWorker holdout green, non-inferiority, one-line PR citing that eval run (**not** ScriptedProposer smoke) |
+| Setting `mode = "llm"` on `readonly` | **Forbidden** — assembly rejects; AC 34 forbids |
 | An operator setting `mode = "llm"` in their own profile | Not a repo gate. It is opt-in, audited (`PlanProposal` records), and fail-closed to templates |
-| Enabling repair generations (`max_repair_generations > 0`, default) | **No.** Repair generations are not the LLM planner: the default path is template-sourced, and the ablation in this section measures them but does not gate them |
+| Enabling repair generations (`max_repair_generations > 0`, default) | **No.** Repair generations are not the LLM planner; the ablation in this section measures them but does not gate them |
+| ScriptedProposer `stack-driver` LLM-arm smoke | **No** — non-gating prep only; must not be cited for the default flip |
 
-The last row is the one the audit read as ambiguous, and it is now explicit: the eval bar attaches to the *plan source*, not to the *generation loop*.
+The repair-generations row is the one the audit read as ambiguous, and it is now explicit: the eval bar attaches to the *plan source*, not to the *generation loop*.
 
 ---
 
@@ -1179,7 +1183,7 @@ The last row is the one the audit read as ambiguous, and it is now explicit: the
 | `VerifyCompile`-triggered generations | **MVP** |
 | `VerifyTest`-triggered generations | Deferred — blocked on an RFC-0010 DG7 amendment (§16.5) |
 | e2e rewrite onto production seeding | **MVP** |
-| LLM default-on | Deferred — eval-gated (§12.4) |
+| LLM default-on | Deferred — eval-gated (§12.4); ScriptedProposer smoke is non-gating prep only |
 | Seeded re-proposal; non-linear proposals; durable loop; cache; graph-channel sanitization | Deferred (§1.4, §16) |
 
 ---
@@ -1234,7 +1238,7 @@ Every criterion is independently testable by a named test or mechanical check.
 - [ ] 31. `RuntimeConfig.max_repair_generations` defaults to `2`; `0` makes the driver execute exactly one generation; **`SchedConfig` has no such field** and `max_repair_generations` appears nowhere under `crates/alloy-runtime/src/scheduler/` (CI grep).
 - [ ] 32. `derive_dag_state` D1–D9 unchanged (RFC-0010 regression suite untouched and green).
 - [ ] 33. Profile `[planner]` parsing incl. range rejection (`proposal_max_bytes > 32768` rejected — OC7 headroom); `readonly` + `mode = "llm"` fails assembly; `[limits] max_repair_generations` maps to `RuntimeConfig` and range-rejects outside `0..=8`.
-- [ ] 34. All shipped profiles have `mode = "template"` (CI grep).
+- [ ] 34. All shipped profiles have `mode = "template"` (CI grep `ac34_shipped_profiles_stay_template_mode`); §12.4 flip not satisfied.
 - [ ] 35. `PlanProducedPayload` with absent `source`/`proposal_artifact` decodes (old events replay — AM-0009-2 back-compat).
 - [ ] 36. Decision kinds `Replan`/`PlanProposal` exist with §9.2 payloads (AM-0004-1).
 - [ ] 37. Planning budget denial → `ProposeError::Budget` → fallback; no tier downgrade retry (FB6/BG4).

@@ -50,13 +50,13 @@ This gate applies to RFC-0001 … RFC-0016 and any follow-on implementation RFCs
 | [RFC-0008](./RFC-0008-edit-engine.md) | EditEngine (TextPatch + Git Checkpoint) | Implemented | 4–6 pd | 0001, 0005, 0006 | **Yes** |
 | [RFC-0009](./RFC-0009-task-dag-templates-planner.md) | Task DAG, Templates & Planner | Implemented | 4–6 pd | 0001, 0002 | **Yes** |
 | [RFC-0010](./RFC-0010-scheduler-runtime-adapters.md) | Scheduler & Runtime Adapters | Implemented | 5–8 pd | 0003, 0004, 0006, 0008 (draft), 0009 | **Yes** |
-| [RFC-0011](./RFC-0011-project-graph.md) | ProjectGraph (`alloy-index`) | Draft | 6–10 pd | 0001, 0002 | M2 path |
-| [RFC-0012](./RFC-0012-context-engine.md) | Context Engine | Draft | 4–6 pd | 0001, 0007, 0011 | M1 thin / M2 deep |
+| [RFC-0011](./RFC-0011-project-graph.md) | ProjectGraph (`alloy-index`) | Implemented (syn-deep + un-stubbed queries; cargo metadata **post-Beta**; RA deferred) | 6–10 pd | 0001, 0002 | Beta path |
+| [RFC-0012](./RFC-0012-context-engine.md) | Context Engine | Implemented (Beta deep landed; measured weights deferred/unmeasured) | 4–6 pd | 0001, 0007, 0011 | Beta deep |
 | [RFC-0013](./RFC-0013-capability-registry-workers.md) | Capability Registry & MVP Workers | Implemented | 6–10 pd | 0006, 0007, 0008, 0011, 0012 | **Yes** |
-| [RFC-0014](./RFC-0014-language-backend-rust.md) | LanguageBackend (Rust Module) | Draft | 3–5 pd | 0001, 0011 | M2 path |
+| [RFC-0014](./RFC-0014-language-backend-rust.md) | LanguageBackend (Rust Module) | Implemented (RustBackend + syn deep; RA / SemanticEditOp deferred) | 3–5 pd | 0001, 0011 | Beta path |
 | [RFC-0015](./RFC-0015-cli-profiles-config.md) | CLI, Profiles & Config | Implemented | 4–6 pd | 0003, 0004, 0010, 0013 | **Yes** |
-| [RFC-0016](./RFC-0016-eval-harness-holdout-gates.md) | Eval Harness & Holdout Gates | Implemented (Day-1 harness skeleton; ControlPlane driver deferred) | 5–8 pd | 0001, 0007 | **Yes** (skeleton early) |
-| [RFC-0017](./RFC-0017-dynamic-planning.md) | Dynamic Planning & Repair Generations | Implemented (LLM mode opt-in; default flip eval-gated) | 9–13 pd | 0003, 0004, 0009, 0010, 0013, 0015, 0016 | Post-MVP (in-run repair vertical) |
+| [RFC-0016](./RFC-0016-eval-harness-holdout-gates.md) | Eval Harness & Holdout Gates | Implemented (Day-1 + offline ControlPlane + `stack-driver` **integration smoke**, not thesis citation; thesis still needs independent model outputs) | 5–8 pd | 0001, 0007 | **Yes** (skeleton early) |
+| [RFC-0017](./RFC-0017-dynamic-planning.md) | Dynamic Planning & Repair Generations | Implemented (LLM planner **opt-in**; default flip **eval-gated**; ScriptedProposer `stack-driver` smoke is not flip evidence) | 9–13 pd | 0003, 0004, 0009, 0010, 0013, 0015, 0016 | Post-MVP (in-run repair vertical) |
 
 **pd** = person-days. Honest ranges; parallelization shortens calendar time.
 
@@ -170,7 +170,7 @@ Aligned with V2 §19 milestones. Sandbox before dogfood is non-negotiable (V2 §
 
 | Order | RFCs | Goal |
 | --- | --- | --- |
-| 9 | **0011** deepen + **0014** | syn + cargo metadata + diagnostics/fix ingest; Rust `LanguageBackend` |
+| 9 | **0011** deepen + **0014** | syn + diagnostics/fix ingest; Rust `LanguageBackend` (**cargo metadata** deferred **post-Beta** — see RFC-0011 §1.4 / §14.2) |
 | 10 | **0012** deepen + Review polish | WorkingSet graph projections; optional Review worker quality |
 
 ### Wave E — Semantic path (M3 — future extensions only in RFCs)

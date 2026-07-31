@@ -38,9 +38,10 @@ retain_tool_bodies = false
 run_timeout_secs = 1800             # ABSOLUTE bound across repair generations (RFC-0017 GN7)
 max_repair_generations = 2          # 0..=8; 0 disables auto-replan (RFC-0017 AM-0015-2)
 
-# Plan source (RFC-0017 §7.1, AM-0015-2). "llm" is opt-in and eval-gated
-# (§12.4); every shipped profile stays "template" until the holdout gate
-# passes. Values are the §3.3 defaults, spelled out for discoverability.
+# Plan source (RFC-0017 §7.1, AM-0015-2). "llm" is opt-in until a production
+# CapabilityPlanProposer/PlanningWorker holdout (§12.4) passes — ScriptedProposer
+# smoke is NOT flip evidence. Every shipped profile stays "template".
+# Values are the §3.3 defaults, spelled out for discoverability.
 [planner]
 mode = "template"            # "template" | "llm"
 max_proposed_nodes = 8       # 2..=16

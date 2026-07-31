@@ -115,6 +115,9 @@ pub struct ScriptedInvocation {
     pub request: CompletionRequest,
     /// Fingerprint of the request.
     pub fingerprint: RequestFingerprint,
+    /// Response returned to the caller when the scripted outcome was
+    /// [`ScriptOutcome::Response`]; `None` on scripted errors or misses.
+    pub response: Option<ModelResponse>,
 }
 
 impl ScriptedProvider {
@@ -230,12 +233,6 @@ impl ModelProvider for ScriptedProvider {
         _span.record("fingerprint", fp.as_hex());
 
         let mut state = Self::lock(&self.state);
-        state.invocations.push(ScriptedInvocation {
-            endpoint: self.endpoint.clone(),
-            request,
-            fingerprint: fp.clone(),
-        });
-
         let outcome = match state.queues.get_mut(&fp) {
             Some(queue) => {
                 let outcome = queue.pop_front();
@@ -246,6 +243,16 @@ impl ModelProvider for ScriptedProvider {
             }
             None => None,
         };
+        let response = match &outcome {
+            Some(ScriptOutcome::Response(response)) => Some(response.clone()),
+            _ => None,
+        };
+        state.invocations.push(ScriptedInvocation {
+            endpoint: self.endpoint.clone(),
+            request,
+            fingerprint: fp.clone(),
+            response,
+        });
 
         match outcome {
             Some(ScriptOutcome::Response(response)) => {

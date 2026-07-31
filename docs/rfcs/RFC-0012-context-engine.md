@@ -2,8 +2,8 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Draft |
-| **Implementation** | M7 thin: merged · amendment A-0012-1 (bounded Callers/Refs impact): merged (#63) · **Beta deep posture: landed** — the WorkingSet consumes the syn-deep projection (store-side population per RFC-0011/#62) with documented weight hygiene; *measured* re-weighting stays with the Beta holdout (RFC-0016). Status detail: §2.2a, §14.2 |
+| **Status** | Implemented (Beta deep posture landed; measured weight re-derivation **deferred/unmeasured** — keep V2 Appendix B defaults; see §14.2) |
+| **Implementation** | M7 thin: merged · amendment A-0012-1 (bounded Callers/Refs impact): merged (#63) · **Beta deep posture: landed** — the WorkingSet consumes the syn-deep projection (store-side population per RFC-0011/#62) with documented weight hygiene; *measured* re-weighting remains deferred (prep harness under `stack-driver` exists; no signal yet — see §14.2). Status detail: §2.2a, §14.2 |
 | **Author** | arkadianet |
 | **Architecture** | Alloy Architecture V2 (**frozen**) — do not redesign |
 | **Depends on** | [RFC-0001](./RFC-0001-alloy-runtime.md) (merged), [RFC-0007](./RFC-0007-model-router-provider.md) (merged — owns `PromptPack`), [RFC-0011](./RFC-0011-project-graph.md) (merged seam — owns `GraphViewHandle`) |
@@ -66,8 +66,8 @@ Each deferral names the seam that already exists to carry it, so nothing has to 
 | Retrieval ranking / relevance scoring | Item order is a **total order derived from facts** (recency, severity, path), not a learned score (§4.1 D5) | Deferred; needs an eval signal that does not exist |
 | Summarization / "aggressive economy" compaction | `ContextEngine::compact` exists and is a **Stub** no-op (§3.3, A12) | Deferred (V2 §8.1 Deferred), measured in Eval |
 | Long-term memory / External Memory auto-retrieve | `DomainId::LongTerm` returns empty; no store is opened | Deferred (V2 §8.1, ADR F-23) |
-| Graph `SimilarFixes` / `Impls` in the WorkingSet | RFC-0011 `GraphQuery` variants exist and return empty | RFC-0011 Beta; this RFC never issues them (D14). `Callers` / `Refs` are no longer deferred: amendment **A-0012-1** issues them, bounded, and degrades to honest absence while the store's stubs return empty |
-| `syn`-deep symbol bodies in the projection | `GraphView.fidelity` labels the projection; `GraphFidelity::SynDeep` reserved | RFC-0011 Beta / RFC-0014 |
+| Graph `SimilarFixes` / `Impls` in the WorkingSet | Queries are live store-side (A-0011-5 / A-0011-6); this engine never issues them (D14) | Wider WorkingSet injection deferred until precision measured. `Callers` / `Refs`: amendment **A-0012-1** issues them, bounded, and degrades to honest absence when the store has no edges |
+| Deeper-than-syn projection bodies / Analyzer fidelity | `GraphView.fidelity` labels the projection; `GraphFidelity::SynDeep` **landed** (RFC-0011 Beta deep) | Further depth / `GraphFidelity::Analyzer` deferred with RFC-0011 RA passthrough |
 | Real tokenizer counts | `TokenEstimator` is a trait with one impl (§6.2) | Deferred until a provider disagrees measurably |
 | Prompt caching / prefix reuse | `PromptPack` shape is frozen by V2 §8.1 Evolution "keep PromptPack shape stable for cache discipline" | Post-Beta |
 | A sixth crate, `unsafe`, or any new external dependency | none | Forbidden (§12) |
@@ -151,7 +151,7 @@ This RFC therefore makes the thin behaviour **normative**:
 The roadmap's Beta line — *"RFC-0012 deep (WorkingSet graph projections; weight hygiene)"* with the acceptance criterion *"Context WorkingSet includes graph projections; still exactly three live domains"* — is met as follows:
 
 - **Rich graph projections: landed.** The population change happened store-side, exactly where C5 puts it: RFC-0011's deep pass (A-0011-6, merged as #62) writes `Item` nodes and `Imports` / `References` / `Calls` / `Impls` edges at `GRAPH_MODEL_VERSION = 3`, so every served view is labelled `GraphFidelity::SynDeep`. The context side needed **no §3 shape change** — seeds, neighbourhood, edges, citations and clamps are kind-generic by construction — only proof: the test double now serves the faithful deep shape (SynDeep label, import edges, anchor-inclusive impact views), and T4j / T4k / T8i pin the acceptance criterion, including the five reserved domains staying inert (D1). Bounded `Callers` / `Refs` impact reads inside the projection shipped separately as amendment **A-0012-1** (#63); `Impls` / `SimilarFixes` remain forbidden in `context/**` (D14 as amended).
-- **Weight hygiene: landed; *measured* weights: still deferred.** The hygienic half is in force and now pinned for non-default profiles: weights are validated (D2, D19), normalised by the live-weight sum (B4), and exactly applied — T2j pins the arithmetic, T2k proves the rendered budget follows the profile's weights rather than hard-coded constants. Re-deriving the weights from holdout data is the Beta exit gate's measurement (RFC-0016), not a code change here; the V2 Appendix B defaults stay in force until that measurement exists.
+- **Weight hygiene: landed; *measured* weights: deferred/unmeasured (keep V2 defaults).** The hygienic half is in force and now pinned for non-default profiles: weights are validated (D2, D19), normalised by the live-weight sum (B4), and exactly applied — T2j pins the arithmetic, T2k proves the rendered budget follows the profile's weights rather than hard-coded constants. Re-deriving weights from holdout data is still unmeasured: a prep harness (`StackLiveOptions.context_profile` / `holdout_beta_compare_mvp`) can compare arms under `DefaultContextEngine`, but committed-recording outputs yield no differential signal — see §14.2 — so `DomainWeights::v2_defaults()` and profile weight tables stay in force until a real measurement exists.
 - **Stub contract unchanged.** `compact` stays an A12 no-op, the five reserved domains stay empty (D1), and no embedding index exists (SEC7). The `domains` manifest schema and `CONTEXT_FORMAT_VERSION = 1` are untouched — recording weights in the manifest was considered and rejected: a manifest change bumps `format_version` (CIT9), which RFC-0016's fixtures pin.
 
 ### 2.3 Relationship to merged RFCs + authorised amendments
@@ -1348,21 +1348,21 @@ T5i serialises two packs assembled from the same fixture and compares bytes. T8h
 
 ### 14.1 MVP (this RFC, M7)
 
-`ContextEngine` trait verbatim · `DefaultContextEngine` + `NullContextEngine` · three live domains · `WorkingSet` = files + graph projection + diagnostics · `GraphViewHandle` consumption limited to `Symbol` / `Diagnostics` / `Subgraph` · fixed V2 Appendix B weights · byte-based budget with deterministic drop and mandatory markers · populated `citations` with digests · `domains` manifest · `GraphVersion`-keyed memo with `mark_stale` / `evict` · degrade-never-fail posture · untrusted-content fencing + redaction · spans + metrics snapshot.
+`ContextEngine` trait verbatim · `DefaultContextEngine` + `NullContextEngine` · three live domains · `WorkingSet` = files + graph projection + diagnostics · `GraphViewHandle` consumption of `Symbol` / `Diagnostics` / `Subgraph` plus bounded `Callers` / `Refs` impact reads (A-0012-1) · fixed V2 Appendix B weights · byte-based budget with deterministic drop and mandatory markers · populated `citations` with digests · `domains` manifest · `GraphVersion`-keyed memo with `mark_stale` / `evict` · degrade-never-fail posture · untrusted-content fencing + redaction · spans + metrics snapshot.
 
 ### 14.2 Deferred (with the seam that carries it)
 
 | Item | Seam | Milestone |
 | --- | --- | --- |
 | Rich graph projections (item-level nodes, import edges) | `GraphProjection` + `GraphFidelity::SynDeep` — population only (C5) | **Beta — landed** ("0012 deep"): the store populates Item/Imports (RFC-0011, #62); the engine consumes any fidelity with no §3 change; bounded `Callers`/`Refs` impact shipped by A-0012-1 (#63); T4j/T4k/T8i pin the acceptance criterion |
-| Weight hygiene / measured weights | `ContextProfile.weights` is already profile-driven | **Beta — hygiene landed, measurement deferred**: validation (D2/D19) and exact application (B4; T2j/T2k) are in force; re-deriving weights from holdout data is RFC-0016's Beta exit gate, not a code change here |
+| Weight hygiene / measured weights | `ContextProfile.weights` is already profile-driven | **Beta — hygiene landed; measured re-derivation deferred/unmeasured**: validation (D2/D19) and exact application (B4; T2j/T2k) are in force. Prep harness: `StackLiveOptions.context_profile` + `holdout_beta_compare_mvp` run V2 defaults vs alternate splits under `DefaultContextEngine` + FIFO `RecordingModelProvider` with live `SqliteProjectGraph` ingest + diagnostic seed (CLI bootstrap parity). **Why not change weights yet:** with committed-recording / golden-fed worker JSON, success/compile rates are identical across arms (outputs ignore PromptPack shape) — not weight evidence. Keep `DomainWeights::v2_defaults()` and profile weight tables until independent model outputs produce a real signal |
 | Summarization / economy compaction | `ContextEngine::compact` + `CompactStrategy::Summarize` + `SummaryId` | Post-Beta, gated on Eval |
 | Architecture / Scratchpad / LongTerm live | `DomainId` variants + profile liveness (D18) | Post-Beta, "when metrics show need" |
 | Embedding fuzzy recall | none — explicitly absent (SEC7) | Deferred (ADR F-23) |
 | Real tokenizer counts | `TokenEstimator` trait | When a provider disagreement is measured |
 | Prompt-cache prefix discipline | Stable `PromptPack` shape (V2 §8.1 Evolution) | Post-Beta |
 | Cross-session conversation recall | `DomainId::LongTerm` | Deferred |
-| `SimilarFixes` in the WorkingSet | RFC-0011 query variant returns empty | After RFC-0011 Beta + precision measurement. (`Callers` / `Refs`: shipped by A-0012-1, §2.3a) |
+| `SimilarFixes` in the WorkingSet | Query is live (A-0011-5a); this engine never issues it (D14). Wider injection awaits precision measurement | After precision measurement. (`Callers` / `Refs`: shipped by A-0012-1, §2.3a) |
 | Versioned redaction passes over captured packs | RFC-0004 retention + `redactor_version` (§7.11 item 12) | RFC-0018 scope, not this RFC |
 
 Rule **C5** restated as the deepening contract: **Beta changes population, never shape.** If a Beta change requires editing any signature in §3, it is out of scope and needs its own RFC.
@@ -1371,7 +1371,7 @@ Rule **C5** restated as the deepening contract: **Beta changes population, never
 
 ## 15. Acceptance criteria
 
-Each criterion is verifiable by a named test from §13, by a CI grep, or by a mechanical diff/compile check. All start unchecked.
+Each criterion is verifiable by a named test from §13, by a CI grep, or by a mechanical diff/compile check. Criteria marked `[x]` below are complete for the landed Beta-deep posture (including 9, 10, 22, 31, and 46); remaining items stay unchecked until their named tests are treated as closed.
 
 - [ ] 1. All new code lives in `alloy-runtime::context`; the workspace still has exactly five members (**C1**, **C6**).
 - [ ] 2. `Cargo.toml` gains **no** `[workspace.dependencies]` entry (**C6**).
@@ -1381,8 +1381,8 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 6. `PromptPack`, `Citation` and `ChatMessage` are unchanged — same fields, same types, same order (**C7**, T-CI10).
 - [ ] 7. `SummaryId` is minted with the existing private `uuid_id!` macro in `types::ids` (amendment **A1**).
 - [ ] 8. `AssembleRequest` and `DomainId` match V2 §8.1 field-for-field and variant-for-variant (§3.2).
-- [ ] 9. `DomainId::LIVE` has exactly three entries and `is_live` is false for the other five (**D1**, T1a).
-- [ ] 10. Reserved domains render no message, no citation, and receive zero budget (**D1**, T3a).
+- [x] 9. `DomainId::LIVE` has exactly three entries and `is_live` is false for the other five (**D1**, T1a; also pinned by T4k / T8i for the deep posture).
+- [x] 10. Reserved domains render no message, no citation, and receive zero budget (**D1**, T3a; T4k / T8i keep them inert over the syn-deep shape).
 - [ ] 11. Reserved-domain identifiers appear in `context/**` only in the enum, `ALL`, `is_live`, `label` and the manifest loop (**D1**, T-CI4).
 - [ ] 12. `ContextProfile::v2_defaults()` equals V2 Appendix B: `32_000`, `0.20 / 0.55 / 0.25` (**D2**, T1e).
 - [ ] 13. Invalid weights and unknown weight keys are `InvalidProfile` (**D2**, **D19**, T1c, T1f).
@@ -1394,7 +1394,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 19. `DiagnosticEvent.raw_json` is never rendered (**D17**, T3g).
 - [ ] 20. `ArtifactKind::PromptPack` artifacts are never embedded in a pack (**D12**, T3i).
 - [ ] 21. Non-UTF-8 or NUL-bearing inputs are excluded as `NotTextual` (**D7**, T3j).
-- [ ] 22. Only `Symbol`, `Diagnostics` and `Subgraph` graph queries are constructed (**D14**, T4e, T-CI6). *(Amended by A-0012-1a: plus bounded `Callers` / `Refs`; `Impls` / `SimilarFixes` still absent — T4e is renamed `only_the_read_path_query_kinds_are_queried`.)*
+- [x] 22. Only `Symbol`, `Diagnostics` and `Subgraph` graph queries are constructed (**D14**, T4e, T-CI6). *(Amended by A-0012-1a: plus bounded `Callers` / `Refs`; `Impls` / `SimilarFixes` still absent — T4e is renamed `only_the_read_path_query_kinds_are_queried`.)*
 - [ ] 23. The neighbourhood is one `Subgraph` query for all seeds (**D10**, T4f).
 - [ ] 24. Graph seeds are deduplicated and sorted (**D9**, T4i).
 - [ ] 25. The engine holds a `GraphViewHandle`; `dyn ProjectGraph` and the write methods appear nowhere in `context/**` (**SEC1**, T-CI3).
@@ -1403,7 +1403,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 28. `GraphError::Busy` is retried exactly once, then degrades (**E4**, T4c).
 - [ ] 29. Every other `GraphError` maps to `GraphUnavailable` with no error propagation (**E2**, T4d).
 - [ ] 30. No `From<GraphError>` and no `From<StoreError>` for `ContextError` exists (**E1**, T-CI8, T1g).
-- [ ] 31. `GraphFidelity` is rendered as a label and never described as call-graph knowledge (**CIT6**, T4g).
+- [x] 31. `GraphFidelity` is rendered as a label and never described as call-graph knowledge (**CIT6**, T4g; T4j pins the syn_deep deep-posture label).
 - [ ] 32. `GraphView.truncated` propagates a marker and a counter (**B7/B8**, T4h).
 - [ ] 33. Message order matches A2 exactly; empty sections are omitted (**A2**, T5a).
 - [ ] 34. Exactly one `System` message, first, and no `Assistant` / `Tool` messages (**A3/A4**, T5b, T5c).
@@ -1418,7 +1418,7 @@ Each criterion is verifiable by a named test from §13, by a CI grep, or by a me
 - [ ] 43. `CONTEXT_FORMAT_VERSION` is `1` and is recorded in the manifest (**A5/CIT9**, T5n).
 - [ ] 44. The effective budget is `min(request, profile, TokenBudget.max_input)` (**B1**, T2d).
 - [ ] 45. Estimation is `bytes.div_ceil(4)`, byte-based, monotonic, and every count field is named `*_est` (**B2/B13**, T2a–T2c).
-- [ ] 46. Allowances match the §6.3 table exactly (**B4**, T2g).
+- [x] 46. Allowances match the §6.3 table exactly (**B4**, T2g; T2j / T2k pin non-default weight hygiene — exact arithmetic and end-to-end budget shift).
 - [ ] 47. Redistribution runs exactly once, in `DomainId::LIVE` order (**B5**, T2h).
 - [ ] 48. The final estimate never exceeds the effective budget; the assertion is present in release builds (**B12**, T2i).
 - [ ] 49. File truncation cuts at a line boundary and leaves a marker (**B9/B7**, T6a).

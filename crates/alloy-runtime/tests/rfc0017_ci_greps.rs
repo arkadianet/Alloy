@@ -168,8 +168,11 @@ fn ac48_driver_never_touches_run_lifecycle() {
     }
 }
 
-/// AC 34: every shipped profile keeps `mode = "template"` — the LLM planner
-/// is opt-in and eval-gated (RFC-0017 §12.4); no catalog profile enables it.
+/// AC 34: every shipped profile keeps `[planner].mode = "template"` — the
+/// LLM planner is opt-in until a production CapabilityPlanProposer /
+/// PlanningWorker holdout (§12.4) passes; ScriptedProposer smoke is NOT
+/// flip evidence. Parse TOML (not a substring scan) so comments may document
+/// the `"llm"` opt-in without false positives.
 #[test]
 fn ac34_shipped_profiles_stay_template_mode() {
     let profiles = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
@@ -184,19 +187,23 @@ fn ac34_shipped_profiles_stay_template_mode() {
         seen += 1;
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        for (idx, line) in text.lines().enumerate() {
-            // TOML comments (`#`) may *document* the rule without violating it.
-            let code = line.split('#').next().unwrap_or("");
-            assert!(
-                !code.replace(' ', "").contains("mode=\"llm\""),
-                "AC 34 violated: {}:{} sets planner mode llm",
-                path.display(),
-                idx + 1
-            );
-        }
-        assert!(
-            text.replace(' ', "").contains("mode=\"template\""),
-            "AC 34: {} does not pin [planner] mode = \"template\"",
+        let doc: toml::Value = text
+            .parse()
+            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let mode = doc
+            .get("planner")
+            .and_then(|p| p.get("mode"))
+            .and_then(|m| m.as_str())
+            .unwrap_or_else(|| {
+                panic!(
+                    "AC 34: {} missing [planner].mode (expected \"template\")",
+                    path.display()
+                )
+            });
+        assert_eq!(
+            mode,
+            "template",
+            "AC 34 violated: {} has [planner].mode = {mode:?} (LLM stays opt-in / eval-gated)",
             path.display()
         );
     }

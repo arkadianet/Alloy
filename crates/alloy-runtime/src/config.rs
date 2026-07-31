@@ -118,7 +118,8 @@ pub struct RuntimeConfig {
     /// Parsed `[planner]` table, or [`crate::planner::PlannerConfig::new`]
     /// defaults when absent (RFC-0017 §7.1 / AM-0015-2). Every shipped
     /// profile keeps `mode = "template"`; `readonly` additionally rejects
-    /// `mode = "llm"` at load (fail closed).
+    /// `mode = "llm"` at load (fail closed). LLM default-on awaits a
+    /// production CapabilityPlanProposer/PlanningWorker holdout (§12.4).
     pub planner: crate::planner::PlannerConfig,
 }
 

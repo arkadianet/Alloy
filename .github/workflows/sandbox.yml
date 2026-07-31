@@ -7,6 +7,7 @@ on:
     paths:
       - "crates/alloy-tools/**"
       - "crates/alloy-runtime/**"
+      - "crates/alloy-eval/**"
       - "profiles/**"
       - "docs/security/sandbox-residual-risk.md"
       - ".github/workflows/sandbox.yml"
@@ -16,6 +17,7 @@ on:
     paths:
       - "crates/alloy-tools/**"
       - "crates/alloy-runtime/**"
+      - "crates/alloy-eval/**"
       - "profiles/**"
       - "docs/security/sandbox-residual-risk.md"
       - ".github/workflows/sandbox.yml"
@@ -55,6 +57,14 @@ jobs:
       - name: Require Landlock enforcement test ran
         run: |
           cargo test -p alloy-tools --locked --test sandbox_rfc0005 landlock_actually_applied -- --nocapture --exact
+      - name: Clippy alloy-eval stack-driver (deny warnings)
+        run: cargo clippy -p alloy-eval --features stack-driver --locked --all-targets -- -D warnings
+      - name: Live stack-driver holdout smoke (alloy-eval)
+        env:
+          ALLOY_EVAL_LIVE_STACK: "1"
+        run: |
+          cargo test -p alloy-eval --features stack-driver --locked \
+            --test stack_driver_holdout --test holdout_beta_compare_mvp -- --nocapture
       - name: Clippy (deny warnings)
         run: cargo clippy -p alloy-tools --locked --all-targets -- -D warnings
       - name: Fmt
