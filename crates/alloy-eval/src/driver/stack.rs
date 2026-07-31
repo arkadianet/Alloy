@@ -4,9 +4,10 @@
 //! `alloy-tools/tests/scheduler_repair_e2e.rs`: Landlock jail, hermetic
 //! `CARGO_HOME`, `GitEditEngine`, MCP `cargo_check` / `apply_patch`,
 //! `CapabilityRegistry`, `TomlModelRouter` + [`ScriptedProvider`],
-//! `GenerationDriver`, `TemplatePlanService`, and
-//! [`GenerationSwitchCapabilities`] (inert gen1 analyze/edit so the real
-//! `cargo_check` soft-fails and harvests diagnostics; real registry on gen2).
+//! `GenerationDriver`, `TemplatePlanService` / `LlmPlanService` (RFC-0017
+//! §12.4), and [`GenerationSwitchCapabilities`] (inert gen1 analyze/edit so
+//! the real `cargo_check` soft-fails and harvests diagnostics; real registry
+//! on gen2).
 //!
 //! Scripted repair/edit JSON is synthesized from the fixture golden `*.post`
 //! (unified diff) — not the skeleton full-file-text turns. Thesis citation
@@ -14,8 +15,9 @@
 //!
 //! Author: arkadianet
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy_runtime::adapters::SessionGateHumanAdapter;
@@ -33,14 +35,15 @@ use alloy_runtime::{
     CapabilityOutcome, CapabilityRegistry, ChatMessage, ChatRole, CompletionRequest,
     ContextEngine, CostMeterFactory, EndpointId, GateHumanAdapter, GenerationDriver,
     GenerationDriverDeps, GenerationPolicy, Goal, GraphViewHandle, LinearScheduler,
-    LinearSchedulerDeps, McpVerifyCompileAdapter, ModelEndpoint, ModelProvider, ModelResponse,
-    ModelTier, NodeKind, NullContextEngine, PlanContext, PlanFingerprints, PlanService,
-    ProcessCostMeterFactory, ProcessRunRouterProvider, ProviderId, RecordingDecisionLog,
-    RegistryCapabilityExecutor, ResponseFormat, RetentionPolicy, RouterConfig, RunControlState,
-    RunGoalRecord, RunRow, RuntimeConfig, SchedConfig, Session, SessionVerifyPermissions,
-    SessionWorkerPermissions, TemplatePlanService, Timestamp, ToolCaller, ToolChoice, ToolName,
-    ToolSelector, ToolchainRecord, UnavailableVerifyTest, Usage, Verifier, WorkerConfig,
-    WorkerDeps, EDIT_SYSTEM, REPAIR_SYSTEM,
+    LinearSchedulerDeps, LlmPlanService, McpVerifyCompileAdapter, ModelEndpoint, ModelProvider,
+    ModelResponse, ModelTier, NodeKind, NullContextEngine, PlanContext, PlanFingerprints,
+    PlanProposer, PlanService, PlannerConfig, PlannerMode, ProcessCostMeterFactory,
+    ProcessRunRouterProvider, ProposeError, ProposedDagManifest, ProposedNodeSpec, ProviderId,
+    RecordingDecisionLog, RegistryCapabilityExecutor, ResponseFormat, RetentionPolicy,
+    RouterConfig, RunControlState, RunGoalRecord, RunRow, RuntimeConfig, SchedConfig, Session,
+    SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService, Timestamp,
+    ToolCaller, ToolChoice, ToolName, ToolSelector, ToolchainRecord, UnavailableVerifyTest, Usage,
+    Verifier, WorkerConfig, WorkerDeps, EDIT_SYSTEM, PROPOSAL_SCHEMA_VERSION, REPAIR_SYSTEM,
 };
 use alloy_tools::mcp::{
     InProcessMcpHost, McpHostConfig, McpPlatform, ToolHandle, ToolHandleToolCaller,
@@ -63,6 +66,56 @@ use crate::scripted::{ScriptOutcome, ScriptedProvider};
 use crate::trajectory::EvalTrajectoryRecord;
 
 const GOAL_TEXT: &str = "fix the compile error";
+
+/// Scripted proposer for the §12.4 LLM-mode holdout arm: returns a valid
+/// `ProposedDagManifest` matching the `repair_local_diagnostic` shape
+/// (Analyze→Edit→VerifyCompile→GateHuman). Replan reuses the stored prior
+/// source (GN10), so a single queued accept covers the whole run.
+struct ScriptedProposer {
+    queue: Mutex<VecDeque<Result<ProposedDagManifest, ProposeError>>>,
+}
+
+impl ScriptedProposer {
+    fn new(results: Vec<Result<ProposedDagManifest, ProposeError>>) -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(VecDeque::from(results)),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl PlanProposer for ScriptedProposer {
+    async fn propose(&self, _ctx: &PlanContext) -> Result<ProposedDagManifest, ProposeError> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(Err(ProposeError::Unavailable("script exhausted".into())))
+    }
+}
+
+/// Linear repair chain matching `repair_local_diagnostic` / RFC-0017 AC shape.
+fn repair_local_manifest() -> ProposedDagManifest {
+    let node = |name: &str, kind: NodeKind, reason: Option<&str>| ProposedNodeSpec {
+        name: name.into(),
+        kind,
+        approval_reason: reason.map(String::from),
+    };
+    ProposedDagManifest {
+        schema_version: PROPOSAL_SCHEMA_VERSION,
+        nodes: vec![
+            node("analyze", NodeKind::Analyze, None),
+            node("edit", NodeKind::Edit, None),
+            node("verify", NodeKind::VerifyCompile, None),
+            node(
+                "gate",
+                NodeKind::GateHuman,
+                Some("Approve before completion"),
+            ),
+        ],
+        rationale: "stack-driver llm holdout: repair_local_diagnostic shape".into(),
+    }
+}
 
 /// Generation 1 stand-in: inert analyze/edit so real `cargo_check` harvests
 /// diagnostics; generation ≥2 dispatches the real RFC-0013 registry.
@@ -90,17 +143,31 @@ impl CapabilityExecutor for GenerationSwitchCapabilities {
     }
 }
 
-/// Live ControlPlane path for a holdout (or train) fixture.
+/// Live ControlPlane path for a holdout (or train) fixture (template planner).
 pub(crate) async fn run_live(
     fixture: &LoadedFixture,
     cancel: Option<CancellationToken>,
+) -> FixtureRunOutput {
+    run_live_with_mode(fixture, cancel, PlannerMode::Template).await
+}
+
+/// Live ControlPlane path with an explicit [`PlannerMode`] (RFC-0017 §12.4).
+///
+/// `PlannerMode::Template` uses [`TemplatePlanService`]. `PlannerMode::Llm`
+/// wires [`LlmPlanService`] over a [`ScriptedProposer`] that returns a valid
+/// `repair_local_diagnostic`-shaped proposal. Gen2 repair/edit
+/// [`ScriptedProvider`] turns are unchanged; replan reuses prior LLM source.
+pub(crate) async fn run_live_with_mode(
+    fixture: &LoadedFixture,
+    cancel: Option<CancellationToken>,
+    mode: PlannerMode,
 ) -> FixtureRunOutput {
     let started = Instant::now();
     if cancelled(&cancel) {
         return cancelled_output(fixture, started);
     }
 
-    match run_live_inner(fixture, &cancel).await {
+    match run_live_inner(fixture, &cancel, mode).await {
         Ok(output) => output,
         Err(error) => error_output(fixture, started, error),
     }
@@ -126,11 +193,12 @@ pub(crate) async fn run_naive_live(
 async fn run_live_inner(
     fixture: &LoadedFixture,
     cancel: &Option<CancellationToken>,
+    mode: PlannerMode,
 ) -> Result<FixtureRunOutput, EvalError> {
     let started = Instant::now();
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (fixture, cancel);
+        let _ = (fixture, cancel, mode);
         return Err(sandbox_unavailable(
             "live stack-driver requires Linux/Landlock",
         ));
@@ -200,7 +268,10 @@ async fn run_live_inner(
             budget_policy: BudgetPolicy::default(),
             context_profile: alloy_runtime::ContextProfile::v2_defaults(),
             capture: Default::default(),
-            planner: alloy_runtime::PlannerConfig::new(),
+            planner: PlannerConfig {
+                mode,
+                ..PlannerConfig::new()
+            },
             profile_id: None,
             gates: Default::default(),
             sandbox_echo: None,
@@ -327,7 +398,7 @@ async fn run_live_inner(
             .set_scheduler(scheduler as _)
             .map_err(|e| EvalError::Internal(bound_message(format!("set scheduler: {e}"))))?;
 
-        let plans = Arc::new(TemplatePlanService::from_storage(&storage));
+        let plans = build_plan_service(&storage, &decisions, mode);
         PlanService::plan(&*plans, plan_ctx(session_id, run_id, dag_id))
             .await
             .map_err(|e| EvalError::Internal(bound_message(format!("plan: {e}"))))?;
@@ -337,7 +408,7 @@ async fn run_live_inner(
             .unwrap_or_else(CancellationToken::new);
         let driver = Arc::new(GenerationDriver::new(GenerationDriverDeps {
             handle: handle.clone(),
-            plans: Arc::clone(&plans) as _,
+            plans: Arc::clone(&plans),
             runs: plane.runs(),
             dags: storage.dags() as _,
             sessions: storage.sessions() as _,
@@ -1119,6 +1190,31 @@ fn plan_ctx(session: SessionId, run: RunId, dag: DagId) -> PlanContext {
         compiler_fingerprint: prints.compiler_fingerprint,
         prior_source: None,
         prior_proposal_artifact: None,
+    }
+}
+
+fn build_plan_service(
+    storage: &AlloyStorage,
+    decisions: &Arc<RecordingDecisionLog>,
+    mode: PlannerMode,
+) -> Arc<dyn PlanService> {
+    let template = TemplatePlanService::from_storage(storage);
+    match mode {
+        PlannerMode::Template => Arc::new(template),
+        PlannerMode::Llm => {
+            let proposer = ScriptedProposer::new(vec![Ok(repair_local_manifest())]);
+            Arc::new(LlmPlanService::new(
+                template,
+                proposer,
+                storage.artifacts(),
+                Arc::clone(decisions) as _,
+                PlannerConfig {
+                    mode: PlannerMode::Llm,
+                    ..PlannerConfig::new()
+                },
+                true,
+            ))
+        }
     }
 }
 

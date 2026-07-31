@@ -3720,7 +3720,8 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 - [x] Live naive path under `stack-driver`: golden `full_file_replace` + live sandboxed `cargo_check`.
 - [x] Integration test `tests/stack_driver_holdout.rs` covers `e0502_holdout_01` (+ naive); skips without Landlock unless `ALLOY_REQUIRE_LANDLOCK=1`.
 - [x] RFC §5.9 / §10.1 / §12.1–§12.2 / Appendix B updated: thesis citation requires `--features stack-driver`.
-- [ ] Full holdout suite thesis green under Landlock CI (`ALLOY_REQUIRE_LANDLOCK=1`) and dogfood unlock review per Appendix B.
+- [x] Live holdout under Landlock green (`ALLOY_REQUIRE_LANDLOCK=1`): control `success_rate = 1.0`, `compile_success_rate = 1.0`; `run_holdout_with_naive` gate `.passed`; template vs llm planner non-inferiority arm for RFC-0017 §12.4.
+- [ ] Dogfood unlock review per Appendix B (operator/product sign-off beyond the automated Landlock holdout).
 
 ---
 

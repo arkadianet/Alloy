@@ -268,6 +268,22 @@ impl EvalHarness {
         self.run_fixture_collect(fixture).await.outcome
     }
 
+    /// Live ControlPlane stack-driver with an explicit planner mode
+    /// (RFC-0017 §12.4 template vs llm holdout comparison).
+    ///
+    /// Requires `--features stack-driver`. Does not consume fixture scripts
+    /// (the live path synthesizes repair/edit turns from the golden).
+    #[cfg(feature = "stack-driver")]
+    pub async fn run_live_with_planner_mode(
+        &self,
+        fixture: &LoadedFixture,
+        mode: alloy_runtime::PlannerMode,
+    ) -> FixtureOutcome {
+        driver::stack::run_live_with_mode(fixture, self.config.cancel.clone(), mode)
+            .await
+            .outcome
+    }
+
     /// Run all fixtures in `set` and attach gate and optional artifacts.
     ///
     /// # Errors

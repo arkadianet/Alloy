@@ -37,7 +37,8 @@ retain_tool_bodies = false
 run_timeout_secs = 900
 max_repair_generations = 2          # 0..=8; 0 disables auto-replan (RFC-0017 AM-0015-2)
 
-# Plan source (RFC-0017 §7.1). A read-only profile has no business proposing
-# edit chains: mode = "llm" here is rejected at assembly, fail closed.
+# Plan source (RFC-0017 §7.1). Must stay "template": a read-only profile has
+# no business proposing edit chains; mode = "llm" is rejected at assembly
+# (fail closed). The §12.4 default flip applies only to default/autonomous.
 [planner]
 mode = "template"

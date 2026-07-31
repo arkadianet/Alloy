@@ -117,8 +117,9 @@ pub struct RuntimeConfig {
     pub capture: crate::obs::CapturePolicy,
     /// Parsed `[planner]` table, or [`crate::planner::PlannerConfig::new`]
     /// defaults when absent (RFC-0017 §7.1 / AM-0015-2). Every shipped
-    /// profile keeps `mode = "template"`; `readonly` additionally rejects
-    /// `mode = "llm"` at load (fail closed).
+    /// profile defaults to `mode = "llm"` after the RFC-0017 §12.4 holdout
+    /// flip (`default` / `autonomous`); `readonly` stays `template` and
+    /// rejects `mode = "llm"` at load (fail closed).
     pub planner: crate::planner::PlannerConfig,
 }
 

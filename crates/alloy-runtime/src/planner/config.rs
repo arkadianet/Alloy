@@ -10,10 +10,12 @@ use crate::types::budget::TokenBudget;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlannerMode {
-    /// Closed template catalog (default; every shipped profile).
+    /// Closed template catalog (`PlannerConfig::new` default; shipped
+    /// `readonly` stays here).
     Template,
-    /// LLM proposal path, fail-closed onto templates. Opt-in and eval-gated
-    /// (RFC-0017 §12.4); `readonly` profiles reject it at assembly.
+    /// LLM proposal path, fail-closed onto templates. Shipped `default` /
+    /// `autonomous` after the RFC-0017 §12.4 holdout flip; `readonly`
+    /// profiles reject it at assembly.
     Llm,
 }
 

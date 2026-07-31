@@ -36,7 +36,8 @@ retain_tool_bodies = false
 run_timeout_secs = 1800
 max_repair_generations = 2          # 0..=8; 0 disables auto-replan (RFC-0017 AM-0015-2)
 
-# Plan source (RFC-0017 §7.1). "llm" is opt-in and eval-gated (§12.4);
-# every shipped profile stays "template".
+# Plan source (RFC-0017 §7.1). Flipped to "llm" after the §12.4
+# stack-driver holdout comparison (template vs llm non-inferiority;
+# see `stack_driver_holdout` / RFC-0017 §12.4 status notes).
 [planner]
-mode = "template"
+mode = "llm"
