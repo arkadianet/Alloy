@@ -46,7 +46,7 @@ api_key_env = "ALLOY_API_KEY"
 id = "bench"
 display_name = "Bench"
 model = "{model}"
-tiers = ["standard", "economy"]
+tiers = ["standard", "economy", "premium"]
 supports_tools = true
 supports_structured_output = true
 max_context = 32768
@@ -121,6 +121,8 @@ mod tests {
             parsed["capability_tiers"]["repair"].as_str().unwrap(),
             "standard"
         );
+        let tiers = model_endpoint["tiers"].as_array().unwrap();
+        assert!(tiers.iter().any(|tier| tier.as_str() == Some("premium")));
         assert!(rendered.ends_with('\n'));
     }
 

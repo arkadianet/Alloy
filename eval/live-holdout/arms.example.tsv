@@ -1,0 +1,4 @@
+# arm_id	model	temperature	profile	base_url	reps
+# Keep repetitions equal across arms so the comparison has one denominator per fixture.
+baseline	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	30
+autonomous-profile	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	30

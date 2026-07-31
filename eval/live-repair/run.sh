@@ -88,6 +88,7 @@ esac
 case "$TIMEOUT" in
   ''|*[!0-9]*) die "TIMEOUT must be a positive integer of seconds, got '$TIMEOUT'";;
 esac
+[ "$TIMEOUT" -ge 1 ] || die "TIMEOUT must be at least 1 second, got '$TIMEOUT'"
 # Endpoint identity is written verbatim into every JSON row, so it must not
 # need escaping.
 case "$MODEL$BASEURL" in
@@ -103,36 +104,62 @@ esac
 plan="$("$SCORER" plan --fixtures "$FIXTURES")" || exit 2
 router="$("$SCORER" render-router --model "$MODEL" --temperature "$TEMP" --base-url "$BASEURL")" || exit 2
 
-: > "$out"
+: > "$out" || die "could not initialize observations file: $out"
 total=0
 passed=0
 unexecutable=0
 while IFS=$'\t' read -r id workspace goal; do
   [ -n "$id" ] || continue
   for rep in $(seq 1 "$REPS"); do
-    ws="$(mktemp -d)"
-    cp -r "$workspace/." "$ws/"
-    cp -r "$repo/profiles" "$ws/profiles"
-    printf '%s' "$router" >"$ws/router.toml"
-    git -C "$ws" init -q
-    git -C "$ws" add -A
-    git -C "$ws" -c user.name=bench -c user.email=bench@localhost commit -qm fixture
+    ws="$(mktemp -d)" || die "could not create workspace for $id#$rep"
+    cp -r "$workspace/." "$ws/" ||
+      die "fixture copy failed for $id#$rep"
+    cp -r "$repo/profiles" "$ws/profiles" ||
+      die "profile copy failed for $id#$rep"
+    printf '%s' "$router" >"$ws/router.toml" ||
+      die "router write failed for $id#$rep"
+    git -C "$ws" init -q || die "git init failed for $id#$rep"
+    git -C "$ws" add -A || die "git add failed for $id#$rep"
+    git -C "$ws" -c user.name=bench \
+      -c user.email=bench@localhost commit -qm fixture ||
+      die "git commit failed for $id#$rep"
     start_ms=$(date +%s%3N)
     ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout "$TIMEOUT" \
       "$ALLOY" --workspace "$ws" run "$goal" --yes >"$ws/run.log" 2>&1
     code=$?
     wall_ms=$(($(date +%s%3N) - start_ms))
+    # Absent post-check evidence is the legacy (null, null) pair. Do not emit
+    # a partial (false, null) row when cargo check never ran.
+    compile_clean=null
+    cargo_check_exit=null
+    case "$code" in
+      124|126|127)
+        ;;
+      *)
+        if timeout "$TIMEOUT" cargo check --offline --quiet \
+          --manifest-path "$ws/Cargo.toml" >"$ws/cargo-check.log" 2>&1; then
+          compile_clean=true
+          cargo_check_exit=0
+        else
+          compile_clean=false
+          cargo_check_exit=$?
+        fi
+        ;;
+    esac
     retries=$(grep -c -- "$RETRY_PATTERN" "$ws/run.log" || true)
     total=$((total + 1))
-    [ "$code" -eq 0 ] && passed=$((passed + 1))
+    [ "$code" -eq 0 ] && [ "$compile_clean" = true ] &&
+      passed=$((passed + 1))
     case "$code" in
       126|127) unexecutable=$((unexecutable + 1));;
     esac
     # Every row carries the endpoint it was produced against, so rows from two
     # models or two temperatures can never be pooled into one pass rate.
-    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"retries":%d,"wall_ms":%d,"model":"%s","temperature":%s,"base_url":"%s"}\n' \
-      "$id" "$rep" "$code" "$retries" "$wall_ms" "$MODEL" "$TEMP" "$BASEURL" >>"$out"
-    echo "[$passed/$total] $id#$rep exit=$code retries=$retries ${wall_ms}ms"
+    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"compile_clean":%s,"cargo_check_exit":%s,"retries":%d,"wall_ms":%d,"model":"%s","temperature":%s,"base_url":"%s"}\n' \
+      "$id" "$rep" "$code" "$compile_clean" "$cargo_check_exit" "$retries" \
+      "$wall_ms" "$MODEL" "$TEMP" "$BASEURL" >>"$out"
+    echo "[$passed/$total] $id#$rep exit=$code compile_clean=$compile_clean \
+cargo_check_exit=$cargo_check_exit retries=$retries ${wall_ms}ms"
     rm -rf "$ws"
   done
 done <<<"$plan"

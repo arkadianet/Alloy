@@ -61,8 +61,11 @@ fixture's `workspace/`, copies the repo `profiles/`, writes the rendered
 alloy --workspace <tmp> run "<goal from the manifest>" --yes
 ```
 
-Exit code `0` is a pass. Wall time and the retry-line count scraped from the
-run log are recorded alongside it. Nothing is written inside the repository.
+Exit code `0` is only a process pass. The runner independently executes
+`cargo check --offline` against the final workspace and records
+`compile_clean`/`cargo_check_exit`; the scored pass requires both the process
+exit and a clean post-check. Wall time and the retry-line count scraped from
+the run log are recorded alongside it. Nothing is written inside the repository.
 
 Before the first repetition, `run.sh` preflights itself: the scorer and the
 `alloy` binary must exist and be executable (and must not answer a probe with
@@ -95,7 +98,7 @@ Its exit codes distinguish the two kinds of bad news:
 `run.sh` appends one JSON object per repetition to the results file:
 
 ```json
-{"fixture_id":"missing_mut","repetition":1,"exit_code":0,"retries":1,"wall_ms":18422,"model":"qwen2.5-coder:32b","temperature":0.6,"base_url":"http://127.0.0.1:11434/v1/"}
+{"fixture_id":"missing_mut","repetition":1,"exit_code":0,"compile_clean":true,"cargo_check_exit":0,"retries":1,"wall_ms":18422,"model":"qwen2.5-coder:32b","temperature":0.6,"base_url":"http://127.0.0.1:11434/v1/"}
 ```
 
 Every row carries the endpoint identity it was produced against, and the scorer
@@ -135,9 +138,14 @@ target/debug/alloy-eval-live-repair score \
 
 ### Scoring semantics
 
-* Exit `0` → `Pass`; exit `124` (killed by `timeout(1)`) → `Timeout`; exit
-  `126` / `127` (the binary could not be executed) → `HarnessError`; any other
-  non-zero code → `Fail`.
+* Exit `0` with `compile_clean=true` and `cargo_check_exit=0` → `Pass`; exit
+  `0` with both `compile_clean` and `cargo_check_exit` absent (legacy rows) →
+  `Fail`; incomplete pairs (exactly one field present) or contradictory
+  evidence are rejected as invalid observations before scoring; exit `0` with
+  a failed post-check (`compile_clean=false`, non-zero `cargo_check_exit`) →
+  `Fail`; exit `124` (killed by `timeout(1)`) → `Timeout`; exit `126` / `127`
+  (the binary could not be executed) → `HarnessError`; any other non-zero code
+  → `Fail`.
 * **A timeout is a failure.** It stays in the pass-rate denominator and is
   reported in its own `timeout=` column. Excluding it would let a run of
   1 pass + 9 timeouts render as a 100% pass rate, which is the opposite of what
