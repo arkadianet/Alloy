@@ -16,6 +16,7 @@ FIXTURES="${FIXTURES:-$repo/crates/alloy-eval/fixtures/holdout}"
 MODEL="${MODEL:-Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf}"
 TEMP="${TEMP:-0.6}"
 REPS="${REPS:-1}"
+PROFILE="${PROFILE:-default}"
 BASEURL="${BASEURL:-http://127.0.0.1:8089/v1/}"
 TIMEOUT="${TIMEOUT:-600}"
 GOAL="${GOAL:-fix the compile error in this crate}"
@@ -83,6 +84,10 @@ case "$MODEL$BASEURL" in
 esac
 case "$TEMP" in
   ''|*[!0-9.]*) die "TEMP must be a number, got '$TEMP'";;
+esac
+case "$PROFILE" in
+  default|autonomous) ;;
+  *) die "PROFILE must be default or autonomous, got '$PROFILE'";;
 esac
 [ -d "$FIXTURES" ] || die "fixtures root missing: $FIXTURES"
 [ -f "$ORACLE" ] || die "oracle script missing: $ORACLE"
@@ -153,7 +158,8 @@ for id in "${ids[@]}"; do
       die "git commit failed for $id#$rep"
     start_ms=$(date +%s%3N)
     if ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout "$TIMEOUT" \
-      "$ALLOY" --workspace "$ws" run "$GOAL" --yes >"$ws/run.log" 2>&1; then
+      "$ALLOY" --workspace "$ws" --profile "$PROFILE" run "$GOAL" --yes \
+      >"$ws/run.log" 2>&1; then
       code=0
     else
       code=$?
@@ -190,10 +196,10 @@ PY
     case "$code" in
       126|127) unexecutable=$((unexecutable + 1));;
     esac
-    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"process_pass":%s,"compile_clean":%s,"reference_match":%s,"oracle_pass":%s,"failure_class":"%s","cargo_check_exit":%s,"repair_generations":%d,"wall_ms":%d,"model":"%s","temperature":%s,"base_url":"%s","corpus":"rfc0016-holdout-live"}\n' \
+    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"process_pass":%s,"compile_clean":%s,"reference_match":%s,"oracle_pass":%s,"failure_class":"%s","cargo_check_exit":%s,"repair_generations":%d,"wall_ms":%d,"model":"%s","temperature":%s,"profile":"%s","base_url":"%s","corpus":"rfc0016-holdout-live"}\n' \
       "$id" "$rep" "$code" "${process_pass,,}" "${compile_clean,,}" \
       "${reference_match,,}" "${oracle_pass,,}" "$failure_class" "$cargo_check_exit" \
-      "$generations" "$wall_ms" "$MODEL" "$TEMP" "$BASEURL" >>"$out"
+      "$generations" "$wall_ms" "$MODEL" "$TEMP" "$PROFILE" "$BASEURL" >>"$out"
     echo "[$oracle_passed/$total oracle; $process_passed process] $id#$rep \
 oracle=$oracle_pass class=$failure_class generations=$generations ${wall_ms}ms"
     # Keep non-oracle logs under /tmp for diagnosis; wipe strict passes.
@@ -219,6 +225,7 @@ if [ "$SCORE" = "1" ]; then
     --observations "$out" \
     --model "$MODEL" \
     --temperature "$TEMP" \
+    --profile "$PROFILE" \
     --base-url "$BASEURL" \
     --reps "$REPS" \
     --out "${out%.jsonl}.report.json"

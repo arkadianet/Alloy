@@ -28,7 +28,7 @@ cargo build -p alloy-eval --bin alloy-eval-live-repair
 # llama.cpp on :8089 (see router.toml.local-example), or Ollama on :11434
 MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf' \
   BASEURL='http://127.0.0.1:8089/v1/' \
-  TEMP=0.6 REPS=1 \
+  TEMP=0.6 PROFILE=default REPS=1 \
   ./eval/live-holdout/run.sh /tmp/live-holdout.jsonl
 ```
 
@@ -37,7 +37,7 @@ Each repetition gets a fresh temp workspace copied from
 a git commit, then:
 
 ```text
-alloy --workspace <tmp> run "fix the compile error in this crate" --yes
+alloy --workspace <tmp> --profile <profile> run "fix the compile error in this crate" --yes
 ```
 
 The runner records two separate results:
@@ -58,7 +58,9 @@ validates dense repetition coverage and endpoint identity, and includes
 per-fixture and overall Wilson 95% intervals for process, compile, reference,
 and strict-oracle rates. Exit `0` from `alloy` alone is no longer sufficient for
 the strict oracle, and each row also records `failure_class`, `compile_clean`,
-`reference_match`, cargo's post-check exit code, and repair-generation count.
+`reference_match`, cargo's post-check exit code, repair-generation count, and
+the selected `profile`. Profile is part of endpoint identity, so context/profile
+arms cannot be silently mixed in one report.
 Exit codes:
 
 | Exit | Meaning |
@@ -72,6 +74,35 @@ the RFC-0016 offline holdout score. `REPS=3` is useful for fast direction
 checks; use a larger repetition count when estimating reliability and report
 both process and oracle rates. A malformed or incomplete observation file is a
 harness error, not a zero-result model score.
+
+## Matrix runs
+
+Use `matrix.py` to compare model, temperature, or profile/context arms. Each
+arm writes a separate JSONL observation file and validated report. The matrix
+refuses to compare arms with different fixture sets, corpora, or repetition
+counts, and never pools incompatible denominators.
+
+The arms file is tab-separated:
+
+```text
+arm_id	model	temperature	profile	base_url	reps
+baseline	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	30
+context	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	30
+```
+
+Run it with:
+
+```bash
+python3 eval/live-holdout/matrix.py \
+  --arms /path/to/arms.tsv \
+  --out-dir /tmp/live-holdout-matrix
+```
+
+The first arm is the descriptive baseline. `matrix.report.json` retains each
+arm's Wilson 95% interval, failure classes, and per-fixture deltas. A positive
+strict-oracle delta is evidence of improvement on this measured corpus; zero
+or negative deltas are retained as the documented "why not" result, not hidden
+by an aggregate score.
 
 ## Separation from live-repair
 

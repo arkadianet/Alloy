@@ -74,6 +74,7 @@ def validate_rows(
     temperature: float,
     base_url: str,
     reps: int,
+    profile: str = "default",
 ) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = {fixture_id: [] for fixture_id in expected_ids}
     for index, row in enumerate(rows, start=1):
@@ -105,6 +106,9 @@ def validate_rows(
         for field in ("model", "base_url", "corpus"):
             if not isinstance(row[field], str):
                 raise ValueError(f"{field} must be a string on observation line {index}")
+        row_profile = row.get("profile", "default")
+        if not isinstance(row_profile, str):
+            raise ValueError(f"profile must be a string on observation line {index}")
         if not isinstance(row["temperature"], (int, float)) or isinstance(
             row["temperature"], bool
         ):
@@ -115,7 +119,11 @@ def validate_rows(
             raise ValueError(f"compile_clean=true requires cargo_check_exit=0 on observation line {index}")
         if not row["compile_clean"] and cargo_exit == 0:
             raise ValueError(f"compile_clean=false forbids cargo_check_exit=0 on observation line {index}")
-        if row["model"] != model or row["base_url"] != base_url:
+        if (
+            row["model"] != model
+            or row_profile != profile
+            or row["base_url"] != base_url
+        ):
             raise ValueError(f"endpoint mismatch on observation line {index}")
         if not math.isclose(float(row["temperature"]), temperature, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(f"temperature mismatch on observation line {index}")
@@ -164,6 +172,7 @@ def summarize(
     temperature: float,
     base_url: str,
     reps: int,
+    profile: str = "default",
 ) -> dict[str, Any]:
     all_rows = [row for rows in grouped.values() for row in rows]
     return {
@@ -172,6 +181,7 @@ def summarize(
         "endpoint": {
             "model": model,
             "temperature": temperature,
+            "profile": profile,
             "base_url": base_url,
         },
         "repetitions": reps,
@@ -251,6 +261,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--observations", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--temperature", type=float, required=True)
+    parser.add_argument("--profile", default="default")
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--reps", type=int, required=True)
     parser.add_argument("--out", type=Path, required=True)
@@ -273,8 +284,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.temperature,
             args.base_url,
             args.reps,
+            args.profile,
         )
-        report = summarize(grouped, args.model, args.temperature, args.base_url, args.reps)
+        report = summarize(
+            grouped,
+            args.model,
+            args.temperature,
+            args.base_url,
+            args.reps,
+            args.profile,
+        )
         args.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(render_summary(report))
         return 0
