@@ -413,6 +413,52 @@ async fn max_items_zero_is_rejected_at_open() {
     assert!(matches!(err, GraphError::LimitExceeded(_)), "got {err:?}");
 }
 
+// T15 (SY15/SC3 byte-cap arm) — a file above `max_file_bytes` is tracked
+// by a marker digest, counted as skipped, and never handed to `syn`; its
+// module node still exists from the declaration facts.
+#[tokio::test]
+async fn oversized_file_is_tracked_skipped_and_never_parsed() {
+    let fx = Fx::empty();
+    write(&fx.ws.join("Cargo.toml"), "[package]\nname = \"solo\"\n");
+    write(&fx.ws.join("src/lib.rs"), "mod big;\n");
+    write(&fx.ws.join("src/big.rs"), "pub fn hidden() {}\n");
+    let mut opts = fx.opts();
+    opts.limits = IngestLimits {
+        // lib.rs (9 bytes) parses; big.rs (19 bytes) is over the cap.
+        max_file_bytes: 12,
+        ..IngestLimits::default()
+    };
+    let g = SqliteProjectGraph::open(opts).await.unwrap();
+    let report = g.rebuild_reported(&fx.ws).await.unwrap();
+    g.close().await.unwrap();
+
+    assert!(
+        report.skipped >= 1,
+        "the oversized file is counted as skipped: {report:?}"
+    );
+    let modules = node_paths(&fx.data, "module");
+    assert!(
+        modules.contains(&"solo::big".to_string()),
+        "the module node survives from the declaration facts: {modules:?}"
+    );
+    assert_eq!(
+        node_paths(&fx.data, "item"),
+        Vec::<String>::new(),
+        "never parsed, so no items"
+    );
+    // The file row exists with its real length, so a later shrink is a
+    // content change and IN6 stays meaningful over the marker digest.
+    let conn = rusqlite::Connection::open(fx.data.join("graph/graph.sqlite")).unwrap();
+    let byte_len: i64 = conn
+        .query_row(
+            "SELECT byte_len FROM graph_files WHERE path = 'src/big.rs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(byte_len, 19);
+}
+
 // ---------------------------------------------------------------------
 // §12.3 — model-version transition and diagnostics parity
 // ---------------------------------------------------------------------
