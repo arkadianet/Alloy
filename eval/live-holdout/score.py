@@ -7,7 +7,6 @@ import argparse
 import json
 import math
 import sys
-import tomllib
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -89,6 +88,8 @@ def validate_rows(
                 raise ValueError(f"{field} must be boolean on observation line {index}")
         if not isinstance(row["repetition"], int) or isinstance(row["repetition"], bool):
             raise ValueError(f"repetition must be an integer on observation line {index}")
+        if row["process_pass"] != (row["exit_code"] == 0):
+            raise ValueError(f"inconsistent process fields on observation line {index}")
         if row["model"] != model or row["base_url"] != base_url:
             raise ValueError(f"endpoint mismatch on observation line {index}")
         if not math.isclose(float(row["temperature"]), temperature, rel_tol=0.0, abs_tol=1e-12):
@@ -244,7 +245,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(render_summary(report))
         return 0
-    except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
+    except (OSError, ValueError) as error:
         print(f"live-holdout/score.py: {error}", file=sys.stderr)
         return 2
 
