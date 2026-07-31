@@ -693,7 +693,7 @@ The instruction is prepended as `ChatRole::System` **only if** the assembled pac
 
 ### 7.2 Turn budget
 
-One attempt performs **at most `WorkerConfig.max_model_turns` completions** (default 2: the primary turn plus at most one parse-repair turn, PS6). Tool calls do not consume model turns; they consume `max_tool_calls`.
+One attempt performs **at most `WorkerConfig.max_model_turns` completions** (default **3**: the primary turn plus repair turns for parse / ops / dry-run, PS6 / EW6). Tool calls do not consume model turns; they consume `max_tool_calls`.
 
 ### 7.3 What the router already does (so workers do not)
 
@@ -1310,7 +1310,7 @@ Merge only when the series [Definition of Done](./README.md#definition-of-done-m
 | # | Question | Current answer | Revisit |
 | --- | --- | --- | --- |
 | **Q1** | Should `EditWorker` request a structured `PatchSet` object instead of a unified diff? | No for MVP: one wire form (unified diff) matches `parse_unified_diff` in the tool backend and is what models emit most reliably. The tool already accepts both. | After live-provider parse-rate data |
-| **Q2** | Should the parse-repair turn count against `max_model_turns` or be free? | It counts (default 2 turns total). A free repair turn hides cost. | If parse rates are poor on `Economy` tier |
+| **Q2** | Should the parse-repair turn count against `max_model_turns` or be free? | It counts (default **3** turns total). A free repair turn hides cost. | If parse rates are poor on `Economy` tier |
 | **Q3** | Should `RepairWorker` be allowed to call `fs_read` before the first model turn (pre-fetch) instead of after? | MVP: after — the model names the files, the worker validates and reads. Pre-fetch would need heuristics the context engine will own. | RFC-0012 deep |
 | **Q4** | Should `WorkerMetrics` also be appended as a session event? | No: the payload plus the `worker_attempt` decision record already carry it; a third copy invites drift. | RFC-0015 UI needs |
 | **Q5** | Should `review` be registered at all in M7 given no template reaches it? | Yes, behind `enable_review` (default on): registering it proves the four-capability cap is real and keeps `expected_capability(Review)` resolvable. | If registry churn becomes a cost |

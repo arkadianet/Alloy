@@ -809,9 +809,9 @@ Values are transcribed from `crates/alloy-runtime/src/dag/templates.rs` on `main
 
 | Kind | capability | budget | model_tier | timeout_ms | retry (`max_attempts`, backoff, `retry_on`) | source ctor |
 | --- | --- | --- | --- | --- | --- | --- |
-| Analyze | `repair` | `{32768, 8192}` | Standard | 300_000 | 2, `Fixed{1000}`, `[Model]`, no escalate | `llm_retry()` |
-| Edit | `edit` | `{32768, 8192}` | Standard | 300_000 | 2, `Fixed{1000}`, `[Model]`, no escalate | `llm_retry()` |
-| Review | `review` | `{32768, 8192}` | Standard | 300_000 | 2, `Fixed{1000}`, `[Model]`, no escalate | `llm_retry()` |
+| Analyze | `repair` | `{32768, 8192}` | Standard | 300_000 | **3**, `Fixed{1000}`, `[Model]`, `escalate_after=1` → Premium | `llm_retry()` |
+| Edit | `edit` | `{32768, 8192}` | Standard | 300_000 | **3**, `Fixed{1000}`, `[Model]`, `escalate_after=1` → Premium | `llm_retry()` |
+| Review | `review` | `{32768, 8192}` | Standard | 300_000 | **3**, `Fixed{1000}`, `[Model]`, `escalate_after=1` → Premium | `llm_retry()` |
 | VerifyCompile / VerifyTest | none | `{0, 0}` | Economy (ignored) | 600_000 | **2, `Fixed{1000}`, `[ErrorClass::Tool]`**, no escalate | `verify_retry()` |
 | GateHuman | none | `{0, 0}` | Economy (ignored) | 3_600_000 | 1, `Fixed{0}`, `[]` | `adapter_retry()` |
 
@@ -1211,7 +1211,7 @@ Every criterion is independently testable by a named test or mechanical check.
 - [ ] 10. Exactly one `PlanProposal` decision per `plan` call with the §9.2 payload; `prompt_body = None`.
 - [ ] 11. `load_template` never invokes the proposer (LP6).
 - [ ] 12. `PlanningProposalPayload` old wire shape (no `proposal` field) still decodes (AM-0013-2 back-compat).
-- [ ] 13. `PlanningWorker` deterministic branch makes no model/tool call (re-scoped RFC-0013 test stays green); model branch is bounded by `max_model_turns` with at most one repair turn (PW-B).
+- [ ] 13. `PlanningWorker` deterministic branch makes no model/tool call (re-scoped RFC-0013 test stays green); model branch is bounded by `max_model_turns` (default **3**; PW-B).
 - [ ] 14. Proposer uses the production `CapabilityExecutor` (router/meter/budget via X-steps); planning-call cost appears in the **run's** meter, not a fresh one (PP4) — asserted with `SharedCostMeter::shares_state_with`.
 - [ ] 14b. `CapabilityPlanProposer` constructs a complete `CapabilityExecContext`: `workspace_root` from `ProposerDeps` (never the process CWD — grep for `current_dir` under `planner/`), `cancellation` from `ProposerDeps`, `cost_meter` from `ProposerDeps`, `attempt == meta.attempt` (PP1/PP1b). Firing the token aborts an in-flight planning call.
 - [ ] 15. `ProposeError` mapping from executor/capability outcomes matches PP5 (unit per arm).

@@ -1713,8 +1713,10 @@ async fn ac13_planning_model_branch_emits_proposal_payload() {
     assert!(fx.tools.calls().is_empty(), "PW-C: no tools");
 }
 
-/// RFC-0017 AC 13 (PW-B): the model branch is bounded by `max_model_turns`
-/// with at most one repair turn — two invalid replies end the attempt.
+/// RFC-0017 AC 13 (PW-B): the planning model branch is bounded — two
+/// invalid replies end the attempt (author + one parse-repair via the
+/// shared `llm_exchange` one-shot; `max_model_turns` default 3 is the
+/// hard ceiling Edit uses for ops + dry-run repairs).
 #[tokio::test]
 async fn ac13_planning_model_branch_bounded_by_one_repair_turn() {
     let bad = json!({ "unexpected": "shape" });
@@ -1729,8 +1731,11 @@ async fn ac13_planning_model_branch_bounded_by_one_repair_turn() {
         panic!("two invalid replies must fail the attempt");
     };
     assert_eq!(failure.error_class, ErrorClass::Model);
-    // One original turn + exactly one repair turn (max_model_turns = 2).
     assert_eq!(fx.provider.requests().len(), 2);
+    assert!(
+        fx.provider.requests().len() as u8 <= WorkerConfig::default().max_model_turns,
+        "planning repair path must stay within WorkerConfig.max_model_turns"
+    );
 }
 
 #[tokio::test]

@@ -206,11 +206,11 @@ fn cap(s: &str) -> CapabilityId {
 /// Model-backed nodes escalate after the first failed attempt (RFC-0009
 /// §5.7.2; executed by RFC-0010 §5.11.4 ES1/ES3): a `Model`-class failure
 /// that a same-tier retry would most likely reproduce is exactly the case a
-/// bigger model is for. `escalate_after = 1` with `max_attempts = 2` means
-/// attempt 1 runs at `node.model_tier` and the single retry (attempt 2,
-/// `k > n`) routes at [`ModelTier::Premium`] — only via
-/// `CapabilityExecContext.effective_tier`, never by writing `model_tier`
-/// (ES3). `1 < max_attempts` satisfies V14's `EscalateAfterOrder`.
+/// bigger model is for. `escalate_after = 1` with `max_attempts = 3` means
+/// attempt 1 runs at `node.model_tier` and attempts 2–3 (`k > n`) route at
+/// [`ModelTier::Premium`] — only via `CapabilityExecContext.effective_tier`,
+/// never by writing `model_tier` (ES3). `1 < max_attempts` satisfies V14's
+/// `EscalateAfterOrder`.
 ///
 /// RFC-0013 MR2 forwards that tier to the router as
 /// `RoutingRequest.tier_override`, so the escalation actually changes the
@@ -218,9 +218,13 @@ fn cap(s: &str) -> CapabilityId {
 /// the retry to reach a bigger model; when nothing serves it, RFC-0007 §5.2.1
 /// routes the retry at the configured tier and records `escalation_unserved`
 /// — escalation only ever raises a tier, never lowers one.
+///
+/// `max_attempts = 3` (was 2): live single-tier dogfood often burns two
+/// Model attempts on Edit after a morphing gen1 patch; the third is the
+/// spare under AM-0017-1 lineage replans (measurement-phase reliability).
 pub(crate) fn llm_retry() -> RetryPolicy {
     RetryPolicy {
-        max_attempts: 2,
+        max_attempts: 3,
         backoff: Backoff::Fixed { delay_ms: 1000 },
         retry_on: vec![ErrorClass::Model],
         escalate_after: Some(1),
@@ -621,7 +625,7 @@ mod tests {
             .find(|n| n.kind == NodeKind::Analyze)
             .unwrap();
         assert_eq!(analyze.capability.as_ref().unwrap().as_str(), "repair");
-        assert_eq!(analyze.retry.max_attempts, 2);
+        assert_eq!(analyze.retry.max_attempts, 3);
         assert!(matches!(
             analyze.retry.backoff,
             Backoff::Fixed { delay_ms: 1000 }
@@ -643,7 +647,7 @@ mod tests {
             .find(|n| n.kind == NodeKind::Edit)
             .unwrap();
         assert_eq!(edit.capability.as_ref().unwrap().as_str(), "edit");
-        assert_eq!(edit.retry.max_attempts, 2);
+        assert_eq!(edit.retry.max_attempts, 3);
         assert!(matches!(
             edit.retry.backoff,
             Backoff::Fixed { delay_ms: 1000 }

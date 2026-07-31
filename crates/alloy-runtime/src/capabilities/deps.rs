@@ -66,7 +66,8 @@ impl std::fmt::Debug for WorkerDeps {
 /// RFC defines the struct and its defaults only (Q7).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerConfig {
-    /// Max model turns per attempt, including one parse-repair turn (PS6).
+    /// Max model turns per attempt, including parse/ops/dry-run repair
+    /// turns (PS6 / EW6). Default 3.
     pub max_model_turns: u8,
     /// Max tool calls per attempt (TL4).
     pub max_tool_calls: u8,
@@ -79,11 +80,15 @@ pub struct WorkerConfig {
 }
 
 impl Default for WorkerConfig {
-    /// §3.9 defaults: 2 turns, 8 tool calls, 16 KiB tool-result feedback,
+    /// §3.9 defaults: 3 turns, 8 tool calls, 16 KiB tool-result feedback,
     /// dry-run first, review registered.
+    ///
+    /// `max_model_turns = 3` lets Edit spend an author turn plus both an
+    /// ops-repair and a dry-run-repair turn inside one scheduler attempt
+    /// (EW6 / PS6), instead of terminalizing after the first repair.
     fn default() -> Self {
         Self {
-            max_model_turns: 2,
+            max_model_turns: 3,
             max_tool_calls: 8,
             max_tool_result_bytes: 16 * 1024,
             validate_before_apply: true,
