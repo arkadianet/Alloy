@@ -109,8 +109,7 @@ fn harness_driver_public_path_has_no_toolchain_spawn() {
         // shell out with std::process::Command — the broker owns process spawn.
         if relative == Path::new("src/driver/stack.rs") {
             assert!(
-                source.contains("feature `stack-driver`")
-                    || source.contains("stack-driver"),
+                source.contains("feature `stack-driver`") || source.contains("stack-driver"),
                 "stack.rs must document the stack-driver feature gate"
             );
             for forbidden in ["Command::new(\"cargo\")", "std::process::Command"] {

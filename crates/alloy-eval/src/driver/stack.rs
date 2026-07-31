@@ -32,18 +32,18 @@ use alloy_runtime::SessionProvenance;
 use alloy_runtime::{
     compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, Approval, BudgetPolicy,
     CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityId,
-    CapabilityOutcome, CapabilityRegistry, ChatMessage, ChatRole, CompletionRequest,
-    ContextEngine, CostMeterFactory, EndpointId, GateHumanAdapter, GenerationDriver,
-    GenerationDriverDeps, GenerationPolicy, Goal, GraphViewHandle, LinearScheduler,
-    LinearSchedulerDeps, LlmPlanService, McpVerifyCompileAdapter, ModelEndpoint, ModelProvider,
-    ModelResponse, ModelTier, NodeKind, NullContextEngine, PlanContext, PlanFingerprints,
-    PlanProposer, PlanService, PlannerConfig, PlannerMode, ProcessCostMeterFactory,
-    ProcessRunRouterProvider, ProposeError, ProposedDagManifest, ProposedNodeSpec, ProviderId,
-    RecordingDecisionLog, RegistryCapabilityExecutor, ResponseFormat, RetentionPolicy,
-    RouterConfig, RunControlState, RunGoalRecord, RunRow, RuntimeConfig, SchedConfig, Session,
-    SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService, Timestamp,
-    ToolCaller, ToolChoice, ToolName, ToolSelector, ToolchainRecord, UnavailableVerifyTest, Usage,
-    Verifier, WorkerConfig, WorkerDeps, EDIT_SYSTEM, PROPOSAL_SCHEMA_VERSION, REPAIR_SYSTEM,
+    CapabilityOutcome, CapabilityRegistry, ChatMessage, ChatRole, CompletionRequest, ContextEngine,
+    CostMeterFactory, EndpointId, GateHumanAdapter, GenerationDriver, GenerationDriverDeps,
+    GenerationPolicy, Goal, GraphViewHandle, LinearScheduler, LinearSchedulerDeps, LlmPlanService,
+    McpVerifyCompileAdapter, ModelEndpoint, ModelProvider, ModelResponse, ModelTier, NodeKind,
+    NullContextEngine, PlanContext, PlanFingerprints, PlanProposer, PlanService, PlannerConfig,
+    PlannerMode, ProcessCostMeterFactory, ProcessRunRouterProvider, ProposeError,
+    ProposedDagManifest, ProposedNodeSpec, ProviderId, RecordingDecisionLog,
+    RegistryCapabilityExecutor, ResponseFormat, RetentionPolicy, RouterConfig, RunControlState,
+    RunGoalRecord, RunRow, RuntimeConfig, SchedConfig, Session, SessionVerifyPermissions,
+    SessionWorkerPermissions, TemplatePlanService, Timestamp, ToolCaller, ToolChoice, ToolName,
+    ToolSelector, ToolchainRecord, UnavailableVerifyTest, Usage, Verifier, WorkerConfig,
+    WorkerDeps, EDIT_SYSTEM, PROPOSAL_SCHEMA_VERSION, REPAIR_SYSTEM,
 };
 use alloy_tools::mcp::{
     InProcessMcpHost, McpHostConfig, McpPlatform, ToolHandle, ToolHandleToolCaller,
@@ -210,9 +210,8 @@ async fn run_live_inner(
         let Some(cargo_bin) = which_cargo() else {
             return Err(sandbox_unavailable("cargo not on PATH"));
         };
-        let real_homes = OperatorHomes::resolve().map_err(|e| {
-            sandbox_unavailable(&format!("operator homes: {e}"))
-        })?;
+        let real_homes = OperatorHomes::resolve()
+            .map_err(|e| sandbox_unavailable(&format!("operator homes: {e}")))?;
 
         let workspace_src = fixture.root.join(&fixture.manifest.workspace.path);
         let work_dir = tempfile::tempdir().map_err(EvalError::Io)?;
@@ -222,9 +221,7 @@ async fn run_live_inner(
         let _ = std::fs::remove_file(
             workspace_root.join(format!("{}.post", fixture.manifest.naive_target_path)),
         );
-        let workspace_root = workspace_root
-            .canonicalize()
-            .map_err(EvalError::Io)?;
+        let workspace_root = workspace_root.canonicalize().map_err(EvalError::Io)?;
         let jail = workspace_root.clone();
 
         let homes_root = tempfile::tempdir().map_err(EvalError::Io)?;
@@ -232,9 +229,8 @@ async fn run_live_inner(
             return Err(sandbox_unavailable("could not stage a hermetic CARGO_HOME"));
         };
 
-        let mut profile = SandboxProfile::default_for_jail(jail.clone()).map_err(|e| {
-            EvalError::Internal(bound_message(format!("sandbox profile: {e}")))
-        })?;
+        let mut profile = SandboxProfile::default_for_jail(jail.clone())
+            .map_err(|e| EvalError::Internal(bound_message(format!("sandbox profile: {e}"))))?;
         profile.check_backend = SandboxBackend::Landlock;
         profile.exec_timeout = Duration::from_secs(240);
         let broker = NativeSandboxBroker::with_operator_homes(profile.clone(), homes.clone())
@@ -247,8 +243,9 @@ async fn run_live_inner(
             return Ok(cancelled_output(fixture, started));
         }
 
-        let pre_source = std::fs::read_to_string(workspace_root.join(&fixture.manifest.naive_target_path))
-            .map_err(EvalError::Io)?;
+        let pre_source =
+            std::fs::read_to_string(workspace_root.join(&fixture.manifest.naive_target_path))
+                .map_err(EvalError::Io)?;
         let golden = std::fs::read_to_string(&fixture.paths.golden).map_err(EvalError::Io)?;
         let rel_target = fixture.manifest.naive_target_path.clone();
         let fix_diff = unified_diff(&rel_target, &pre_source, &golden);
@@ -332,12 +329,9 @@ async fn run_live_inner(
                 Arc::clone(&host) as Arc<dyn McpPlatform>,
                 vec![ToolSelector::name(ToolName::new("cargo_check").unwrap())],
             )));
-        let verify_perms: Arc<dyn alloy_runtime::VerifyPermissions> =
-            Arc::new(SessionVerifyPermissions::new(
-                storage.sessions(),
-                Some("check*".into()),
-                None,
-            ));
+        let verify_perms: Arc<dyn alloy_runtime::VerifyPermissions> = Arc::new(
+            SessionVerifyPermissions::new(storage.sessions(), Some("check*".into()), None),
+        );
         let verify_compile: Arc<dyn Verifier> = Arc::new(McpVerifyCompileAdapter::new(
             verify_tools,
             verify_perms,
@@ -352,9 +346,8 @@ async fn run_live_inner(
                     ToolSelector::name(ToolName::new("apply_patch").unwrap()),
                 ],
             )));
-        let router_config = RouterConfig::from_str("eval-stack", router_toml()).map_err(|e| {
-            EvalError::Internal(bound_message(format!("router config: {e}")))
-        })?;
+        let router_config = RouterConfig::from_str("eval-stack", router_toml())
+            .map_err(|e| EvalError::Internal(bound_message(format!("router config: {e}"))))?;
         let provider = build_scripted_provider(&fixture.endpoint, &rel_target, &fix_diff).await?;
         let routers = Arc::new(ProcessRunRouterProvider::new(
             router_config,
@@ -403,9 +396,7 @@ async fn run_live_inner(
             .await
             .map_err(|e| EvalError::Internal(bound_message(format!("plan: {e}"))))?;
 
-        let runtime_cancel = cancel
-            .clone()
-            .unwrap_or_else(CancellationToken::new);
+        let runtime_cancel = cancel.clone().unwrap_or_else(CancellationToken::new);
         let driver = Arc::new(GenerationDriver::new(GenerationDriverDeps {
             handle: handle.clone(),
             plans: Arc::clone(&plans),
@@ -518,18 +509,13 @@ async fn run_live_inner(
             .get(dag_id)
             .await
             .map_err(|e| EvalError::Internal(bound_message(format!("final dag: {e}"))))?;
-        let retry_count = final_dag.as_ref().map(|d| {
-            u32::try_from(d.generation.saturating_sub(1)).unwrap_or(u32::MAX)
-        });
+        let retry_count = final_dag
+            .as_ref()
+            .map(|d| u32::try_from(d.generation.saturating_sub(1)).unwrap_or(u32::MAX));
 
         let scripts_exhausted = provider.is_exhausted();
         let unsafe_introduced = unsafe_introduced(&pre_source, &fixed_source);
-        let criteria = live_criteria(
-            fixture,
-            compile_clean,
-            unsafe_introduced,
-            scripts_exhausted,
-        );
+        let criteria = live_criteria(fixture, compile_clean, unsafe_introduced, scripts_exhausted);
 
         let status = if !succeeded {
             FixtureStatus::Fail
@@ -588,9 +574,8 @@ async fn run_naive_live_inner(
         let Some(cargo_bin) = which_cargo() else {
             return Err(sandbox_unavailable("cargo not on PATH"));
         };
-        let real_homes = OperatorHomes::resolve().map_err(|e| {
-            sandbox_unavailable(&format!("operator homes: {e}"))
-        })?;
+        let real_homes = OperatorHomes::resolve()
+            .map_err(|e| sandbox_unavailable(&format!("operator homes: {e}")))?;
 
         let workspace_src = fixture.root.join(&fixture.manifest.workspace.path);
         let work_dir = tempfile::tempdir().map_err(EvalError::Io)?;
@@ -599,13 +584,12 @@ async fn run_naive_live_inner(
         let _ = std::fs::remove_file(
             workspace_root.join(format!("{}.post", fixture.manifest.naive_target_path)),
         );
-        let workspace_root = workspace_root
-            .canonicalize()
-            .map_err(EvalError::Io)?;
+        let workspace_root = workspace_root.canonicalize().map_err(EvalError::Io)?;
         let jail = workspace_root.clone();
 
-        let pre_source = std::fs::read_to_string(workspace_root.join(&fixture.manifest.naive_target_path))
-            .map_err(EvalError::Io)?;
+        let pre_source =
+            std::fs::read_to_string(workspace_root.join(&fixture.manifest.naive_target_path))
+                .map_err(EvalError::Io)?;
         let golden = std::fs::read_to_string(&fixture.paths.golden).map_err(EvalError::Io)?;
         std::fs::write(
             workspace_root.join(&fixture.manifest.naive_target_path),
@@ -622,9 +606,8 @@ async fn run_naive_live_inner(
             return Err(sandbox_unavailable("could not stage a hermetic CARGO_HOME"));
         };
 
-        let mut profile = SandboxProfile::default_for_jail(jail.clone()).map_err(|e| {
-            EvalError::Internal(bound_message(format!("sandbox profile: {e}")))
-        })?;
+        let mut profile = SandboxProfile::default_for_jail(jail.clone())
+            .map_err(|e| EvalError::Internal(bound_message(format!("sandbox profile: {e}"))))?;
         profile.check_backend = SandboxBackend::Landlock;
         profile.exec_timeout = Duration::from_secs(240);
         let broker = NativeSandboxBroker::with_operator_homes(profile, homes)
@@ -636,12 +619,7 @@ async fn run_naive_live_inner(
         let unsafe_introduced = unsafe_introduced(&pre_source, &golden);
         // Naive installs no scripted provider keys under the live path.
         let scripts_exhausted = true;
-        let criteria = live_criteria(
-            fixture,
-            compile_clean,
-            unsafe_introduced,
-            scripts_exhausted,
-        );
+        let criteria = live_criteria(fixture, compile_clean, unsafe_introduced, scripts_exhausted);
         let status = if criteria.iter().all(|c| c.passed) {
             FixtureStatus::Pass
         } else {
@@ -744,11 +722,7 @@ fn unsafe_introduced(pre: &str, post: &str) -> bool {
     let re = RE.get_or_init(|| {
         Regex::new(r"(^|\s)unsafe(\s|!|\(|\{)").expect("unsafe line regex is valid")
     });
-    let count = |src: &str| {
-        src.lines()
-            .filter(|line| re.is_match(line))
-            .count()
-    };
+    let count = |src: &str| src.lines().filter(|line| re.is_match(line)).count();
     count(post) > count(pre)
 }
 
@@ -787,11 +761,7 @@ fn cancelled_output(fixture: &LoadedFixture, started: Instant) -> FixtureRunOutp
     }
 }
 
-fn error_output(
-    fixture: &LoadedFixture,
-    started: Instant,
-    error: EvalError,
-) -> FixtureRunOutput {
+fn error_output(fixture: &LoadedFixture, started: Instant, error: EvalError) -> FixtureRunOutput {
     let mut report = ReportError::from_eval(&error);
     if matches!(&error, EvalError::Internal(m) if m.contains("stack_driver_sandbox_unavailable")) {
         report.kind = "stack_driver_sandbox_unavailable".to_owned();
@@ -828,9 +798,8 @@ fn require_landlock() -> bool {
 #[cfg(target_os = "linux")]
 async fn landlock_or_error() -> Result<(), EvalError> {
     let dir = tempfile::tempdir().map_err(EvalError::Io)?;
-    let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf()).map_err(|e| {
-        EvalError::Internal(bound_message(format!("sandbox profile: {e}")))
-    })?;
+    let mut profile = SandboxProfile::default_for_jail(dir.path().to_path_buf())
+        .map_err(|e| EvalError::Internal(bound_message(format!("sandbox profile: {e}"))))?;
     profile.check_backend = SandboxBackend::Landlock;
     let (available, detail) = match NativeSandboxBroker::new(profile).await {
         Ok(b) => match &b.capabilities().landlock {
@@ -1166,10 +1135,7 @@ fn fingerprints() -> PlanFingerprints {
             &BudgetPolicy::default(),
         ),
         tool_versions: tool_versions_digest(&toolchain),
-        compiler_fingerprint: compiler_fingerprint_digest(
-            &toolchain,
-            "x86_64-unknown-linux-gnu",
-        ),
+        compiler_fingerprint: compiler_fingerprint_digest(&toolchain, "x86_64-unknown-linux-gnu"),
     }
 }
 
@@ -1245,9 +1211,7 @@ fn build_scheduler(
         capabilities: Arc::clone(capabilities),
         decisions: Arc::clone(decisions) as _,
         cost_meters: Arc::clone(cost_meters) as _,
-        runtime_cancel: cancel
-            .clone()
-            .unwrap_or_else(CancellationToken::new),
+        runtime_cancel: cancel.clone().unwrap_or_else(CancellationToken::new),
         budget_policy: BudgetPolicy::default(),
         run_timeout: Duration::from_secs(300),
         config,
@@ -1285,10 +1249,7 @@ async fn live_compile_clean(
     Ok(result.exit_code == Some(0))
 }
 
-async fn shutdown_runtime(
-    rt: AlloyRuntime,
-    storage: Arc<AlloyStorage>,
-) -> Result<(), EvalError> {
+async fn shutdown_runtime(rt: AlloyRuntime, storage: Arc<AlloyStorage>) -> Result<(), EvalError> {
     storage
         .close()
         .await
