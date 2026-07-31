@@ -128,7 +128,9 @@ while IFS=$'\t' read -r id workspace goal; do
       "$ALLOY" --workspace "$ws" run "$goal" --yes >"$ws/run.log" 2>&1
     code=$?
     wall_ms=$(($(date +%s%3N) - start_ms))
-    compile_clean=false
+    # Absent post-check evidence is the legacy (null, null) pair. Do not emit
+    # a partial (false, null) row when cargo check never ran.
+    compile_clean=null
     cargo_check_exit=null
     case "$code" in
       124|126|127)
@@ -139,6 +141,7 @@ while IFS=$'\t' read -r id workspace goal; do
           compile_clean=true
           cargo_check_exit=0
         else
+          compile_clean=false
           cargo_check_exit=$?
         fi
         ;;
