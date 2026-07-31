@@ -13,8 +13,10 @@
 //! run deadline (GN7 / AM-0010-2). Day-1 the seed usually comes from a
 //! `VerifyCompile` Fail; a narrow GN2 exception also admits an exhausted
 //! `Edit`/`Analyze` Model failure when the current repair lineage still
-//! carries that seed (AM-0017-1). Everything else — including exhaustion —
-//! is an *outcome*, not an error (GN11).
+//! carries that seed (AM-0017-1). When wired, GN13 restores the newest
+//! edit checkpoint and re-verifies before replan so gen N+1 does not
+//! repair a morph. Everything else — including exhaustion — is an
+//! *outcome*, not an error (GN11).
 //!
 //! Author: arkadianet
 
@@ -27,9 +29,12 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::adapters::{NodeExecContext, NodeExecRef, VerdictOutcome, Verifier};
+use crate::capabilities::{WorkerPermissions, WorkerToolClass};
 use crate::dag::NodeKind;
+use crate::edit::{rollback_run_edits, EditContext, EditEngine};
 use crate::error::{RunError, RuntimeError};
-use crate::events::SessionEventType;
+use crate::events::{SessionEvent, SessionEventType};
 use crate::obs::{BudgetCheck, CostMeterFactory, DecisionKind, DecisionLog, DecisionRecord};
 use crate::planner::seed::seed_projection_is_empty;
 use crate::planner::{PlanContext, PlanError, PlanProducedPayload, PlanService, PlanSource};
@@ -37,8 +42,8 @@ use crate::scheduler::{DagOutcome, DagState};
 use crate::session::{ReplanReason, RunController, RunExecCtx, RunExecutor, RunGoalRecord};
 use crate::storage::{DagStore, EventStore, SessionRows, StoreError};
 use crate::types::budget::BudgetPolicy;
-use crate::types::diagnostic::{ErrorClass, FailureIr};
-use crate::types::ids::{DagId, Digest, SessionId};
+use crate::types::diagnostic::{ErrorClass, FailureIr, RetryDisposition};
+use crate::types::ids::{DagId, Digest, EventSeq, SessionId};
 
 /// The driver's own policy struct (RFC-0017 §3.8). One field today; it
 /// exists so the bound has a home that is neither `SchedConfig` nor a bare
@@ -99,6 +104,13 @@ pub struct GenerationDriverDeps {
     pub fingerprints: PlanFingerprints,
     /// The generation bound (from `RuntimeConfig.max_repair_generations`).
     pub policy: GenerationPolicy,
+    /// GN13: restore pre-edit workspace before replan. Absent in scripted
+    /// harnesses — rollback is then a no-op.
+    pub edit_engine: Option<Arc<dyn EditEngine>>,
+    /// GN13: mint Patch grants for [`EditEngine::rollback`].
+    pub worker_permissions: Option<Arc<dyn WorkerPermissions>>,
+    /// GN13: re-verify after a successful restore so the seed matches disk.
+    pub verify_compile: Option<Arc<dyn Verifier>>,
 }
 
 /// Internal driver failure; folded into [`RuntimeError::Internal`] at the
@@ -322,6 +334,109 @@ impl GenerationDriver {
         }
     }
 
+    /// GN13: after admit, restore the newest journaled edit checkpoint and
+    /// re-verify so the replan seed matches the pre-edit workspace. No-op
+    /// when edit/verify wiring is absent (scripted harnesses).
+    async fn restore_workspace_and_reseed(
+        &self,
+        ctx: &RunExecCtx,
+        seed: FailureIr,
+    ) -> Result<FailureIr, DriveError> {
+        let (Some(engine), Some(perms), Some(verify)) = (
+            self.deps.edit_engine.as_ref(),
+            self.deps.worker_permissions.as_ref(),
+            self.deps.verify_compile.as_ref(),
+        ) else {
+            return Ok(seed);
+        };
+
+        let session = self
+            .deps
+            .sessions
+            .get_session(ctx.session_id)
+            .await?
+            .ok_or_else(|| DriveError::Internal("session missing during GN13 restore".into()))?;
+        let events = list_all_session_events(&self.deps.events, ctx.session_id).await?;
+        let dag = self.deps.dags.get(ctx.dag_id).await?;
+        let meta = NodeExecRef {
+            session_id: ctx.session_id,
+            run_id: ctx.run_id,
+            dag_id: ctx.dag_id,
+            node_id: seed.node,
+            workspace_root: session.workspace_root.clone(),
+            attempt: 1,
+        };
+        let token = perms
+            .token_for(&meta, WorkerToolClass::Patch)
+            .await
+            .map_err(|e| DriveError::Internal(format!("GN13 mint patch token: {e}")))?;
+        let edit_ctx = EditContext {
+            session_id: Some(ctx.session_id),
+            run_id: Some(ctx.run_id),
+            perms: token,
+        };
+        let report = rollback_run_edits(
+            engine.as_ref(),
+            &events,
+            ctx.run_id,
+            dag.as_ref(),
+            &edit_ctx,
+        )
+        .await;
+        if report.restored.is_empty() {
+            if report.declined.is_some() || report.unjournaled_edits > 0 {
+                warn!(
+                    run_id = %ctx.run_id,
+                    declined = ?report.declined.as_ref().map(|d| &d.reason),
+                    unjournaled = report.unjournaled_edits,
+                    "GN13: no edit restored; reseeding against current workspace"
+                );
+            }
+            return Ok(seed);
+        }
+        info!(
+            run_id = %ctx.run_id,
+            restored = report.restored.len(),
+            "GN13: restored edit checkpoint(s); re-verifying for seed"
+        );
+
+        let verdict = verify
+            .verify(&NodeExecContext {
+                meta: meta.clone(),
+                cancellation: self.deps.cancellation.clone(),
+            })
+            .await
+            .map_err(|e| DriveError::Internal(format!("GN13 re-verify: {e}")))?;
+        match verdict.outcome {
+            VerdictOutcome::Fail if !verdict.diagnostics.is_empty() => {
+                let reseeds = FailureIr {
+                    node: seed.node,
+                    error_class: ErrorClass::Compile,
+                    retry: RetryDisposition::NonRetryable,
+                    diagnostics: verdict.diagnostics,
+                    notes: "GN13 re-verify after edit rollback".into(),
+                };
+                if seed_projection_is_empty(&reseeds) {
+                    warn!(
+                        run_id = %ctx.run_id,
+                        "GN13: re-verify diagnostics projected empty; keeping admitted seed"
+                    );
+                    return Ok(seed);
+                }
+                Ok(reseeds)
+            }
+            other => {
+                warn!(
+                    run_id = %ctx.run_id,
+                    ?other,
+                    diag_count = verdict.diagnostics.len(),
+                    "GN13: re-verify did not yield Compile Fail with diags; keeping admitted seed"
+                );
+                Ok(seed)
+            }
+        }
+    }
+
     /// Rebuild the replan [`PlanContext`] (GN10): goal from the run row's
     /// durable goal envelope, fingerprints from the composition root,
     /// provenance from the last `PlanProduced` event for this DAG.
@@ -352,6 +467,23 @@ impl GenerationDriver {
             prior_proposal_artifact: provenance.prior_proposal_artifact,
         })
     }
+}
+
+async fn list_all_session_events(
+    events: &Arc<dyn EventStore>,
+    session: SessionId,
+) -> Result<Vec<SessionEvent>, StoreError> {
+    let mut out = Vec::new();
+    let mut after: Option<EventSeq> = None;
+    loop {
+        let page = events.list_session_events(session, after, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|e| e.seq);
+        out.extend(page);
+    }
+    Ok(out)
 }
 
 /// GN10 / AC 26b — recover plan provenance from the last durable
@@ -498,6 +630,13 @@ impl RunExecutor for GenerationDriver {
                     gen_span.record("admitted", true);
                     seed
                 }
+                Err(e) => return Err(fold(e)),
+            };
+
+            // GN13 — undo morphing edits and re-derive the seed against the
+            // restored tree before the planner writes generation N+1.
+            let seed = match self.restore_workspace_and_reseed(&ctx, seed).await {
+                Ok(seed) => seed,
                 Err(e) => return Err(fold(e)),
             };
 

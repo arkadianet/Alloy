@@ -516,6 +516,10 @@ pub async fn assemble_full_with(
         policy: GenerationPolicy {
             max_repair_generations: cfg.max_repair_generations,
         },
+        // GN13: rollback morphing edits before repair replan (live path only).
+        edit_engine: edit_engine.clone(),
+        worker_permissions: Some(Arc::clone(&worker_perms)),
+        verify_compile: Some(Arc::clone(&verify_compile)),
     });
     plane.set_executor(Arc::new(driver));
 

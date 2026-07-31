@@ -364,6 +364,9 @@ impl Harness {
             policy: GenerationPolicy {
                 max_repair_generations: options.max_repair_generations,
             },
+            edit_engine: None,
+            worker_permissions: None,
+            verify_compile: None,
         }));
         plane.set_executor(Arc::clone(&driver) as _);
         Self {

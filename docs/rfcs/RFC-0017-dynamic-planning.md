@@ -583,6 +583,11 @@ pub struct GenerationDriverDeps {
     /// GN6's second half: the run's cancellation token.
     pub cancellation: CancellationToken,
     pub policy: GenerationPolicy,
+    /// GN13 (measurement-phase): optional live-path restore wiring.
+    /// Scripted harnesses leave these `None` (no-op).
+    pub edit_engine: Option<Arc<dyn EditEngine>>,
+    pub worker_permissions: Option<Arc<dyn WorkerPermissions>>,
+    pub verify_compile: Option<Arc<dyn Verifier>>,
 }
 
 /// The driver's own policy struct. One field today; it exists so the bound has
@@ -877,6 +882,7 @@ execute(RunExecCtx { run_id, session_id, dag_id, deadline }):
     if outcome.state != Failed: return Ok(outcome)             # Succeeded / Cancelled / ReplanRequired pass through
     seed ← admit(outcome, bumps, deadline, lineage_seed)       # Ok(seed) or Err(reason)
     if seed is Err: record Replan{admitted:false, reason}; return Ok(outcome)
+    seed ← restore_workspace_and_reseed(seed)                  # GN13 (no-op if unwired)
     record Replan{admitted:true, from, to, seed_source}
     runs.begin_repair_generation(run_id, &FailureIr(seed))     # GN8: waiters dropped, ReplanRequested event, row stays Running
     plan  ← plans.replan(FailureIr(seed), ctx')                # seeds per §5.4; ctx' per GN10
@@ -903,6 +909,7 @@ The value returned here is the *only* thing §6.3 steps 9–10 ever see, so exac
 | GN10 | The replan `PlanContext` preserves provenance: `template_override = Some(prior template_id)`, plus AM-0009-7's `prior_source` and `prior_proposal_artifact`. If `prior_source == LlmProposed`, the plan service MUST re-compile **the same stored proposal manifest** (fetched from `prior_proposal_artifact`) at the new generation rather than re-selecting a template — repair generations change *inputs*, not *shape*. In-process the driver has these from the last `PlanResult`; after a restart it recovers them from the last `PlanProduced` event's AM-0009-3 fields. If neither is available, the driver MUST fall back to `template_override` alone and record `Replan.provenance = "degraded"` — it MUST NOT silently re-select. Seeded re-*proposal* is deferred (§16.1). |
 | GN11 | Exhaustion is not an error: when GN5 or GN7 fails, `execute` returns the final `Failed` outcome with its `FailureIr` intact, after a `Replan { admitted: false, reason: "exhausted" \| "deadline" }` decision. `DriveError` is reserved for infrastructure faults (store, control plane) and is folded into `RuntimeError::Internal` at the seam. |
 | GN12 | Decision-record and metric failures are best-effort (LP11): they are logged and dropped, never converted into a `DriveError` and never used to deny admission. An audit-log outage must not silently disable repair. |
+| **GN13** | **Restore-before-replan (measurement-phase).** When the composition root wires `edit_engine` + `worker_permissions` + `verify_compile` into `GenerationDriverDeps`, after an admit and **before** `begin_repair_generation` the driver MUST call `rollback_run_edits` for the run and, if any transaction was restored, re-run `verify_compile` and replace the admitted seed with that Compile Fail IR when it carries usable diagnostics. Scripted harnesses leave the three deps `None` (no-op). A declined/unjournaled rollback keeps the admitted seed and logs a warn — it MUST NOT invent diagnostics. Scheduler and EditWorker MUST NOT perform this restore (FOW1 / EW1). |
 
 ### 5.6 Migration from the interim driver loop (MG rules)
 

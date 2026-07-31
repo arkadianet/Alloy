@@ -774,6 +774,9 @@ planning = "standard"
             policy: GenerationPolicy {
                 max_repair_generations: 2,
             },
+            edit_engine: None,
+            worker_permissions: None,
+            verify_compile: None,
         }));
         fx.plane.set_executor(driver as _);
 
