@@ -15,6 +15,7 @@ use crate::live_repair::{wilson_interval, WilsonInterval, WILSON_Z_95};
 
 const CORPUS: &str = "rfc0016-holdout-live";
 const TIMEOUT_EXIT_CODE: i32 = 124;
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Deserialize)]
 struct HoldoutManifest {
@@ -55,6 +56,7 @@ pub struct FixtureSummary {
     pub fixture_id: String,
     pub process: Rate,
     pub compile_clean: Rate,
+    pub compile_clean_reference_mismatch: Rate,
     pub reference_match: Rate,
     pub oracle: Rate,
     pub failure_classes: BTreeMap<String, u32>,
@@ -103,6 +105,7 @@ pub struct ArmComparison {
     pub oracle: MetricDelta,
     pub process: MetricDelta,
     pub compile_clean: MetricDelta,
+    pub compile_clean_reference_mismatch: MetricDelta,
     pub reference_match: MetricDelta,
     pub assessment: Assessment,
 }
@@ -276,6 +279,9 @@ fn summarize_fixture(id: &str, rows: &[StrictObservation]) -> FixtureSummary {
         fixture_id: id.to_owned(),
         process: rate(rows, |row| row.process_pass),
         compile_clean: rate(rows, |row| row.compile_clean),
+        compile_clean_reference_mismatch: rate(rows, |row| {
+            row.compile_clean && !row.reference_match
+        }),
         reference_match: rate(rows, |row| row.reference_match),
         oracle: rate(rows, |row| row.oracle_pass),
         failure_classes,
@@ -372,7 +378,7 @@ pub fn score(
         .collect::<Vec<_>>();
     let overall = summarize_fixture("overall", &rows);
     Ok(StrictReport {
-        schema_version: 1,
+        schema_version: REPORT_SCHEMA_VERSION,
         corpus: CORPUS.to_owned(),
         endpoint,
         repetitions,
@@ -450,6 +456,10 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
                     &baseline.overall.compile_clean,
                     &report.overall.compile_clean,
                 ),
+                compile_clean_reference_mismatch: delta(
+                    &baseline.overall.compile_clean_reference_mismatch,
+                    &report.overall.compile_clean_reference_mismatch,
+                ),
                 reference_match: delta(
                     &baseline.overall.reference_match,
                     &report.overall.reference_match,
@@ -463,7 +473,7 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
         })
         .collect();
     Ok(MatrixComparison {
-        schema_version: 1,
+        schema_version: REPORT_SCHEMA_VERSION,
         corpus: baseline.corpus.clone(),
         repetitions: baseline.repetitions,
         baseline: baseline_name.clone(),
@@ -573,9 +583,10 @@ mod tests {
             observation("b", 2),
         ];
         let report = score(fixtures.path(), rows, endpoint(), 2).unwrap();
-        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.schema_version, REPORT_SCHEMA_VERSION);
         assert_eq!(report.overall.oracle.passes, 4);
         assert_eq!(report.overall.oracle.attempts, 4);
+        assert_eq!(report.overall.compile_clean_reference_mismatch.passes, 0);
         assert_eq!(report.fixtures.len(), 2);
     }
 
@@ -671,5 +682,9 @@ mod tests {
         .unwrap();
         assert_eq!(matrix.comparisons.len(), 1);
         assert_eq!(matrix.comparisons[0].assessment.result, "why_not");
+        assert_eq!(
+            matrix.comparisons[0].compile_clean_reference_mismatch.delta,
+            Some(1.0)
+        );
     }
 }

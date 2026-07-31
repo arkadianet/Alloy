@@ -54,14 +54,18 @@ is what exposes a compiling but semantically wrong morph such as changing E0502
 into E0614. A reference mismatch is diagnostic evidence, not proof that all
 valid Rust repairs are impossible.
 
-JSONL rows and `<results>.report.json` are written outside the repo. The report
+JSONL rows and `<results>.report.json` are written outside the repo. Report
+schema v2 adds the explicit compile-clean reference-mismatch rate. The report
 validates dense repetition coverage and endpoint identity, and includes
 per-fixture and overall Wilson 95% intervals for process, compile, reference,
-and strict-oracle rates. Exit `0` from `alloy` alone is no longer sufficient for
+strict-oracle, and compile-clean reference-mismatch rates. The mismatch rate
+counts code that independently compiles but does not match the fixture's
+intended repair; it is a morph warning, not proof that every alternate repair
+is semantically wrong. Exit `0` from `alloy` alone is no longer sufficient for
 the strict oracle, and each row also records `failure_class`, `compile_clean`,
 `reference_match`, cargo's post-check exit code, repair-generation count, and
-the selected `profile`. Profile is part of endpoint identity, so context/profile
-arms cannot be silently mixed in one report.
+the selected `profile`. Profile is part of endpoint identity, so
+context/profile arms cannot be silently mixed in one report.
 Exit codes:
 
 | Exit | Meaning |
@@ -100,8 +104,9 @@ Run it with:
 ```
 
 The first arm is the descriptive baseline. `matrix.report.json` retains each
-arm's Wilson 95% interval, failure classes, and per-fixture deltas. A positive
-strict-oracle delta is evidence of improvement on this measured corpus; zero
+arm's Wilson 95% interval, failure classes, compile-clean mismatch rate, and
+per-fixture deltas. A positive strict-oracle delta is evidence of improvement
+on this measured corpus; zero
 or negative deltas are retained as the documented "why not" result, not hidden
 by an aggregate score.
 

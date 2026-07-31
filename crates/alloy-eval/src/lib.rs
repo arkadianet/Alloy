@@ -66,6 +66,7 @@ pub use live_holdout::{
     target_path_text as live_holdout_target_path_text, Endpoint as LiveHoldoutEndpoint,
     MatrixComparison as LiveHoldoutMatrixComparison, StrictObservation as LiveHoldoutObservation,
     StrictObservationFields as LiveHoldoutObservationFields, StrictReport as LiveHoldoutReport,
+    REPORT_SCHEMA_VERSION as LIVE_HOLDOUT_REPORT_VERSION,
 };
 pub use live_repair::{
     parse_observations_jsonl, render_router_toml, wilson_interval, LiveRepairCorpus,

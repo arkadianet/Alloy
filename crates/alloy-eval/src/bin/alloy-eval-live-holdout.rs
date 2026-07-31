@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use alloy_eval::{
     compare_live_holdout, inspect_live_holdout, live_holdout_target_path_text,
     load_live_holdout_observations, score_live_holdout, LiveHoldoutEndpoint, LiveHoldoutReport,
+    LIVE_HOLDOUT_REPORT_VERSION,
 };
 
 const USAGE: &str = "\
@@ -185,10 +186,10 @@ fn compare(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
             .map_err(|error| format!("read {report_path}: {error}"))?;
         let report: LiveHoldoutReport =
             serde_json::from_str(&raw).map_err(|error| format!("parse {report_path}: {error}"))?;
-        if report.schema_version != 1 {
+        if report.schema_version != LIVE_HOLDOUT_REPORT_VERSION {
             return Err(format!(
-                "unsupported schema_version {} in {report_path}; expected 1",
-                report.schema_version
+                "unsupported schema_version {} in {report_path}; expected {LIVE_HOLDOUT_REPORT_VERSION}",
+                report.schema_version,
             ));
         }
         reports.push((name.to_owned(), report));
@@ -210,7 +211,7 @@ fn render_report(report: &LiveHoldoutReport) -> String {
         .map(|value| value.render())
         .unwrap_or_else(|| "unmeasured".to_owned());
     format!(
-        "overall oracle={}/{} rate={} wilson95={} process={}/{} compile={}/{} reference={}/{}\n",
+        "overall oracle={}/{} rate={} wilson95={} process={}/{} compile={}/{} compile_clean_reference_mismatch={}/{} reference={}/{}\n",
         overall.oracle.passes,
         overall.oracle.attempts,
         overall
@@ -223,6 +224,8 @@ fn render_report(report: &LiveHoldoutReport) -> String {
         overall.process.attempts,
         overall.compile_clean.passes,
         overall.compile_clean.attempts,
+        overall.compile_clean_reference_mismatch.passes,
+        overall.compile_clean_reference_mismatch.attempts,
         overall.reference_match.passes,
         overall.reference_match.attempts,
     )
@@ -230,7 +233,7 @@ fn render_report(report: &LiveHoldoutReport) -> String {
 
 fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> String {
     let mut output = format!(
-        "baseline={} repetitions={}\narm\toracle\toracle_wilson95\n",
+        "baseline={} repetitions={}\narm\toracle\tcompile_clean_reference_mismatch\toracle_wilson95\n",
         comparison.baseline, comparison.repetitions
     );
     for (name, report) in &comparison.arms {
@@ -241,8 +244,11 @@ fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> St
             .map(|value| value.render())
             .unwrap_or_else(|| "unmeasured".to_owned());
         output.push_str(&format!(
-            "{name}\t{}/{}\t{interval}\n",
-            report.overall.oracle.passes, report.overall.oracle.attempts
+            "{name}\t{}/{}\t{}/{}\t{interval}\n",
+            report.overall.oracle.passes,
+            report.overall.oracle.attempts,
+            report.overall.compile_clean_reference_mismatch.passes,
+            report.overall.compile_clean_reference_mismatch.attempts,
         ));
     }
     for item in &comparison.comparisons {
