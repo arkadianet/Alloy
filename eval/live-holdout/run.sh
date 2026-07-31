@@ -20,6 +20,7 @@ BASEURL="${BASEURL:-http://127.0.0.1:8089/v1/}"
 TIMEOUT="${TIMEOUT:-600}"
 GOAL="${GOAL:-fix the compile error in this crate}"
 SCORE="${SCORE:-1}"
+ORACLE="${ORACLE:-$repo/eval/live-holdout/oracle.py}"
 
 die() { echo "live-holdout/run.sh: $1" >&2; exit 2; }
 
@@ -72,6 +73,7 @@ case "$TEMP" in
   ''|*[!0-9.]*) die "TEMP must be a number, got '$TEMP'";;
 esac
 [ -d "$FIXTURES" ] || die "fixtures root missing: $FIXTURES"
+[ -f "$ORACLE" ] || die "oracle script missing: $ORACLE"
 
 router="$("$SCORER" render-router --model "$MODEL" --temperature "$TEMP" --base-url "$BASEURL")" \
   || die "render-router failed"
@@ -81,21 +83,51 @@ mapfile -t ids < <(
 )
 [ "${#ids[@]}" -gt 0 ] || die "no holdout fixture directories under $FIXTURES"
 
+fixture_target_path() {
+  python3 - "$1" <<'PY'
+import sys
+import tomllib
+from pathlib import PurePosixPath
+
+with open(sys.argv[1], "rb") as handle:
+    path = tomllib.load(handle)["naive_target_path"]
+parsed = PurePosixPath(path)
+if not path or parsed.is_absolute() or ".." in parsed.parts:
+    raise SystemExit("naive_target_path must stay inside the fixture workspace")
+print(path)
+PY
+}
+
+for id in "${ids[@]}"; do
+  fixture_dir="$FIXTURES/$id"
+  manifest="$fixture_dir/manifest.toml"
+  [ -f "$manifest" ] || die "fixture $id missing manifest.toml"
+  target_path="$(fixture_target_path "$manifest")" ||
+    die "fixture $id manifest has no naive_target_path"
+  [ -f "$fixture_dir/workspace/$target_path.post" ] ||
+    die "fixture $id missing strict oracle workspace/$target_path.post"
+done
+
 # Exclusive lock on the observations file so two sweeps cannot interleave rows.
 mkdir -p "$(dirname -- "$out")"
 exec 9>"$out.lock" || die "could not open lock $out.lock"
 flock -n 9 || die "another live-holdout sweep holds $out.lock"
 : > "$out"
 total=0
-passed=0
+process_passed=0
+oracle_passed=0
 unexecutable=0
 
 for id in "${ids[@]}"; do
   workspace="$FIXTURES/$id/workspace"
   [ -d "$workspace" ] || die "fixture $id missing workspace/ at $workspace"
+  target_path="$(fixture_target_path "$FIXTURES/$id/manifest.toml")"
   for rep in $(seq 1 "$REPS"); do
     ws="$(mktemp -d)"
     cp -a "$workspace"/. "$ws/"
+    # The golden reference is an oracle input, never model-visible workspace
+    # content.
+    rm -f "$ws/$target_path.post"
     cp -a "$repo/profiles" "$ws/profiles"
     printf '%s' "$router" >"$ws/router.toml"
     git -C "$ws" init -q
@@ -108,16 +140,45 @@ for id in "${ids[@]}"; do
     code=$?
     set -e
     wall_ms=$(($(date +%s%3N) - start_ms))
+    oracle_json="$(
+      python3 "$ORACLE" \
+        --fixture-dir "$FIXTURES/$id" \
+        --workspace "$ws" \
+        --run-log "$ws/run.log" \
+        --exit-code "$code" \
+        --cargo-timeout "$TIMEOUT"
+    )" || die "oracle failed for $id#$rep"
+    read -r process_pass compile_clean reference_match oracle_pass failure_class cargo_check_exit generations <<<"$(
+      python3 - "$oracle_json" <<'PY'
+import json
+import sys
+
+row = json.loads(sys.argv[1])
+print(
+    row["process_pass"],
+    row["compile_clean"],
+    row["reference_match"],
+    row["oracle_pass"],
+    row["failure_class"],
+    row["cargo_check_exit"] if row["cargo_check_exit"] is not None else "null",
+    row["repair_generations"],
+)
+PY
+    )"
     total=$((total + 1))
-    [ "$code" -eq 0 ] && passed=$((passed + 1))
+    [ "$process_pass" = "True" ] && process_passed=$((process_passed + 1))
+    [ "$oracle_pass" = "True" ] && oracle_passed=$((oracle_passed + 1))
     case "$code" in
       126|127) unexecutable=$((unexecutable + 1));;
     esac
-    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"wall_ms":%d,"model":"%s","temperature":%s,"base_url":"%s","corpus":"rfc0016-holdout-live"}\n' \
-      "$id" "$rep" "$code" "$wall_ms" "$MODEL" "$TEMP" "$BASEURL" >>"$out"
-    echo "[$passed/$total] $id#$rep exit=$code ${wall_ms}ms"
-    # Keep failing logs under /tmp for diagnosis; wipe passes.
-    if [ "$code" -eq 0 ]; then
+    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"process_pass":%s,"compile_clean":%s,"reference_match":%s,"oracle_pass":%s,"failure_class":"%s","cargo_check_exit":%s,"repair_generations":%d,"wall_ms":%d,"model":"%s","temperature":%s,"base_url":"%s","corpus":"rfc0016-holdout-live"}\n' \
+      "$id" "$rep" "$code" "${process_pass,,}" "${compile_clean,,}" \
+      "${reference_match,,}" "${oracle_pass,,}" "$failure_class" "$cargo_check_exit" \
+      "$generations" "$wall_ms" "$MODEL" "$TEMP" "$BASEURL" >>"$out"
+    echo "[$oracle_passed/$total oracle; $process_passed process] $id#$rep \
+oracle=$oracle_pass class=$failure_class generations=$generations ${wall_ms}ms"
+    # Keep non-oracle logs under /tmp for diagnosis; wipe strict passes.
+    if [ "$oracle_pass" = "True" ]; then
       rm -rf "$ws"
     else
       echo "  log: $ws/run.log" >&2
@@ -125,27 +186,34 @@ for id in "${ids[@]}"; do
   done
 done
 
-echo "DONE $passed/$total -> $out (live-BYOM holdout; not an offline gate)"
+echo "DONE oracle=$oracle_passed/$total process=$process_passed/$total -> $out \
+(live-BYOM holdout; not an offline gate)"
 
 if [ "$total" -eq 0 ]; then
   die "no repetitions ran — the sweep is broken, not the fixtures"
 fi
 
 if [ "$SCORE" = "1" ]; then
-  python3 - "$out" "$passed" "$total" <<'PY'
+  python3 - "$out" "$total" <<'PY'
 import json, sys
-path, passed, total = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+path, total = sys.argv[1], int(sys.argv[2])
 rows = [json.loads(line) for line in open(path) if line.strip()]
 by = {}
 for r in rows:
-    by.setdefault(r["fixture_id"], []).append(r["exit_code"] == 0)
-print("fixture_id\tpasses\tattempts")
+    by.setdefault(r["fixture_id"], []).append(r)
+print("fixture_id\toracle_passes\tprocess_passes\tattempts")
 for fid in sorted(by):
     xs = by[fid]
-    print(f"{fid}\t{sum(xs)}\t{len(xs)}")
-rate = (passed / total) if total else 0.0
-print(f"overall\t{passed}\t{total}\tpass_rate={rate:.3f}")
-print("NOTE: operator telemetry only — do not cite as RFC-0016 offline holdout.")
+    print(
+        f"{fid}\t{sum(r['oracle_pass'] for r in xs)}\t"
+        f"{sum(r['process_pass'] for r in xs)}\t{len(xs)}"
+    )
+oracle = sum(r["oracle_pass"] for r in rows)
+process = sum(r["process_pass"] for r in rows)
+rate = (oracle / total) if total else 0.0
+process_rate = (process / total) if total else 0.0
+print(f"overall\t{oracle}\t{process}\t{total}\toracle_rate={rate:.3f}\tprocess_rate={process_rate:.3f}")
+print("NOTE: strict oracle is a fixture-reference diagnostic; live telemetry is not an RFC-0016 offline holdout.")
 PY
 fi
 
