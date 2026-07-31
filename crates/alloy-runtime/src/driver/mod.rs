@@ -32,7 +32,7 @@ use tracing::{info, warn};
 use crate::adapters::{NodeExecContext, NodeExecRef, VerdictOutcome, Verifier};
 use crate::capabilities::{WorkerPermissions, WorkerToolClass};
 use crate::dag::NodeKind;
-use crate::edit::{rollback_run_edits, EditContext, EditEngine};
+use crate::edit::{transactions_of_run, EditContext, EditEngine};
 use crate::error::{RunError, RuntimeError};
 use crate::events::{SessionEvent, SessionEventType};
 use crate::obs::{BudgetCheck, CostMeterFactory, DecisionKind, DecisionLog, DecisionRecord};
@@ -334,9 +334,9 @@ impl GenerationDriver {
         }
     }
 
-    /// GN13: after admit, restore the newest journaled edit checkpoint and
-    /// re-verify so the replan seed matches the pre-edit workspace. No-op
-    /// when edit/verify wiring is absent (scripted harnesses).
+    /// GN13: after admit, restore the **newest** journaled edit checkpoint
+    /// only (not the whole run) and re-verify so the replan seed matches the
+    /// pre-edit workspace. No-op when edit/verify wiring is absent.
     async fn restore_workspace_and_reseed(
         &self,
         ctx: &RunExecCtx,
@@ -357,7 +357,9 @@ impl GenerationDriver {
             .await?
             .ok_or_else(|| DriveError::Internal("session missing during GN13 restore".into()))?;
         let events = list_all_session_events(&self.deps.events, ctx.session_id).await?;
-        let dag = self.deps.dags.get(ctx.dag_id).await?;
+        let Some(newest) = transactions_of_run(&events, ctx.run_id).last().copied() else {
+            return Ok(seed);
+        };
         let meta = NodeExecRef {
             session_id: ctx.session_id,
             run_id: ctx.run_id,
@@ -375,29 +377,19 @@ impl GenerationDriver {
             run_id: Some(ctx.run_id),
             perms: token,
         };
-        let report = rollback_run_edits(
-            engine.as_ref(),
-            &events,
-            ctx.run_id,
-            dag.as_ref(),
-            &edit_ctx,
-        )
-        .await;
-        if report.restored.is_empty() {
-            if report.declined.is_some() || report.unjournaled_edits > 0 {
-                warn!(
-                    run_id = %ctx.run_id,
-                    declined = ?report.declined.as_ref().map(|d| &d.reason),
-                    unjournaled = report.unjournaled_edits,
-                    "GN13: no edit restored; reseeding against current workspace"
-                );
-            }
+        if let Err(err) = engine.rollback(newest, &edit_ctx).await {
+            warn!(
+                run_id = %ctx.run_id,
+                tx = %newest,
+                error = %err,
+                "GN13: newest-edit rollback declined; reseeding against current workspace"
+            );
             return Ok(seed);
         }
         info!(
             run_id = %ctx.run_id,
-            restored = report.restored.len(),
-            "GN13: restored edit checkpoint(s); re-verifying for seed"
+            tx = %newest,
+            "GN13: restored newest edit checkpoint; re-verifying for seed"
         );
 
         let verdict = verify
