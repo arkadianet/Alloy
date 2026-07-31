@@ -111,6 +111,11 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
+        args.arms = args.arms.resolve()
+        args.out_dir = args.out_dir.resolve()
+        args.run_script = args.run_script.resolve()
+        if args.comparison_out is not None:
+            args.comparison_out = args.comparison_out.resolve()
         arms = parse_arms(args.arms)
         if not args.run_script.is_file():
             raise ValueError(f"run script missing: {args.run_script}")

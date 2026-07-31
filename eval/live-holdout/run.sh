@@ -3,7 +3,7 @@
 # the RFC-0016 holdout workspaces. NOT an offline gate. See ./README.md.
 #
 # Usage:
-#   MODEL=… BASEURL=http://127.0.0.1:8089/v1/ REPS=1 \
+#   MODEL=… BASEURL=http://127.0.0.1:8089/v1/ PROFILE=default REPS=1 \
 #     ./eval/live-holdout/run.sh /tmp/live-holdout.jsonl
 #
 # Author: arkadianet
