@@ -1,0 +1,5 @@
+{
+  "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,6 +1,6 @@\n-pub fn normalized() -> i32 {\n-    let mut base = 40;\n-    let read = &base;\n-    base += 2;\n-    *read\n-}\n+pub fn normalized() -> i32 {\n+    let mut base = 40;\n+    let read = base;\n+    base += 2;\n+    read\n+}\n",
+  "summary": "apply committed fix to src/lib.rs",
+  "confidence": 0.85
+}

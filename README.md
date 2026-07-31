@@ -108,7 +108,8 @@ clippy/fmt clean, no in-scope TODOs, review approved).
 | [0013](docs/rfcs/RFC-0013-capability-registry-workers.md) | Capability workers | ✅ Implemented |
 | [0014](docs/rfcs/RFC-0014-language-backend-rust.md) | LanguageBackend (Rust) | ✅ Implemented (RA / SemanticEditOp deferred) |
 | [0015](docs/rfcs/RFC-0015-cli-profiles-config.md) | CLI, profiles & config | ✅ Implemented |
-| [0016](docs/rfcs/RFC-0016-eval-harness-holdout-gates.md) | Eval harness & holdout gates | ✅ Day-1 + offline ControlPlane + `stack-driver` smoke (thesis citation still needs independent model outputs) |
+| [0016](docs/rfcs/RFC-0016-eval-harness-holdout-gates.md) | Eval harness & holdout gates | ✅ Day-1 + offline ControlPlane + `stack-driver` **integration smoke** (not thesis citation; needs independent model outputs) |
+| [0017](docs/rfcs/RFC-0017-dynamic-planning.md) | Dynamic planning & repair generations | ✅ Implemented (LLM planner **opt-in**; default flip **eval-gated**) |
 
 Full sequencing, effort estimates, and milestone gates:
 [implementation roadmap](docs/roadmap/IMPLEMENTATION-ROADMAP.md).

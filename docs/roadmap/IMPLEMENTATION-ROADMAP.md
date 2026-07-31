@@ -397,7 +397,7 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 - [x] ProjectGraph thin→deep without changing trait; Callers/Refs/Impls live at syn-grade (A-0011-6); SimilarFixes reads recorded fixes (A-0011-5) — wider auto-retrieve still deferred pending precision
 - [x] Context WorkingSet includes graph projections; still exactly three live domains
 - [x] LanguageBackend Rust-only; no PY/TS/cdylib
-- [ ] Holdout re-run shows improvement **or** written “why not” with metrics — **deferred/unmeasured for context weights:** live `stack-driver` uses `NullContextEngine` and has no alternate weight arms, so it is not measured-weight / “why not” evidence (RFC-0012 §14.2). Keep `DomainWeights::v2_defaults()` until a real measurement exists.
+- [ ] Holdout re-run shows improvement **or** written “why not” with metrics — **deferred/unmeasured for context weights:** prep harness (`holdout_beta_compare_mvp`) can compare weight arms under `DefaultContextEngine`, but committed-recording outputs yield no differential signal (RFC-0012 §14.2 why-not). Keep `DomainWeights::v2_defaults()` until independent model outputs produce a real measurement.
 - [ ] Still `max_parallel=1`; still git-only checkpoints
 - [ ] No External Memory auto-retrieve; no typed call/lifetime layers
 

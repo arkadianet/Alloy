@@ -270,10 +270,10 @@ impl EvalHarness {
 
     /// Live ControlPlane stack-driver with an explicit planner mode.
     ///
-    /// Used by the non-gating ScriptedProposer LLM-arm smoke test; not
+    /// Used by the non-gating CapabilityPlanProposer LLM-arm smoke test; not
     /// RFC-0017 §12.4 flip citation. Requires `--features stack-driver`.
-    /// Does not consume fixture scripts (the live path synthesizes
-    /// repair/edit turns from the golden).
+    /// Loads committed `recordings/{repair_plan,edit_patch,planning_proposal}.json`
+    /// (does not construct control patches from `*.post`).
     #[cfg(feature = "stack-driver")]
     pub async fn run_live_with_planner_mode(
         &self,
@@ -281,6 +281,22 @@ impl EvalHarness {
         mode: alloy_runtime::PlannerMode,
     ) -> FixtureOutcome {
         driver::stack::run_live_with_mode(fixture, self.config.cancel.clone(), mode)
+            .await
+            .outcome
+    }
+
+    /// Live ControlPlane stack-driver with full [`crate::StackLiveOptions`].
+    ///
+    /// Supports planner mode, `max_repair_generations` ablation, and optional
+    /// `context_profile` weight arms (`DefaultContextEngine` + FIFO recording
+    /// provider). Requires `--features stack-driver`.
+    #[cfg(feature = "stack-driver")]
+    pub async fn run_live_with_options(
+        &self,
+        fixture: &LoadedFixture,
+        options: driver::stack_live_options::StackLiveOptions,
+    ) -> FixtureOutcome {
+        driver::stack::run_live_with_options(fixture, self.config.cancel.clone(), options)
             .await
             .outcome
     }

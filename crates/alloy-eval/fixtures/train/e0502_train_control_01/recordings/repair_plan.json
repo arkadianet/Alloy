@@ -1,0 +1,13 @@
+{
+  "summary": "repair src/lib.rs so the crate compiles cleanly",
+  "target_files": ["src/lib.rs"],
+  "steps": [
+    {
+      "file": "src/lib.rs",
+      "rationale": "copy the head element by value before mutating the vec",
+      "anchor_line": 1
+    }
+  ],
+  "needs_replan": false,
+  "confidence": 0.9
+}

@@ -10,8 +10,9 @@ rust-version.workspace = true
 [features]
 default = []
 # Live ControlPlane stack driver (RFC-0016 §5.9): scheduler + Landlock sandbox +
-# MCP cargo_check + GitEditEngine + GenerationDriver. Thesis citation requires
-# this feature; the default build stays offline and free of alloy-tools.
+# MCP cargo_check + GitEditEngine + GenerationDriver. Integration smoke over
+# committed recordings/* worker JSON (not thesis citation — needs independent
+# model outputs). Default `cargo test -p alloy-eval` stays offline (no alloy-tools).
 stack-driver = ["dep:alloy-tools", "dep:tempfile"]
 
 [dependencies]

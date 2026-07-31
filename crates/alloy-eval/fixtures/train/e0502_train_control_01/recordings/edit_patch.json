@@ -1,0 +1,5 @@
+{
+  "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,6 +1,6 @@\n-pub fn bump_first() -> i32 {\n-    let mut scores = vec![1, 2, 3];\n-    let head = &scores[0];\n-    scores.push(4);\n-    *head + scores.len() as i32\n-}\n+pub fn bump_first() -> i32 {\n+    let mut scores = vec![1, 2, 3];\n+    let head = scores[0];\n+    scores.push(4);\n+    head + scores.len() as i32\n+}\n",
+  "summary": "apply committed fix to src/lib.rs",
+  "confidence": 0.85
+}

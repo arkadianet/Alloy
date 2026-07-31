@@ -4,9 +4,10 @@
 //! without network access, aggregates eval metrics, evaluates gates, and can
 //! compare holdout control runs against the naive single-turn baseline.
 //!
-//! Optional feature `stack-driver` enables the live ControlPlane path
-//! (scheduler + Landlock sandbox + MCP + EditEngine). Thesis citation requires
-//! that feature; the default build stays offline.
+//! Optional feature `stack-driver` enables the live ControlPlane **integration
+//! smoke** path (scheduler + Landlock sandbox + MCP + EditEngine). Golden /
+//! committed-recording patches are not thesis citation; the default build stays
+//! offline.
 //!
 //! It additionally hosts the `live_repair` module, the **operator**
 //! live-endpoint repair benchmark rooted at [`LiveRepairCorpus`] and
@@ -76,3 +77,7 @@ pub use recording::{CargoJsonRecording, RecordedDiagnostic, CARGO_RECORDING_FORM
 pub use report::{CriterionResult, EvalReport, FixtureOutcome, FixtureStatus};
 pub use scripted::{ScriptOutcome, ScriptedInvocation, ScriptedProvider, ScriptedProviderError};
 pub use trajectory::EvalTrajectoryRecord;
+
+/// Live stack-driver options (planner, context-profile weight arms, repair gens).
+#[cfg(feature = "stack-driver")]
+pub use driver::stack_live_options::StackLiveOptions;

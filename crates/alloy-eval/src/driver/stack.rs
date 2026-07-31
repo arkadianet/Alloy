@@ -4,20 +4,22 @@
 //! `alloy-tools/tests/scheduler_repair_e2e.rs`: Landlock jail, hermetic
 //! `CARGO_HOME`, `GitEditEngine`, MCP `cargo_check` / `apply_patch`,
 //! `CapabilityRegistry`, `TomlModelRouter` + [`ScriptedProvider`],
-//! `GenerationDriver`, `TemplatePlanService` / `LlmPlanService` (smoke),
-//! and [`GenerationSwitchCapabilities`] (inert gen1 analyze/edit so the real
+//! `GenerationDriver`, `TemplatePlanService` / `LlmPlanService` +
+//! [`CapabilityPlanProposer`] (LLM-arm smoke), and
+//! [`GenerationSwitchCapabilities`] (inert gen1 analyze/edit so the real
 //! `cargo_check` soft-fails and harvests diagnostics; real registry on gen2).
 //!
 //! Activated only when [`live_stack_requested`] is true (`ALLOY_EVAL_LIVE_STACK=1`
-//! plus this feature). Repair/edit JSON is synthesized from the fixture golden
-//! `*.post` — that makes this **integration smoke**, not thesis evidence
-//! (independent model outputs required for Appendix B citation).
+//! plus this feature). Control-plane repair/edit/planning turns load committed
+//! worker JSON under `recordings/` (`repair_plan.json`, `edit_patch.json`,
+//! `planning_proposal.json`). Fixture `*.post` remains the naive-arm oracle
+//! (`full_file_replace`) and offline criteria reference — control MUST NOT
+//! construct its patch by reading the golden.
 //!
 //! Author: arkadianet
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_runtime::adapters::SessionGateHumanAdapter;
@@ -32,18 +34,19 @@ use alloy_runtime::SessionProvenance;
 use alloy_runtime::{
     compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, Approval, BudgetPolicy,
     CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityId,
-    CapabilityOutcome, CapabilityRegistry, ChatMessage, ChatRole, CompletionRequest, ContextEngine,
-    CostMeterFactory, EndpointId, GateHumanAdapter, GenerationDriver, GenerationDriverDeps,
-    GenerationPolicy, Goal, GraphViewHandle, LinearScheduler, LinearSchedulerDeps, LlmPlanService,
-    McpVerifyCompileAdapter, ModelEndpoint, ModelProvider, ModelResponse, ModelTier, NodeKind,
-    NullContextEngine, PlanContext, PlanFingerprints, PlanProposer, PlanService, PlannerConfig,
-    PlannerMode, ProcessCostMeterFactory, ProcessRunRouterProvider, ProposeError,
-    ProposedDagManifest, ProposedNodeSpec, ProviderId, RecordingDecisionLog,
-    RegistryCapabilityExecutor, ResponseFormat, RetentionPolicy, RouterConfig, RunControlState,
-    RunGoalRecord, RunRow, RuntimeConfig, SchedConfig, Session, SessionVerifyPermissions,
-    SessionWorkerPermissions, TemplatePlanService, Timestamp, ToolCaller, ToolChoice, ToolName,
-    ToolSelector, ToolchainRecord, UnavailableVerifyTest, Usage, Verifier, WorkerConfig,
-    WorkerDeps, EDIT_SYSTEM, PROPOSAL_SCHEMA_VERSION, REPAIR_SYSTEM,
+    CapabilityOutcome, CapabilityPlanProposer, CapabilityRegistry, ChatMessage, ChatRole,
+    CompletionRequest, ContextEngine, ContextProfile, CostMeterFactory, DefaultContextEngine,
+    EndpointId, GateHumanAdapter, GenerationDriver, GenerationDriverDeps, GenerationPolicy, Goal,
+    GraphViewHandle, LinearScheduler, LinearSchedulerDeps, LlmPlanService, McpVerifyCompileAdapter,
+    ModelEndpoint, ModelProvider, ModelResponse, ModelTier, NodeKind, NullContextEngine,
+    PlanContext, PlanFingerprints, PlanService, PlannerConfig, PlannerMode,
+    ProcessCostMeterFactory, ProcessRunRouterProvider, ProposerDeps, ProviderId,
+    RecordingDecisionLog, RecordingModelProvider, RegistryCapabilityExecutor, ResponseFormat,
+    RetentionPolicy, RouterConfig, RunControlState, RunGoalRecord, RunRow, RuntimeConfig,
+    SchedConfig, Session, SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService,
+    Timestamp, ToolCaller, ToolChoice, ToolName, ToolSelector, ToolchainRecord,
+    UnavailableVerifyTest, Usage, Verifier, WorkerConfig, WorkerDeps, EDIT_SYSTEM, PLANNING_SYSTEM,
+    REPAIR_SYSTEM,
 };
 use alloy_tools::mcp::{
     InProcessMcpHost, McpHostConfig, McpPlatform, ToolHandle, ToolHandleToolCaller,
@@ -57,6 +60,7 @@ use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
 use crate::cost_claim::derive_eval_usd;
+use crate::driver::stack_live_options::StackLiveOptions;
 use crate::error::{bound_message, EvalError, ReportError};
 use crate::fingerprint::RequestFingerprint;
 use crate::harness::{FixtureRunOutput, LoadedFixture};
@@ -66,6 +70,34 @@ use crate::scripted::{ScriptOutcome, ScriptedProvider};
 use crate::trajectory::EvalTrajectoryRecord;
 
 const GOAL_TEXT: &str = "fix the compile error";
+
+/// Live model provider: keyed smoke vs FIFO weight-arm recording.
+enum LiveModelProvider {
+    /// Null-context smoke path (fingerprint-keyed).
+    Scripted(Arc<ScriptedProvider>),
+    /// Weight arms: FIFO so [`DefaultContextEngine`] packs need not match
+    /// [`NullContextEngine`] fingerprints.
+    Recording {
+        provider: Arc<RecordingModelProvider>,
+        pushed: usize,
+    },
+}
+
+impl LiveModelProvider {
+    fn as_dyn(&self) -> Arc<dyn ModelProvider> {
+        match self {
+            Self::Scripted(p) => Arc::clone(p) as Arc<dyn ModelProvider>,
+            Self::Recording { provider, .. } => Arc::clone(provider) as Arc<dyn ModelProvider>,
+        }
+    }
+
+    fn scripts_exhausted(&self) -> bool {
+        match self {
+            Self::Scripted(p) => p.is_exhausted(),
+            Self::Recording { provider, pushed } => provider.recorded().len() >= *pushed,
+        }
+    }
+}
 
 /// True when the live stack path should run: feature compiled in and
 /// `ALLOY_EVAL_LIVE_STACK` is exactly `1` or `true` (case-insensitive).
@@ -77,57 +109,6 @@ pub(crate) fn live_stack_requested() -> bool {
             v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true")
         }
         Err(_) => false,
-    }
-}
-
-/// Non-gating LLM-arm smoke proposer: returns a valid
-/// `ProposedDagManifest` matching the `repair_local_diagnostic` shape
-/// (Analyze→Edit→VerifyCompile→GateHuman). Bypasses production
-/// `CapabilityPlanProposer` / PlanningWorker — **not** RFC-0017 §12.4 flip
-/// evidence. Replan reuses the stored prior source (GN10).
-struct ScriptedProposer {
-    queue: Mutex<VecDeque<Result<ProposedDagManifest, ProposeError>>>,
-}
-
-impl ScriptedProposer {
-    fn new(results: Vec<Result<ProposedDagManifest, ProposeError>>) -> Arc<Self> {
-        Arc::new(Self {
-            queue: Mutex::new(VecDeque::from(results)),
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl PlanProposer for ScriptedProposer {
-    async fn propose(&self, _ctx: &PlanContext) -> Result<ProposedDagManifest, ProposeError> {
-        self.queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop_front()
-            .unwrap_or(Err(ProposeError::Unavailable("script exhausted".into())))
-    }
-}
-
-/// Linear repair chain matching `repair_local_diagnostic` / RFC-0017 AC shape.
-fn repair_local_manifest() -> ProposedDagManifest {
-    let node = |name: &str, kind: NodeKind, reason: Option<&str>| ProposedNodeSpec {
-        name: name.into(),
-        kind,
-        approval_reason: reason.map(String::from),
-    };
-    ProposedDagManifest {
-        schema_version: PROPOSAL_SCHEMA_VERSION,
-        nodes: vec![
-            node("analyze", NodeKind::Analyze, None),
-            node("edit", NodeKind::Edit, None),
-            node("verify", NodeKind::VerifyCompile, None),
-            node(
-                "gate",
-                NodeKind::GateHuman,
-                Some("Approve before completion"),
-            ),
-        ],
-        rationale: "stack-driver llm holdout: repair_local_diagnostic shape".into(),
     }
 }
 
@@ -162,26 +143,38 @@ pub(crate) async fn run_live(
     fixture: &LoadedFixture,
     cancel: Option<CancellationToken>,
 ) -> FixtureRunOutput {
-    run_live_with_mode(fixture, cancel, PlannerMode::Template).await
+    run_live_with_options(fixture, cancel, StackLiveOptions::template()).await
 }
 
 /// Live ControlPlane path with an explicit [`PlannerMode`].
 ///
 /// `PlannerMode::Template` uses [`TemplatePlanService`]. `PlannerMode::Llm`
-/// wires [`LlmPlanService`] over a [`ScriptedProposer`] (non-gating smoke;
-/// not production proposing). Gen2 repair/edit [`ScriptedProvider`] turns
-/// are unchanged; replan reuses prior LLM source.
+/// wires [`LlmPlanService`] over production [`CapabilityPlanProposer`] +
+/// PlanningWorker (model branch) driven by committed
+/// `recordings/planning_proposal.json` (non-gating smoke — not RFC-0017
+/// §12.4 flip evidence). Gen2 repair/edit turns load committed worker JSON;
+/// replan reuses prior LLM source (GN10).
 pub(crate) async fn run_live_with_mode(
     fixture: &LoadedFixture,
     cancel: Option<CancellationToken>,
     mode: PlannerMode,
+) -> FixtureRunOutput {
+    run_live_with_options(fixture, cancel, StackLiveOptions::template().planner(mode)).await
+}
+
+/// Live ControlPlane path with full [`StackLiveOptions`] (planner mode,
+/// max_repair_generations ablation, optional context-profile weight arms).
+pub(crate) async fn run_live_with_options(
+    fixture: &LoadedFixture,
+    cancel: Option<CancellationToken>,
+    options: StackLiveOptions,
 ) -> FixtureRunOutput {
     let started = Instant::now();
     if cancelled(&cancel) {
         return cancelled_output(fixture, started);
     }
 
-    match run_live_inner(fixture, &cancel, mode).await {
+    match run_live_inner(fixture, &cancel, options).await {
         Ok(output) => output,
         Err(error) => error_output(fixture, started, error),
     }
@@ -207,12 +200,12 @@ pub(crate) async fn run_naive_live(
 async fn run_live_inner(
     fixture: &LoadedFixture,
     cancel: &Option<CancellationToken>,
-    mode: PlannerMode,
+    options: StackLiveOptions,
 ) -> Result<FixtureRunOutput, EvalError> {
     let started = Instant::now();
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (fixture, cancel, mode);
+        let _ = (fixture, cancel, options);
         return Err(sandbox_unavailable(
             "live stack-driver requires Linux/Landlock",
         ));
@@ -220,6 +213,8 @@ async fn run_live_inner(
 
     #[cfg(target_os = "linux")]
     {
+        let mode = options.planner;
+        let max_repair_generations = options.max_repair_generations;
         landlock_or_error().await?;
         let Some(cargo_bin) = which_cargo() else {
             return Err(EvalError::Internal("cargo not on PATH".into()));
@@ -266,9 +261,8 @@ async fn run_live_inner(
         let pre_source =
             std::fs::read_to_string(workspace_root.join(&fixture.manifest.naive_target_path))
                 .map_err(EvalError::Io)?;
-        let golden = std::fs::read_to_string(&fixture.paths.golden).map_err(EvalError::Io)?;
-        let rel_target = fixture.manifest.naive_target_path.clone();
-        let fix_diff = unified_diff(&rel_target, &pre_source, &golden);
+        // Control-plane patches come from committed recordings/* JSON — never
+        // from fixture.paths.golden / *.post (naive-arm oracle only).
 
         let runtime_dir = tempfile::tempdir().map_err(EvalError::Io)?;
         let mut rt = AlloyRuntime::new();
@@ -283,7 +277,10 @@ async fn run_live_inner(
             retain_tool_bodies: false,
             run_timeout: Duration::from_secs(300),
             budget_policy: BudgetPolicy::default(),
-            context_profile: alloy_runtime::ContextProfile::v2_defaults(),
+            context_profile: options
+                .context_profile
+                .clone()
+                .unwrap_or_else(ContextProfile::v2_defaults),
             capture: Default::default(),
             planner: PlannerConfig {
                 mode,
@@ -293,7 +290,7 @@ async fn run_live_inner(
             gates: Default::default(),
             sandbox_echo: None,
             gate_timeout: None,
-            max_repair_generations: 2,
+            max_repair_generations,
         })
         .map_err(|e| EvalError::Internal(bound_message(format!("runtime configure: {e}"))))?;
         let handle = rt
@@ -368,16 +365,35 @@ async fn run_live_inner(
             )));
         let router_config = RouterConfig::from_str("eval-stack", router_toml())
             .map_err(|e| EvalError::Internal(bound_message(format!("router config: {e}"))))?;
-        let provider = build_scripted_provider(&fixture.endpoint, &rel_target, &fix_diff).await?;
+        let llm_planning = mode == PlannerMode::Llm;
+        let use_default_context = options.context_profile.is_some();
+        let provider = build_live_provider(
+            fixture,
+            &fixture.endpoint,
+            llm_planning,
+            use_default_context,
+        )
+        .await?;
         let routers = Arc::new(ProcessRunRouterProvider::new(
             router_config,
-            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            provider.as_dyn(),
             BudgetPolicy::default(),
             Some(Arc::clone(&decisions) as _),
         ));
+        let worker_config = WorkerConfig::default();
+        let context: Arc<dyn ContextEngine> = match &options.context_profile {
+            Some(profile) => Arc::new(DefaultContextEngine::new(
+                profile.clone(),
+                GraphViewHandle::null(),
+                storage.events() as _,
+                storage.artifacts() as _,
+                workspace_root.clone(),
+            )),
+            None => Arc::new(NullContextEngine::with_goal(GOAL_TEXT)),
+        };
         let deps = WorkerDeps {
             routers,
-            context: Arc::new(NullContextEngine::with_goal(GOAL_TEXT)),
+            context,
             tools: worker_tools,
             perms: Arc::new(SessionWorkerPermissions::new(
                 storage.sessions(),
@@ -388,14 +404,15 @@ async fn run_live_inner(
             artifacts: storage.artifacts(),
             decisions: Arc::clone(&decisions) as _,
             sessions: storage.sessions(),
-            config: WorkerConfig::default(),
+            config: worker_config.clone(),
         };
-        let registry = CapabilityRegistry::mvp(deps)
+        let registry = CapabilityRegistry::mvp_with(deps, llm_planning)
             .map_err(|e| EvalError::Internal(bound_message(format!("capability registry: {e}"))))?;
         let real_caps: Arc<dyn CapabilityExecutor> =
             Arc::new(RegistryCapabilityExecutor::new(Arc::new(registry)));
-        let caps: Arc<dyn CapabilityExecutor> =
-            Arc::new(GenerationSwitchCapabilities { real: real_caps });
+        let caps: Arc<dyn CapabilityExecutor> = Arc::new(GenerationSwitchCapabilities {
+            real: Arc::clone(&real_caps),
+        });
 
         let scheduler = Arc::new(build_scheduler(
             &storage,
@@ -411,12 +428,23 @@ async fn run_live_inner(
             .set_scheduler(scheduler as _)
             .map_err(|e| EvalError::Internal(bound_message(format!("set scheduler: {e}"))))?;
 
-        let plans = build_plan_service(&storage, &decisions, mode);
+        let runtime_cancel = cancel.clone().unwrap_or_default();
+        // CapabilityPlanProposer uses the real registry executor — not
+        // GenerationSwitchCapabilities (Plan is never a gen1 DAG node).
+        let plans = build_plan_service(
+            &storage,
+            &decisions,
+            mode,
+            Arc::clone(&real_caps),
+            workspace_root.clone(),
+            runtime_cancel.clone(),
+            Arc::clone(&cost_meters),
+            worker_config.enable_review,
+        );
         PlanService::plan(&*plans, plan_ctx(session_id, run_id, dag_id))
             .await
             .map_err(|e| EvalError::Internal(bound_message(format!("plan: {e}"))))?;
 
-        let runtime_cancel = cancel.clone().unwrap_or_default();
         let driver = Arc::new(GenerationDriver::new(GenerationDriverDeps {
             handle: handle.clone(),
             plans: Arc::clone(&plans),
@@ -430,7 +458,7 @@ async fn run_live_inner(
             cancellation: runtime_cancel,
             fingerprints: fingerprints(),
             policy: GenerationPolicy {
-                max_repair_generations: 2,
+                max_repair_generations,
             },
         }));
         plane.set_executor(driver as _);
@@ -449,10 +477,91 @@ async fn run_live_inner(
                 return Ok(cancelled_output(fixture, started));
             }
             if run_task.is_finished() {
+                // Ablation max_repair_generations=0: gen1 inert analyze/edit
+                // fails verify and the run ends without opening GateHuman.
+                run_task
+                    .await
+                    .map_err(|e| EvalError::Internal(bound_message(format!("run join: {e}"))))?
+                    .map_err(|e| {
+                        EvalError::Internal(bound_message(format!("run failed early: {e}")))
+                    })?;
+                let run_row = storage
+                    .sessions()
+                    .get_run(run_id)
+                    .await
+                    .map_err(|e| EvalError::Internal(bound_message(format!("get_run: {e}"))))?
+                    .ok_or_else(|| EvalError::Internal("run row missing".into()))?;
+                let succeeded = run_row.state == "succeeded";
+                let fixed_source = std::fs::read_to_string(
+                    workspace_root.join(&fixture.manifest.naive_target_path),
+                )
+                .map_err(EvalError::Io)?;
+                let compile_clean = succeeded && live_compile_clean(&broker, &jail).await?;
+                let meter = cost_meters.meter_for(run_id).snapshot();
+                let model_calls = meter.model_calls.min(u32::MAX as u64) as u32;
+                let tokens_in = if meter.tokens_in > 0 {
+                    Some(meter.tokens_in)
+                } else {
+                    None
+                };
+                let tokens_out = if meter.tokens_out > 0 {
+                    Some(meter.tokens_out)
+                } else {
+                    None
+                };
+                let cost_usd = match (tokens_in, tokens_out) {
+                    (Some(input_tokens), Some(output_tokens)) => derive_eval_usd(
+                        &fixture.endpoint,
+                        &Usage {
+                            input_tokens: Some(input_tokens),
+                            output_tokens: Some(output_tokens),
+                        },
+                    ),
+                    _ => None,
+                };
+                let final_dag =
+                    storage.dags().get(dag_id).await.map_err(|e| {
+                        EvalError::Internal(bound_message(format!("final dag: {e}")))
+                    })?;
+                let retry_count = final_dag
+                    .as_ref()
+                    .map(|d| u32::try_from(d.generation.saturating_sub(1)).unwrap_or(u32::MAX));
+                let scripts_exhausted = provider.scripts_exhausted();
+                let unsafe_introduced = unsafe_introduced(&pre_source, &fixed_source);
+                let criteria =
+                    live_criteria(fixture, compile_clean, unsafe_introduced, scripts_exhausted);
+                let status = if !succeeded {
+                    FixtureStatus::Fail
+                } else if criteria.iter().all(|c| c.passed) {
+                    FixtureStatus::Pass
+                } else {
+                    FixtureStatus::Fail
+                };
+                let trajectories =
+                    live_trajectories(fixture, &provider, status, Some(compile_clean));
                 let _ = shutdown_runtime(rt, storage).await;
-                return Err(EvalError::Internal(
-                    "live stack-driver: run returned before GateHuman opened".into(),
-                ));
+                drop(homes_root);
+                drop(work_dir);
+                drop(runtime_dir);
+                return Ok(FixtureRunOutput {
+                    outcome: FixtureOutcome {
+                        fixture_id: fixture.manifest.id.clone(),
+                        set: fixture.manifest.set,
+                        status,
+                        criteria,
+                        wall_ms: elapsed_ms(started),
+                        model_calls,
+                        tokens_in,
+                        tokens_out,
+                        cost_usd,
+                        retry_count,
+                        human_interventions: Some(human_interventions),
+                        unsafe_introduced: Some(unsafe_introduced),
+                        compile_clean: Some(compile_clean),
+                        error: None,
+                    },
+                    trajectories,
+                });
             }
             let dag = storage
                 .dags()
@@ -533,7 +642,7 @@ async fn run_live_inner(
             .as_ref()
             .map(|d| u32::try_from(d.generation.saturating_sub(1)).unwrap_or(u32::MAX));
 
-        let scripts_exhausted = provider.is_exhausted();
+        let scripts_exhausted = provider.scripts_exhausted();
         let unsafe_introduced = unsafe_introduced(&pre_source, &fixed_source);
         let criteria = live_criteria(fixture, compile_clean, unsafe_introduced, scripts_exhausted);
 
@@ -734,16 +843,30 @@ fn live_criteria(
 
 fn live_trajectories(
     fixture: &LoadedFixture,
-    provider: &ScriptedProvider,
+    provider: &LiveModelProvider,
     status: FixtureStatus,
     compile_clean: Option<bool>,
 ) -> Vec<EvalTrajectoryRecord> {
     let mut caps_seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    provider
-        .recorded()
+    let invocations: Vec<(ModelEndpoint, CompletionRequest, RequestFingerprint)> = match provider {
+        LiveModelProvider::Scripted(p) => p
+            .recorded()
+            .into_iter()
+            .map(|inv| (inv.endpoint, inv.request, inv.fingerprint))
+            .collect(),
+        LiveModelProvider::Recording { provider, .. } => provider
+            .recorded()
+            .into_iter()
+            .map(|(endpoint, request)| {
+                let fingerprint = RequestFingerprint::of(&request);
+                (endpoint, request, fingerprint)
+            })
+            .collect(),
+    };
+    invocations
         .into_iter()
-        .map(|inv| {
-            let capability = capability_from_request(&inv.request);
+        .map(|(endpoint, request, fingerprint)| {
+            let capability = capability_from_request(&request);
             let ordinal = {
                 let entry = caps_seen.entry(capability.clone()).or_insert(0);
                 let n = *entry;
@@ -761,8 +884,8 @@ fn live_trajectories(
                 fixture.manifest.id.clone(),
                 fixture.manifest.set,
                 turn_id,
-                inv.fingerprint,
-                &inv.endpoint,
+                fingerprint,
+                &endpoint,
                 &ModelResponse {
                     text: None,
                     structured: None,
@@ -778,16 +901,12 @@ fn live_trajectories(
                 status,
                 compile_clean,
             );
-            // from_response marks complete_ok from usage; force success for a
-            // consumed scripted invocation even when tokens were not metered.
             row.complete_ok = true;
             row
         })
         .collect()
 }
 
-/// One observational row for live naive (no model calls): the ordinal-0 repair
-/// turn identity from the manifest, so scrub/determinism still has a trajectory.
 fn naive_live_trajectories(
     fixture: &LoadedFixture,
     status: FixtureStatus,
@@ -834,10 +953,12 @@ fn capability_from_request(request: &CompletionRequest) -> String {
         .find(|m| m.role == ChatRole::System)
         .map(|m| m.content.as_str())
         .unwrap_or("");
-    if sys == EDIT_SYSTEM || sys.contains("EditWorker") {
+    if sys == PLANNING_SYSTEM || sys.contains("plan a linear chain") {
+        "planning".into()
+    } else if sys == EDIT_SYSTEM || sys.contains("EditWorker") {
         "edit".into()
     } else {
-        // Default / REPAIR_SYSTEM / unknown → repair (live stack only scripts those two).
+        // Default / REPAIR_SYSTEM / unknown → repair.
         "repair".into()
     }
 }
@@ -997,28 +1118,6 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), EvalError> {
     Ok(())
 }
 
-/// Full-file unified diff suitable for `apply_patch` / `GitEditEngine`.
-fn unified_diff(rel_path: &str, before: &str, after: &str) -> String {
-    let old_lines: Vec<&str> = before.lines().collect();
-    let new_lines: Vec<&str> = after.lines().collect();
-    let old_n = old_lines.len();
-    let new_n = new_lines.len();
-    let mut out = String::new();
-    out.push_str(&format!("--- a/{rel_path}\n+++ b/{rel_path}\n"));
-    out.push_str(&format!("@@ -1,{old_n} +1,{new_n} @@\n"));
-    for line in &old_lines {
-        out.push('-');
-        out.push_str(line);
-        out.push('\n');
-    }
-    for line in &new_lines {
-        out.push('+');
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
-}
-
 fn router_toml() -> &'static str {
     r#"
 [policy]
@@ -1097,8 +1196,78 @@ async fn worker_request(capability: &str, system: &'static str) -> CompletionReq
     }
 }
 
-fn scripted_response(value: serde_json::Value) -> ScriptOutcome {
-    ScriptOutcome::Response(ModelResponse {
+fn load_recording_json(
+    fixture: &LoadedFixture,
+    name: &str,
+) -> Result<serde_json::Value, EvalError> {
+    let path = fixture.root.join("recordings").join(name);
+    let bytes = std::fs::read(&path).map_err(|e| {
+        EvalError::Internal(bound_message(format!(
+            "load committed worker JSON {}: {e}",
+            path.display()
+        )))
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        EvalError::Internal(bound_message(format!(
+            "parse committed worker JSON {}: {e}",
+            path.display()
+        )))
+    })
+}
+
+async fn build_live_provider(
+    fixture: &LoadedFixture,
+    fixture_endpoint: &ModelEndpoint,
+    llm_planning: bool,
+    use_recording_fifo: bool,
+) -> Result<LiveModelProvider, EvalError> {
+    let repair = load_recording_json(fixture, "repair_plan.json")?;
+    let edit = load_recording_json(fixture, "edit_patch.json")?;
+    let planning = if llm_planning {
+        Some(load_recording_json(fixture, "planning_proposal.json")?)
+    } else {
+        None
+    };
+
+    if use_recording_fifo {
+        // Weight arms: DefaultContextEngine changes PromptPack bytes, so
+        // NullContextEngine fingerprints miss. FIFO ignores request identity.
+        let provider = Arc::new(RecordingModelProvider::new(
+            ProviderId::new("provider").unwrap(),
+        ));
+        let mut pushed = 0usize;
+        if let Some(plan) = planning {
+            provider.push(Ok(scripted_model_response(plan)));
+            pushed += 1;
+        }
+        provider.push(Ok(scripted_model_response(repair)));
+        provider.push(Ok(scripted_model_response(edit)));
+        pushed += 2;
+        return Ok(LiveModelProvider::Recording { provider, pushed });
+    }
+
+    let endpoint = scripted_endpoint_for(fixture_endpoint);
+    let provider = ScriptedProvider::new(ProviderId::new("provider").unwrap(), endpoint)
+        .map_err(|e| EvalError::Internal(bound_message(format!("scripted provider: {e}"))))?;
+    if let Some(plan) = planning {
+        provider.insert(
+            RequestFingerprint::of(&worker_request("planning", PLANNING_SYSTEM).await),
+            ScriptOutcome::Response(scripted_model_response(plan)),
+        );
+    }
+    provider.insert(
+        RequestFingerprint::of(&worker_request("repair", REPAIR_SYSTEM).await),
+        ScriptOutcome::Response(scripted_model_response(repair)),
+    );
+    provider.insert(
+        RequestFingerprint::of(&worker_request("edit", EDIT_SYSTEM).await),
+        ScriptOutcome::Response(scripted_model_response(edit)),
+    );
+    Ok(LiveModelProvider::Scripted(Arc::new(provider)))
+}
+
+fn scripted_model_response(value: serde_json::Value) -> ModelResponse {
+    ModelResponse {
         text: Some(value.to_string()),
         structured: Some(value),
         tool_calls: vec![],
@@ -1108,40 +1277,7 @@ fn scripted_response(value: serde_json::Value) -> ScriptOutcome {
         },
         provider_request_id: Some("stack-driver".into()),
         finish_reason: Some("stop".into()),
-    })
-}
-
-async fn build_scripted_provider(
-    fixture_endpoint: &ModelEndpoint,
-    rel_target: &str,
-    fix_diff: &str,
-) -> Result<Arc<ScriptedProvider>, EvalError> {
-    let endpoint = scripted_endpoint_for(fixture_endpoint);
-    let provider = ScriptedProvider::new(ProviderId::new("provider").unwrap(), endpoint)
-        .map_err(|e| EvalError::Internal(bound_message(format!("scripted provider: {e}"))))?;
-    provider.insert(
-        RequestFingerprint::of(&worker_request("repair", REPAIR_SYSTEM).await),
-        scripted_response(serde_json::json!({
-            "summary": format!("repair {rel_target} so the crate compiles cleanly"),
-            "target_files": [rel_target],
-            "steps": [{
-                "file": rel_target,
-                "rationale": "apply the golden fix as a minimal unified diff",
-                "anchor_line": 1,
-            }],
-            "needs_replan": false,
-            "confidence": 0.9,
-        })),
-    );
-    provider.insert(
-        RequestFingerprint::of(&worker_request("edit", EDIT_SYSTEM).await),
-        scripted_response(serde_json::json!({
-            "patch": fix_diff,
-            "summary": format!("apply golden fix to {rel_target}"),
-            "confidence": 0.85,
-        })),
-    );
-    Ok(Arc::new(provider))
+    }
 }
 
 fn git_token(run_id: RunId) -> alloy_runtime::PermissionToken {
@@ -1290,26 +1426,42 @@ fn plan_ctx(session: SessionId, run: RunId, dag: DagId) -> PlanContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_plan_service(
     storage: &AlloyStorage,
     decisions: &Arc<RecordingDecisionLog>,
     mode: PlannerMode,
+    real_caps: Arc<dyn CapabilityExecutor>,
+    workspace_root: PathBuf,
+    cancellation: CancellationToken,
+    cost_meters: Arc<ProcessCostMeterFactory>,
+    enable_review: bool,
 ) -> Arc<dyn PlanService> {
     let template = TemplatePlanService::from_storage(storage);
     match mode {
         PlannerMode::Template => Arc::new(template),
         PlannerMode::Llm => {
-            let proposer = ScriptedProposer::new(vec![Ok(repair_local_manifest())]);
+            let cfg = PlannerConfig {
+                mode: PlannerMode::Llm,
+                ..PlannerConfig::new()
+            };
+            let proposer = CapabilityPlanProposer::new(
+                real_caps,
+                ProposerDeps {
+                    workspace_root,
+                    cancellation,
+                    cost_meters: cost_meters as _,
+                    budget_policy: BudgetPolicy::default(),
+                },
+                cfg.clone(),
+            );
             Arc::new(LlmPlanService::new(
                 template,
-                proposer,
+                Arc::new(proposer),
                 storage.artifacts(),
                 Arc::clone(decisions) as _,
-                PlannerConfig {
-                    mode: PlannerMode::Llm,
-                    ..PlannerConfig::new()
-                },
-                true,
+                cfg,
+                enable_review,
             ))
         }
     }
