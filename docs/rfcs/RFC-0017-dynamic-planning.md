@@ -869,16 +869,19 @@ Called by `RunController::start` at RFC-0003 §6.3 step 8, with the per-run mute
 ```text
 execute(RunExecCtx { run_id, session_id, dag_id, deadline }):
   bumps ← 0
+  lineage_seed ← None                                          # AM-0017-1: in-run only
   loop:
     remaining ← deadline.saturating_duration_since(now())      # GN7: one absolute clock
     if remaining == 0: return Ok(last_outcome_or_timeout)      # never dispatch with a zero budget
     outcome ← handle.run_dag_within(dag_id, remaining)         # one generation; AM-0010-2
     if outcome.state != Failed: return Ok(outcome)             # Succeeded / Cancelled / ReplanRequired pass through
-    if !admit(outcome, bumps, deadline): record Replan{admitted:false, reason}; return Ok(outcome)
-    record Replan{admitted:true, from, to}
-    runs.begin_repair_generation(run_id, &FailureIr(f))        # GN8: waiters dropped, ReplanRequested event, row stays Running
-    plan  ← plans.replan(FailureIr(f), ctx')                   # seeds per §5.4; ctx' per GN10
+    seed ← admit(outcome, bumps, deadline, lineage_seed)       # Ok(seed) or Err(reason)
+    if seed is Err: record Replan{admitted:false, reason}; return Ok(outcome)
+    record Replan{admitted:true, from, to, seed_source}
+    runs.begin_repair_generation(run_id, &FailureIr(seed))     # GN8: waiters dropped, ReplanRequested event, row stays Running
+    plan  ← plans.replan(FailureIr(seed), ctx')                # seeds per §5.4; ctx' per GN10
     runs.complete_repair_generation(run_id, plan.dag.generation)# ReplanResumed event
+    lineage_seed ← Some(seed)                                  # reopen lineage on every admit
     bumps += 1
 ```
 
@@ -889,9 +892,9 @@ The value returned here is the *only* thing §6.3 steps 9–10 ever see, so exac
 | # | Rule |
 | --- | --- |
 | GN1 | `outcome.state == DagState::Failed` and `outcome.failure == Some(f)` and `outcome.failed_node == Some(n)`. Derivation rule D3 itself is untouched — the driver converts the *outcome*, the scheduler never re-routes it. |
-| GN2 | The failed node's kind, looked up in the post-run blob (`dags.get(dag_id)`), is **`VerifyCompile`**. `VerifyTest` is excluded day-1: RFC-0010 **DG7** requires `McpVerifyTestAdapter` to return an **empty** `diagnostics` vector and to rely on the raw log artifact, so a test failure can never satisfy GN4 — admitting it would produce exactly the blind generation GN4 exists to prevent. Enabling it needs an amendment to DG7 that gives test failures a structured IR; that amendment is **not** made here (§16.5). Failures of LLM nodes, gates, or structural invariants never auto-replan. |
-| GN3 | `f.error_class == ErrorClass::Compile` — a genuine verify `Fail` verdict. (`Test` is reachable in the enum but unreachable through GN2 today; the rule is written as `Compile` alone so the two do not silently disagree.) By RFC-0010 §5.13.2 (as amended by #52's `fail_requires_diagnostics`), Inconclusive conditions (signal kills, truncated output, non-{0,101} exits, bare 101 without rustc diagnostics) surface as `ErrorClass::Tool`/`Timeout` and are excluded by construction — and `verify_retry()` has already spent its one `Tool` re-run on them (§5.2.3). |
-| GN4 | `f.diagnostics` is non-empty **after the SD9 projection** — no diagnostics, no seed, no bump (an empty seed would recreate the blind generation this RFC exists to kill). Checking post-projection matters: a diagnostic whose only content was `raw_json` projects to nothing. |
+| GN2 | **Primary:** the failed node's kind, looked up in the post-run blob (`dags.get(dag_id)`), is **`VerifyCompile`**; the seed `FailureIr` is the outcome's. **AM-0017-1 lineage exception:** if the failed kind is **`Edit` or `Analyze`**, the terminal failure's `error_class` is **`Model`**, and this `execute()` still holds an in-run **lineage seed** — the Compile `FailureIr` from the `VerifyCompile` Fail that most recently admitted a repair bump in this driver loop — then admission continues with that lineage seed (not the Edit/Analyze IR). The lineage seed is stashed only when a verify Fail is admitted; it MUST NOT be reconstructed by scanning session history. `VerifyTest` stays excluded day-1: RFC-0010 **DG7** empties its diagnostics, so admitting it would recreate the blind generation GN4 exists to prevent (§16.5). Gates, Aggregate, and non-Model LLM failures still never auto-replan (`reason: "kind"`). |
+| GN3 | The **seed** `FailureIr` (outcome verify Fail, or AM-0017-1 lineage) has `error_class == ErrorClass::Compile` — a genuine verify `Fail` verdict. (`Test` is reachable in the enum but unreachable through GN2 today; the rule is written as `Compile` alone so the two do not silently disagree.) By RFC-0010 §5.13.2 (as amended by #52's `fail_requires_diagnostics`), Inconclusive conditions (signal kills, truncated output, non-{0,101} exits, bare 101 without rustc diagnostics) surface as `ErrorClass::Tool`/`Timeout` and are excluded by construction — and `verify_retry()` has already spent its one `Tool` re-run on them (§5.2.3). |
+| GN4 | The **seed**'s `diagnostics` are non-empty **after the SD9 projection** — no diagnostics, no seed, no bump (an empty seed would recreate the blind generation this RFC exists to kill). Checking post-projection matters: a diagnostic whose only content was `raw_json` projects to nothing. |
 | GN5 | `bumps < policy.max_repair_generations`. |
 | GN6 | The run is not cancelled and the budget is not exhausted. Two concrete reads, both now available: `runs.control_state(run_id)` MUST NOT be `Cancelling` or terminal (AM-0003-3 — no such accessor exists today), **and** `deps.cancellation.is_cancelled()` MUST be false, **and** `cost_meter.check_budget(&deps.budget_policy) == BudgetCheck::Ok`. Note `SharedCostMeter` exposes no "remaining" quantity — only `check_budget`'s verdict and `snapshot()`'s totals — so the verdict enum is the seam; the audited draft's "remaining > 0" was not expressible. Mirror of retry admission A5. |
 | **GN7** | **One absolute deadline.** `deadline` is computed once by `start` (`Instant::now() + RuntimeConfig.run_timeout`) and carried on `RunExecCtx`; each generation is dispatched via `run_dag_within(dag_id, remaining)` where `remaining = deadline - now()`. Admission additionally requires `remaining > 0`. `N` generations therefore consume ≤ one `run_timeout` in total, not `N × run_timeout`. Gate-wait exclusion (RFC-0010 §5.19) still applies *within* each generation; time spent replanning between generations is charged to the run. |
@@ -1074,7 +1077,7 @@ Comment-only additions: `ALLOY_MAX_REPAIR_GENERATIONS=2` (the knob is run policy
 | Kind | When | Payload keys |
 | --- | --- | --- |
 | `PlanProposal` | every `LlmPlanService::plan` (LP8) | `dag_id`, `generation`, `accepted: bool`, `rejected_reason?`, `node_count?`, `proposal_artifact?`, `fallback_template?` |
-| `Replan` | every driver admission decision (admit or reject) | `run_id`, `dag_id`, `from_generation`, `to_generation?`, `failed_node`, `error_class`, `diagnostic_count`, `admitted: bool`, `reason?` (`exhausted` \| `deadline` \| `kind` \| `class` \| `no_diagnostics` \| `cancelled` \| `budget`), `provenance?` (`preserved` \| `degraded`, GN10) |
+| `Replan` | every driver admission decision (admit or reject) | `run_id`, `dag_id`, `from_generation`, `to_generation?`, `failed_node`, `error_class` (terminal outcome), `diagnostic_count` (from seed when admitted), `admitted: bool`, `reason?` (`exhausted` \| `deadline` \| `kind` \| `class` \| `no_diagnostics` \| `cancelled` \| `budget`), `provenance?` (`preserved` \| `degraded`, GN10), `seed_source?` (`outcome` \| `lineage`, AM-0017-1, admits only) |
 
 ### 9.3 Session events
 
@@ -1223,7 +1226,8 @@ Every criterion is independently testable by a named test or mechanical check.
 - [ ] 21b. **Run-control integration (blocker 1).** A 2-generation run driven through `RunController::start` emits exactly one `RunAccepted`, one `RunCompleted`, one `RunFinished`, and writes a terminal row once. The run row reads `running` between generations — never `created`, never `replan_requested` (RC1). A 1-generation and a 3-generation run emit the same lifecycle-event multiset.
 - [ ] 21c. `DirectRunExecutor` is the default and RFC-0003's existing `start` suite passes against it unchanged (RX3). The driver never emits a lifecycle event and never calls `start` (grep, AC 48).
 - [ ] 22. `scheduler_repair_e2e` produces generation 2 via `PlanService::replan` (no hand-crafted seed remains in the test) and still converts a genuine `E0308` (MG5).
-- [ ] 23. GN2: a Failed `Edit` node (ErrorClass::Model) never bumps; a Failed **`VerifyTest`** node never bumps (day-1 exclusion). GN3: `ErrorClass::Tool` (cargo signal/truncation/config classes) never bumps. GN4: empty diagnostics never bump.
+- [ ] 23. GN2 baseline: a Failed `Edit` node (ErrorClass::Model) **with no lineage seed** never bumps; a Failed **`VerifyTest`** node never bumps (day-1 exclusion). GN3: `ErrorClass::Tool` (cargo signal/truncation/config classes) never bumps. GN4: empty diagnostics never bump.
+- [ ] 23b. **AM-0017-1:** scripted `VerifyCompile(Compile, diags)` → bump → `Edit(Model)` → bump (decision `seed_source: "lineage"`) → `Succeed` yields final `Succeeded` with two admitted replans. The same `Edit(Model)` as generation 1 (no prior verify admit) still declines `reason: "kind"` (AC 23). An `Edit(Tool)` failure with lineage present still declines `kind`.
 - [ ] 24. GN5/GN11: with `max_repair_generations = 2`, the third verify Fail returns the final `Failed` outcome with `FailureIr` intact and `Replan{admitted:false, reason:"exhausted"}` recorded.
 - [ ] 25. GN6: cancelled run (`control_state == Cancelling` **or** a fired token) / `BudgetCheck != Ok` → no bump, reason recorded.
 - [ ] 25b. **GN7 absolute deadline:** with `run_timeout = T` and a first generation consuming 0.6 T, the second is dispatched with ≈0.4 T remaining, a third is refused with `reason: "deadline"`, and total wall clock ≤ T + ε. The `remaining` argument passed to `run_dag_within` strictly decreases across generations. A run with `max_repair_generations = 2` MUST NOT be able to consume 3 T.
