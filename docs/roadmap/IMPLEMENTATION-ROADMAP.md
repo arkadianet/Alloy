@@ -401,7 +401,7 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 - [x] ProjectGraph thin→deep without changing trait; Callers/Refs/Impls live at syn-grade (A-0011-6); SimilarFixes reads recorded fixes (A-0011-5) — wider auto-retrieve still deferred pending precision
 - [x] Context WorkingSet includes graph projections; still exactly three live domains
 - [x] LanguageBackend Rust-only; no PY/TS/cdylib
-- [ ] Holdout re-run shows improvement **or** written “why not” with metrics — **deferred/unmeasured for context weights:** prep harness (`holdout_beta_compare_mvp`) compares weight arms under `DefaultContextEngine` with live `SqliteProjectGraph` ingest + diagnostic seed (CLI bootstrap parity), but committed-recording outputs yield no differential signal (RFC-0012 §14.2 why-not). Keep `DomainWeights::v2_defaults()` until independent model outputs produce a real measurement.
+- [ ] Holdout re-run shows improvement **or** written “why not” with metrics — `eval/live-holdout` now reports independent process, compile, strict-reference, failure-class, and Wilson-interval results. The first Qwen3-Coder `REPS=3` baseline was process `5/6` but strict `0/6` (one `replan_declined_kind`, five semantic reference mismatches), so this is diagnostic evidence, not a Beta sign-off. Next comparisons must repeat across model/context arms before changing `DomainWeights::v2_defaults()`; committed-recording outputs still cannot produce that differential signal (RFC-0012 §14.2).
 - [ ] Still `max_parallel=1`; still git-only checkpoints
 - [ ] No External Memory auto-retrieve; no typed call/lifetime layers
 

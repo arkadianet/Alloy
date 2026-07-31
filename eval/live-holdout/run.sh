@@ -21,6 +21,7 @@ TIMEOUT="${TIMEOUT:-600}"
 GOAL="${GOAL:-fix the compile error in this crate}"
 SCORE="${SCORE:-1}"
 ORACLE="${ORACLE:-$repo/eval/live-holdout/oracle.py}"
+SCORE_SCRIPT="${SCORE_SCRIPT:-$repo/eval/live-holdout/score.py}"
 
 die() { echo "live-holdout/run.sh: $1" >&2; exit 2; }
 
@@ -74,6 +75,7 @@ case "$TEMP" in
 esac
 [ -d "$FIXTURES" ] || die "fixtures root missing: $FIXTURES"
 [ -f "$ORACLE" ] || die "oracle script missing: $ORACLE"
+[ -f "$SCORE_SCRIPT" ] || die "score script missing: $SCORE_SCRIPT"
 
 router="$("$SCORER" render-router --model "$MODEL" --temperature "$TEMP" --base-url "$BASEURL")" \
   || die "render-router failed"
@@ -194,28 +196,17 @@ if [ "$total" -eq 0 ]; then
   die "no repetitions ran — the sweep is broken, not the fixtures"
 fi
 
+status=0
 if [ "$SCORE" = "1" ]; then
-  python3 - "$out" "$total" <<'PY'
-import json, sys
-path, total = sys.argv[1], int(sys.argv[2])
-rows = [json.loads(line) for line in open(path) if line.strip()]
-by = {}
-for r in rows:
-    by.setdefault(r["fixture_id"], []).append(r)
-print("fixture_id\toracle_passes\tprocess_passes\tattempts")
-for fid in sorted(by):
-    xs = by[fid]
-    print(
-        f"{fid}\t{sum(r['oracle_pass'] for r in xs)}\t"
-        f"{sum(r['process_pass'] for r in xs)}\t{len(xs)}"
-    )
-oracle = sum(r["oracle_pass"] for r in rows)
-process = sum(r["process_pass"] for r in rows)
-rate = (oracle / total) if total else 0.0
-process_rate = (process / total) if total else 0.0
-print(f"overall\t{oracle}\t{process}\t{total}\toracle_rate={rate:.3f}\tprocess_rate={process_rate:.3f}")
-print("NOTE: strict oracle is a fixture-reference diagnostic; live telemetry is not an RFC-0016 offline holdout.")
-PY
+  python3 "$SCORE_SCRIPT" \
+    --fixtures "$FIXTURES" \
+    --observations "$out" \
+    --model "$MODEL" \
+    --temperature "$TEMP" \
+    --base-url "$BASEURL" \
+    --reps "$REPS" \
+    --out "${out%.jsonl}.report.json"
+  status=$?
 fi
 
 if [ "$unexecutable" -gt 0 ]; then
@@ -223,4 +214,4 @@ if [ "$unexecutable" -gt 0 ]; then
     "harness failures — do not publish" >&2
   exit 3
 fi
-exit 0
+exit "$status"

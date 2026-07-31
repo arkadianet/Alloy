@@ -50,10 +50,13 @@ is what exposes a compiling but semantically wrong morph such as changing E0502
 into E0614. A reference mismatch is diagnostic evidence, not proof that all
 valid Rust repairs are impossible.
 
-JSONL rows and a short stderr summary are written outside the repo. Exit `0`
-from `alloy` alone is no longer sufficient for the strict oracle, and each row
-also records `failure_class`, `compile_clean`, `reference_match`, cargo's
-post-check exit code, and repair-generation count. Exit codes:
+JSONL rows and `<results>.report.json` are written outside the repo. The report
+validates dense repetition coverage and endpoint identity, and includes
+per-fixture and overall Wilson 95% intervals for process, compile, reference,
+and strict-oracle rates. Exit `0` from `alloy` alone is no longer sufficient for
+the strict oracle, and each row also records `failure_class`, `compile_clean`,
+`reference_match`, cargo's post-check exit code, and repair-generation count.
+Exit codes:
 
 | Exit | Meaning |
 | --- | --- |
@@ -64,7 +67,8 @@ post-check exit code, and repair-generation count. Exit codes:
 The strict-oracle score is still operator telemetry only — do not cite it as
 the RFC-0016 offline holdout score. `REPS=3` is useful for fast direction
 checks; use a larger repetition count when estimating reliability and report
-both process and oracle rates.
+both process and oracle rates. A malformed or incomplete observation file is a
+harness error, not a zero-result model score.
 
 ## Separation from live-repair
 
@@ -72,6 +76,6 @@ both process and oracle rates.
 | --- | --- | --- |
 | Corpus | RFC-0016 holdout workspaces | Ten single-error operator fixtures |
 | Thesis role | Live-BYOM evidence toward MVP / Beta | Reliability telemetry only |
-| Scoring | Pass/fail + wall time JSONL | Wilson CIs via `alloy-eval-live-repair score` |
+| Scoring | Validated JSON report with Wilson CIs | Wilson CIs via `alloy-eval-live-repair score` |
 
 Author: arkadianet
