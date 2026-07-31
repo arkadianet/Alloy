@@ -15,6 +15,8 @@
 
 **V2 MVP posture (binding):** single-binary · ≤5 crates · hardcoded DAG templates · TextPatch EditEngine · thin ProjectGraph · in-process MCP builtins · sandbox-first · eval week 1 · ≤4 LLM capabilities · TOML tier map · `example.env` only (never overwrite `.env`).
 
+**Current phase (2026-07-31):** Substrate + Beta-depth RFCs are in tree (0001–0017). The product is a **vertical-slice pre-alpha**, not finished. Next work is measurement and reliability — live-BYOM holdout, live-repair telemetry, planner-mode holdout (RFC-0017 §12.4) — not a new architecture wave. Sign MVP only when early-adopter docs and live holdout honesty are green; then close Beta measurement; Production (alloyd / ACP / ops) only when eval warrants.
+
 ---
 
 ## 1. How to read this roadmap
@@ -306,14 +308,14 @@ cargo test -p alloy-runtime -- scheduler_scripted_repair_dag
 - Profiles: default | autonomous | readonly; Appendix B defaults
 
 **Acceptance criteria:**
-- [ ] ≤4 LLM capabilities; Verify* not among them; no `follow_up_nodes` / worker graph mutations
-- [ ] Exactly three live context domains; no embedding index
-- [ ] Thin ProjectGraph: in-process read-only; ingest-only writes; no worker `graph_query` MCP
-- [ ] CLI owns I/O only—no planner/scheduler business logic in `alloy-cli`
-- [ ] Holdout local-diagnostic compile-success gate defined and CI-runnable offline
-- [ ] Quarantine profile proven on the repair path
-- [ ] `.env` never replaced; `example.env` documented
-- [ ] **No Alloy-on-Alloy dogfood** until this gate is green
+- [x] ≤4 LLM capabilities; Verify* not among them; no `follow_up_nodes` / worker graph mutations
+- [x] Exactly three live context domains; no embedding index
+- [x] Thin ProjectGraph: in-process read-only; ingest-only writes; no worker `graph_query` MCP *(deepened in Beta; trait posture unchanged)*
+- [x] CLI owns I/O only—no planner/scheduler business logic in `alloy-cli`
+- [x] Holdout local-diagnostic compile-success gate defined and CI-runnable offline *(scripted ControlPlane + naive; live stack-driver is integration smoke, not thesis citation)*
+- [x] Quarantine profile proven on the repair path
+- [x] `.env` never replaced; `example.env` documented
+- [x] Dogfood policy unblocked after this gate *(live BYOM dogfood has started; Alloy-on-Alloy still discretionary)*
 
 **Demo scenario:**
 ```bash
@@ -357,13 +359,15 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 - Offline eval CI for the holdout set
 
 **Acceptance criteria:**
-- [ ] All M7 acceptance criteria green
-- [ ] Single binary; ≤5 crates
-- [ ] Sandbox on all Exec; quarantine defaults
-- [ ] Holdout local-diagnostic compile success vs naive baseline documented (pass or honest fail of control plane)
-- [ ] No numeric cost differentiators in product claims
-- [ ] README / example.env sufficient for external early adopter without architect consult
-- [ ] Dogfood policy: allowed only after this gate
+- [x] All M7 acceptance criteria green
+- [x] Single binary; ≤5 crates
+- [x] Sandbox on all Exec; quarantine defaults
+- [x] Holdout local-diagnostic compile success vs naive baseline documented offline *(scripted ControlPlane vs naive; live independent-model holdout still open — see Beta)*
+- [x] No numeric cost differentiators in product claims
+- [ ] README / example.env sufficient for external early adopter without architect consult *(README status banner corrected 2026-07-31; still pre-alpha, not an adopter pitch)*
+- [x] Dogfood policy: allowed after M7 *(in progress; not Alloy-on-Alloy as a product claim)*
+
+**Status (2026-07-31):** M1–M7 code is in tree and offline holdout CI is green. **MVP is not signed.** Remaining bar is honest early-adopter docs + a live-BYOM holdout measurement that is not scripted-recording theater. Operator entry point: [`eval/live-holdout/`](../../eval/live-holdout/) (independent model outputs on the holdout workspaces). Beta deep RFCs (0011/0012/0014) and RFC-0017 landed ahead of that signature — depth is present; the certification gate is measurement, not more substrate.
 
 **Demo scenario:** Same as M7 demo, run by someone outside the core team using only docs + `example.env`.
 
@@ -373,7 +377,7 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 
 **Estimated effort:** Included in M1–M7 (**59–94 person-days** / **~12–19 person-weeks** with Wave parallelization calendar ~8–12 weeks per V2 §19.1).
 
-**Exit gate:** MVP checklist signed → Beta may deepen graph/context; Production planning may start for ops tracks.
+**Exit gate:** MVP checklist signed → Beta measurement closes; Production planning may start for ops tracks.
 
 ---
 

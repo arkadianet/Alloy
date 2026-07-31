@@ -7,18 +7,19 @@ Models are plugins; structured execution, tools, and project state are the produ
 
 ---
 
-> ### ⚠️ Status: pre-alpha — not usable yet
+> ### Status: vertical-slice pre-alpha — not a finished product
 >
-> The substrate is in tree: runtime host, durable event log, session/run
-> control plane, observability, sandbox broker, MCP host + builtins, model
-> router (BYOM — any OpenAI-compatible endpoint, including local servers),
-> EditEngine, Task DAG/planner, and the scheduler. What's missing is the
-> layer that connects them into a product: capability workers (RFC-0013)
-> and the CLI run path (RFC-0015). Nothing drives a model end to end yet.
+> RFCs 0001–0017 are implemented. The first product loop works: `alloy run`
+> can take a small Rust crate with a local diagnostic through sandboxed
+> repair → edit → verify → human gate under BYOM (any OpenAI-compatible
+> endpoint, including local servers), with a durable decision log.
 >
-> **The only thing that runs is `alloy host`** — it starts the runtime, idles, and
-> shuts down cleanly on `Ctrl-C`/`SIGTERM`. That is a lifecycle smoke test, not a
-> product. See [What works today](#what-works-today) for the honest breakdown.
+> What this is **not** yet: a general coding agent, an IDE, or something you
+> point at a real multi-crate workspace and trust. The LLM planner stays
+> opt-in (eval-gated), holdout measurement against live model outputs is
+> still incomplete, graph/context depth is research-grade, and UX is CLI-
+> only. See [dogfooding](docs/dogfooding.md) and the
+> [roadmap](docs/roadmap/IMPLEMENTATION-ROADMAP.md) for where it goes next.
 
 ---
 
@@ -67,17 +68,15 @@ flowchart TB
   SP --> OBS["Observability<br/>DecisionLog · CostMeter"]
   OBS --> STORE
 
-  ROUTER -.-> PROV["providers"]
-  MCP -.-> TOOLS["tools"]
-  EDIT -.-> GRAPH["ProjectGraph"]
+  ROUTER --> PROV["providers"]
+  MCP --> TOOLS["tools"]
+  EDIT --> GRAPH["ProjectGraph"]
 
   classDef done fill:#1f6f3f,stroke:#0d3b21,color:#fff
-  classDef todo fill:#4a4a4a,stroke:#2b2b2b,color:#ccc,stroke-dasharray:4 3
-  class CLI,SP,STORE,OBS,SCHED,ROUTER,MCP,EDIT,PROV,TOOLS done
-  class WORK,GRAPH todo
+  class CLI,SP,STORE,OBS,SCHED,ROUTER,MCP,EDIT,PROV,TOOLS,WORK,GRAPH done
 ```
 
-Solid green is implemented; dashed grey is specified but not yet built.
+Solid green is in tree. Depth and product polish still vary by subsystem — see the status table.
 
 Every state transition is durable: if it isn't in the session event log or the DAG
 store, it didn't happen. Session events are append-only with per-session monotonic
@@ -114,8 +113,10 @@ clippy/fmt clean, no in-scope TODOs, review approved).
 Full sequencing, effort estimates, and milestone gates:
 [implementation roadmap](docs/roadmap/IMPLEMENTATION-ROADMAP.md).
 
-**The target vertical slice** (RFC-0013/0015) is `alloy run "fix E0502 in crate X"`
-returning a compile-verified patch with a full decision log, under sandbox.
+**The vertical slice that exists today** is `alloy run "fix the compile error…"`
+on a small crate: sandboxed `cargo_check` → repair/edit workers → TextPatch →
+verify → gate → decision log. That is the product thesis under test — not a
+general agent loop.
 
 ## Build
 
@@ -125,25 +126,25 @@ installs it automatically).
 ```bash
 cargo build --workspace
 cargo test --workspace
-./target/debug/alloy --help
+cargo run -p alloy-cli -- --help
 ```
 
-To run the host, first create an active router config — only the `.example` is
-tracked:
+## First live run (dogfood)
+
+Point a BYOM router at a local OpenAI-compatible server, then repair a toy crate
+— not a precious tree. See [`docs/dogfooding.md`](docs/dogfooding.md).
 
 ```bash
-cp router.toml.example router.toml
-./target/debug/alloy host --workspace .      # Ctrl-C / SIGTERM to stop
+cp router.toml.local-example router.toml   # or router.toml.example
+export ALLOY_API_KEY=local                 # any non-empty value for loopback
+
+# Seed a broken crate (or copy eval/live-repair/fixtures/*/workspace)
+cargo run -p alloy-cli -- --workspace /tmp/broken-crate \
+  run "fix the compile error in this crate" --yes
 ```
 
-Expected output — the runtime starts, idles, and drains on signal:
-
-```
-INFO alloy_runtime::runtime::lifecycle: alloy runtime started data_dir=./.alloy
-INFO alloy: runtime running; Ctrl-C / SIGTERM to stop phase=Running
-INFO alloy: SIGTERM received
-INFO alloy_runtime::runtime::lifecycle: alloy runtime stopped
-```
+`alloy host` remains available as a lifecycle smoke test (start → idle →
+drain on `Ctrl-C`/`SIGTERM`). `alloy review` reviews a unified diff read-only.
 
 ## Configuration
 
@@ -179,8 +180,7 @@ crates/
   alloy-eval/      # eval harness                (RFC-0016)
 ```
 
-≤5 crates by design (Architecture V2) — no sixth crate for storage. `alloy-index`
-and `alloy-eval` are intentionally empty until their RFCs land.
+≤5 crates by design (Architecture V2) — no sixth crate for storage.
 
 `alloy-runtime` is `#![forbid(unsafe_code)]` and `#![deny(missing_docs)]`.
 
@@ -211,6 +211,8 @@ RFC and V2 conflict, V2 wins — see [change control](docs/roadmap/IMPLEMENTATIO
 | [RFC index](docs/rfcs/README.md) | Subsystem RFCs + Definition of Done |
 | [Roadmap](docs/roadmap/IMPLEMENTATION-ROADMAP.md) | Milestone order and effort |
 | [Engineering playbook](docs/playbooks/ENGINEERING-PLAYBOOK.md) | Working conventions |
+| [Dogfooding](docs/dogfooding.md) | First live-model runs and graduation bar |
+| [Live holdout](eval/live-holdout/) | Live-BYOM on RFC-0016 holdout workspaces (not an offline gate) |
 | [Reviews](docs/reviews/) | Architecture and compliance reviews |
 
 ## License
