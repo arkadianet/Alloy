@@ -319,6 +319,15 @@ fn appendix_c_offline_walkthrough() {
     // Resume re-dispatches and completes (SQ13; no replan — SQ14).
     let (code, doc, stderr) = e2e.run_json(&["resume", "--session", &session, "--json"]);
     assert_eq!(code, Some(0), "resume failed: {stderr}\n{doc}");
+    assert_eq!(doc["verification"]["compile"], "passed");
+    assert_eq!(
+        doc["verification"]["intended_fix"],
+        "not_independently_verified"
+    );
+    assert_eq!(
+        doc["inspect_command"],
+        format!("alloy events --session {session} --run {run}")
+    );
 
     // Step 5 — inspect: the event log tells the whole story (OUT5).
     let out = e2e
@@ -486,6 +495,15 @@ fn yes_auto_approves_and_completes() {
     assert!(stderr.contains("measured"), "cost line missing: {stderr}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("succeeded"), "stdout: {stdout}");
+    assert!(stdout.contains("cargo check passed"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("intended fix not independently verified"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("inspect: alloy events --session"),
+        "inspection command missing: {stderr}"
+    );
     let main_rs = std::fs::read_to_string(e2e.ws.path().join("src/main.rs")).unwrap();
     assert!(main_rs.contains("let x: i32 = 42;"));
 }

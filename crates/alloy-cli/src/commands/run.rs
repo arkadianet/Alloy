@@ -570,6 +570,7 @@ pub(crate) async fn execute_and_render(
             Exit::Internal
         }
     });
+    let terminal_reason = super::terminal_reason(&events, run).map(str::to_owned);
     // CR18 — an operator signal is a cancellation even when the interrupted
     // node's failure was classified before the cancel reached it.
     if full.base.handle.cancellation().is_cancelled()
@@ -587,8 +588,12 @@ pub(crate) async fn execute_and_render(
     }
     if exit == Exit::Replan {
         eprintln!(
-            "replan required; MVP does not auto-replan (SQ3): alloy resume --session {session}"
+            "automatic repair stopped before success; inspect the durable events before starting another attempt"
         );
+    }
+    let inspect_command = format!("alloy events --session {session} --run {run}");
+    if !ctx.quiet {
+        eprintln!("inspect: {inspect_command}");
     }
 
     let cost = super::cost_summary(full.base.storage.events().as_ref(), session, run).await;
@@ -607,14 +612,30 @@ pub(crate) async fn execute_and_render(
                 "session": session.to_string(),
                 "run": run.to_string(),
                 "cost": cost,
+                "terminal_reason": terminal_reason,
+                "verification": {
+                    "compile": if exit == Exit::Ok { "passed" } else { "not_proven" },
+                    "intended_fix": if exit == Exit::Ok {
+                        "not_independently_verified"
+                    } else {
+                        "not_proven"
+                    },
+                },
+                "inspect_command": inspect_command,
             }),
         );
         println!("{doc}");
     } else {
+        let reason = terminal_reason
+            .as_deref()
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
         println!(
-            "run {run} {}",
+            "run {run} {}{reason}",
             match exit {
-                Exit::Ok => "succeeded",
+                Exit::Ok => {
+                    "succeeded: cargo check passed; intended fix not independently verified"
+                }
                 Exit::Cancelled => "cancelled",
                 Exit::GateDenied => "denied at gate",
                 Exit::Replan => "needs replan",
