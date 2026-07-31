@@ -64,3 +64,88 @@ impl StackLiveOptions {
         self
     }
 }
+
+/// Split into lines and whether the text ends with a trailing newline.
+///
+/// `str::lines()` drops the final-newline distinction; unified diffs need
+/// `\ No newline at end of file` when a side lacks a terminating newline.
+#[must_use]
+#[allow(dead_code)] // pinned by unit tests; live path prefers recordings/
+pub(crate) fn split_diff_lines(text: &str) -> (Vec<&str>, bool) {
+    if text.is_empty() {
+        return (Vec::new(), false);
+    }
+    let ends_with_newline = text.ends_with('\n');
+    (text.lines().collect(), ends_with_newline)
+}
+
+/// Full-file unified diff suitable for `apply_patch` / `GitEditEngine`.
+///
+/// Handles files with and without a final newline (emits
+/// `\ No newline at end of file` per side when needed).
+#[must_use]
+#[allow(dead_code)] // pinned by unit tests; live path prefers recordings/
+pub(crate) fn unified_diff(rel_path: &str, before: &str, after: &str) -> String {
+    let (old_lines, old_nl) = split_diff_lines(before);
+    let (new_lines, new_nl) = split_diff_lines(after);
+    let old_n = old_lines.len();
+    let new_n = new_lines.len();
+    let mut out = String::new();
+    out.push_str(&format!("--- a/{rel_path}\n+++ b/{rel_path}\n"));
+    match (old_n, new_n) {
+        (0, 0) => out.push_str("@@ -0,0 +0,0 @@\n"),
+        (0, n) => out.push_str(&format!("@@ -0,0 +1,{n} @@\n")),
+        (o, 0) => out.push_str(&format!("@@ -1,{o} +0,0 @@\n")),
+        (o, n) => out.push_str(&format!("@@ -1,{o} +1,{n} @@\n")),
+    }
+    for line in &old_lines {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !old_lines.is_empty() && !old_nl {
+        out.push_str("\\ No newline at end of file\n");
+    }
+    for line in &new_lines {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !new_lines.is_empty() && !new_nl {
+        out.push_str("\\ No newline at end of file\n");
+    }
+    out
+}
+
+#[cfg(test)]
+mod unified_diff_tests {
+    use super::unified_diff;
+
+    #[test]
+    fn preserves_trailing_newline_on_both_sides() {
+        let diff = unified_diff("a.rs", "old\n", "new\n");
+        assert!(diff.contains("-old\n"));
+        assert!(diff.contains("+new\n"));
+        assert!(!diff.contains("\\ No newline at end of file"));
+    }
+
+    #[test]
+    fn marks_missing_final_newline_on_each_side() {
+        let diff = unified_diff("a.rs", "old", "new");
+        assert!(
+            diff.contains(
+                "-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
+            ),
+            "{diff}"
+        );
+    }
+
+    #[test]
+    fn marks_only_the_side_without_newline() {
+        let diff = unified_diff("a.rs", "old\n", "new");
+        assert!(
+            diff.contains("-old\n+new\n\\ No newline at end of file\n"),
+            "{diff}"
+        );
+    }
+}
