@@ -138,10 +138,10 @@ target/debug/alloy-eval-live-repair score \
 
 ### Scoring semantics
 
-* Exit `0` with `compile_clean=true` → `Pass`; exit `0` with a failed
-  post-check → `Fail`; exit `124` (killed by `timeout(1)`) → `Timeout`; exit
-  `126` / `127` (the binary could not be executed) → `HarnessError`; any other
-  non-zero code → `Fail`.
+* Exit `0` with `compile_clean=true` and `cargo_check_exit=0` → `Pass`; exit
+  `0` with missing, contradictory, or failed post-check evidence → `Fail`; exit
+  `124` (killed by `timeout(1)`) → `Timeout`; exit `126` / `127` (the binary
+  could not be executed) → `HarnessError`; any other non-zero code → `Fail`.
 * **A timeout is a failure.** It stays in the pass-rate denominator and is
   reported in its own `timeout=` column. Excluding it would let a run of
   1 pass + 9 timeouts render as a 100% pass rate, which is the opposite of what

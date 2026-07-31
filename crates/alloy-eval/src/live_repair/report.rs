@@ -103,12 +103,16 @@ pub struct LiveRepairObservation {
 impl LiveRepairObservation {
     /// Classify this observation.
     ///
-    /// Exit `0` with a failed independent compile check is a failure, `124` is
-    /// a `timeout(1)` kill, `126`/`127` mean the shell could not execute the
-    /// binary, and every other non-zero code is a plain failure.
+    /// Exit `0` is a pass only with `compile_clean = Some(true)` and
+    /// `cargo_check_exit = Some(0)`. Missing or contradictory post-check
+    /// evidence is a failure. Exit `124` is a `timeout(1)` kill, `126`/`127`
+    /// mean the shell could not execute the binary, and every other non-zero
+    /// code is a plain failure.
     #[must_use]
     pub fn outcome(&self) -> LiveRepairOutcome {
-        if self.exit_code == 0 && self.compile_clean == Some(false) {
+        if self.exit_code == 0
+            && (self.compile_clean != Some(true) || self.cargo_check_exit != Some(0))
+        {
             return LiveRepairOutcome::Fail;
         }
         match self.exit_code {
@@ -301,6 +305,18 @@ impl LiveRepairReport {
                     endpoint.model,
                     endpoint.temperature,
                     endpoint.base_url,
+                )));
+            }
+            if observation.compile_clean == Some(true) && observation.cargo_check_exit != Some(0) {
+                return Err(EvalError::Manifest(format!(
+                    "observation {}#{} claims compile_clean=true without cargo_check_exit=0",
+                    observation.fixture_id, observation.repetition
+                )));
+            }
+            if observation.compile_clean == Some(false) && observation.cargo_check_exit == Some(0) {
+                return Err(EvalError::Manifest(format!(
+                    "observation {}#{} claims compile_clean=false with cargo_check_exit=0",
+                    observation.fixture_id, observation.repetition
                 )));
             }
             grouped
@@ -601,8 +617,8 @@ package = "{id}"
             fixture_id: FixtureId::new(id).unwrap(),
             repetition: rep,
             exit_code: exit,
-            compile_clean: None,
-            cargo_check_exit: None,
+            compile_clean: Some(true),
+            cargo_check_exit: Some(0),
             retries,
             wall_ms,
             model: "stub-model".to_owned(),
@@ -662,6 +678,28 @@ package = "{id}"
         observed.cargo_check_exit = Some(101);
         assert_eq!(observed.outcome(), LiveRepairOutcome::Fail);
         assert_eq!(observed.status(), FixtureStatus::Fail);
+    }
+
+    #[test]
+    fn a_process_pass_without_compile_evidence_is_not_a_pass() {
+        let mut observed = observation("aaa", 1, 0, 0, 1);
+        observed.compile_clean = None;
+        observed.cargo_check_exit = None;
+        assert_eq!(observed.outcome(), LiveRepairOutcome::Fail);
+        assert_eq!(observed.status(), FixtureStatus::Fail);
+    }
+
+    #[test]
+    fn assemble_rejects_inconsistent_compile_evidence() {
+        let (_dir, corpus) = corpus();
+        let mut observed = observation("aaa", 1, 0, 0, 1);
+        observed.compile_clean = Some(true);
+        observed.cargo_check_exit = Some(101);
+        let result = assemble(&corpus, vec![observed]);
+        assert!(
+            matches!(&result, Err(EvalError::Manifest(message)) if message.contains("compile_clean=true")),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -959,13 +997,13 @@ cost_disclaimer=internal-only";
         let src = "\n{\"fixture_id\":\"aaa\",\"repetition\":1,\"exit_code\":0,\"retries\":2,\"wall_ms\":1500,\"model\":\"stub-model\",\"temperature\":0.6,\"base_url\":\"http://127.0.0.1:11434/v1/\"}\n\n\
 {\"fixture_id\":\"bbb\",\"repetition\":1,\"exit_code\":124,\"retries\":0,\"wall_ms\":600000,\"model\":\"stub-model\",\"temperature\":0.6,\"base_url\":\"http://127.0.0.1:11434/v1/\"}\n";
         let parsed = parse_observations_jsonl(src).unwrap();
-        assert_eq!(
-            parsed,
-            vec![
-                observation("aaa", 1, 0, 2, 1_500),
-                observation("bbb", 1, 124, 0, 600_000),
-            ]
-        );
+        let mut legacy_aaa = observation("aaa", 1, 0, 2, 1_500);
+        legacy_aaa.compile_clean = None;
+        legacy_aaa.cargo_check_exit = None;
+        let mut legacy_bbb = observation("bbb", 1, 124, 0, 600_000);
+        legacy_bbb.compile_clean = None;
+        legacy_bbb.cargo_check_exit = None;
+        assert_eq!(parsed, vec![legacy_aaa, legacy_bbb,]);
 
         for bad in [
             "{\"fixture_id\":\"aaa\"}",
