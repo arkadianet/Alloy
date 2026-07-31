@@ -368,10 +368,19 @@ impl GenerationDriver {
             workspace_root: session.workspace_root.clone(),
             attempt: 1,
         };
-        let token = perms
-            .token_for(&meta, WorkerToolClass::Patch)
-            .await
-            .map_err(|e| DriveError::Internal(format!("GN13 mint patch token: {e}")))?;
+        let token = match perms.token_for(&meta, WorkerToolClass::Patch).await {
+            Ok(token) => token,
+            Err(error) => {
+                warn!(
+                    run_id = %ctx.run_id,
+                    dag_id = %ctx.dag_id,
+                    node_id = %seed.node,
+                    error = %error,
+                    "GN13: patch token mint failed; keeping admitted seed"
+                );
+                return Ok(seed);
+            }
+        };
         let edit_ctx = EditContext {
             session_id: Some(ctx.session_id),
             run_id: Some(ctx.run_id),
@@ -392,13 +401,25 @@ impl GenerationDriver {
             "GN13: restored newest edit checkpoint; re-verifying for seed"
         );
 
-        let verdict = verify
+        let verdict = match verify
             .verify(&NodeExecContext {
                 meta: meta.clone(),
                 cancellation: self.deps.cancellation.clone(),
             })
             .await
-            .map_err(|e| DriveError::Internal(format!("GN13 re-verify: {e}")))?;
+        {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                warn!(
+                    run_id = %ctx.run_id,
+                    dag_id = %ctx.dag_id,
+                    node_id = %seed.node,
+                    error = %error,
+                    "GN13: re-verification failed; keeping admitted seed"
+                );
+                return Ok(seed);
+            }
+        };
         match verdict.outcome {
             VerdictOutcome::Fail if !verdict.diagnostics.is_empty() => {
                 let reseeds = FailureIr {
