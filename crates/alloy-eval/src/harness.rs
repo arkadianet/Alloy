@@ -268,11 +268,12 @@ impl EvalHarness {
         self.run_fixture_collect(fixture).await.outcome
     }
 
-    /// Live ControlPlane stack-driver with an explicit planner mode
-    /// (RFC-0017 §12.4 template vs llm holdout comparison).
+    /// Live ControlPlane stack-driver with an explicit planner mode.
     ///
-    /// Requires `--features stack-driver`. Does not consume fixture scripts
-    /// (the live path synthesizes repair/edit turns from the golden).
+    /// Used by the non-gating ScriptedProposer LLM-arm smoke test; not
+    /// RFC-0017 §12.4 flip citation. Requires `--features stack-driver`.
+    /// Does not consume fixture scripts (the live path synthesizes
+    /// repair/edit turns from the golden).
     #[cfg(feature = "stack-driver")]
     pub async fn run_live_with_planner_mode(
         &self,

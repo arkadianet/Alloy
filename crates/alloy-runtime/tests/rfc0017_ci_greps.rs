@@ -168,68 +168,40 @@ fn ac48_driver_never_touches_run_lifecycle() {
     }
 }
 
-/// AC 34: after the RFC-0017 §12.4 stack-driver holdout gate, `default` and
-/// `autonomous` ship `mode = "llm"`; `readonly` stays `mode = "template"`
-/// and must never enable llm (assembly rejects it).
+/// AC 34: every shipped profile keeps `mode = "template"` — the LLM planner
+/// is opt-in until a production CapabilityPlanProposer/PlanningWorker
+/// holdout (§12.4) passes; ScriptedProposer smoke is NOT flip evidence.
 #[test]
-fn ac34_shipped_profiles_llm_default_except_readonly() {
+fn ac34_shipped_profiles_stay_template_mode() {
     let profiles = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
     let entries = std::fs::read_dir(&profiles)
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", profiles.display()));
     let mut seen = 0usize;
-    let mut saw_default = false;
-    let mut saw_autonomous = false;
-    let mut saw_readonly = false;
     for entry in entries {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|e| e != "toml") {
             continue;
         }
         seen += 1;
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let compact = text.replace(' ', "");
-        match name {
-            "default.toml" => {
-                saw_default = true;
-                assert!(
-                    compact.contains("mode=\"llm\""),
-                    "AC 34: default.toml must pin [planner] mode = \"llm\" after §12.4 flip"
-                );
-            }
-            "autonomous.toml" => {
-                saw_autonomous = true;
-                assert!(
-                    compact.contains("mode=\"llm\""),
-                    "AC 34: autonomous.toml must pin [planner] mode = \"llm\" after §12.4 flip"
-                );
-            }
-            "readonly.toml" => {
-                saw_readonly = true;
-                assert!(
-                    compact.contains("mode=\"template\""),
-                    "AC 34: readonly.toml must stay [planner] mode = \"template\""
-                );
-                for (idx, line) in text.lines().enumerate() {
-                    // TOML comments (`#`) may *document* the forbid without violating it.
-                    let code = line.split('#').next().unwrap_or("");
-                    assert!(
-                        !code.replace(' ', "").contains("mode=\"llm\""),
-                        "AC 34 violated: {}:{} sets planner mode llm on readonly",
-                        path.display(),
-                        idx + 1
-                    );
-                }
-            }
-            other => panic!("AC 34: unexpected shipped profile {other}"),
+        for (idx, line) in text.lines().enumerate() {
+            // TOML comments (`#`) may *document* the rule without violating it.
+            let code = line.split('#').next().unwrap_or("");
+            assert!(
+                !code.replace(' ', "").contains("mode=\"llm\""),
+                "AC 34 violated: {}:{} sets planner mode llm",
+                path.display(),
+                idx + 1
+            );
         }
+        assert!(
+            text.replace(' ', "").contains("mode=\"template\""),
+            "AC 34: {} does not pin [planner] mode = \"template\"",
+            path.display()
+        );
     }
     assert_eq!(seen, 3, "expected the three shipped profiles");
-    assert!(saw_default && saw_autonomous && saw_readonly);
 }
 
 /// AC 14b (grep half): nothing under `src/planner` reads the process CWD —

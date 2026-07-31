@@ -38,13 +38,12 @@ retain_tool_bodies = false
 run_timeout_secs = 1800             # ABSOLUTE bound across repair generations (RFC-0017 GN7)
 max_repair_generations = 2          # 0..=8; 0 disables auto-replan (RFC-0017 AM-0015-2)
 
-# Plan source (RFC-0017 §7.1, AM-0015-2). Flipped to "llm" after the
-# §12.4 stack-driver holdout comparison (template vs llm) showed
-# non-inferiority on local-diagnostic fixtures
-# (`stack_driver_holdout` / `holdout_template_vs_llm_planner_non_inferior`).
+# Plan source (RFC-0017 §7.1, AM-0015-2). "llm" is opt-in until a production
+# CapabilityPlanProposer/PlanningWorker holdout (§12.4) passes — ScriptedProposer
+# smoke is NOT flip evidence. Every shipped profile stays "template".
 # Values are the §3.3 defaults, spelled out for discoverability.
 [planner]
-mode = "llm"                 # "template" | "llm"
+mode = "template"            # "template" | "llm"
 max_proposed_nodes = 8       # 2..=16
 proposal_max_bytes = 16384   # 1024..=32768 — hard-capped under OC7's 64 KiB payload bound
 planning_max_input = 16384   # tokens, planning capability call

@@ -1,7 +1,9 @@
-//! RFC-0016 §5.9 live ControlPlane stack-driver thesis test.
+//! RFC-0016 §5.9 live ControlPlane stack-driver integration smoke.
 //!
-//! Requires `--features stack-driver`. Linux/Landlock only; skips when
-//! Landlock is unavailable unless `ALLOY_REQUIRE_LANDLOCK=1` (then fails).
+//! Exercises scheduler/Landlock/MCP/EditEngine wiring with golden-derived
+//! patches — plumbing, not thesis citation. Requires `--features stack-driver`.
+//! Linux/Landlock only; skips when Landlock is unavailable unless
+//! `ALLOY_REQUIRE_LANDLOCK=1` (then fails).
 //!
 //! Author: arkadianet
 
@@ -116,11 +118,16 @@ async fn holdout_01_live_control_plane_and_naive() {
     assert_eq!(naive.model_calls, 0, "naive must not call the model");
 }
 
-/// RFC-0017 §12.4: LLM planner non-inferiority vs template on the live
-/// local-diagnostic holdout arm (ScriptedProposer; gen2 repair/edit unchanged).
+/// Non-gating ScriptedProposer LLM-arm smoke (wiring prep only).
+///
+/// Exercises `PlannerMode::Llm` over a [`ScriptedProposer`] that returns the
+/// catalog `repair_local_diagnostic` shape. This is **not** RFC-0017 §12.4
+/// flip evidence — that gate requires a production
+/// CapabilityPlanProposer/PlanningWorker holdout with independent model
+/// outputs, not scripted proposal smoke.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn holdout_template_vs_llm_planner_non_inferior() {
+async fn holdout_scripted_proposer_llm_arm_smoke_non_gating() {
     let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
     let id = FixtureId::new("e0502_holdout_01").unwrap();
 
@@ -171,11 +178,6 @@ async fn holdout_template_vs_llm_planner_non_inferior() {
     let llm_pass_rate = pass_rate(std::slice::from_ref(&llm_out));
     assert!(
         llm_pass_rate >= template_pass_rate,
-        "§12.4 non-inferiority: llm_pass_rate={llm_pass_rate} < template_pass_rate={template_pass_rate}"
-    );
-
-    // One-line citation for the default-flip PR (RFC-0017 §12.4).
-    eprintln!(
-        "RFC-0017 §12.4 flip citation: stack_driver_holdout e0502_holdout_01 template_pass_rate={template_pass_rate} llm_pass_rate={llm_pass_rate} (both Pass; ALLOY_REQUIRE_LANDLOCK=1 cargo test -p alloy-eval --features stack-driver --test stack_driver_holdout)"
+        "ScriptedProposer smoke: llm_pass_rate={llm_pass_rate} < template_pass_rate={template_pass_rate} (non-gating wiring check only)"
     );
 }

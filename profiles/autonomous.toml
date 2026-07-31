@@ -36,8 +36,9 @@ retain_tool_bodies = false
 run_timeout_secs = 1800
 max_repair_generations = 2          # 0..=8; 0 disables auto-replan (RFC-0017 AM-0015-2)
 
-# Plan source (RFC-0017 §7.1). Flipped to "llm" after the §12.4
-# stack-driver holdout comparison (template vs llm non-inferiority;
-# see `stack_driver_holdout` / RFC-0017 §12.4 status notes).
+# Plan source (RFC-0017 §7.1). "llm" is opt-in until a production
+# CapabilityPlanProposer/PlanningWorker holdout (§12.4) passes —
+# ScriptedProposer smoke is NOT flip evidence. Every shipped profile
+# stays "template".
 [planner]
-mode = "llm"
+mode = "template"

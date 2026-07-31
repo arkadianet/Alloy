@@ -63,8 +63,8 @@ pub struct FullAssembly {
     /// Run-scoped router provider (CR20 — per-run routers, one provider).
     pub routers: Arc<ProcessRunRouterProvider>,
     /// Plan service (RFC-0009 / RFC-0017 AM-0009-5): `TemplatePlanService`
-    /// when `planner.mode = "template"`, `LlmPlanService` when `"llm"`
-    /// (shipped `default`/`autonomous` are llm after §12.4).
+    /// when `planner.mode = "template"` (shipped default), `LlmPlanService`
+    /// when `"llm"` (opt-in; §12.4 production holdout still pending).
     pub plan: Arc<dyn PlanService>,
     /// The installed scheduler (kept for wiring assertions).
     pub scheduler: Arc<LinearScheduler>,

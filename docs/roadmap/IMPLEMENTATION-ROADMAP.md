@@ -383,7 +383,7 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 
 **RFCs completed:**
 - [RFC-0011](../rfcs/RFC-0011-project-graph.md) **deep** (syn symbols + diagnostics/fix ingest + un-stubbed Callers/Refs/Impls/SimilarFixes; **cargo metadata deferred post-Beta** — needs host sandboxed Exec; SEC5 keeps index exec-free; RA passthrough still deferred as available)
-- [RFC-0012](../rfcs/RFC-0012-context-engine.md) **deep** (WorkingSet graph projections; weight hygiene landed — measured re-derivation declined; V2 0.20/0.55/0.25 retained)
+- [RFC-0012](../rfcs/RFC-0012-context-engine.md) **deep** (WorkingSet graph projections; weight hygiene landed — measured re-derivation deferred/unmeasured; V2 0.20/0.55/0.25 retained)
 - [RFC-0014](../rfcs/RFC-0014-language-backend-rust.md) (Rust-only internal module)
 - Review worker polish (already in 0013 optional—quality bar, not new RFC)
 
@@ -397,7 +397,7 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 - [x] ProjectGraph thin→deep without changing trait; Callers/Refs/Impls live at syn-grade (A-0011-6); SimilarFixes reads recorded fixes (A-0011-5) — wider auto-retrieve still deferred pending precision
 - [x] Context WorkingSet includes graph projections; still exactly three live domains
 - [x] LanguageBackend Rust-only; no PY/TS/cdylib
-- [x] Holdout re-run shows improvement **or** written “why not” with metrics — **why not (context weights):** live stack-driver holdout under Landlock (`ALLOY_REQUIRE_LANDLOCK=1 cargo test -p alloy-eval --features stack-driver --test stack_driver_holdout`) reports control `success_rate = 1.0`, `compile_success_rate = 1.0` under V2 Appendix B defaults (0.20/0.55/0.25). Fixture class is local-diagnostic only and already saturates under those weights; no alternate weight arm showed an improvement opportunity. Keep `DomainWeights::v2_defaults()` and profile weight tables (RFC-0012 §14.2).
+- [ ] Holdout re-run shows improvement **or** written “why not” with metrics — **deferred/unmeasured for context weights:** live `stack-driver` uses `NullContextEngine` and has no alternate weight arms, so it is not measured-weight / “why not” evidence (RFC-0012 §14.2). Keep `DomainWeights::v2_defaults()` until a real measurement exists.
 - [ ] Still `max_parallel=1`; still git-only checkpoints
 - [ ] No External Memory auto-retrieve; no typed call/lifetime layers
 
@@ -409,9 +409,7 @@ cargo test -p alloy-eval -- holdout_beta_compare_mvp
 # Expect: EvalMetrics delta table; no savings % in user-facing copy
 ```
 
-**NOT in Beta:** SemanticOps product · parallel Analyze without uplift proof · alloyd · ACP · multi-provider scoring · second language
-
-**Note:** LLM Planner default-on for shipped `default` / `autonomous` landed via RFC-0017 §12.4 after the live stack-driver holdout non-inferiority comparison (`stack_driver_holdout`); `readonly` stays template.
+**NOT in Beta:** LLM Planner as default · SemanticOps product · parallel Analyze without uplift proof · alloyd · ACP · multi-provider scoring · second language
 
 **Risks:** Graph incorrect edges poisoning context (keep confidence reserved; rebuild path); scope into compiler-frontend (reject).
 

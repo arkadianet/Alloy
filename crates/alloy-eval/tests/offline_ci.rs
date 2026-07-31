@@ -160,7 +160,7 @@ fn stack_driver_feature_is_optional_and_default_off() {
         std::fs::read_to_string(crate_root().join("Cargo.toml")).expect("read Cargo.toml");
     assert!(
         manifest.contains("stack-driver"),
-        "stack-driver feature must be declared for thesis runs"
+        "stack-driver feature must be declared for live stack integration smoke"
     );
     assert!(
         manifest.contains("default = []"),

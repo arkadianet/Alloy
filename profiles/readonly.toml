@@ -39,6 +39,8 @@ max_repair_generations = 2          # 0..=8; 0 disables auto-replan (RFC-0017 AM
 
 # Plan source (RFC-0017 §7.1). Must stay "template": a read-only profile has
 # no business proposing edit chains; mode = "llm" is rejected at assembly
-# (fail closed). The §12.4 default flip applies only to default/autonomous.
+# (fail closed). Shipped defaults remain template until a production
+# CapabilityPlanProposer/PlanningWorker holdout (§12.4) — ScriptedProposer
+# smoke is NOT that gate.
 [planner]
 mode = "template"
