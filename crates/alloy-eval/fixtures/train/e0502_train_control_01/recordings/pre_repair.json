@@ -1,0 +1,22 @@
+{
+  "recording_format_version": 1,
+  "toolchain": {
+    "channel": "1.97.1",
+    "rustc_version": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo_version": "cargo 1.97.1 (c980f4866 2026-06-30)"
+  },
+  "argv": [
+    "cargo",
+    "check",
+    "--message-format=json",
+    "-p",
+    "e0502_train_control_01"
+  ],
+  "exit_code": 101,
+  "stdout_lines": [
+    "{\"reason\":\"compiler-message\",\"message\":{\"code\":{\"code\":\"E0502\"},\"level\":\"error\",\"message\":\"cannot borrow `scores` as mutable because it is also borrowed as immutable\"}}",
+    "{\"reason\":\"build-finished\",\"success\":false}"
+  ],
+  "stderr": "",
+  "content_digest": "24138b349599ede71677cb4f8e9a510b7d00aa7680f40a5d474dc415029bfb89"
+}

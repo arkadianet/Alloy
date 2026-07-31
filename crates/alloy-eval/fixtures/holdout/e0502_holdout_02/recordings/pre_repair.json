@@ -1,0 +1,22 @@
+{
+  "recording_format_version": 1,
+  "toolchain": {
+    "channel": "1.97.1",
+    "rustc_version": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo_version": "cargo 1.97.1 (c980f4866 2026-06-30)"
+  },
+  "argv": [
+    "cargo",
+    "check",
+    "--message-format=json",
+    "-p",
+    "e0502_holdout_02"
+  ],
+  "exit_code": 101,
+  "stdout_lines": [
+    "{\"reason\":\"compiler-message\",\"message\":{\"code\":{\"code\":\"E0502\"},\"level\":\"error\",\"message\":\"cannot borrow `base` as mutable because it is also borrowed as immutable\"}}",
+    "{\"reason\":\"build-finished\",\"success\":false}"
+  ],
+  "stderr": "",
+  "content_digest": "370b845ec551daf0e59e8ba451be9622e22eda14e9c160ad7e08ec0cfd58d8c0"
+}

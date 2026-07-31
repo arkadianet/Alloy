@@ -1,6 +1,6 @@
 manifest_version = 1
-id = "e0502_holdout_01"
-set = "holdout"
+id = "e0502_train_control_01"
+set = "train"
 naive_target_path = "src/lib.rs"
 naive_patch_mode = "full_file_replace"
 success_criteria = ["compile_clean", "expected_diagnostics_cleared", "script_turns_consumed", "no_new_unsafe"]
@@ -10,7 +10,7 @@ driver = "control_plane"
 [license]
 class = "permitted"
 spdx = "Alloy-Original"
-source_note = "Alloy-original RFC-0016 E0502 holdout fixture by arkadianet."
+source_note = "Alloy-original RFC-0016 E0502 multi-turn control-plane train fixture by arkadianet."
 
 [toolchain]
 channel = "1.97.1"
@@ -19,7 +19,7 @@ cargo_version = "cargo 1.97.1 (c980f4866 2026-06-30)"
 
 [workspace]
 path = "workspace"
-package = "e0502_holdout_01"
+package = "e0502_train_control_01"
 
 [endpoint_prices]
 input_usd_per_mtok = 2.0
@@ -48,14 +48,33 @@ tools = []
 [turns.outcome]
 type = "response"
 text = '''
-pub fn broken_total() -> i32 {
-    let mut total = 10;
-    let snapshot = total;
-    total += 5;
-    snapshot + total
+pub fn bump_first() -> i32 {
+    let mut scores = vec![1, 2, 3];
+    let head = scores[0];
+    scores.push(4);
+    head + scores.len() as i32
 }
 '''
 
 [turns.outcome.usage]
-input_tokens = 37
-output_tokens = 35
+input_tokens = 41
+output_tokens = 37
+
+[[turns]]
+request_fingerprint = "0659f81c280057a2c93aa8e6933a550cd23a183a69d5f2a462e5a6a6b18580f9"
+
+[turns.turn_id]
+capability = "review"
+ordinal = 0
+
+[turns.request]
+messages = [{ role = "user", content = "Review the repaired workspace/src/lib.rs for correctness and respond with the structured verdict." }]
+tools = []
+
+[turns.outcome]
+type = "response"
+structured = { verdict = "clean" }
+
+[turns.outcome.usage]
+input_tokens = 19
+output_tokens = 7
