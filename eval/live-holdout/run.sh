@@ -134,11 +134,12 @@ for id in "${ids[@]}"; do
     git -C "$ws" add -A
     git -C "$ws" -c user.name=live-holdout -c user.email=live-holdout@localhost commit -qm fixture
     start_ms=$(date +%s%3N)
-    set +e
-    ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout "$TIMEOUT" \
-      "$ALLOY" --workspace "$ws" run "$GOAL" --yes >"$ws/run.log" 2>&1
-    code=$?
-    set -e
+    if ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout "$TIMEOUT" \
+      "$ALLOY" --workspace "$ws" run "$GOAL" --yes >"$ws/run.log" 2>&1; then
+      code=0
+    else
+      code=$?
+    fi
     wall_ms=$(($(date +%s%3N) - start_ms))
     oracle_json="$(
       python3 "$ORACLE" \
