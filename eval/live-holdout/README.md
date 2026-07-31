@@ -3,8 +3,8 @@
 Operator tooling that runs the **real `alloy` binary** against the RFC-0016
 **holdout** fixture workspaces with a **live** OpenAI-compatible endpoint.
 
-The wrapper requires Python 3.11+ for standard-library TOML parsing and report
-validation.
+The evaluator and scorer are implemented in Rust in `alloy-eval`; the shell
+wrapper only orchestrates `alloy`, `cargo check`, and the evaluator binary.
 
 > **This is not the offline holdout gate.** Offline CI (`ScriptedProvider` /
 > committed `recordings/*`) stays the milestone falsification target. Results
@@ -24,6 +24,7 @@ the holdout diagnostics. This sweep does.
 ```bash
 cargo build -p alloy-cli --bin alloy
 cargo build -p alloy-eval --bin alloy-eval-live-repair
+cargo build -p alloy-eval --bin alloy-eval-live-holdout
 
 # llama.cpp on :8089 (see router.toml.local-example), or Ollama on :11434
 MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf' \
@@ -77,7 +78,7 @@ harness error, not a zero-result model score.
 
 ## Matrix runs
 
-Use `matrix.py` to compare model, temperature, or profile/context arms. Each
+Use `matrix.sh` to compare model, temperature, or profile/context arms. Each
 arm writes a separate JSONL observation file and validated report. The matrix
 refuses to compare arms with different fixture sets, corpora, or repetition
 counts, and never pools incompatible denominators.
@@ -93,9 +94,9 @@ context	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	autonomous	http://127.0
 Run it with:
 
 ```bash
-python3 eval/live-holdout/matrix.py \
-  --arms /path/to/arms.tsv \
-  --out-dir /tmp/live-holdout-matrix
+./eval/live-holdout/matrix.sh \
+  /path/to/arms.tsv \
+  /tmp/live-holdout-matrix
 ```
 
 The first arm is the descriptive baseline. `matrix.report.json` retains each

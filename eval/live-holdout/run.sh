@@ -21,20 +21,9 @@ BASEURL="${BASEURL:-http://127.0.0.1:8089/v1/}"
 TIMEOUT="${TIMEOUT:-600}"
 GOAL="${GOAL:-fix the compile error in this crate}"
 SCORE="${SCORE:-1}"
-ORACLE="${ORACLE:-$repo/eval/live-holdout/oracle.py}"
-SCORE_SCRIPT="${SCORE_SCRIPT:-$repo/eval/live-holdout/score.py}"
+EVAL_HOLDOUT="${EVAL_HOLDOUT:-}"
 
 die() { echo "live-holdout/run.sh: $1" >&2; exit 2; }
-
-if ! python3 - <<'PY'
-import sys
-
-if sys.version_info < (3, 11):
-    raise SystemExit("Python 3.11 or newer is required")
-PY
-then
-  die "Python 3.11 or newer is required"
-fi
 
 resolve_bin() {
   local name="$1"
@@ -48,22 +37,18 @@ resolve_bin() {
     return
   fi
   local target
-  target="$(cargo metadata --no-deps --format-version 1 --manifest-path "$repo/Cargo.toml" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')" \
-    || die "could not resolve cargo target directory"
-  if [ -x "$target/debug/$name" ]; then
-    printf '%s' "$target/debug/$name"
-    return
-  fi
-  if [ -x "$repo/target/debug/$name" ]; then
-    printf '%s' "$repo/target/debug/$name"
-    return
-  fi
-  die "missing $name (cargo build -p …); looked under $target/debug and $repo/target/debug"
+  for target in "${CARGO_TARGET_DIR:-$repo/target}" "$HOME/.cache/cargo-target"; do
+    if [ -x "$target/debug/$name" ]; then
+      printf '%s' "$target/debug/$name"
+      return
+    fi
+  done
+  die "missing $name (cargo build -p …); looked under configured target directories"
 }
 
 ALLOY="$(resolve_bin alloy "${ALLOY:-}")"
 SCORER="$(resolve_bin alloy-eval-live-repair "${SCORER:-}")"
+EVAL_HOLDOUT="$(resolve_bin alloy-eval-live-holdout "$EVAL_HOLDOUT")"
 
 "$ALLOY" --version >/dev/null 2>&1
 probe=$?
@@ -90,8 +75,6 @@ case "$PROFILE" in
   *) die "PROFILE must be default or autonomous, got '$PROFILE'";;
 esac
 [ -d "$FIXTURES" ] || die "fixtures root missing: $FIXTURES"
-[ -f "$ORACLE" ] || die "oracle script missing: $ORACLE"
-[ -f "$SCORE_SCRIPT" ] || die "score script missing: $SCORE_SCRIPT"
 
 router="$("$SCORER" render-router --model "$MODEL" --temperature "$TEMP" --base-url "$BASEURL")" \
   || die "render-router failed"
@@ -102,18 +85,7 @@ mapfile -t ids < <(
 [ "${#ids[@]}" -gt 0 ] || die "no holdout fixture directories under $FIXTURES"
 
 fixture_target_path() {
-  python3 - "$1" <<'PY'
-import sys
-import tomllib
-from pathlib import PurePosixPath
-
-with open(sys.argv[1], "rb") as handle:
-    path = tomllib.load(handle)["naive_target_path"]
-parsed = PurePosixPath(path)
-if not path or parsed.is_absolute() or ".." in parsed.parts:
-    raise SystemExit("naive_target_path must stay inside the fixture workspace")
-print(path)
-PY
+  "$EVAL_HOLDOUT" target-path --manifest "$1"
 }
 
 for id in "${ids[@]}"; do
@@ -165,34 +137,35 @@ for id in "${ids[@]}"; do
       code=$?
     fi
     wall_ms=$(($(date +%s%3N) - start_ms))
-    oracle_json="$(
-      python3 "$ORACLE" \
+    compile_clean=false
+    cargo_check_exit=null
+    case "$code" in
+      124|126|127) ;;
+      *)
+        if [ -f "$ws/$target_path" ]; then
+          if (cd "$ws" && timeout "$TIMEOUT" cargo check --offline --quiet) \
+            >"$ws/oracle-cargo.log" 2>&1; then
+            compile_clean=true
+            cargo_check_exit=0
+          else
+            cargo_check_exit=$?
+          fi
+        fi
+        ;;
+    esac
+    read -r process_pass compile_clean reference_match oracle_pass failure_class \
+      cargo_check_exit generations <<<"$(
+      "$EVAL_HOLDOUT" oracle \
         --fixture-dir "$FIXTURES/$id" \
         --workspace "$ws" \
         --run-log "$ws/run.log" \
         --exit-code "$code" \
-        --cargo-timeout "$TIMEOUT"
+        --compile-clean "$compile_clean" \
+        --cargo-check-exit "$cargo_check_exit"
     )" || die "oracle failed for $id#$rep"
-    read -r process_pass compile_clean reference_match oracle_pass failure_class cargo_check_exit generations <<<"$(
-      python3 - "$oracle_json" <<'PY'
-import json
-import sys
-
-row = json.loads(sys.argv[1])
-print(
-    row["process_pass"],
-    row["compile_clean"],
-    row["reference_match"],
-    row["oracle_pass"],
-    row["failure_class"],
-    row["cargo_check_exit"] if row["cargo_check_exit"] is not None else "null",
-    row["repair_generations"],
-)
-PY
-    )"
     total=$((total + 1))
-    [ "$process_pass" = "True" ] && process_passed=$((process_passed + 1))
-    [ "$oracle_pass" = "True" ] && oracle_passed=$((oracle_passed + 1))
+    [ "$process_pass" = "true" ] && process_passed=$((process_passed + 1))
+    [ "$oracle_pass" = "true" ] && oracle_passed=$((oracle_passed + 1))
     case "$code" in
       126|127) unexecutable=$((unexecutable + 1));;
     esac
@@ -203,7 +176,7 @@ PY
     echo "[$oracle_passed/$total oracle; $process_passed process] $id#$rep \
 oracle=$oracle_pass class=$failure_class generations=$generations ${wall_ms}ms"
     # Keep non-oracle logs under /tmp for diagnosis; wipe strict passes.
-    if [ "$oracle_pass" = "True" ]; then
+    if [ "$oracle_pass" = "true" ]; then
       rm -rf "$ws"
     else
       echo "  log: $ws/run.log" >&2
@@ -220,7 +193,7 @@ fi
 
 status=0
 if [ "$SCORE" = "1" ]; then
-  python3 "$SCORE_SCRIPT" \
+  "$EVAL_HOLDOUT" score \
     --fixtures "$FIXTURES" \
     --observations "$out" \
     --model "$MODEL" \
