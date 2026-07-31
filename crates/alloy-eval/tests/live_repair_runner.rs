@@ -414,12 +414,25 @@ fn runner_writes_a_structured_report_using_the_eval_report_vocabulary() {
 #[test]
 fn runner_leaves_no_state_in_the_repository() {
     let bench = bench(&["pass_fixture"]);
-    let before = fs::read_to_string(workspace_root().join("router.toml.example")).ok();
+    let root = workspace_root();
+    let router = root.join("router.toml");
+    // Dogfooders keep a gitignored `/router.toml` locally; the runner must
+    // neither create one nor delete/mutate an existing local file.
+    let had_router = router.exists();
+    let router_before = had_router.then(|| fs::read_to_string(&router).unwrap());
+    let before = fs::read_to_string(root.join("router.toml.example")).ok();
     let output = run_bench(&bench, "1");
     assert!(output.status.success());
-    assert!(!workspace_root().join("router.toml").exists());
     assert_eq!(
-        fs::read_to_string(workspace_root().join("router.toml.example")).ok(),
+        router.exists(),
+        had_router,
+        "run.sh must not create or remove the repo-root router.toml"
+    );
+    if had_router {
+        assert_eq!(fs::read_to_string(&router).unwrap(), router_before.unwrap());
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("router.toml.example")).ok(),
         before
     );
 }

@@ -36,8 +36,6 @@ MODEL="${MODEL:-qwen2.5-coder:32b}"
 TEMP="${TEMP:-0.6}"
 REPS="${REPS:-10}"
 BASEURL="${BASEURL:-http://127.0.0.1:11434/v1/}"
-ALLOY="${ALLOY:-$repo/target/debug/alloy}"
-SCORER="${SCORER:-$repo/target/debug/alloy-eval-live-repair}"
 TIMEOUT="${TIMEOUT:-600}"
 RETRY_PATTERN="${RETRY_PATTERN:-retrying with fresh diagnostics}"
 SCORE="${SCORE:-1}"
@@ -47,10 +45,35 @@ SCORE="${SCORE:-1}"
 # a 0% pass rate produced by a missing binary is a lie about the model.
 die() { echo "run.sh: $1" >&2; exit 2; }
 
-[ -x "$SCORER" ] ||
-  die "missing scorer at $SCORER (cargo build -p alloy-eval --bin alloy-eval-live-repair)"
-[ -x "$ALLOY" ] ||
-  die "alloy binary not found or not executable at $ALLOY (cargo build -p alloy-cli --bin alloy)"
+resolve_bin() {
+  local name="$1"
+  local override="${2:-}"
+  # An explicit override must win — including when it is missing/unusable —
+  # so preflight can refuse a broken sweep instead of silently falling back.
+  if [ -n "$override" ]; then
+    [ -x "$override" ] ||
+      die "$name binary not found or not executable at $override"
+    printf '%s' "$override"
+    return
+  fi
+  local target
+  target="$(cargo metadata --no-deps --format-version 1 --manifest-path "$repo/Cargo.toml" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')" \
+    || die "could not resolve cargo target directory"
+  if [ -x "$target/debug/$name" ]; then
+    printf '%s' "$target/debug/$name"
+    return
+  fi
+  if [ -x "$repo/target/debug/$name" ]; then
+    printf '%s' "$repo/target/debug/$name"
+    return
+  fi
+  die "missing $name (cargo build -p …); looked under $target/debug and $repo/target/debug"
+}
+
+ALLOY="$(resolve_bin alloy "${ALLOY:-}")"
+SCORER="$(resolve_bin alloy-eval-live-repair "${SCORER:-}")"
+
 # Executability probe: any exit code is fine except the shell's
 # "found but could not execute" (126) and "not found" (127).
 "$ALLOY" --version >/dev/null 2>&1

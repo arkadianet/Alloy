@@ -109,3 +109,40 @@ already passes — index → plan → edit → gate approval → verify →
 `Succeeded`, workspace fixed on disk — plus at least a handful of varied
 goals on real repos without harness-side failures. Model-side failures
 don't block the tag; harness-side ones do.
+
+## 6. Live measurement sweeps
+
+Two operator corpora — neither is an offline milestone gate:
+
+| Sweep | Path | Role |
+| --- | --- | --- |
+| Live holdout | [`eval/live-holdout/`](../eval/live-holdout/) | Real model on RFC-0016 holdout workspaces (independent outputs) |
+| Live-repair | [`eval/live-repair/`](../eval/live-repair/) | Reliability telemetry across ten single-error crates |
+
+```bash
+cargo build -p alloy-cli --bin alloy
+cargo build -p alloy-eval --bin alloy-eval-live-repair
+export ALLOY_API_KEY=local
+
+MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf' \
+  BASEURL='http://127.0.0.1:8089/v1/' REPS=1 \
+  ./eval/live-holdout/run.sh /tmp/live-holdout.jsonl
+```
+
+## 7. Where this is going (honest)
+
+Alloy is not aiming to become a chat-first general coding assistant. The
+roadmap after the vertical slice is:
+
+1. **Prove the control-plane thesis** — live holdout on E0502-class fixtures
+   with independent model outputs; offline scripted success is not enough.
+2. **Reliability on the repair loop** — retries, escalation, line-ops,
+   schema-constrained decoding, repair generations — measured via
+   `eval/live-repair`, not vibes.
+3. **Close Beta measurement** — do graph/context weights help, or write the
+   why-not with numbers (RFC-0012).
+4. **Eval-gate the LLM planner** — RFC-0017 §12.4 before any default flip.
+5. **Widen only when justified** — harder diagnostics, multi-file, cargo
+   metadata, SemanticEditOp / RA — Future extensions, not a redesign.
+6. **Productize last** — alloyd, ACP, IDE surfaces — Production track after
+   the thesis holds for someone outside the core team.

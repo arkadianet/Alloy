@@ -1,6 +1,11 @@
 # router.toml.local-example — Author: arkadianet
 # Local-model dogfooding config (see docs/dogfooding.md).
 # Copy to router.toml. http:// is allowed for loopback only (RFC-0007).
+#
+# Preferred on RTX 3090: llama.cpp serving Qwen3-Coder-30B-A3B on :8089.
+# Ollama (:11434) remains a fine alternative.
+# supports_tools = true is a *routing* flag only — Alloy does not yet send
+# OpenAI tools[] to the provider; host MCP builtins are used instead.
 
 [policy]
 default_tier = "standard"
@@ -13,26 +18,24 @@ max_in_flight = 2
 [[providers]]
 id = "local"
 kind = "openai_compatible"
-base_url = "http://127.0.0.1:11434/v1/"
-# Ollama ignores the key but Alloy requires the env var to exist and never
+# llama.cpp (serve.sh). For Ollama use http://127.0.0.1:11434/v1/
+base_url = "http://127.0.0.1:8089/v1/"
+# Provider ignores the key but Alloy requires the env var to exist and never
 # invents one: export ALLOY_API_KEY=local
 api_key_env = "ALLOY_API_KEY"
 
 [[providers.endpoints]]
 id = "local-coder"
-display_name = "Local coder"
-# Must match the model id your server actually serves (`ollama list`).
-model = "qwen2.5-coder:14b"
-tiers = ["standard", "economy"]
+display_name = "Local coder (Qwen3-Coder-30B-A3B)"
+# Must match the model id your server actually serves (`curl …/v1/models`).
+model = "Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf"
+tiers = ["standard", "economy", "premium"]
 supports_tools = true
 supports_structured_output = true
-# Schema-constrained decoding (RFC-0007 A-0007-2): Ollama >= 0.5 maps the
-# OpenAI response_format = {type = "json_schema", ...} shape onto its native
-# grammar-constrained `format`, so local models stop burning repair turns on
-# malformed JSON. Set false if your server rejects the shape; Alloy then
-# degrades that endpoint to plain json_object. Ollama constrains by grammar
-# whether or not strict is sent, so json_schema_strict stays off here.
-supports_json_schema = true
+# Schema-constrained decoding (RFC-0007 A-0007-2): set true for Ollama >= 0.5;
+# llama.cpp may reject json_schema — if so, omit or set false (Alloy degrades
+# to plain json_object).
+# supports_json_schema = true
 max_context = 32768
 # Optional sampling temperature (0.0..=2.0); omit for the provider default.
 # Moderate values suit repair with the retry loop: low temp re-samples the
@@ -42,20 +45,12 @@ temperature = 0.6
 input_usd_per_mtok = 0.0
 output_usd_per_mtok = 0.0
 
-# Tier escalation target (RFC-0010 §5.11.4 ES1). `repair_local_diagnostic`
-# escalates analyze/edit to `premium` on their retry. To make that escalation
-# mean something, serve `premium` with a bigger local model:
-# `ollama pull qwen2.5-coder:32b`, then uncomment. (Lower-effort alternative:
-# add "premium" to `local-coder`'s `tiers` above and the retry re-runs on the
-# same model.)
-#
-# If you do neither, nothing breaks: with no `premium` endpoint the escalated
-# retry routes at the configured tier — the same `local-coder` that just
-# failed — and the route decision records `escalation_unserved = true`. An
-# escalation only ever raises a tier; it never lowers one (RFC-0007 §5.2.1).
+# Optional Ollama alt: switch base_url to :11434/v1/ and model to e.g.
+# qwen3-coder:30b; set supports_json_schema = true for Ollama >= 0.5.
+# Optional second denser endpoint for A-B: uncomment and assign tiers.
 # [[providers.endpoints]]
-# id = "local-coder-big"
-# display_name = "Local coder (big)"
+# id = "local-coder-qwen25"
+# display_name = "Local coder (Qwen2.5 dense)"
 # model = "qwen2.5-coder:32b"
 # tiers = ["premium"]
 # supports_tools = true
