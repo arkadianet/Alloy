@@ -47,8 +47,13 @@ die() { echo "run.sh: $1" >&2; exit 2; }
 
 resolve_bin() {
   local name="$1"
-  if [ -n "${2:-}" ] && [ -x "$2" ]; then
-    printf '%s' "$2"
+  local override="${2:-}"
+  # An explicit override must win — including when it is missing/unusable —
+  # so preflight can refuse a broken sweep instead of silently falling back.
+  if [ -n "$override" ]; then
+    [ -x "$override" ] ||
+      die "$name binary not found or not executable at $override"
+    printf '%s' "$override"
     return
   fi
   local target
