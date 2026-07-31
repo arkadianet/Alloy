@@ -5,9 +5,9 @@
 //! not thesis citation. LLM arm uses production CapabilityPlanProposer +
 //! PlanningWorker over `recordings/planning_proposal.json` (non-gating).
 //!
-//! Requires `--features stack-driver` and `ALLOY_EVAL_LIVE_STACK=1` (set by
-//! each test). Linux/Landlock only; skips when Landlock is unavailable unless
-//! `ALLOY_REQUIRE_LANDLOCK=1` (then fails).
+//! Requires `--features stack-driver` and `ALLOY_EVAL_LIVE_STACK=1` in the
+//! parent process (see `enable_live_stack`). Linux/Landlock only; skips when
+//! Landlock is unavailable unless `ALLOY_REQUIRE_LANDLOCK=1` (then fails).
 //!
 //! Author: arkadianet
 

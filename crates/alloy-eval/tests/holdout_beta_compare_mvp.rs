@@ -13,7 +13,8 @@
 //! This harness is measurement prep only; keep `DomainWeights::v2_defaults()`
 //! until independent model outputs produce a real signal (RFC-0012 §14.2).
 //!
-//! Requires `--features stack-driver` and `ALLOY_EVAL_LIVE_STACK=1`.
+//! Requires `--features stack-driver` and `ALLOY_EVAL_LIVE_STACK=1` in the
+//! parent process (see `enable_live_stack`).
 //!
 //! Author: arkadianet
 
