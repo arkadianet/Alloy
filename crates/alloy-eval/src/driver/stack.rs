@@ -4,14 +4,14 @@
 //! `alloy-tools/tests/scheduler_repair_e2e.rs`: Landlock jail, hermetic
 //! `CARGO_HOME`, `GitEditEngine`, MCP `cargo_check` / `apply_patch`,
 //! `CapabilityRegistry`, `TomlModelRouter` + [`ScriptedProvider`],
-//! `GenerationDriver`, `TemplatePlanService` / `LlmPlanService` (RFC-0017
-//! §12.4), and [`GenerationSwitchCapabilities`] (inert gen1 analyze/edit so
-//! the real `cargo_check` soft-fails and harvests diagnostics; real registry
-//! on gen2).
+//! `GenerationDriver`, `TemplatePlanService` / `LlmPlanService` (smoke),
+//! and [`GenerationSwitchCapabilities`] (inert gen1 analyze/edit so the real
+//! `cargo_check` soft-fails and harvests diagnostics; real registry on gen2).
 //!
-//! Scripted repair/edit JSON is synthesized from the fixture golden `*.post`
-//! (unified diff) — not the skeleton full-file-text turns. Thesis citation
-//! requires `--features stack-driver`.
+//! Activated only when [`live_stack_requested`] is true (`ALLOY_EVAL_LIVE_STACK=1`
+//! plus this feature). Repair/edit JSON is synthesized from the fixture golden
+//! `*.post` — that makes this **integration smoke**, not thesis evidence
+//! (independent model outputs required for Appendix B citation).
 //!
 //! Author: arkadianet
 
@@ -60,17 +60,31 @@ use crate::cost_claim::derive_eval_usd;
 use crate::error::{bound_message, EvalError, ReportError};
 use crate::fingerprint::RequestFingerprint;
 use crate::harness::{FixtureRunOutput, LoadedFixture};
-use crate::manifest::SuccessCriterion;
+use crate::manifest::{FixtureTurnId, SuccessCriterion};
 use crate::report::{CriterionResult, FixtureOutcome, FixtureStatus};
 use crate::scripted::{ScriptOutcome, ScriptedProvider};
 use crate::trajectory::EvalTrajectoryRecord;
 
 const GOAL_TEXT: &str = "fix the compile error";
 
-/// Scripted proposer for the §12.4 LLM-mode holdout arm: returns a valid
+/// True when the live stack path should run: feature compiled in and
+/// `ALLOY_EVAL_LIVE_STACK` is exactly `1` or `true` (case-insensitive).
+#[must_use]
+pub(crate) fn live_stack_requested() -> bool {
+    match std::env::var("ALLOY_EVAL_LIVE_STACK") {
+        Ok(v) => {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Non-gating LLM-arm smoke proposer: returns a valid
 /// `ProposedDagManifest` matching the `repair_local_diagnostic` shape
-/// (Analyze→Edit→VerifyCompile→GateHuman). Replan reuses the stored prior
-/// source (GN10), so a single queued accept covers the whole run.
+/// (Analyze→Edit→VerifyCompile→GateHuman). Bypasses production
+/// `CapabilityPlanProposer` / PlanningWorker — **not** RFC-0017 §12.4 flip
+/// evidence. Replan reuses the stored prior source (GN10).
 struct ScriptedProposer {
     queue: Mutex<VecDeque<Result<ProposedDagManifest, ProposeError>>>,
 }
@@ -151,12 +165,12 @@ pub(crate) async fn run_live(
     run_live_with_mode(fixture, cancel, PlannerMode::Template).await
 }
 
-/// Live ControlPlane path with an explicit [`PlannerMode`] (RFC-0017 §12.4).
+/// Live ControlPlane path with an explicit [`PlannerMode`].
 ///
 /// `PlannerMode::Template` uses [`TemplatePlanService`]. `PlannerMode::Llm`
-/// wires [`LlmPlanService`] over a [`ScriptedProposer`] that returns a valid
-/// `repair_local_diagnostic`-shaped proposal. Gen2 repair/edit
-/// [`ScriptedProvider`] turns are unchanged; replan reuses prior LLM source.
+/// wires [`LlmPlanService`] over a [`ScriptedProposer`] (non-gating smoke;
+/// not production proposing). Gen2 repair/edit [`ScriptedProvider`] turns
+/// are unchanged; replan reuses prior LLM source.
 pub(crate) async fn run_live_with_mode(
     fixture: &LoadedFixture,
     cancel: Option<CancellationToken>,
@@ -208,10 +222,10 @@ async fn run_live_inner(
     {
         landlock_or_error().await?;
         let Some(cargo_bin) = which_cargo() else {
-            return Err(sandbox_unavailable("cargo not on PATH"));
+            return Err(EvalError::Internal("cargo not on PATH".into()));
         };
         let real_homes = OperatorHomes::resolve()
-            .map_err(|e| sandbox_unavailable(&format!("operator homes: {e}")))?;
+            .map_err(|e| EvalError::Internal(bound_message(format!("operator homes: {e}"))))?;
 
         let workspace_src = fixture.root.join(&fixture.manifest.workspace.path);
         let work_dir = tempfile::tempdir().map_err(EvalError::Io)?;
@@ -226,7 +240,9 @@ async fn run_live_inner(
 
         let homes_root = tempfile::tempdir().map_err(EvalError::Io)?;
         let Some(homes) = hermetic_cargo_home(homes_root.path(), &real_homes, &cargo_bin) else {
-            return Err(sandbox_unavailable("could not stage a hermetic CARGO_HOME"));
+            return Err(EvalError::Internal(
+                "could not stage a hermetic CARGO_HOME".into(),
+            ));
         };
 
         let mut profile = SandboxProfile::default_for_jail(jail.clone())
@@ -235,7 +251,11 @@ async fn run_live_inner(
         profile.exec_timeout = Duration::from_secs(240);
         let broker = NativeSandboxBroker::with_operator_homes(profile.clone(), homes.clone())
             .await
-            .map_err(|e| sandbox_unavailable(&format!("landlock broker unavailable: {e}")))?;
+            .map_err(|e| {
+                EvalError::Internal(bound_message(format!(
+                    "landlock broker construct failed after Available probe: {e}"
+                )))
+            })?;
         let broker = Arc::new(broker);
         init_git_repo(&broker, &jail).await?;
 
@@ -396,7 +416,7 @@ async fn run_live_inner(
             .await
             .map_err(|e| EvalError::Internal(bound_message(format!("plan: {e}"))))?;
 
-        let runtime_cancel = cancel.clone().unwrap_or_else(CancellationToken::new);
+        let runtime_cancel = cancel.clone().unwrap_or_default();
         let driver = Arc::new(GenerationDriver::new(GenerationDriverDeps {
             handle: handle.clone(),
             plans: Arc::clone(&plans),
@@ -572,10 +592,10 @@ async fn run_naive_live_inner(
     {
         landlock_or_error().await?;
         let Some(cargo_bin) = which_cargo() else {
-            return Err(sandbox_unavailable("cargo not on PATH"));
+            return Err(EvalError::Internal("cargo not on PATH".into()));
         };
         let real_homes = OperatorHomes::resolve()
-            .map_err(|e| sandbox_unavailable(&format!("operator homes: {e}")))?;
+            .map_err(|e| EvalError::Internal(bound_message(format!("operator homes: {e}"))))?;
 
         let workspace_src = fixture.root.join(&fixture.manifest.workspace.path);
         let work_dir = tempfile::tempdir().map_err(EvalError::Io)?;
@@ -603,7 +623,9 @@ async fn run_naive_live_inner(
 
         let homes_root = tempfile::tempdir().map_err(EvalError::Io)?;
         let Some(homes) = hermetic_cargo_home(homes_root.path(), &real_homes, &cargo_bin) else {
-            return Err(sandbox_unavailable("could not stage a hermetic CARGO_HOME"));
+            return Err(EvalError::Internal(
+                "could not stage a hermetic CARGO_HOME".into(),
+            ));
         };
 
         let mut profile = SandboxProfile::default_for_jail(jail.clone())
@@ -612,7 +634,11 @@ async fn run_naive_live_inner(
         profile.exec_timeout = Duration::from_secs(240);
         let broker = NativeSandboxBroker::with_operator_homes(profile, homes)
             .await
-            .map_err(|e| sandbox_unavailable(&format!("landlock broker unavailable: {e}")))?;
+            .map_err(|e| {
+                EvalError::Internal(bound_message(format!(
+                    "landlock broker construct failed after Available probe: {e}"
+                )))
+            })?;
         let broker = Arc::new(broker);
 
         let compile_clean = live_compile_clean(&broker, &jail).await?;
@@ -625,6 +651,7 @@ async fn run_naive_live_inner(
         } else {
             FixtureStatus::Fail
         };
+        let trajectories = naive_live_trajectories(fixture, status, Some(compile_clean));
 
         drop(homes_root);
         drop(work_dir);
@@ -646,7 +673,7 @@ async fn run_naive_live_inner(
                 compile_clean: Some(compile_clean),
                 error: None,
             },
-            trajectories: vec![],
+            trajectories,
         })
     }
 }
@@ -711,10 +738,108 @@ fn live_trajectories(
     status: FixtureStatus,
     compile_clean: Option<bool>,
 ) -> Vec<EvalTrajectoryRecord> {
-    // Stack-driver synthesizes repair/edit turns; surface one row per consumed
-    // scripted invocation when the provider exposes history — otherwise omit.
-    let _ = (fixture, provider, status, compile_clean);
-    Vec::new()
+    let mut caps_seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    provider
+        .recorded()
+        .into_iter()
+        .map(|inv| {
+            let capability = capability_from_request(&inv.request);
+            let ordinal = {
+                let entry = caps_seen.entry(capability.clone()).or_insert(0);
+                let n = *entry;
+                *entry = entry.saturating_add(1);
+                n
+            };
+            let turn_id = FixtureTurnId {
+                capability: CapabilityId::new(capability).unwrap_or_else(|_| {
+                    CapabilityId::new("repair").expect("repair capability id is valid")
+                }),
+                node: None,
+                ordinal,
+            };
+            let mut row = EvalTrajectoryRecord::from_response(
+                fixture.manifest.id.clone(),
+                fixture.manifest.set,
+                turn_id,
+                inv.fingerprint,
+                &inv.endpoint,
+                &ModelResponse {
+                    text: None,
+                    structured: None,
+                    tool_calls: vec![],
+                    usage: Usage {
+                        input_tokens: None,
+                        output_tokens: None,
+                    },
+                    provider_request_id: None,
+                    finish_reason: None,
+                },
+                None,
+                status,
+                compile_clean,
+            );
+            // from_response marks complete_ok from usage; force success for a
+            // consumed scripted invocation even when tokens were not metered.
+            row.complete_ok = true;
+            row
+        })
+        .collect()
+}
+
+/// One observational row for live naive (no model calls): the ordinal-0 repair
+/// turn identity from the manifest, so scrub/determinism still has a trajectory.
+fn naive_live_trajectories(
+    fixture: &LoadedFixture,
+    status: FixtureStatus,
+    compile_clean: Option<bool>,
+) -> Vec<EvalTrajectoryRecord> {
+    let Some(turn) = fixture
+        .manifest
+        .turns
+        .iter()
+        .find(|t| t.turn_id.capability.as_str() == "repair" && t.turn_id.ordinal == 0)
+    else {
+        return Vec::new();
+    };
+    let fingerprint = RequestFingerprint::of(&turn.request);
+    let mut row = EvalTrajectoryRecord::from_response(
+        fixture.manifest.id.clone(),
+        fixture.manifest.set,
+        turn.turn_id.clone(),
+        fingerprint,
+        &fixture.endpoint,
+        &ModelResponse {
+            text: None,
+            structured: None,
+            tool_calls: vec![],
+            usage: Usage {
+                input_tokens: None,
+                output_tokens: None,
+            },
+            provider_request_id: None,
+            finish_reason: None,
+        },
+        None,
+        status,
+        compile_clean,
+    );
+    row.complete_ok = true;
+    vec![row]
+}
+
+fn capability_from_request(request: &CompletionRequest) -> String {
+    let sys = request
+        .messages
+        .iter()
+        .find(|m| m.role == ChatRole::System)
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    if sys == EDIT_SYSTEM || sys.contains("EditWorker") {
+        "edit".into()
+    } else {
+        // Default / REPAIR_SYSTEM / unknown → repair (live stack only scripts those two).
+        "repair".into()
+    }
 }
 
 fn unsafe_introduced(pre: &str, post: &str) -> bool {
@@ -792,7 +917,13 @@ fn elapsed_ms(started: Instant) -> u64 {
 }
 
 fn require_landlock() -> bool {
-    std::env::var_os("ALLOY_REQUIRE_LANDLOCK").is_some()
+    match std::env::var("ALLOY_REQUIRE_LANDLOCK") {
+        Ok(v) => {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1211,7 +1342,7 @@ fn build_scheduler(
         capabilities: Arc::clone(capabilities),
         decisions: Arc::clone(decisions) as _,
         cost_meters: Arc::clone(cost_meters) as _,
-        runtime_cancel: cancel.clone().unwrap_or_else(CancellationToken::new),
+        runtime_cancel: cancel.clone().unwrap_or_default(),
         budget_policy: BudgetPolicy::default(),
         run_timeout: Duration::from_secs(300),
         config,

@@ -40,14 +40,11 @@ thread_local! {
 pub(crate) enum ScriptedDriverMode {
     SkeletonReplay,
     /// Offline scripted control-plane path: all manifest turns, same oracle as
-    /// skeleton replay. Under `--features stack-driver` the live path is used
-    /// instead, so this variant is constructed only in the offline build.
-    #[cfg_attr(feature = "stack-driver", allow(dead_code))]
+    /// skeleton replay. Live stack requires `ALLOY_EVAL_LIVE_STACK=1` in addition
+    /// to `--features stack-driver`; otherwise this variant is used.
     ControlPlane,
-    /// Offline scripted naive baseline. Under `--features stack-driver` the
-    /// live naive path is used instead (lib build); unit tests still construct
-    /// this variant under `cfg(test)`.
-    #[cfg_attr(all(feature = "stack-driver", not(test)), allow(dead_code))]
+    /// Offline scripted naive baseline. Live naive requires
+    /// `ALLOY_EVAL_LIVE_STACK=1` plus `--features stack-driver`.
     NaiveBaseline,
 }
 

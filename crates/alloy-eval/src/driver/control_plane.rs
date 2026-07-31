@@ -1,18 +1,21 @@
 //! Control-plane driver for RFC-0016 holdout control runs.
 //!
-//! Default (offline) build: scripted replay of every manifest turn via
-//! [`ScriptedProvider`] with the golden byte oracle ([`super::skeleton`]).
+//! Default: scripted replay of every manifest turn via [`ScriptedProvider`]
+//! with the golden byte oracle ([`super::skeleton`]).
 //!
-//! With `--features stack-driver`: live scheduler / Landlock / MCP /
-//! EditEngine / GenerationDriver path ([`super::stack`]). Thesis citation
-//! requires the live feature; offline scripted ControlPlane remains gate
-//! plumbing only (RFC-0016 §5.9 / Appendix B).
+//! Live stack path (scheduler / Landlock / MCP / EditEngine /
+//! GenerationDriver) requires **both** `--features stack-driver` and
+//! `ALLOY_EVAL_LIVE_STACK=1`. Without the env flag, the feature only compiles
+//! the live module so clippy/CI can check it; holdout goldens stay scripted.
+//! Golden-derived live runs are integration smoke, not thesis evidence
+//! (RFC-0016 §5.9 / Appendix B).
+//!
+//! Author: arkadianet
 
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-#[cfg(not(feature = "stack-driver"))]
 use crate::driver::skeleton::{run_scripted, ScriptedDriverMode};
 use crate::harness::{FixtureRunOutput, LoadedFixture};
 use crate::scripted::ScriptedProvider;
@@ -23,17 +26,14 @@ pub(crate) async fn run(
     cancel: Option<CancellationToken>,
 ) -> FixtureRunOutput {
     #[cfg(feature = "stack-driver")]
-    {
+    if crate::driver::stack::live_stack_requested() {
         let _ = provider;
         return crate::driver::stack::run_live(fixture, cancel).await;
     }
-    #[cfg(not(feature = "stack-driver"))]
-    {
-        run_scripted(fixture, provider, cancel, ScriptedDriverMode::ControlPlane).await
-    }
+    run_scripted(fixture, provider, cancel, ScriptedDriverMode::ControlPlane).await
 }
 
-#[cfg(all(test, not(feature = "stack-driver")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::driver::skeleton::{run_scripted, ScriptedDriverMode};
@@ -44,9 +44,8 @@ mod tests {
     use crate::scripted::ScriptOutcome;
     use alloy_runtime::Usage;
 
-    /// Offline scripted semantics — exercised directly so
-    /// `--features stack-driver` does not rewrite these unit tests onto the
-    /// live path.
+    /// Offline scripted semantics — exercised directly so a live-stack env
+    /// cannot rewrite these unit tests onto the Landlock path.
     async fn run_offline(
         fixture: &LoadedFixture,
         provider: Arc<ScriptedProvider>,

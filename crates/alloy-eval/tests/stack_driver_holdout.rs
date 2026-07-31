@@ -1,8 +1,10 @@
 //! RFC-0016 §5.9 live ControlPlane stack-driver integration smoke.
 //!
 //! Exercises scheduler/Landlock/MCP/EditEngine wiring with golden-derived
-//! patches — plumbing, not thesis citation. Requires `--features stack-driver`.
-//! Linux/Landlock only; skips when Landlock is unavailable unless
+//! patches — plumbing, not thesis citation.
+//!
+//! Requires `--features stack-driver` and `ALLOY_EVAL_LIVE_STACK=1` (set by
+//! each test). Linux/Landlock only; skips when Landlock is unavailable unless
 //! `ALLOY_REQUIRE_LANDLOCK=1` (then fails).
 //!
 //! Author: arkadianet
@@ -10,6 +12,7 @@
 #![cfg(feature = "stack-driver")]
 
 use std::path::PathBuf;
+use std::sync::Once;
 
 use alloy_eval::{
     EvalHarness, EvalHarnessConfig, FixtureDriverKind, FixtureId, FixtureOutcome, FixtureSet,
@@ -21,8 +24,22 @@ fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+fn enable_live_stack() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: test process; set before any concurrent live-stack work.
+        std::env::set_var("ALLOY_EVAL_LIVE_STACK", "1");
+    });
+}
+
 fn require_landlock() -> bool {
-    std::env::var_os("ALLOY_REQUIRE_LANDLOCK").is_some()
+    match std::env::var("ALLOY_REQUIRE_LANDLOCK") {
+        Ok(v) => {
+            let v = v.trim();
+            v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
 }
 
 fn is_sandbox_skip(outcome: &FixtureOutcome) -> bool {
@@ -57,6 +74,7 @@ async fn stack_driver_holdout_is_linux_only() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn holdout_01_live_control_plane_and_naive() {
+    enable_live_stack();
     let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
     let id = FixtureId::new("e0502_holdout_01").unwrap();
 
@@ -89,9 +107,19 @@ async fn holdout_01_live_control_plane_and_naive() {
         control_out.retry_count
     );
 
-    // Fair naive baseline: golden full_file_replace + live cargo_check.
-    // `run_holdout_with_naive` exercises the feature-gated naive live path.
+    // Golden full_file_replace + live cargo_check (plumbing smoke vs control).
     let report = harness.run_holdout_with_naive().await.unwrap();
+    assert!(
+        !report.trajectories.is_empty(),
+        "live control must emit trajectories"
+    );
+    assert!(
+        report
+            .naive_trajectories
+            .as_ref()
+            .is_some_and(|rows| !rows.is_empty()),
+        "live naive must emit trajectories"
+    );
     assert!(
         report.gate.as_ref().unwrap().passed,
         "live holdout gate must pass when sandbox available: {:?}",
@@ -128,6 +156,7 @@ async fn holdout_01_live_control_plane_and_naive() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn holdout_scripted_proposer_llm_arm_smoke_non_gating() {
+    enable_live_stack();
     let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
     let id = FixtureId::new("e0502_holdout_01").unwrap();
 

@@ -23,7 +23,6 @@ async fn golden_skeleton_pass() {
 }
 
 #[tokio::test]
-#[cfg(not(feature = "stack-driver"))]
 async fn gate_skeleton_defaults_pass() {
     let harness = EvalHarness::new(EvalHarnessConfig::skeleton(fixture_root())).unwrap();
     let report = harness.run_batch(FixtureSet::Train).await.unwrap();
@@ -39,7 +38,6 @@ async fn gate_skeleton_defaults_pass() {
 }
 
 #[tokio::test]
-#[cfg(not(feature = "stack-driver"))]
 async fn golden_train_control_plane_multi_turn_pass() {
     let harness = EvalHarness::new(EvalHarnessConfig::skeleton(fixture_root())).unwrap();
     let id = FixtureId::new("e0502_train_control_01").unwrap();
@@ -58,7 +56,6 @@ async fn golden_train_control_plane_multi_turn_pass() {
 }
 
 #[tokio::test]
-#[cfg(not(feature = "stack-driver"))]
 async fn golden_holdout_control_plane_pass() {
     let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
     for (id, model_calls) in [("e0502_holdout_01", 1), ("e0502_holdout_02", 2)] {
@@ -76,7 +73,6 @@ async fn golden_holdout_control_plane_pass() {
 }
 
 #[tokio::test]
-#[cfg(not(feature = "stack-driver"))]
 async fn e2e_holdout_with_naive() {
     let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
     let report = harness.run_holdout_with_naive().await.unwrap();
@@ -156,7 +152,6 @@ async fn turn_node_absent_in_day1_fixtures() {
 }
 
 #[tokio::test]
-#[cfg(not(feature = "stack-driver"))]
 async fn trajectories_survive_batch_and_group() {
     let harness = EvalHarness::new(EvalHarnessConfig::skeleton(fixture_root())).unwrap();
     let report = harness.run_batch(FixtureSet::Train).await.unwrap();
