@@ -63,9 +63,37 @@ fn router_example_is_never_auto_copied() {
         .args(["index", "--stats"])
         .assert()
         .code(3)
-        .stderr(predicate::str::contains("router.toml.example"));
+        .stderr(predicate::str::contains("router.toml.example"))
+        .stderr(predicate::str::contains("ALLOY_ROUTER"))
+        .stderr(predicate::str::contains(
+            dir.path().join("router.toml").display().to_string(),
+        ));
     assert!(
         !dir.path().join("router.toml").exists(),
         "router.toml must never be auto-created (SEC6)"
     );
+}
+
+#[test]
+fn missing_profile_names_both_recovery_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("router.toml"),
+        alloy_runtime::default_router_toml(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("example.env"), "ALLOY_API_KEY=\n").unwrap();
+
+    common::alloy_in(dir.path())
+        .args(["index", "--stats"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("profiles/"))
+        .stderr(predicate::str::contains("ALLOY_PROFILE"))
+        .stderr(predicate::str::contains(
+            dir.path()
+                .join("profiles/default.toml")
+                .display()
+                .to_string(),
+        ));
 }

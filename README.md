@@ -135,13 +135,29 @@ Point a BYOM router at a local OpenAI-compatible server, then repair a toy crate
 — not a precious tree. See [`docs/dogfooding.md`](docs/dogfooding.md).
 
 ```bash
-cp router.toml.local-example router.toml   # or router.toml.example
+cargo build -p alloy-cli --bin alloy
+cp router.toml.local-example router.toml   # edit model/base_url if needed
 export ALLOY_API_KEY=local                 # any non-empty value for loopback
+export ALLOY_PROFILE="$PWD/profiles/default.toml"
+export ALLOY_ROUTER="$PWD/router.toml"
 
-# Seed a broken crate (or copy eval/live-repair/fixtures/*/workspace)
-cargo run -p alloy-cli -- --workspace /tmp/broken-crate \
-  run "fix the compile error in this crate" --yes
+dogfood="$(mktemp -d)"
+cp -a eval/live-repair/fixtures/missing_mut/workspace/. "$dogfood/"
+git -C "$dogfood" init
+git -C "$dogfood" add -A
+git -C "$dogfood" -c user.name=dogfood -c user.email=dogfood@localhost \
+  -c commit.gpgsign=false commit -m fixture
+
+"$PWD/target/debug/alloy" --workspace "$dogfood" \
+  run "fix the compile error in src/main.rs" --yes
+"$PWD/target/debug/alloy" --workspace "$dogfood" events
 ```
+
+`ALLOY_PROFILE` and `ALLOY_ROUTER` are absolute above because relative override
+paths resolve against `--workspace`, not the shell's current directory. The
+terminal success message distinguishes compile verification from intended-fix
+verification; use the printed `alloy events` command to inspect the durable
+decisions and patch record.
 
 `alloy host` remains available as a lifecycle smoke test (start → idle →
 drain on `Ctrl-C`/`SIGTERM`). `alloy review` reviews a unified diff read-only.

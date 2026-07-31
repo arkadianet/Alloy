@@ -350,7 +350,7 @@ impl RuntimeConfig {
     pub fn load(paths: ConfigPaths) -> Result<Self, RuntimeError> {
         if !paths.profile.is_file() {
             return Err(RuntimeError::Config(format!(
-                "missing profile TOML at {} (see {})",
+                "missing profile TOML at {}; copy the shipped profiles/ directory into the workspace or set ALLOY_PROFILE to an absolute profile path (see {})",
                 paths.profile.display(),
                 paths.example_env.display()
             )));
@@ -364,7 +364,7 @@ impl RuntimeConfig {
 
         if !paths.router.is_file() {
             return Err(RuntimeError::Config(format!(
-                "missing router TOML at {} (copy router.toml.example; see {})",
+                "missing router TOML at {}; copy router.toml.local-example or router.toml.example there, or set ALLOY_ROUTER to an absolute router path (see {})",
                 paths.router.display(),
                 paths.example_env.display()
             )));
