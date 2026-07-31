@@ -45,7 +45,7 @@ use alloy_runtime::{
     PlanService, PlannerConfig, PlannerMode, ProcessCostMeterFactory, ProcessRunRouterProvider,
     ProjectGraph, ProposerDeps, ProviderId, RecordingDecisionLog, RecordingModelProvider,
     RegistryCapabilityExecutor, ResponseFormat, RetentionPolicy, RouterConfig, RunControlState,
-    RunGoalRecord, RunRow, RuntimeConfig, SchedConfig, Session, SessionVerifyPermissions,
+    RunError, RunGoalRecord, RunRow, RuntimeConfig, SchedConfig, Session, SessionVerifyPermissions,
     SessionWorkerPermissions, TemplatePlanService, Timestamp, ToolCaller, ToolChoice, ToolName,
     ToolSelector, ToolchainRecord, UnavailableVerifyTest, Usage, Verifier, WorkerConfig,
     WorkerDeps, EDIT_SYSTEM, PLANNING_SYSTEM, REPAIR_SYSTEM,
@@ -586,10 +586,36 @@ async fn run_live_inner(
                         .ok_or_else(|| {
                             EvalError::Internal("gate node missing ApprovalSpec".into())
                         })?;
-                    runs.approve(run_id, gate_id, Approval::Allow)
-                        .await
-                        .map_err(|e| EvalError::Internal(bound_message(format!("approve: {e}"))))?;
-                    human_interventions = human_interventions.saturating_add(1);
+                    // The scheduler can mark `DagState::WaitingApproval` before
+                    // `ApprovalRequested` is durable / before the run row flips
+                    // (run_controller approve race, 2026-07-29). Retry that
+                    // window instead of failing the fixture and shutting the
+                    // store under a still-running GateHuman waiter.
+                    match runs.approve(run_id, gate_id, Approval::Allow).await {
+                        Ok(()) => {
+                            human_interventions = human_interventions.saturating_add(1);
+                        }
+                        Err(e)
+                            if matches!(
+                                &e,
+                                RunError::InvalidPhase(m) if m == "not waiting approval"
+                            ) =>
+                        {
+                            tracing::debug!(
+                                %run_id,
+                                %gate_id,
+                                error = %e,
+                                "approve raced ahead of ApprovalRequested; retrying"
+                            );
+                        }
+                        Err(e) => {
+                            run_task.abort();
+                            let _ = run_task.await;
+                            return Err(EvalError::Internal(bound_message(format!(
+                                "approve: {e}"
+                            ))));
+                        }
+                    }
                     // Continue polling so cancellation, a later gate, or finish are
                     // observed under the same deadline (no unbounded join here).
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -597,6 +623,7 @@ async fn run_live_inner(
                 }
                 if tokio::time::Instant::now() >= deadline {
                     run_task.abort();
+                    let _ = run_task.await;
                     return Err(EvalError::Internal(
                         "live stack-driver: poll deadline exceeded (beyond scheduler run_timeout)"
                             .into(),
