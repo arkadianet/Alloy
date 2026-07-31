@@ -40,6 +40,7 @@ pub(super) fn allowances(profile: &ContextProfile, remainder: usize) -> [(Domain
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::profile::DomainWeights;
     use crate::types::budget::TokenBudget;
 
     // T2d — B1.
@@ -72,5 +73,34 @@ mod tests {
         assert_eq!(got[2], (DomainId::Artifacts, 7_572));
         let sum: usize = got.iter().map(|(_, a)| a).sum();
         assert_eq!(sum, 30_287, "floor loss <= 3 and never redistributed");
+    }
+
+    // T2j — B4 weight hygiene: profile weights, not hard-coded constants,
+    // drive the allocation; non-normalised weights are normalised by the
+    // live-weight sum and floor loss stays bounded by the live-domain count.
+    #[test]
+    fn allowances_follow_non_default_weights_exactly() {
+        let mut profile = ContextProfile::v2_defaults();
+        profile.weights = DomainWeights {
+            conversation: 2.0,
+            working_set: 1.0,
+            artifacts: 1.0,
+        };
+        let got = allowances(&profile, 10_000);
+        assert_eq!(got[0], (DomainId::Conversation, 5_000));
+        assert_eq!(got[1], (DomainId::WorkingSet, 2_500));
+        assert_eq!(got[2], (DomainId::Artifacts, 2_500));
+
+        profile.weights = DomainWeights {
+            conversation: 0.0,
+            working_set: 0.9,
+            artifacts: 0.1,
+        };
+        let got = allowances(&profile, 1_001);
+        assert_eq!(got[0], (DomainId::Conversation, 0));
+        assert_eq!(got[1], (DomainId::WorkingSet, 900));
+        assert_eq!(got[2], (DomainId::Artifacts, 100));
+        let sum: usize = got.iter().map(|(_, a)| a).sum();
+        assert!(1_001 - sum <= 3, "floor loss bounded by live domains");
     }
 }

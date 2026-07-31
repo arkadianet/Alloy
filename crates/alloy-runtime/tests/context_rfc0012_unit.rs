@@ -347,6 +347,74 @@ async fn redistribution_lets_working_set_use_unused_conversation_allowance() {
     assert!(ws["tokens_est"].as_u64().unwrap() > 40);
 }
 
+#[tokio::test]
+async fn weights_actually_shift_the_budget_between_domains() {
+    // T2k — weight hygiene end to end (B4): with conversation and
+    // working-set content both bottomless, moving weight from working_set
+    // to conversation moves the rendered budget the same way. The weights
+    // are the profile's, never hard-coded.
+    let big = (1..=400)
+        .map(|i| format!("// big file line {i:03} ................"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let assemble = |weights: DomainWeights| {
+        let big = big.clone();
+        async move {
+            let fx = Fx::new(GraphMode::Empty);
+            write_file(&fx.ws.root.join("crates/toy-core/src/big.rs"), &big);
+            for i in 0..250 {
+                fx.events.push(
+                    fixed_session(),
+                    SessionEventType::BudgetWarning,
+                    serde_json::json!({ "message": format!("warning {i}") }),
+                );
+            }
+            let mut profile = ContextProfile::v2_defaults();
+            profile.weights = weights;
+            let inputs = make_inputs(
+                Some("small goal"),
+                vec![],
+                vec!["crates/toy-core/src/big.rs"],
+            );
+            fx.engine_with(profile)
+                .assemble_with(repair_request(3_000, vec![]), inputs)
+                .await
+                .unwrap()
+        }
+    };
+
+    let defaults = assemble(DomainWeights::v2_defaults()).await;
+    let conv_heavy = assemble(DomainWeights {
+        conversation: 0.60,
+        working_set: 0.20,
+        artifacts: 0.20,
+    })
+    .await;
+
+    let tokens = |pack: &PromptPack, label: &str| {
+        domain_entry(&manifest(pack), label)["tokens_est"]
+            .as_u64()
+            .unwrap()
+    };
+    let (conv_a, ws_a) = (
+        tokens(&defaults, "conversation"),
+        tokens(&defaults, "working_set"),
+    );
+    let (conv_b, ws_b) = (
+        tokens(&conv_heavy, "conversation"),
+        tokens(&conv_heavy, "working_set"),
+    );
+    assert!(
+        conv_b > conv_a,
+        "0.60 conversation weight must out-render 0.20: {conv_a} -> {conv_b}"
+    );
+    assert!(
+        ws_a > ws_b,
+        "0.55 working_set weight must out-render 0.20: {ws_a} -> {ws_b}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // T3 — domains
 // ---------------------------------------------------------------------
@@ -936,6 +1004,100 @@ async fn fidelity_manifest_is_labelled_and_not_called_a_call_graph() {
         "CIT6 label missing"
     );
     assert_eq!(manifest(&pack)["graph"]["fidelity"], "manifest");
+}
+
+#[tokio::test]
+async fn syn_deep_fidelity_is_labelled_and_recorded_in_the_manifest() {
+    // T4j — CIT6 for the deep posture: when the store serves the syn-deep
+    // shape (main's `GRAPH_MODEL_VERSION = 3`), the fence carries
+    // `fidelity=syn_deep` and the manifest records it. The
+    // "module layout only" caveat is exclusive to Manifest data — a
+    // syn-deep view really is call/reference knowledge.
+    let fx = Fx::new(GraphMode::Toy);
+    fx.graph.set_impact(true);
+    let pack = fx
+        .engine()
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let text = pack_text(&pack);
+    assert!(text.contains("fidelity=syn_deep"), "CIT6 label: {text}");
+    assert!(!text.contains("module layout only"));
+    assert_eq!(manifest(&pack)["graph"]["fidelity"], "syn_deep");
+}
+
+#[tokio::test]
+async fn deep_projection_flows_into_the_working_set_with_reserved_domains_inert() {
+    // T4k — the Beta acceptance criterion, end to end over the public API:
+    // the WorkingSet includes the rich graph projection — item-level
+    // nodes, import edges and impact facts, each citation-carrying — while
+    // the five reserved domains stay inert (D1).
+    let fx = Fx::new(GraphMode::Toy);
+    fx.graph.set_impact(true);
+    let pack = fx
+        .engine()
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let text = pack_text(&pack);
+    for line in [
+        "item  toy_core::io::read_all  crates/toy-core/src/io.rs",
+        "defines toy_core::io -> toy_core::io::read_all",
+        "imports toy_core::io::reader -> toy_core::io::read_all",
+        "calls toy_cli::main -> toy_core::io::read_all",
+        "refs toy_core::io::reader -> toy_core::io::read_all",
+    ] {
+        assert!(text.contains(line), "deep projection missing: {line}");
+    }
+    // The item node carries a per-node citation at the read version (CIT2).
+    assert!(
+        pack.citations
+            .iter()
+            .any(|c| c.source == "alloy://working_set/graph/1/toy_core::io::read_all"),
+        "item node citation missing"
+    );
+    let m = manifest(&pack);
+    for (label, live) in [
+        ("conversation", true),
+        ("working_set", true),
+        ("artifacts", true),
+        ("architecture", false),
+        ("scratchpad", false),
+        ("long_term", false),
+        ("planning", false),
+        ("project_legacy_alias", false),
+    ] {
+        assert_eq!(
+            m["domains"][label]["live"], live,
+            "exactly three live domains: {label}"
+        );
+        if !live {
+            assert_eq!(m["domains"][label]["items"], 0, "D1: {label} inert");
+        }
+    }
+}
+
+#[tokio::test]
+async fn two_assemblies_over_the_deep_store_are_byte_identical() {
+    // A1 holds for the deep projection: the second call rides the memo
+    // (K8), so byte-identity also proves the impact-bearing projection is
+    // memo-stable.
+    let fx = Fx::new(GraphMode::Toy);
+    fx.graph.set_impact(true);
+    let engine = fx.engine();
+    let a = engine
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    let b = engine
+        .assemble_with(repair_request(32_000, vec![]), fx.goal_inputs())
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&a).unwrap(),
+        serde_json::to_vec(&b).unwrap(),
+        "A1 across a memo hit, deep projection"
+    );
 }
 
 #[tokio::test]
