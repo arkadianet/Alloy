@@ -329,9 +329,18 @@ pub fn score(
                 row.fixture_id
             ));
         }
-        if (row.oracle_pass && row.failure_class != "pass")
-            || (!row.oracle_pass && row.failure_class == "pass")
-        {
+        if row.process_pass {
+            // Process-success classes are fully determined by compile/reference
+            // evidence; reject spoofed labels such as timeout/reference swaps.
+            let postcheck_clean = row.compile_clean && row.cargo_check_exit == Some(0);
+            let expected_class = classify(row.exit_code, "", postcheck_clean, row.reference_match);
+            if row.failure_class != expected_class {
+                return Err(format!(
+                    "failure-class consistency violation for {}: expected {expected_class}, got {}",
+                    row.fixture_id, row.failure_class
+                ));
+            }
+        } else if row.oracle_pass || row.failure_class == "pass" {
             return Err(format!(
                 "failure-class consistency violation for {}",
                 row.fixture_id
@@ -590,6 +599,21 @@ mod tests {
         let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
         assert!(
             error.contains("process/compile evidence inconsistency"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn score_rejects_spoofed_failure_class_on_process_success() {
+        let fixtures = fixtures_with(&["a"]);
+        let mut row = observation("a", 1);
+        row.reference_match = false;
+        row.oracle_pass = false;
+        row.failure_class = "timeout".to_owned();
+        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        assert!(
+            error.contains("failure-class consistency violation")
+                && error.contains("reference_mismatch"),
             "{error}"
         );
     }
