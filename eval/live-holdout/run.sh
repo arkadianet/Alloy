@@ -81,6 +81,10 @@ mapfile -t ids < <(
 )
 [ "${#ids[@]}" -gt 0 ] || die "no holdout fixture directories under $FIXTURES"
 
+# Exclusive lock on the observations file so two sweeps cannot interleave rows.
+mkdir -p "$(dirname -- "$out")"
+exec 9>"$out.lock" || die "could not open lock $out.lock"
+flock -n 9 || die "another live-holdout sweep holds $out.lock"
 : > "$out"
 total=0
 passed=0
