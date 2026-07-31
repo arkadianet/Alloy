@@ -8,11 +8,15 @@
 //! the run's lifecycle events and row writes stay single-sourced in §6.3
 //! (rules RX1/RX2 — see the AC 48 CI grep).
 //!
-//! Admission is GN1–GN7: a genuine `VerifyCompile` `Fail`
-//! (`ErrorClass::Compile`) whose diagnostics survive the SD9 projection,
-//! within the `max_repair_generations` bound, the run's budget, and one
-//! **absolute** run deadline (GN7 / AM-0010-2). Everything else — including
-//! exhaustion — is an *outcome*, not an error (GN11).
+//! Admission is GN1–GN7: a seedable compile `FailureIr` within the
+//! `max_repair_generations` bound, the run's budget, and one **absolute**
+//! run deadline (GN7 / AM-0010-2). Day-1 the seed usually comes from a
+//! `VerifyCompile` Fail; a narrow GN2 exception also admits an exhausted
+//! `Edit`/`Analyze` Model failure when the current repair lineage still
+//! carries that seed (AM-0017-1). When wired, GN13 restores the newest
+//! edit checkpoint and re-verifies before replan so gen N+1 does not
+//! repair a morph. Everything else — including exhaustion — is an
+//! *outcome*, not an error (GN11).
 //!
 //! Author: arkadianet
 
@@ -25,9 +29,12 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::adapters::{NodeExecContext, NodeExecRef, VerdictOutcome, Verifier};
+use crate::capabilities::{WorkerPermissions, WorkerToolClass};
 use crate::dag::NodeKind;
+use crate::edit::{transactions_of_run, EditContext, EditEngine};
 use crate::error::{RunError, RuntimeError};
-use crate::events::SessionEventType;
+use crate::events::{SessionEvent, SessionEventType};
 use crate::obs::{BudgetCheck, CostMeterFactory, DecisionKind, DecisionLog, DecisionRecord};
 use crate::planner::seed::seed_projection_is_empty;
 use crate::planner::{PlanContext, PlanError, PlanProducedPayload, PlanService, PlanSource};
@@ -35,8 +42,8 @@ use crate::scheduler::{DagOutcome, DagState};
 use crate::session::{ReplanReason, RunController, RunExecCtx, RunExecutor, RunGoalRecord};
 use crate::storage::{DagStore, EventStore, SessionRows, StoreError};
 use crate::types::budget::BudgetPolicy;
-use crate::types::diagnostic::{ErrorClass, FailureIr};
-use crate::types::ids::{DagId, Digest, SessionId};
+use crate::types::diagnostic::{ErrorClass, FailureIr, RetryDisposition};
+use crate::types::ids::{DagId, Digest, EventSeq, SessionId};
 
 /// The driver's own policy struct (RFC-0017 §3.8). One field today; it
 /// exists so the bound has a home that is neither `SchedConfig` nor a bare
@@ -97,6 +104,13 @@ pub struct GenerationDriverDeps {
     pub fingerprints: PlanFingerprints,
     /// The generation bound (from `RuntimeConfig.max_repair_generations`).
     pub policy: GenerationPolicy,
+    /// GN13: restore pre-edit workspace before replan. Absent in scripted
+    /// harnesses — rollback is then a no-op.
+    pub edit_engine: Option<Arc<dyn EditEngine>>,
+    /// GN13: mint Patch grants for [`EditEngine::rollback`].
+    pub worker_permissions: Option<Arc<dyn WorkerPermissions>>,
+    /// GN13: re-verify after a successful restore so the seed matches disk.
+    pub verify_compile: Option<Arc<dyn Verifier>>,
 }
 
 /// Internal driver failure; folded into [`RuntimeError::Internal`] at the
@@ -146,6 +160,15 @@ pub struct GenerationDriver {
     metrics: AtomicDriverMetrics,
 }
 
+/// Fields for a best-effort `Replan` decision record (§9.2).
+struct ReplanDecisionMeta<'a> {
+    admitted: bool,
+    reason: Option<&'a str>,
+    provenance: Option<&'a str>,
+    seed: Option<&'a FailureIr>,
+    seed_source: Option<&'a str>,
+}
+
 /// GN10 provenance for the rebuilt replan context.
 #[derive(Debug, Clone)]
 pub(crate) struct RecoveredProvenance {
@@ -178,46 +201,60 @@ impl GenerationDriver {
     }
 
     /// GN1–GN7 in order; the first failed rule names the rejection reason
-    /// (§9.2's `reason` vocabulary).
+    /// (§9.2's `reason` vocabulary). On admit, returns the `FailureIr` that
+    /// MUST seed the next generation (outcome verify Fail, or the in-run
+    /// lineage seed for AM-0017-1).
     async fn admission_reason(
         &self,
         ctx: &RunExecCtx,
         outcome: &DagOutcome,
         bumps: u32,
-    ) -> Result<Option<&'static str>, DriveError> {
+        lineage_seed: Option<&FailureIr>,
+    ) -> Result<Result<FailureIr, &'static str>, DriveError> {
         // GN1 — a Failed outcome must carry its failure and failed node.
         // Without them there is nothing to seed, so the reject is reported
         // as `no_diagnostics`.
         let (Some(failure), Some(failed_node)) = (&outcome.failure, outcome.failed_node) else {
-            return Ok(Some("no_diagnostics"));
+            return Ok(Err("no_diagnostics"));
         };
 
-        // GN2 — only a VerifyCompile failure auto-replans day-1. A node
-        // absent from the blob (or a missing blob) cannot be shown to be
-        // one, and unknown failures never auto-replan.
+        // GN2 — VerifyCompile Fail seeds from the outcome. AM-0017-1: an
+        // exhausted Edit/Analyze Model failure may reuse the lineage seed
+        // from the VerifyCompile Fail that admitted the current repair
+        // generation. No session-history scrape — only the in-run stash.
         let kind = self
             .deps
             .dags
             .get(ctx.dag_id)
             .await?
             .and_then(|dag| dag.nodes.get(&failed_node).map(|n| n.kind));
-        if kind != Some(NodeKind::VerifyCompile) {
-            return Ok(Some("kind"));
-        }
+        let seed = match kind {
+            Some(NodeKind::VerifyCompile) => failure.clone(),
+            Some(NodeKind::Edit | NodeKind::Analyze) => {
+                if failure.error_class != ErrorClass::Model {
+                    return Ok(Err("kind"));
+                }
+                match lineage_seed {
+                    Some(seed) => seed.clone(),
+                    None => return Ok(Err("kind")),
+                }
+            }
+            _ => return Ok(Err("kind")),
+        };
 
-        // GN3 — a genuine verify Fail verdict only.
-        if failure.error_class != ErrorClass::Compile {
-            return Ok(Some("class"));
+        // GN3 — seed must be a genuine verify Fail verdict.
+        if seed.error_class != ErrorClass::Compile {
+            return Ok(Err("class"));
         }
 
         // GN4 — no diagnostics after the SD9 projection, no seed, no bump.
-        if seed_projection_is_empty(failure) {
-            return Ok(Some("no_diagnostics"));
+        if seed_projection_is_empty(&seed) {
+            return Ok(Err("no_diagnostics"));
         }
 
         // GN5 — the bound.
         if bumps >= self.deps.policy.max_repair_generations {
-            return Ok(Some("exhausted"));
+            return Ok(Err("exhausted"));
         }
 
         // GN6 — run not cancelled…
@@ -226,12 +263,12 @@ impl GenerationDriver {
             || state.is_terminal()
             || self.deps.cancellation.is_cancelled()
         {
-            return Ok(Some("cancelled"));
+            return Ok(Err("cancelled"));
         }
         // …and budget not exhausted.
         let meter = self.deps.cost_meters.meter_for(ctx.run_id);
         if meter.check_budget(&self.deps.budget_policy) != BudgetCheck::Ok {
-            return Ok(Some("budget"));
+            return Ok(Err("budget"));
         }
 
         // GN7 — the absolute deadline must have budget left.
@@ -240,10 +277,10 @@ impl GenerationDriver {
             .saturating_duration_since(Instant::now())
             .is_zero()
         {
-            return Ok(Some("deadline"));
+            return Ok(Err("deadline"));
         }
 
-        Ok(None)
+        Ok(Ok(seed))
     }
 
     /// Best-effort `Replan` decision record (GN12 / LP11): failures are
@@ -252,31 +289,30 @@ impl GenerationDriver {
         &self,
         ctx: &RunExecCtx,
         outcome: &DagOutcome,
-        admitted: bool,
-        reason: Option<&str>,
-        provenance: Option<&str>,
+        decision: ReplanDecisionMeta<'_>,
     ) {
+        let seed_or_outcome = decision.seed.or(outcome.failure.as_ref());
         let mut metadata = json!({
             "run_id": ctx.run_id,
             "dag_id": ctx.dag_id,
             "from_generation": outcome.generation,
             "failed_node": outcome.failed_node,
             "error_class": outcome.failure.as_ref().map(|f| f.error_class),
-            "diagnostic_count": outcome
-                .failure
-                .as_ref()
-                .map_or(0, |f| f.diagnostics.len()),
-            "admitted": admitted,
+            "diagnostic_count": seed_or_outcome.map_or(0, |f| f.diagnostics.len()),
+            "admitted": decision.admitted,
         });
         if let Some(map) = metadata.as_object_mut() {
-            if admitted {
+            if decision.admitted {
                 map.insert("to_generation".into(), json!(outcome.generation + 1));
             }
-            if let Some(reason) = reason {
+            if let Some(reason) = decision.reason {
                 map.insert("reason".into(), json!(reason));
             }
-            if let Some(provenance) = provenance {
+            if let Some(provenance) = decision.provenance {
                 map.insert("provenance".into(), json!(provenance));
+            }
+            if let Some(seed_source) = decision.seed_source {
+                map.insert("seed_source".into(), json!(seed_source));
             }
         }
         let record = DecisionRecord {
@@ -295,6 +331,122 @@ impl GenerationDriver {
                 error = %e,
                 "Replan decision record dropped (best-effort, GN12)"
             );
+        }
+    }
+
+    /// GN13: after admit, restore the **newest** journaled edit checkpoint
+    /// only (not the whole run) and re-verify so the replan seed matches the
+    /// pre-edit workspace. No-op when edit/verify wiring is absent.
+    async fn restore_workspace_and_reseed(
+        &self,
+        ctx: &RunExecCtx,
+        seed: FailureIr,
+    ) -> Result<FailureIr, DriveError> {
+        let (Some(engine), Some(perms), Some(verify)) = (
+            self.deps.edit_engine.as_ref(),
+            self.deps.worker_permissions.as_ref(),
+            self.deps.verify_compile.as_ref(),
+        ) else {
+            return Ok(seed);
+        };
+
+        let session = self
+            .deps
+            .sessions
+            .get_session(ctx.session_id)
+            .await?
+            .ok_or_else(|| DriveError::Internal("session missing during GN13 restore".into()))?;
+        let events = list_all_session_events(&self.deps.events, ctx.session_id).await?;
+        let Some(newest) = transactions_of_run(&events, ctx.run_id).last().copied() else {
+            return Ok(seed);
+        };
+        let meta = NodeExecRef {
+            session_id: ctx.session_id,
+            run_id: ctx.run_id,
+            dag_id: ctx.dag_id,
+            node_id: seed.node,
+            workspace_root: session.workspace_root.clone(),
+            attempt: 1,
+        };
+        let token = match perms.token_for(&meta, WorkerToolClass::Patch).await {
+            Ok(token) => token,
+            Err(error) => {
+                warn!(
+                    run_id = %ctx.run_id,
+                    dag_id = %ctx.dag_id,
+                    node_id = %seed.node,
+                    error = %error,
+                    "GN13: patch token mint failed; keeping admitted seed"
+                );
+                return Ok(seed);
+            }
+        };
+        let edit_ctx = EditContext {
+            session_id: Some(ctx.session_id),
+            run_id: Some(ctx.run_id),
+            perms: token,
+        };
+        if let Err(err) = engine.rollback(newest, &edit_ctx).await {
+            warn!(
+                run_id = %ctx.run_id,
+                tx = %newest,
+                error = %err,
+                "GN13: newest-edit rollback declined; reseeding against current workspace"
+            );
+            return Ok(seed);
+        }
+        info!(
+            run_id = %ctx.run_id,
+            tx = %newest,
+            "GN13: restored newest edit checkpoint; re-verifying for seed"
+        );
+
+        let verdict = match verify
+            .verify(&NodeExecContext {
+                meta: meta.clone(),
+                cancellation: self.deps.cancellation.clone(),
+            })
+            .await
+        {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                warn!(
+                    run_id = %ctx.run_id,
+                    dag_id = %ctx.dag_id,
+                    node_id = %seed.node,
+                    error = %error,
+                    "GN13: re-verification failed; keeping admitted seed"
+                );
+                return Ok(seed);
+            }
+        };
+        match verdict.outcome {
+            VerdictOutcome::Fail if !verdict.diagnostics.is_empty() => {
+                let reseeds = FailureIr {
+                    node: seed.node,
+                    error_class: ErrorClass::Compile,
+                    retry: RetryDisposition::NonRetryable,
+                    diagnostics: verdict.diagnostics,
+                    notes: "GN13 re-verify after edit rollback".into(),
+                };
+                if seed_projection_is_empty(&reseeds) {
+                    warn!(
+                        run_id = %ctx.run_id,
+                        "GN13: re-verify diagnostics projected empty; keeping admitted seed"
+                    );
+                    return Ok(seed);
+                }
+                Ok(reseeds)
+            }
+            other => {
+                warn!(
+                    run_id = %ctx.run_id,
+                    ?other,
+                    diag_count = verdict.diagnostics.len(),
+                    "GN13: re-verify did not yield Compile Fail with diags; keeping admitted seed"
+                );
+                Ok(seed)
+            }
         }
     }
 
@@ -328,6 +480,23 @@ impl GenerationDriver {
             prior_proposal_artifact: provenance.prior_proposal_artifact,
         })
     }
+}
+
+async fn list_all_session_events(
+    events: &Arc<dyn EventStore>,
+    session: SessionId,
+) -> Result<Vec<SessionEvent>, StoreError> {
+    let mut out = Vec::new();
+    let mut after: Option<EventSeq> = None;
+    loop {
+        let page = events.list_session_events(session, after, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|e| e.seq);
+        out.extend(page);
+    }
+    Ok(out)
 }
 
 /// GN10 / AC 26b — recover plan provenance from the last durable
@@ -394,6 +563,10 @@ impl RunExecutor for GenerationDriver {
     async fn execute(&self, ctx: RunExecCtx) -> Result<DagOutcome, RuntimeError> {
         let mut bumps: u32 = 0;
         let mut last: Option<DagOutcome> = None;
+        // AM-0017-1: Compile FailureIr from the VerifyCompile Fail that
+        // admitted the current repair lineage. Never loaded from session
+        // history — only from admitted verify outcomes in this execute().
+        let mut lineage_seed: Option<FailureIr> = None;
         loop {
             let remaining = ctx.deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -435,15 +608,28 @@ impl RunExecutor for GenerationDriver {
                 return Ok(outcome);
             }
 
-            match self.admission_reason(&ctx, &outcome, bumps).await {
-                Ok(Some(reason)) => {
+            let seed = match self
+                .admission_reason(&ctx, &outcome, bumps, lineage_seed.as_ref())
+                .await
+            {
+                Ok(Err(reason)) => {
                     gen_span.record("admitted", false);
                     gen_span.record("reject_reason", reason);
                     self.metrics
                         .replans_rejected
                         .fetch_add(1, Ordering::Relaxed);
-                    self.record_replan_decision(&ctx, &outcome, false, Some(reason), None)
-                        .await;
+                    self.record_replan_decision(
+                        &ctx,
+                        &outcome,
+                        ReplanDecisionMeta {
+                            admitted: false,
+                            reason: Some(reason),
+                            provenance: None,
+                            seed: None,
+                            seed_source: None,
+                        },
+                    )
+                    .await;
                     info!(
                         run_id = %ctx.run_id,
                         dag_id = %ctx.dag_id,
@@ -453,11 +639,19 @@ impl RunExecutor for GenerationDriver {
                     );
                     return Ok(outcome);
                 }
-                Ok(None) => {
+                Ok(Ok(seed)) => {
                     gen_span.record("admitted", true);
+                    seed
                 }
                 Err(e) => return Err(fold(e)),
-            }
+            };
+
+            // GN13 — undo morphing edits and re-derive the seed against the
+            // restored tree before the planner writes generation N+1.
+            let seed = match self.restore_workspace_and_reseed(&ctx, seed).await {
+                Ok(seed) => seed,
+                Err(e) => return Err(fold(e)),
+            };
 
             // Admitted. Recover provenance first (read-only) so the
             // decision record can carry it (§9.2).
@@ -471,20 +665,32 @@ impl RunExecutor for GenerationDriver {
             } else {
                 "degraded"
             };
+            let seed_source = if outcome
+                .failure
+                .as_ref()
+                .is_some_and(|f| f.node == seed.node && f.error_class == ErrorClass::Compile)
+            {
+                "outcome"
+            } else {
+                "lineage"
+            };
             self.metrics
                 .replans_admitted
                 .fetch_add(1, Ordering::Relaxed);
-            self.record_replan_decision(&ctx, &outcome, true, None, Some(provenance_str))
-                .await;
+            self.record_replan_decision(
+                &ctx,
+                &outcome,
+                ReplanDecisionMeta {
+                    admitted: true,
+                    reason: None,
+                    provenance: Some(provenance_str),
+                    seed: Some(&seed),
+                    seed_source: Some(seed_source),
+                },
+            )
+            .await;
 
-            // GN1 verified presence; no panic-capable unwrap in the control
-            // plane regardless.
-            let Some(failure): Option<FailureIr> = outcome.failure.clone() else {
-                return Err(fold(DriveError::Internal(
-                    "admitted outcome lost its FailureIr".into(),
-                )));
-            };
-            let reason = ReplanReason::FailureIr(failure);
+            let reason = ReplanReason::FailureIr(seed.clone());
 
             // GN8 ordering: begin → replan (topology write, seeded per
             // §5.4) → complete → next dispatch.
@@ -512,8 +718,12 @@ impl RunExecutor for GenerationDriver {
                 generation = plan.dag.generation,
                 bumps = bumps + 1,
                 provenance = provenance_str,
+                seed_source,
                 "repair generation replanned"
             );
+            // Lineage tracks the Compile seed that opened (or reopened)
+            // this repair generation — never an Edit/Analyze Model IR.
+            lineage_seed = Some(seed);
             bumps += 1;
             last = Some(outcome);
         }

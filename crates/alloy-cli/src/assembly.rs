@@ -516,6 +516,14 @@ pub async fn assemble_full_with(
         policy: GenerationPolicy {
             max_repair_generations: cfg.max_repair_generations,
         },
+        // GN13 impl is in GenerationDriver but left unwired: live REPS=3 on
+        // e0502_holdout_01 dropped 3/3 → 0/3 (honest reset removes the
+        // E0502→E0614 morph shortcut this local model was riding). Re-enable
+        // with `Some(edit_engine.clone())` / worker_perms / verify_compile
+        // when first-gen E0502 repair is solid without that crutch.
+        edit_engine: None,
+        worker_permissions: None,
+        verify_compile: None,
     });
     plane.set_executor(Arc::new(driver));
 

@@ -29,6 +29,7 @@ enum NodeSel {
     VerifyCompile,
     VerifyTest,
     Edit,
+    Analyze,
 }
 
 /// One scripted `run_within` response.
@@ -109,6 +110,7 @@ impl Scripted {
             NodeSel::VerifyCompile => NodeKind::VerifyCompile,
             NodeSel::VerifyTest => NodeKind::VerifyTest,
             NodeSel::Edit => NodeKind::Edit,
+            NodeSel::Analyze => NodeKind::Analyze,
         };
         let node = dag
             .nodes
@@ -362,6 +364,9 @@ impl Harness {
             policy: GenerationPolicy {
                 max_repair_generations: options.max_repair_generations,
             },
+            edit_engine: None,
+            worker_permissions: None,
+            verify_compile: None,
         }));
         plane.set_executor(Arc::clone(&driver) as _);
         Self {
@@ -606,8 +611,8 @@ async fn ac21b_lifecycle_single_sourced_across_generations() {
     }
 }
 
-/// AC 23: GN2 (Edit / VerifyTest failures) and GN3 (`Tool` class) and GN4
-/// (empty diagnostics) never bump; the decision names the rule.
+/// AC 23: GN2 baseline (Edit without lineage / VerifyTest), GN3 (`Tool`),
+/// and GN4 (empty diagnostics) never bump; the decision names the rule.
 #[tokio::test]
 async fn ac23_kind_class_and_empty_diagnostics_never_bump() {
     for (step, reason) in [
@@ -680,6 +685,108 @@ async fn ac23_kind_class_and_empty_diagnostics_never_bump() {
     assert_eq!(sched.calls(), 1, "a VerifyTest failure never bumps (day-1)");
     let decisions = h.replan_decisions(session).await;
     assert_eq!(decisions[0]["reason"], json!("kind"));
+    h.close().await;
+}
+
+/// AC 23b / AM-0017-1: after a verify Fail opens a lineage, an exhausted
+/// Edit Model failure may consume a remaining bump; without lineage (or
+/// with a non-Model Edit class) the decline stays `kind`.
+#[tokio::test]
+async fn ac23b_lineage_edit_model_may_bump() {
+    let h = Harness::new(HarnessOptions::default()).await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            Step::Fail {
+                node: NodeSel::VerifyCompile,
+                class: ErrorClass::Compile,
+                diags: 1,
+            },
+            Step::Fail {
+                node: NodeSel::Edit,
+                class: ErrorClass::Model,
+                diags: 0,
+            },
+            Step::Succeed,
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+
+    h.plane.runs().start(run).await.unwrap();
+
+    assert_eq!(sched.calls(), 3, "verify → lineage edit → succeed");
+    assert_eq!(h.run_state(run).await, "succeeded");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0]["admitted"], json!(true));
+    assert_eq!(decisions[0]["seed_source"], json!("outcome"));
+    assert_eq!(decisions[1]["admitted"], json!(true));
+    assert_eq!(decisions[1]["seed_source"], json!("lineage"));
+    assert_eq!(decisions[1]["error_class"], json!("model"));
+    assert!(
+        decisions[1]["diagnostic_count"].as_u64().unwrap() >= 1,
+        "admitted lineage decision reports seed diagnostic_count, not the empty Edit IR"
+    );
+    h.close().await;
+
+    // Non-Model Edit with lineage present still declines kind.
+    let h = Harness::new(HarnessOptions::default()).await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            Step::Fail {
+                node: NodeSel::VerifyCompile,
+                class: ErrorClass::Compile,
+                diags: 1,
+            },
+            Step::Fail {
+                node: NodeSel::Edit,
+                class: ErrorClass::Tool,
+                diags: 0,
+            },
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+    h.plane.runs().start(run).await.unwrap();
+    assert_eq!(sched.calls(), 2);
+    assert_eq!(h.run_state(run).await, "failed");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0]["admitted"], json!(true));
+    assert_eq!(decisions[1]["admitted"], json!(false));
+    assert_eq!(decisions[1]["reason"], json!("kind"));
+    h.close().await;
+
+    // Analyze Model with lineage may bump the same way.
+    let h = Harness::new(HarnessOptions::default()).await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            Step::Fail {
+                node: NodeSel::VerifyCompile,
+                class: ErrorClass::Compile,
+                diags: 1,
+            },
+            Step::Fail {
+                node: NodeSel::Analyze,
+                class: ErrorClass::Model,
+                diags: 0,
+            },
+            Step::Succeed,
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+    h.plane.runs().start(run).await.unwrap();
+    assert_eq!(sched.calls(), 3);
+    assert_eq!(h.run_state(run).await, "succeeded");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions[1]["seed_source"], json!("lineage"));
     h.close().await;
 }
 
