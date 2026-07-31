@@ -397,10 +397,12 @@ fn execution_plan(
     mode: ScriptedDriverMode,
 ) -> Result<ExecutionPlan, EvalError> {
     match mode {
-        ScriptedDriverMode::SkeletonReplay | ScriptedDriverMode::ControlPlane => Ok(ExecutionPlan {
-            turns: fixture.manifest.turns.clone(),
-            entries: fixture.script_entries.clone(),
-        }),
+        ScriptedDriverMode::SkeletonReplay | ScriptedDriverMode::ControlPlane => {
+            Ok(ExecutionPlan {
+                turns: fixture.manifest.turns.clone(),
+                entries: fixture.script_entries.clone(),
+            })
+        }
         ScriptedDriverMode::NaiveBaseline => {
             let turn =
                 crate::manifest::require_single_repair_ordinal_zero(&fixture.manifest.turns)?;

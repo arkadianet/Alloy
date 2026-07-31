@@ -38,16 +38,38 @@ async fn gate_skeleton_defaults_pass() {
 }
 
 #[tokio::test]
-async fn golden_holdout_control_plane_pass() {
-    let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
-    let id = FixtureId::new("e0502_holdout_01").unwrap();
-    let fixture = harness.load_fixture(FixtureSet::Holdout, &id).unwrap();
+async fn golden_train_control_plane_multi_turn_pass() {
+    let harness = EvalHarness::new(EvalHarnessConfig::skeleton(fixture_root())).unwrap();
+    let id = FixtureId::new("e0502_train_control_01").unwrap();
+    let fixture = harness.load_fixture(FixtureSet::Train, &id).unwrap();
     assert_eq!(fixture.manifest().driver, FixtureDriverKind::ControlPlane);
-    let mut fixture = harness.load_fixture(FixtureSet::Holdout, &id).unwrap();
+    assert_eq!(fixture.manifest().turns.len(), 2);
+    let mut fixture = harness.load_fixture(FixtureSet::Train, &id).unwrap();
     let outcome = harness.run_fixture(&mut fixture).await;
     assert_eq!(outcome.status, FixtureStatus::Pass, "{outcome:?}");
+    assert_eq!(outcome.model_calls, 2);
+    assert_eq!(outcome.tokens_in, Some(60));
+    assert_eq!(outcome.tokens_out, Some(44));
     assert!(outcome.compile_clean == Some(true));
     assert!(outcome.error.is_none());
+    assert!(outcome.criteria.iter().all(|criterion| criterion.passed));
+}
+
+#[tokio::test]
+async fn golden_holdout_control_plane_pass() {
+    let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
+    for (id, model_calls) in [("e0502_holdout_01", 1), ("e0502_holdout_02", 2)] {
+        let id = FixtureId::new(id).unwrap();
+        let fixture = harness.load_fixture(FixtureSet::Holdout, &id).unwrap();
+        assert_eq!(fixture.manifest().driver, FixtureDriverKind::ControlPlane);
+        let mut fixture = harness.load_fixture(FixtureSet::Holdout, &id).unwrap();
+        let outcome = harness.run_fixture(&mut fixture).await;
+        assert_eq!(outcome.status, FixtureStatus::Pass, "{outcome:?}");
+        assert_eq!(outcome.model_calls, model_calls, "{outcome:?}");
+        assert!(outcome.compile_clean == Some(true));
+        assert!(outcome.error.is_none());
+        assert!(outcome.criteria.iter().all(|criterion| criterion.passed));
+    }
 }
 
 #[tokio::test]
@@ -58,13 +80,16 @@ async fn e2e_holdout_with_naive() {
     assert!(report.naive_trajectories.is_some());
     assert!(report.naive_comparison.is_some());
     assert!(report.gate.as_ref().unwrap().passed, "{:?}", report.gate);
-    assert!(
-        report
-            .naive_comparison
-            .as_ref()
-            .unwrap()
-            .control_meets_or_beats_naive
-    );
+    let comparison = report.naive_comparison.as_ref().unwrap();
+    assert!(comparison.control_meets_or_beats_naive);
+    // §5.8 step 8: the comparison control copy is the exact control aggregate.
+    assert!(comparison.control == report.metrics);
+    let control_calls: u32 = report
+        .fixtures
+        .iter()
+        .map(|outcome| outcome.model_calls)
+        .sum();
+    assert_eq!(report.trajectories.len(), control_calls as usize);
     for outcome in &report.fixtures {
         assert_eq!(outcome.status, FixtureStatus::Pass, "{outcome:?}");
         let fixture = harness
@@ -75,9 +100,27 @@ async fn e2e_holdout_with_naive() {
             FixtureDriverKind::ControlPlane,
             "holdout control fixtures must use the control_plane driver at M7"
         );
+        assert_eq!(
+            outcome.model_calls as usize,
+            fixture.manifest().turns.len(),
+            "control plane replays every manifest turn: {outcome:?}"
+        );
     }
-    for outcome in report.naive_fixtures.as_ref().unwrap() {
+    let naive_fixtures = report.naive_fixtures.as_ref().unwrap();
+    let naive_calls: u32 = naive_fixtures
+        .iter()
+        .map(|outcome| outcome.model_calls)
+        .sum();
+    assert_eq!(
+        report.naive_trajectories.as_ref().unwrap().len(),
+        naive_calls as usize
+    );
+    for outcome in naive_fixtures {
         assert_eq!(outcome.status, FixtureStatus::Pass, "{outcome:?}");
+        assert_eq!(
+            outcome.model_calls, 1,
+            "naive baseline invokes only the ordinal-0 repair turn: {outcome:?}"
+        );
     }
 }
 
@@ -95,7 +138,9 @@ async fn turn_node_absent_in_day1_fixtures() {
     let harness = EvalHarness::new(EvalHarnessConfig::skeleton(fixture_root())).unwrap();
     for (set, id) in [
         (FixtureSet::Train, "e0502_local_borrow"),
+        (FixtureSet::Train, "e0502_train_control_01"),
         (FixtureSet::Holdout, "e0502_holdout_01"),
+        (FixtureSet::Holdout, "e0502_holdout_02"),
     ] {
         let fixture = harness
             .load_fixture(set, &FixtureId::new(id).unwrap())

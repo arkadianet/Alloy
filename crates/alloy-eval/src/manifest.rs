@@ -264,7 +264,10 @@ pub enum SuccessCriterion {
 pub enum FixtureDriverKind {
     /// Day-1 scripted replay driver.
     SkeletonReplay,
-    /// Full control-plane driver; deferred.
+    /// Offline scripted control-plane driver; replays every manifest turn.
+    ///
+    /// The live scheduler/CLI stack driver (sandbox apply, live compile
+    /// oracle, `TomlModelRouter`) remains deferred to RFCs 0008–0015.
     ControlPlane,
     /// Naive single-turn baseline driver.
     NaiveBaseline,
