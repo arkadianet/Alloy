@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use alloy_eval::{
-    compare_live_holdout, inspect_live_holdout, load_live_holdout_observations, score_live_holdout,
-    target_path_text, LiveHoldoutEndpoint, LiveHoldoutReport,
+    compare_live_holdout, inspect_live_holdout, live_holdout_target_path_text,
+    load_live_holdout_observations, score_live_holdout, LiveHoldoutEndpoint, LiveHoldoutReport,
 };
 
 const USAGE: &str = "\
@@ -48,7 +48,10 @@ fn run() -> Result<String, String> {
     match command.as_str() {
         "target-path" => {
             let manifest = required(&options, "manifest")?;
-            Ok(format!("{}\n", target_path_text(&PathBuf::from(manifest))?))
+            Ok(format!(
+                "{}\n",
+                live_holdout_target_path_text(&PathBuf::from(manifest))?
+            ))
         }
         "oracle" => oracle(&options),
         "score" => score(&options),
@@ -78,10 +81,11 @@ fn required<'a>(
     options: &'a BTreeMap<String, Vec<String>>,
     key: &str,
 ) -> Result<&'a String, String> {
-    options
-        .get(key)
-        .and_then(|values| values.first())
-        .ok_or_else(|| format!("missing required option --{key}"))
+    match options.get(key).map(Vec::as_slice) {
+        None | Some([]) => Err(format!("missing required option --{key}")),
+        Some([value]) => Ok(value),
+        Some(_) => Err(format!("option --{key} may only be provided once")),
+    }
 }
 
 fn parse_bool(options: &BTreeMap<String, Vec<String>>, key: &str) -> Result<bool, String> {
@@ -115,6 +119,9 @@ fn oracle(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
         parse_bool(options, "compile-clean")?,
         parse_cargo_exit(options)?,
     )?;
+    // Seven-field TSV consumed by eval/live-holdout/run.sh, in order:
+    // process_pass, compile_clean, reference_match, oracle_pass,
+    // failure_class, cargo_check_exit, repair_generations.
     Ok(format!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         fields.process_pass,
@@ -131,11 +138,15 @@ fn oracle(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
 }
 
 fn endpoint(options: &BTreeMap<String, Vec<String>>) -> Result<LiveHoldoutEndpoint, String> {
+    let temperature: f64 = required(options, "temperature")?
+        .parse()
+        .map_err(|_| "--temperature must be a number".to_owned())?;
+    if !temperature.is_finite() {
+        return Err("--temperature must be a finite number".to_owned());
+    }
     Ok(LiveHoldoutEndpoint {
         model: required(options, "model")?.clone(),
-        temperature: required(options, "temperature")?
-            .parse()
-            .map_err(|_| "--temperature must be a number".to_owned())?,
+        temperature,
         profile: required(options, "profile")?.clone(),
         base_url: required(options, "base-url")?.clone(),
     })
@@ -174,6 +185,12 @@ fn compare(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
             .map_err(|error| format!("read {report_path}: {error}"))?;
         let report: LiveHoldoutReport =
             serde_json::from_str(&raw).map_err(|error| format!("parse {report_path}: {error}"))?;
+        if report.schema_version != 1 {
+            return Err(format!(
+                "unsupported schema_version {} in {report_path}; expected 1",
+                report.schema_version
+            ));
+        }
         reports.push((name.to_owned(), report));
     }
     let comparison = compare_live_holdout(reports)?;

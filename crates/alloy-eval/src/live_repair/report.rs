@@ -109,10 +109,11 @@ impl LiveRepairObservation {
     /// Classify this observation.
     ///
     /// Exit `0` is a pass only with `compile_clean = Some(true)` and
-    /// `cargo_check_exit = Some(0)`. Missing or contradictory post-check
-    /// evidence is a failure. Exit `124` is a `timeout(1)` kill, `126`/`127`
-    /// mean the shell could not execute the binary, and every other non-zero
-    /// code is a plain failure.
+    /// `cargo_check_exit = Some(0)`. Legacy `(None, None)` evidence is a
+    /// failure. Incomplete or contradictory pairs are rejected by
+    /// [`LiveRepairReport::assemble`] before scoring. Exit `124` is a
+    /// `timeout(1)` kill, `126`/`127` mean the shell could not execute the
+    /// binary, and every other non-zero code is a plain failure.
     #[must_use]
     pub fn outcome(&self) -> LiveRepairOutcome {
         if self.exit_code == 0
@@ -310,6 +311,13 @@ impl LiveRepairReport {
                     endpoint.model,
                     endpoint.temperature,
                     endpoint.base_url,
+                )));
+            }
+            if observation.compile_clean.is_some() != observation.cargo_check_exit.is_some() {
+                return Err(EvalError::Manifest(format!(
+                    "observation {}#{} has incomplete compile evidence \
+                     (exactly one of compile_clean/cargo_check_exit is present)",
+                    observation.fixture_id, observation.repetition
                 )));
             }
             if observation.compile_clean == Some(true) && observation.cargo_check_exit != Some(0) {
@@ -703,6 +711,19 @@ package = "{id}"
         let result = assemble(&corpus, vec![observed]);
         assert!(
             matches!(&result, Err(EvalError::Manifest(message)) if message.contains("compile_clean=true")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn assemble_rejects_incomplete_compile_evidence() {
+        let (_dir, corpus) = corpus();
+        let mut observed = observation("aaa", 1, 0, 0, 1);
+        observed.compile_clean = Some(false);
+        observed.cargo_check_exit = None;
+        let result = assemble(&corpus, vec![observed]);
+        assert!(
+            matches!(&result, Err(EvalError::Manifest(message)) if message.contains("incomplete compile evidence")),
             "{result:?}"
         );
     }

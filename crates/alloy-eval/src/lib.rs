@@ -62,10 +62,10 @@ pub use gate::{
 pub use harness::{EvalHarness, EvalHarnessConfig, LoadedFixture, EVAL_MAX_CONCURRENCY};
 pub use live_holdout::{
     compare as compare_live_holdout, load_observations as load_live_holdout_observations,
-    oracle as inspect_live_holdout, score as score_live_holdout, target_path_text,
-    Endpoint as LiveHoldoutEndpoint, MatrixComparison as LiveHoldoutMatrixComparison,
-    StrictObservation as LiveHoldoutObservation, StrictObservationFields,
-    StrictReport as LiveHoldoutReport,
+    oracle as inspect_live_holdout, score as score_live_holdout,
+    target_path_text as live_holdout_target_path_text, Endpoint as LiveHoldoutEndpoint,
+    MatrixComparison as LiveHoldoutMatrixComparison, StrictObservation as LiveHoldoutObservation,
+    StrictObservationFields as LiveHoldoutObservationFields, StrictReport as LiveHoldoutReport,
 };
 pub use live_repair::{
     parse_observations_jsonl, render_router_toml, wilson_interval, LiveRepairCorpus,

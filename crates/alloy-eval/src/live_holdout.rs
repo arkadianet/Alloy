@@ -159,10 +159,17 @@ pub fn oracle(
     let expected = fixture_dir
         .join("workspace")
         .join(format!("{}.post", relative_target.to_string_lossy()));
-    let log = fs::read_to_string(run_log).unwrap_or_default();
-    let reference_match = actual.is_file()
-        && expected.is_file()
-        && fs::read(&actual).ok() == fs::read(&expected).ok();
+    let log = fs::read_to_string(run_log)
+        .map_err(|error| format!("unreadable run log {}: {error}", run_log.display()))?;
+    let reference_match = if actual.is_file() && expected.is_file() {
+        let actual_bytes = fs::read(&actual)
+            .map_err(|error| format!("read actual {}: {error}", actual.display()))?;
+        let expected_bytes = fs::read(&expected)
+            .map_err(|error| format!("read expected {}: {error}", expected.display()))?;
+        actual_bytes == expected_bytes
+    } else {
+        false
+    };
     let postcheck_clean = compile_clean && cargo_check_exit == Some(0);
     let failure_class = classify(exit_code, &log, postcheck_clean, reference_match);
     Ok(StrictObservationFields {
@@ -298,19 +305,37 @@ pub fn score(
             || row.model != endpoint.model
             || row.base_url != endpoint.base_url
             || row.profile != endpoint.profile
-            || (row.temperature - endpoint.temperature).abs() > f64::EPSILON
-            || row.process_pass != (row.exit_code == 0)
+            || row.temperature != endpoint.temperature
+        {
+            return Err(format!("endpoint identity mismatch for {}", row.fixture_id));
+        }
+        if row.process_pass != (row.exit_code == 0)
             || (row.compile_clean && row.cargo_check_exit != Some(0))
             || (!row.compile_clean && row.cargo_check_exit == Some(0))
-            || row.oracle_pass
-                != (row.process_pass
-                    && row.compile_clean
-                    && row.cargo_check_exit == Some(0)
-                    && row.reference_match)
-            || (row.oracle_pass && row.failure_class != "pass")
+        {
+            return Err(format!(
+                "process/compile evidence inconsistency for {}",
+                row.fixture_id
+            ));
+        }
+        if row.oracle_pass
+            != (row.process_pass
+                && row.compile_clean
+                && row.cargo_check_exit == Some(0)
+                && row.reference_match)
+        {
+            return Err(format!(
+                "oracle derivation inconsistency for {}",
+                row.fixture_id
+            ));
+        }
+        if (row.oracle_pass && row.failure_class != "pass")
             || (!row.oracle_pass && row.failure_class == "pass")
         {
-            return Err(format!("inconsistent observation for {}", row.fixture_id));
+            return Err(format!(
+                "failure-class consistency violation for {}",
+                row.fixture_id
+            ));
         }
         grouped
             .get_mut(&row.fixture_id)
@@ -382,7 +407,9 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
                 baseline.repetitions
             ));
         }
-        arms.insert(name.clone(), report.clone());
+        if arms.insert(name.clone(), report.clone()).is_some() {
+            return Err(format!("duplicate arm identity {name}"));
+        }
     }
     let comparisons = named_reports[1..]
         .iter()
@@ -449,6 +476,62 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
 mod tests {
     use super::*;
 
+    fn endpoint() -> Endpoint {
+        Endpoint {
+            model: "stub-model".to_owned(),
+            temperature: 0.6,
+            profile: "default".to_owned(),
+            base_url: "http://127.0.0.1:8089/v1/".to_owned(),
+        }
+    }
+
+    fn observation(fixture_id: &str, repetition: u32) -> StrictObservation {
+        let endpoint = endpoint();
+        StrictObservation {
+            fixture_id: fixture_id.to_owned(),
+            repetition,
+            exit_code: 0,
+            process_pass: true,
+            compile_clean: true,
+            reference_match: true,
+            oracle_pass: true,
+            failure_class: "pass".to_owned(),
+            cargo_check_exit: Some(0),
+            repair_generations: 0,
+            wall_ms: 10,
+            model: endpoint.model,
+            temperature: endpoint.temperature,
+            profile: endpoint.profile,
+            base_url: endpoint.base_url,
+            corpus: CORPUS.to_owned(),
+        }
+    }
+
+    fn fixtures_with(ids: &[&str]) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        for id in ids {
+            let fixture = directory.path().join(id);
+            fs::create_dir_all(&fixture).unwrap();
+            fs::write(
+                fixture.join("manifest.toml"),
+                "naive_target_path = \"src/lib.rs\"\n",
+            )
+            .unwrap();
+        }
+        directory
+    }
+
+    fn report_for(oracle_pass: bool) -> StrictReport {
+        let fixtures = fixtures_with(&["shared"]);
+        let mut row = observation("shared", 1);
+        if !oracle_pass {
+            row.reference_match = false;
+            row.oracle_pass = false;
+            row.failure_class = "reference_mismatch".to_owned();
+        }
+        score(fixtures.path(), vec![row], endpoint(), 1).unwrap()
+    }
+
     #[test]
     fn classifies_strict_success_and_false_green() {
         assert_eq!(classify(0, "", true, true), "pass");
@@ -469,5 +552,100 @@ mod tests {
         let manifest = directory.path().join("manifest.toml");
         fs::write(&manifest, "naive_target_path = '../escape.rs'\n").unwrap();
         assert!(target_path(&manifest).is_err());
+    }
+
+    #[test]
+    fn score_accepts_dense_consistent_observations() {
+        let fixtures = fixtures_with(&["a", "b"]);
+        let rows = vec![
+            observation("a", 1),
+            observation("a", 2),
+            observation("b", 1),
+            observation("b", 2),
+        ];
+        let report = score(fixtures.path(), rows, endpoint(), 2).unwrap();
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.overall.oracle.passes, 4);
+        assert_eq!(report.overall.oracle.attempts, 4);
+        assert_eq!(report.fixtures.len(), 2);
+    }
+
+    #[test]
+    fn score_rejects_endpoint_identity_mismatch() {
+        let fixtures = fixtures_with(&["a"]);
+        let mut row = observation("a", 1);
+        row.temperature = 0.7;
+        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        assert!(error.contains("endpoint identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn score_rejects_process_compile_inconsistency() {
+        let fixtures = fixtures_with(&["a"]);
+        let mut row = observation("a", 1);
+        row.compile_clean = true;
+        row.cargo_check_exit = Some(101);
+        row.oracle_pass = false;
+        row.failure_class = "process_claimed_success_but_compile_failed".to_owned();
+        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        assert!(
+            error.contains("process/compile evidence inconsistency"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn score_rejects_duplicate_and_missing_repetitions() {
+        let fixtures = fixtures_with(&["a"]);
+        let duplicate = score(
+            fixtures.path(),
+            vec![observation("a", 1), observation("a", 1)],
+            endpoint(),
+            2,
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("repetitions"), "{duplicate}");
+
+        let missing = score(fixtures.path(), vec![observation("a", 1)], endpoint(), 2).unwrap_err();
+        assert!(missing.contains("repetitions"), "{missing}");
+    }
+
+    #[test]
+    fn compare_rejects_duplicate_arm_identity() {
+        let baseline = report_for(true);
+        let arm = report_for(false);
+        let error = compare(vec![
+            ("baseline".to_owned(), baseline),
+            ("baseline".to_owned(), arm),
+        ])
+        .unwrap_err();
+        assert!(error.contains("duplicate arm identity"), "{error}");
+    }
+
+    #[test]
+    fn compare_rejects_incompatible_inputs() {
+        let fixtures_a = fixtures_with(&["a"]);
+        let fixtures_b = fixtures_with(&["b"]);
+        let left = score(fixtures_a.path(), vec![observation("a", 1)], endpoint(), 1).unwrap();
+        let right = score(fixtures_b.path(), vec![observation("b", 1)], endpoint(), 1).unwrap();
+        let error = compare(vec![
+            ("baseline".to_owned(), left),
+            ("arm".to_owned(), right),
+        ])
+        .unwrap_err();
+        assert!(error.contains("incompatible"), "{error}");
+    }
+
+    #[test]
+    fn compare_accepts_matching_arms() {
+        let baseline = report_for(true);
+        let arm = report_for(false);
+        let matrix = compare(vec![
+            ("baseline".to_owned(), baseline),
+            ("candidate".to_owned(), arm),
+        ])
+        .unwrap();
+        assert_eq!(matrix.comparisons.len(), 1);
+        assert_eq!(matrix.comparisons[0].assessment.result, "why_not");
     }
 }
