@@ -65,9 +65,7 @@ fn router_example_is_never_auto_copied() {
         .code(3)
         .stderr(predicate::str::contains("router.toml.example"))
         .stderr(predicate::str::contains("ALLOY_ROUTER"))
-        .stderr(predicate::str::contains(
-            dir.path().join("router.toml").display().to_string(),
-        ));
+        .stderr(predicate::str::contains("./router.toml"));
     assert!(
         !dir.path().join("router.toml").exists(),
         "router.toml must never be auto-created (SEC6)"
@@ -90,10 +88,5 @@ fn missing_profile_names_both_recovery_paths() {
         .code(3)
         .stderr(predicate::str::contains("profiles/"))
         .stderr(predicate::str::contains("ALLOY_PROFILE"))
-        .stderr(predicate::str::contains(
-            dir.path()
-                .join("profiles/default.toml")
-                .display()
-                .to_string(),
-        ));
+        .stderr(predicate::str::contains("./profiles/default.toml"));
 }
