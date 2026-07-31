@@ -19,43 +19,15 @@
 
 #![cfg(feature = "stack-driver")]
 
-use std::path::PathBuf;
-use std::sync::Once;
+#[path = "live_stack_support.rs"]
+mod live_stack_support;
+use live_stack_support::{enable_live_stack, fixture_root, is_sandbox_skip, require_landlock};
 
 use alloy_eval::{
     EvalHarness, EvalHarnessConfig, FixtureId, FixtureOutcome, FixtureSet, FixtureStatus,
     StackLiveOptions,
 };
 use alloy_runtime::{ContextProfile, DomainWeights};
-
-fn fixture_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
-}
-
-fn enable_live_stack() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: test process; set before any concurrent live-stack work.
-        std::env::set_var("ALLOY_EVAL_LIVE_STACK", "1");
-    });
-}
-
-fn require_landlock() -> bool {
-    match std::env::var("ALLOY_REQUIRE_LANDLOCK") {
-        Ok(v) => {
-            let v = v.trim();
-            v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true")
-        }
-        Err(_) => false,
-    }
-}
-
-fn is_sandbox_skip(outcome: &FixtureOutcome) -> bool {
-    outcome
-        .error
-        .as_ref()
-        .is_some_and(|e| e.kind == "stack_driver_sandbox_unavailable")
-}
 
 struct ArmMetrics {
     label: &'static str,

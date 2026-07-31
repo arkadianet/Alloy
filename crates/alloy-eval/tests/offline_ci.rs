@@ -109,7 +109,7 @@ fn harness_driver_public_path_has_no_toolchain_spawn() {
         // shell out with std::process::Command — the broker owns process spawn.
         if relative == Path::new("src/driver/stack.rs") {
             assert!(
-                source.contains("feature `stack-driver`") || source.contains("stack-driver"),
+                source.contains("feature `stack-driver`"),
                 "stack.rs must document the stack-driver feature gate"
             );
             for forbidden in ["Command::new(\"cargo\")", "std::process::Command"] {
@@ -135,17 +135,6 @@ fn harness_driver_public_path_has_no_toolchain_spawn() {
 #[test]
 fn alloy_eval_src_has_no_process_command() {
     for (path, source) in rust_sources() {
-        let relative = path.strip_prefix(crate_root()).expect("source under crate");
-        // Optional live stack-driver sources may mention process seams only if
-        // they stay free of std::process::Command (alloy-tools owns spawn).
-        if relative == Path::new("src/driver/stack.rs") {
-            assert!(
-                !source.contains("std::process::Command"),
-                "{} must not use std::process::Command",
-                path.display()
-            );
-            continue;
-        }
         assert!(
             !source.contains("std::process::Command"),
             "{} must not use std::process::Command",

@@ -31,7 +31,7 @@ The [implementation roadmap](../roadmap/IMPLEMENTATION-ROADMAP.md) places RFC-00
 
 Its **near-term value is therefore not code — it is §4, the reserved-seam list.** Six merged RFCs already carry seams that exist only because this backend is coming: `GraphNodeKind::Item`, `GraphEdgeKind::Imports`, the `'item'`/`'imports'` SQL `CHECK` values, `GraphFidelity::SynDeep`, `Session.language_backends: Vec<LanguageId>`, `LanguageId`'s catalog-id shape, and the `SemanticEditOp` envelope. Every one of them looks like dead code to a reviewer sweeping for MVP simplification. §4 names them, states what M7 must not do to them, and pins the statements to CI greps so the answer to "can we delete this?" is a failing test rather than an argument.
 
-Writing that list is worth doing now. Writing the backend is not.
+Writing that list was worth doing before the backend existed. The RustBackend + syn deep pass have since landed (see Status); the historical point of §1.2 remains: M7 must not delete the reserved seams while waiting on Beta.
 
 ### 1.3 Problem statement
 
@@ -135,7 +135,7 @@ Beta acceptance criterion "LanguageBackend Rust-only; no PY/TS/cdylib" is discha
 | `GraphFidelity::SynDeep` | same file, "Reserved: `syn` item-level parse (Beta)" | Becomes reachable (A-0014-4, RS4) |
 | `derive_node_id` | same file (G3/G4) | Reused unchanged for `Item` ids (SY4) |
 | `GRAPH_MODEL_VERSION = 1` | `crates/alloy-index/src/migrate.rs:17` | Becomes `2` (SY1); `check_model_version` already truncates and re-ingests |
-| `GRAPH_SCHEMA_VERSION = 1` | same file | **Unchanged** — the `CHECK (kind IN (…'item'))` / `CHECK (kind IN (…'imports'))` constraints already admit the Beta rows (SY2) |
+| `GRAPH_SCHEMA_VERSION = 1` | same file | Becomes **`2`** with ledgered table recreation for semantic-edge `CHECK` kinds (SY2 as landed; §2.4) |
 | `IngestReport` | `graph/mod.rs`, doc: "adding a field is an API change by design" | Gains `items` / `imports` counters (amendment A-0014-3) |
 | `IngestLimits` | `crates/alloy-index/src/layout.rs` | Gains `max_items` (amendment A-0014-1) |
 | `parse_rustc_diagnostics` | `crates/alloy-runtime/src/adapters/diagnostics.rs`, re-exported at the crate root | **Reused**, not reimplemented (DN1) |
@@ -392,8 +392,8 @@ This is the section that pays for itself before a line of Beta code is written. 
 
 | # | Rule |
 | --- | --- |
-| **SY1** | Emitting `Item` nodes or `Imports` edges MUST accompany `GRAPH_MODEL_VERSION: 1 → 2` (RFC-0011 S4, E.3.2). `check_model_version` then truncates `graph_edges` / `graph_nodes` / `graph_files` and resets `graph_meta`, so a manifest-only database is **re-ingested, never merged**. |
-| **SY2** | `GRAPH_SCHEMA_VERSION` stays `1`. **No DDL, no migration.** The v1 `CHECK (kind IN ('workspace','crate','module','item'))` and `CHECK (kind IN ('defines','imports'))` constraints already admit the new rows; `graph_nodes.file` / `digest` already carry what an item needs. |
+| **SY1** | Emitting `Item` nodes or `Imports` edges accompanied `GRAPH_MODEL_VERSION: 1 → 2`; A-0011-6 then bumped model version to **`3`** for semantic edges. `check_model_version` truncates `graph_edges` / `graph_nodes` / `graph_files` and resets `graph_meta` on mismatch, so older databases are **re-ingested, never merged**. |
+| **SY2** | `GRAPH_SCHEMA_VERSION` is **`2`**. Semantic-edge kinds (`references` / `calls` / `impls`) required expanding the `graph_edges` `CHECK` list; SQLite cannot alter that constraint in place, so migration recreates the table (ledgered DDL). The original v1 `CHECK` lists already admitted `'item'` / `'imports'`; schema v2 is the landed A-0011-6 state. |
 | **SY3** | Item kinds emitted: `fn`, `struct`, `enum`, `union`, `trait`, `type` alias, `const`, `static` — at module level, any visibility. |
 | **SY4** | Item ids use `derive_node_id(GraphNodeKind::Item, stable_key)` with `stable_key = "<crate_id>\0<module_path>::<ident>"`, mirroring the module key shape already asserted in `graph/mod.rs`'s tests (`"toy-core\0toy_core::io"`). `GraphNodeId::new()` MUST NOT be called (G3). `GraphNode.path` is the Rust path (`toy_core::io::Reader`); `file` is the declaring file; `digest` is that file's SHA-256. |
 | **SY5** | `impl` blocks and associated items are **deferred** as nodes. They have no unambiguous path under `UNIQUE (kind, path)` without a name-resolution model the graph does not have. V2 §7.2's mention of `impl` is discharged by the `Impls` query: a syn-grade subset answers since A-0011-6; rustc-grade answers stay deferred to RA passthrough. |

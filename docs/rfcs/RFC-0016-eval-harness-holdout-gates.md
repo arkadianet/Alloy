@@ -58,7 +58,7 @@ RFC-0001 created the five-crate workspace including `alloy-eval` as an empty stu
 | Lifetime-heavy fixtures as P0 | Deferred (V2 §4.1 stretch) |
 | Alloy-on-Alloy dogfood | **Banned** until sandbox + holdout green (ADR F-07) |
 | Numeric cost marketing claims | **Forbidden** until calibrated (V2 §18 / ADR F-08) |
-| End-to-end live scheduler/CLI holdout loop | Optional feature `stack-driver` (§5.9); integration smoke for scheduler/Landlock/MCP/EditEngine — not thesis citation while patches are golden-derived |
+| End-to-end live scheduler/CLI holdout loop | Optional feature `stack-driver` (§5.9); integration smoke for scheduler/Landlock/MCP/EditEngine — not thesis citation while control-plane patches come from committed `recordings/*` JSON |
 | Sixth crate, OTLP, redesign of merged router APIs | Forbidden |
 | Writing or overwriting `.env` | Forbidden |
 
@@ -156,7 +156,7 @@ alloy-eval
    │      └── MUST NOT enable http-provider for default eval builds
    │
    └── (optional feature `stack-driver`) alloy-tools
-          └── sandbox + MCP + EditEngine — live integration smoke (not thesis citation while patches are golden-derived)
+          └── sandbox + MCP + EditEngine — live integration smoke (not thesis citation while control-plane patches use committed recordings)
 ```
 
 - `alloy-eval` remains one of ≤5 crates. **No sixth crate.**
@@ -2751,9 +2751,12 @@ ships an offline scripted `ControlPlane` driver by default.
 **Amended 2026-07-31 (live stack-driver landing).** Feature `stack-driver`
 un-stubs the live scheduler / Landlock / MCP / EditEngine / GenerationDriver
 path behind `driver = ControlPlane`. That path is **integration smoke** for
-the assembled stack — not thesis citation and not dogfood unlock. Patches are
-still synthesized from golden `*.post` files (and naive applies the same
-golden), so a green run proves wiring, not that independent model outputs
+the assembled stack — not thesis citation and not dogfood unlock. Control-plane
+repair/edit/planning turns load committed `recordings/repair_plan.json`,
+`recordings/edit_patch.json`, and (LLM-arm smoke) `recordings/planning_proposal.json`.
+Fixture `*.post` remains the **naive** `full_file_replace` oracle and offline
+golden reference only — the live control path MUST NOT synthesize its patch
+from `*.post`. A green run proves wiring, not that independent model outputs
 beat a naive baseline.
 
 For a fixture with `driver = ControlPlane` **without** `stack-driver`:
@@ -2781,9 +2784,10 @@ For a fixture with `driver = ControlPlane` **with** `--features stack-driver`:
    registry gen2) + `TomlModelRouter` / `ScriptedProvider` with
    `NullContextEngine` fingerprints + `TemplatePlanService` +
    `GenerationDriver` / `RunController`.
-4. Synthesize repair/edit scripted JSON from the fixture golden `*.post`
-   (unified diff). Do not replay skeleton full-file text turns through live
-   workers.
+4. Load committed `recordings/repair_plan.json` / `edit_patch.json` (and
+   `planning_proposal.json` when the LLM planner arm is exercised). Do not
+   synthesize control-plane patches from golden `*.post`; do not replay
+   skeleton full-file text turns through live workers.
 5. Auto-approve `GateHuman` when `WaitingApproval` so batch runs finish.
 6. Live compile oracle: final workspace source / `cargo_check` must be clean;
    set `compile_clean` and criteria for `CompileClean` /

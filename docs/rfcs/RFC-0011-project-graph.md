@@ -62,7 +62,7 @@ Each deferral names the seam that will carry it, so nothing has to be redesigned
 
 | Deferred item | Seam that already exists for it | Owner / when |
 | --- | --- | --- |
-| `syn`-deep AST index (real `Item` nodes, `Imports` edges) | `GraphNodeKind::Item`, `GraphEdgeKind::Imports`, `GraphFidelity::SynDeep` | **Beta** (roadmap "0011 deep") |
+| `syn`-deep AST index (real `Item` nodes, `Imports` edges) | `GraphNodeKind::Item`, `GraphEdgeKind::Imports`, `GraphFidelity::SynDeep` | **Landed** (Beta deep / A-0011-6); remaining deferred work is cargo metadata + RA passthrough below |
 | `LanguageBackend` integration | `LanguageBackend::index(root, &dyn ProjectGraph)` (V2 §15) — this RFC ships the `&dyn ProjectGraph` half | **RFC-0014**, Beta |
 | `cargo metadata` subprocess (resolved deps, features, workspace inheritance) | `IngestReport.source: GraphFidelity` (no separate `IngestSource` type); would need a new fidelity or report field when wired | **Post-Beta** — requires sandbox-mediated `Exec` (SEC5 forbids bare `Command` in `alloy-index`; `SqliteProjectGraph::open` / rebuild has no `SandboxBroker` / Exec grant today). Wiring that without a host-side callback redesign is out of Beta scope. |
 | Typed `Calls` / `HasLifetime` edges | `graph_edges.confidence` column reserved; `GraphEdgeKind` is `#[non_exhaustive]` | Deferred (V2 §7.2 "Deferred") |

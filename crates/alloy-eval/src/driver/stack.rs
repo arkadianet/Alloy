@@ -58,7 +58,6 @@ use alloy_tools::{
     GitEditEngineConfig, NativeSandboxBroker, OperatorHomes, PathPolicy, SandboxBackend,
     SandboxBroker, SandboxExecRequest, SandboxProfile,
 };
-use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
 use crate::cost_claim::derive_eval_usd;
@@ -72,6 +71,10 @@ use crate::scripted::{ScriptOutcome, ScriptedProvider};
 use crate::trajectory::EvalTrajectoryRecord;
 
 const GOAL_TEXT: &str = "fix the compile error";
+/// Scheduler / runtime run timeout for live stack-driver (also `SchedConfig`).
+const LIVE_RUN_TIMEOUT: Duration = Duration::from_secs(300);
+/// Outer poll slack beyond [`LIVE_RUN_TIMEOUT`] so the scheduler timeout wins.
+const LIVE_POLL_SLACK: Duration = Duration::from_secs(60);
 
 /// Live model provider: keyed smoke vs FIFO weight-arm recording.
 enum LiveModelProvider {
@@ -81,7 +84,9 @@ enum LiveModelProvider {
     /// [`NullContextEngine`] fingerprints.
     Recording {
         provider: Arc<RecordingModelProvider>,
-        pushed: usize,
+        /// Scripted responses pushed in FIFO order (RecordingModelProvider does
+        /// not retain outcomes after `complete`).
+        responses: Vec<ModelResponse>,
     },
 }
 
@@ -96,7 +101,10 @@ impl LiveModelProvider {
     fn scripts_exhausted(&self) -> bool {
         match self {
             Self::Scripted(p) => p.is_exhausted(),
-            Self::Recording { provider, pushed } => provider.recorded().len() >= *pushed,
+            Self::Recording {
+                provider,
+                responses,
+            } => provider.recorded().len() >= responses.len(),
         }
     }
 }
@@ -277,7 +285,7 @@ async fn run_live_inner(
             env_file_hint: runtime_dir.path().join("env_file_hint"),
             retain_full_prompts: false,
             retain_tool_bodies: false,
-            run_timeout: Duration::from_secs(300),
+            run_timeout: LIVE_RUN_TIMEOUT,
             budget_policy: BudgetPolicy::default(),
             context_profile: options
                 .context_profile
@@ -307,430 +315,303 @@ async fn run_live_inner(
         )
         .await
         .map_err(|e| EvalError::Internal(bound_message(format!("storage: {e}"))))?;
-        let plane = SessionPlane::new(handle.clone(), Arc::clone(&storage));
+        // All post-start work runs in this block; storage+runtime close exactly
+        // once afterward regardless of Ok/Err (cancelled outcomes included).
+        let result = async {
+            let plane = SessionPlane::new(handle.clone(), Arc::clone(&storage));
 
-        let read_only_roots: Vec<PathBuf> = Vec::new();
-        let path_policy = PathPolicy::from_profile(&profile, read_only_roots.clone())
-            .map_err(|e| EvalError::Internal(bound_message(format!("path policy: {e}"))))?;
-        let engine = Arc::new(
-            GitEditEngine::new(GitEditEngineConfig::new(
-                Arc::clone(&broker) as Arc<dyn SandboxBroker>,
-                path_policy,
-                trusted_exec_path(&homes),
-                storage.artifacts(),
-                storage.events(),
-            ))
-            .map_err(|e| EvalError::Internal(bound_message(format!("edit engine: {e}"))))?,
-        );
-        let host = Arc::new(
-            InProcessMcpHost::new(
-                Arc::clone(&broker) as Arc<dyn SandboxBroker>,
-                homes,
-                read_only_roots,
-                Arc::new(EditEnginePatchBackend::new(
-                    engine as Arc<dyn alloy_runtime::EditEngine>,
-                )),
-                McpHostConfig::new(),
-            )
-            .map_err(|e| EvalError::Internal(bound_message(format!("mcp host: {e}"))))?,
-        );
-
-        let session_id = seed_session(&storage, workspace_root.clone()).await?;
-        let dag_id = DagId::new();
-        let run_id = seed_run(&storage, session_id, dag_id).await?;
-
-        let sched_dir = runtime_dir.path().join("scheduler");
-        let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
-        let cost_meters = Arc::new(ProcessCostMeterFactory::new());
-
-        let verify_tools: Arc<dyn ToolCaller> =
-            Arc::new(ToolHandleToolCaller::new(ToolHandle::new(
-                Arc::clone(&host) as Arc<dyn McpPlatform>,
-                vec![ToolSelector::name(ToolName::new("cargo_check").unwrap())],
-            )));
-        let verify_perms: Arc<dyn alloy_runtime::VerifyPermissions> = Arc::new(
-            SessionVerifyPermissions::new(storage.sessions(), Some("check*".into()), None),
-        );
-        let verify_compile: Arc<dyn Verifier> = Arc::new(McpVerifyCompileAdapter::new(
-            verify_tools,
-            verify_perms,
-            storage.artifacts(),
-        ));
-
-        let worker_tools: Arc<dyn ToolCaller> =
-            Arc::new(ToolHandleToolCaller::new(ToolHandle::new(
-                Arc::clone(&host) as Arc<dyn McpPlatform>,
-                vec![
-                    ToolSelector::name(ToolName::new("fs_read").unwrap()),
-                    ToolSelector::name(ToolName::new("apply_patch").unwrap()),
-                ],
-            )));
-        let router_config = RouterConfig::from_str("eval-stack", router_toml())
-            .map_err(|e| EvalError::Internal(bound_message(format!("router config: {e}"))))?;
-        let llm_planning = mode == PlannerMode::Llm;
-        let use_default_context = options.context_profile.is_some();
-        let provider = build_live_provider(
-            fixture,
-            &fixture.endpoint,
-            llm_planning,
-            use_default_context,
-        )
-        .await?;
-        let routers = Arc::new(ProcessRunRouterProvider::new(
-            router_config,
-            provider.as_dyn(),
-            BudgetPolicy::default(),
-            Some(Arc::clone(&decisions) as _),
-        ));
-        let worker_config = WorkerConfig::default();
-        // Production parity with CLI assembly: open + rebuild SqliteProjectGraph
-        // so WorkerDeps / DefaultContextEngine can resolve Symbol/Callers when
-        // AssembleRequest carries file pins or diagnostic seed paths. Edit turns
-        // with empty seeds still honestly degrade as graph_empty (no seeds ≠
-        // null handle). Committed-recording smoke still ignores PromptPack shape.
-        let graph_store = Arc::new(
-            SqliteProjectGraph::open(GraphOpenOptions::for_data_dir(
-                runtime_dir.path().join("graph"),
-            ))
-            .await
-            .map_err(|e| EvalError::Internal(bound_message(format!("graph open: {e}"))))?,
-        );
-        let ingest = graph_store
-            .rebuild_reported(&workspace_root)
-            .await
-            .map_err(|e| EvalError::Internal(bound_message(format!("graph rebuild: {e}"))))?;
-        if ingest.items == 0 {
-            return Err(EvalError::Internal(bound_message(format!(
-                "graph rebuild ingested 0 items under {}",
-                workspace_root.display()
-            ))));
-        }
-        let graph_handle = GraphViewHandle::new(Arc::clone(&graph_store) as Arc<dyn ProjectGraph>);
-        // CLI bootstrap_diagnostics parity: gen-1 WorkingSet/repair can read
-        // GraphQuery::Diagnostics instead of assembling with empty seeds only.
-        {
-            let exec_ctx = NodeExecContext {
-                meta: NodeExecRef {
-                    session_id,
-                    run_id,
-                    dag_id,
-                    node_id: NodeId::new(),
-                    workspace_root: workspace_root.clone(),
-                    attempt: 1,
-                },
-                cancellation: cancel.clone().unwrap_or_default(),
-            };
-            match seed_graph_diagnostics(verify_compile.as_ref(), graph_store.as_ref(), &exec_ctx)
-                .await
-            {
-                Ok(report) => tracing::info!(
-                    recorded = report.recorded,
-                    errors = report.errors,
-                    "stack-driver seeded diagnostics"
-                ),
-                Err(e) => tracing::warn!(error = %e, "stack-driver diagnostic seed skipped"),
-            }
-        }
-        let context: Arc<dyn ContextEngine> = match &options.context_profile {
-            Some(profile) => Arc::new(DefaultContextEngine::new(
-                profile.clone(),
-                graph_handle.clone(),
-                storage.events() as _,
-                storage.artifacts() as _,
-                workspace_root.clone(),
-            )),
-            None => Arc::new(NullContextEngine::with_goal(GOAL_TEXT)),
-        };
-        let deps = WorkerDeps {
-            routers,
-            context,
-            tools: worker_tools,
-            perms: Arc::new(SessionWorkerPermissions::new(
-                storage.sessions(),
-                Some("**".into()),
-                Some("**".into()),
-            )),
-            graph: graph_handle,
-            artifacts: storage.artifacts(),
-            decisions: Arc::clone(&decisions) as _,
-            sessions: storage.sessions(),
-            config: worker_config.clone(),
-        };
-        let registry = CapabilityRegistry::mvp_with(deps, llm_planning)
-            .map_err(|e| EvalError::Internal(bound_message(format!("capability registry: {e}"))))?;
-        let real_caps: Arc<dyn CapabilityExecutor> =
-            Arc::new(RegistryCapabilityExecutor::new(Arc::new(registry)));
-        let caps: Arc<dyn CapabilityExecutor> = Arc::new(GenerationSwitchCapabilities {
-            real: Arc::clone(&real_caps),
-        });
-
-        let scheduler = Arc::new(build_scheduler(
-            &storage,
-            &plane,
-            sched_dir,
-            &caps,
-            &verify_compile,
-            &decisions,
-            &cost_meters,
-            cancel,
-        )?);
-        handle
-            .set_scheduler(scheduler as _)
-            .map_err(|e| EvalError::Internal(bound_message(format!("set scheduler: {e}"))))?;
-
-        let runtime_cancel = cancel.clone().unwrap_or_default();
-        // CapabilityPlanProposer uses the real registry executor — not
-        // GenerationSwitchCapabilities (Plan is never a gen1 DAG node).
-        let plans = build_plan_service(
-            &storage,
-            &decisions,
-            mode,
-            Arc::clone(&real_caps),
-            workspace_root.clone(),
-            runtime_cancel.clone(),
-            Arc::clone(&cost_meters),
-            worker_config.enable_review,
-        );
-        PlanService::plan(&*plans, plan_ctx(session_id, run_id, dag_id))
-            .await
-            .map_err(|e| EvalError::Internal(bound_message(format!("plan: {e}"))))?;
-
-        let driver = Arc::new(GenerationDriver::new(GenerationDriverDeps {
-            handle: handle.clone(),
-            plans: Arc::clone(&plans),
-            runs: plane.runs(),
-            dags: storage.dags() as _,
-            sessions: storage.sessions() as _,
-            events: storage.events() as _,
-            decisions: Arc::clone(&decisions) as _,
-            cost_meters: Arc::clone(&cost_meters) as _,
-            budget_policy: BudgetPolicy::default(),
-            cancellation: runtime_cancel,
-            fingerprints: fingerprints(),
-            policy: GenerationPolicy {
-                max_repair_generations,
-            },
-        }));
-        plane.set_executor(driver as _);
-
-        let runs = plane.runs();
-        let start_runs = Arc::clone(&runs);
-        let run_task = tokio::spawn(async move { start_runs.start(run_id).await });
-
-        // Auto-approve GateHuman when WaitingApproval so batch runs finish.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
-        let mut human_interventions = 0u32;
-        loop {
-            if cancelled(cancel) {
-                run_task.abort();
-                let _ = shutdown_runtime(rt, storage).await;
-                return Ok(cancelled_output(fixture, started));
-            }
-            if run_task.is_finished() {
-                // Ablation max_repair_generations=0: gen1 inert analyze/edit
-                // fails verify and the run ends without opening GateHuman.
-                run_task
-                    .await
-                    .map_err(|e| EvalError::Internal(bound_message(format!("run join: {e}"))))?
-                    .map_err(|e| {
-                        EvalError::Internal(bound_message(format!("run failed early: {e}")))
-                    })?;
-                let run_row = storage
-                    .sessions()
-                    .get_run(run_id)
-                    .await
-                    .map_err(|e| EvalError::Internal(bound_message(format!("get_run: {e}"))))?
-                    .ok_or_else(|| EvalError::Internal("run row missing".into()))?;
-                let succeeded = run_row.state == "succeeded";
-                let fixed_source = std::fs::read_to_string(
-                    workspace_root.join(&fixture.manifest.naive_target_path),
+            let read_only_roots: Vec<PathBuf> = Vec::new();
+            let path_policy = PathPolicy::from_profile(&profile, read_only_roots.clone())
+                .map_err(|e| EvalError::Internal(bound_message(format!("path policy: {e}"))))?;
+            let engine = Arc::new(
+                GitEditEngine::new(GitEditEngineConfig::new(
+                    Arc::clone(&broker) as Arc<dyn SandboxBroker>,
+                    path_policy,
+                    trusted_exec_path(&homes),
+                    storage.artifacts(),
+                    storage.events(),
+                ))
+                .map_err(|e| EvalError::Internal(bound_message(format!("edit engine: {e}"))))?,
+            );
+            let host = Arc::new(
+                InProcessMcpHost::new(
+                    Arc::clone(&broker) as Arc<dyn SandboxBroker>,
+                    homes,
+                    read_only_roots,
+                    Arc::new(EditEnginePatchBackend::new(
+                        engine as Arc<dyn alloy_runtime::EditEngine>,
+                    )),
+                    McpHostConfig::new(),
                 )
-                .map_err(EvalError::Io)?;
-                let compile_clean = succeeded && live_compile_clean(&broker, &jail).await?;
-                let meter = cost_meters.meter_for(run_id).snapshot();
-                let model_calls = meter.model_calls.min(u32::MAX as u64) as u32;
-                let tokens_in = if meter.tokens_in > 0 {
-                    Some(meter.tokens_in)
-                } else {
-                    None
-                };
-                let tokens_out = if meter.tokens_out > 0 {
-                    Some(meter.tokens_out)
-                } else {
-                    None
-                };
-                let cost_usd = match (tokens_in, tokens_out) {
-                    (Some(input_tokens), Some(output_tokens)) => derive_eval_usd(
-                        &fixture.endpoint,
-                        &Usage {
-                            input_tokens: Some(input_tokens),
-                            output_tokens: Some(output_tokens),
-                        },
-                    ),
-                    _ => None,
-                };
-                let final_dag =
-                    storage.dags().get(dag_id).await.map_err(|e| {
-                        EvalError::Internal(bound_message(format!("final dag: {e}")))
-                    })?;
-                let retry_count = final_dag
-                    .as_ref()
-                    .map(|d| u32::try_from(d.generation.saturating_sub(1)).unwrap_or(u32::MAX));
-                let scripts_exhausted = provider.scripts_exhausted();
-                let unsafe_introduced = unsafe_introduced(&pre_source, &fixed_source);
-                let criteria =
-                    live_criteria(fixture, compile_clean, unsafe_introduced, scripts_exhausted);
-                let status = if !succeeded {
-                    FixtureStatus::Fail
-                } else if criteria.iter().all(|c| c.passed) {
-                    FixtureStatus::Pass
-                } else {
-                    FixtureStatus::Fail
-                };
-                let trajectories =
-                    live_trajectories(fixture, &provider, status, Some(compile_clean));
-                let _ = shutdown_runtime(rt, storage).await;
-                drop(homes_root);
-                drop(work_dir);
-                drop(runtime_dir);
-                return Ok(FixtureRunOutput {
-                    outcome: FixtureOutcome {
-                        fixture_id: fixture.manifest.id.clone(),
-                        set: fixture.manifest.set,
-                        status,
-                        criteria,
-                        wall_ms: elapsed_ms(started),
-                        model_calls,
-                        tokens_in,
-                        tokens_out,
-                        cost_usd,
-                        retry_count,
-                        human_interventions: Some(human_interventions),
-                        unsafe_introduced: Some(unsafe_introduced),
-                        compile_clean: Some(compile_clean),
-                        error: None,
-                    },
-                    trajectories,
-                });
-            }
-            let dag = storage
-                .dags()
-                .get(dag_id)
-                .await
-                .map_err(|e| EvalError::Internal(bound_message(format!("dag get: {e}"))))?
-                .ok_or_else(|| EvalError::Internal("dag missing during poll".into()))?;
-            if dag.state == alloy_runtime::DagState::WaitingApproval {
-                let gate_id = dag
-                    .nodes
-                    .values()
-                    .find(|n| n.kind == NodeKind::GateHuman)
-                    .and_then(|n| n.approval.as_ref())
-                    .map(|a| a.gate)
-                    .ok_or_else(|| EvalError::Internal("gate node missing ApprovalSpec".into()))?;
-                runs.approve(run_id, gate_id, Approval::Allow)
-                    .await
-                    .map_err(|e| EvalError::Internal(bound_message(format!("approve: {e}"))))?;
-                human_interventions = human_interventions.saturating_add(1);
-                run_task
-                    .await
-                    .map_err(|e| EvalError::Internal(bound_message(format!("run join: {e}"))))?
-                    .map_err(|e| EvalError::Internal(bound_message(format!("run failed: {e}"))))?;
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                run_task.abort();
-                let _ = shutdown_runtime(rt, storage).await;
-                return Err(EvalError::Internal(
-                    "live stack-driver: WaitingApproval timeout".into(),
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+                .map_err(|e| EvalError::Internal(bound_message(format!("mcp host: {e}"))))?,
+            );
 
-        let run_row = storage
-            .sessions()
-            .get_run(run_id)
-            .await
-            .map_err(|e| EvalError::Internal(bound_message(format!("get_run: {e}"))))?
-            .ok_or_else(|| EvalError::Internal("run row missing".into()))?;
-        let succeeded = run_row.state == "succeeded";
+            let session_id = seed_session(&storage, workspace_root.clone()).await?;
+            let dag_id = DagId::new();
+            let run_id = seed_run(&storage, session_id, dag_id).await?;
 
-        let fixed_source =
-            std::fs::read_to_string(workspace_root.join(&fixture.manifest.naive_target_path))
-                .map_err(EvalError::Io)?;
-        let compile_clean = succeeded && live_compile_clean(&broker, &jail).await?;
+            let sched_dir = runtime_dir.path().join("scheduler");
+            let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+            let cost_meters = Arc::new(ProcessCostMeterFactory::new());
 
-        let meter = cost_meters.meter_for(run_id).snapshot();
-        let model_calls = meter.model_calls.min(u32::MAX as u64) as u32;
-        let tokens_in = if meter.tokens_in > 0 {
-            Some(meter.tokens_in)
-        } else {
-            None
-        };
-        let tokens_out = if meter.tokens_out > 0 {
-            Some(meter.tokens_out)
-        } else {
-            None
-        };
-        let cost_usd = match (tokens_in, tokens_out) {
-            (Some(input_tokens), Some(output_tokens)) => derive_eval_usd(
+            let verify_tools: Arc<dyn ToolCaller> =
+                Arc::new(ToolHandleToolCaller::new(ToolHandle::new(
+                    Arc::clone(&host) as Arc<dyn McpPlatform>,
+                    vec![ToolSelector::name(ToolName::new("cargo_check").unwrap())],
+                )));
+            let verify_perms: Arc<dyn alloy_runtime::VerifyPermissions> = Arc::new(
+                SessionVerifyPermissions::new(storage.sessions(), Some("check*".into()), None),
+            );
+            let verify_compile: Arc<dyn Verifier> = Arc::new(McpVerifyCompileAdapter::new(
+                verify_tools,
+                verify_perms,
+                storage.artifacts(),
+            ));
+
+            let worker_tools: Arc<dyn ToolCaller> =
+                Arc::new(ToolHandleToolCaller::new(ToolHandle::new(
+                    Arc::clone(&host) as Arc<dyn McpPlatform>,
+                    vec![
+                        ToolSelector::name(ToolName::new("fs_read").unwrap()),
+                        ToolSelector::name(ToolName::new("apply_patch").unwrap()),
+                    ],
+                )));
+            let router_config = RouterConfig::from_str("eval-stack", router_toml())
+                .map_err(|e| EvalError::Internal(bound_message(format!("router config: {e}"))))?;
+            let llm_planning = mode == PlannerMode::Llm;
+            let use_default_context = options.context_profile.is_some();
+            let provider = build_live_provider(
+                fixture,
                 &fixture.endpoint,
-                &Usage {
-                    input_tokens: Some(input_tokens),
-                    output_tokens: Some(output_tokens),
+                llm_planning,
+                use_default_context,
+            )
+            .await?;
+            let routers = Arc::new(ProcessRunRouterProvider::new(
+                router_config,
+                provider.as_dyn(),
+                BudgetPolicy::default(),
+                Some(Arc::clone(&decisions) as _),
+            ));
+            let worker_config = WorkerConfig::default();
+            // Production parity with CLI assembly: open + rebuild SqliteProjectGraph
+            // so WorkerDeps / DefaultContextEngine can resolve Symbol/Callers when
+            // AssembleRequest carries file pins or diagnostic seed paths. Edit turns
+            // with empty seeds still honestly degrade as graph_empty (no seeds ≠
+            // null handle). Committed-recording smoke still ignores PromptPack shape.
+            let graph_store = Arc::new(
+                SqliteProjectGraph::open(GraphOpenOptions::for_data_dir(
+                    runtime_dir.path().join("graph"),
+                ))
+                .await
+                .map_err(|e| EvalError::Internal(bound_message(format!("graph open: {e}"))))?,
+            );
+            let ingest = graph_store
+                .rebuild_reported(&workspace_root)
+                .await
+                .map_err(|e| EvalError::Internal(bound_message(format!("graph rebuild: {e}"))))?;
+            if ingest.items == 0 {
+                return Err(EvalError::Internal(bound_message(format!(
+                    "graph rebuild ingested 0 items under {}",
+                    workspace_root.display()
+                ))));
+            }
+            let graph_handle =
+                GraphViewHandle::new(Arc::clone(&graph_store) as Arc<dyn ProjectGraph>);
+            // CLI bootstrap_diagnostics parity: gen-1 WorkingSet/repair can read
+            // GraphQuery::Diagnostics instead of assembling with empty seeds only.
+            {
+                let exec_ctx = NodeExecContext {
+                    meta: NodeExecRef {
+                        session_id,
+                        run_id,
+                        dag_id,
+                        node_id: NodeId::new(),
+                        workspace_root: workspace_root.clone(),
+                        attempt: 1,
+                    },
+                    cancellation: cancel.clone().unwrap_or_default(),
+                };
+                match seed_graph_diagnostics(
+                    verify_compile.as_ref(),
+                    graph_store.as_ref(),
+                    &exec_ctx,
+                )
+                .await
+                {
+                    Ok(report) => tracing::info!(
+                        recorded = report.recorded,
+                        errors = report.errors,
+                        "stack-driver seeded diagnostics"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "stack-driver diagnostic seed skipped"),
+                }
+            }
+            let context: Arc<dyn ContextEngine> = match &options.context_profile {
+                Some(profile) => Arc::new(DefaultContextEngine::new(
+                    profile.clone(),
+                    graph_handle.clone(),
+                    storage.events() as _,
+                    storage.artifacts() as _,
+                    workspace_root.clone(),
+                )),
+                None => Arc::new(NullContextEngine::with_goal(GOAL_TEXT)),
+            };
+            let deps = WorkerDeps {
+                routers,
+                context,
+                tools: worker_tools,
+                perms: Arc::new(SessionWorkerPermissions::new(
+                    storage.sessions(),
+                    Some("**".into()),
+                    Some("**".into()),
+                )),
+                graph: graph_handle,
+                artifacts: storage.artifacts(),
+                decisions: Arc::clone(&decisions) as _,
+                sessions: storage.sessions(),
+                config: worker_config.clone(),
+            };
+            let registry = CapabilityRegistry::mvp_with(deps, llm_planning).map_err(|e| {
+                EvalError::Internal(bound_message(format!("capability registry: {e}")))
+            })?;
+            let real_caps: Arc<dyn CapabilityExecutor> =
+                Arc::new(RegistryCapabilityExecutor::new(Arc::new(registry)));
+            let caps: Arc<dyn CapabilityExecutor> = Arc::new(GenerationSwitchCapabilities {
+                real: Arc::clone(&real_caps),
+            });
+
+            let scheduler = Arc::new(build_scheduler(
+                &storage,
+                &plane,
+                sched_dir,
+                &caps,
+                &verify_compile,
+                &decisions,
+                &cost_meters,
+                cancel,
+            )?);
+            handle
+                .set_scheduler(scheduler as _)
+                .map_err(|e| EvalError::Internal(bound_message(format!("set scheduler: {e}"))))?;
+
+            let runtime_cancel = cancel.clone().unwrap_or_default();
+            // CapabilityPlanProposer uses the real registry executor — not
+            // GenerationSwitchCapabilities (Plan is never a gen1 DAG node).
+            let plans = build_plan_service(
+                &storage,
+                &decisions,
+                mode,
+                Arc::clone(&real_caps),
+                workspace_root.clone(),
+                runtime_cancel.clone(),
+                Arc::clone(&cost_meters),
+                worker_config.enable_review,
+            );
+            PlanService::plan(&*plans, plan_ctx(session_id, run_id, dag_id))
+                .await
+                .map_err(|e| EvalError::Internal(bound_message(format!("plan: {e}"))))?;
+
+            let driver = Arc::new(GenerationDriver::new(GenerationDriverDeps {
+                handle: handle.clone(),
+                plans: Arc::clone(&plans),
+                runs: plane.runs(),
+                dags: storage.dags() as _,
+                sessions: storage.sessions() as _,
+                events: storage.events() as _,
+                decisions: Arc::clone(&decisions) as _,
+                cost_meters: Arc::clone(&cost_meters) as _,
+                budget_policy: BudgetPolicy::default(),
+                cancellation: runtime_cancel,
+                fingerprints: fingerprints(),
+                policy: GenerationPolicy {
+                    max_repair_generations,
                 },
-            ),
-            _ => None,
-        };
+            }));
+            plane.set_executor(driver as _);
 
-        let final_dag = storage
-            .dags()
-            .get(dag_id)
-            .await
-            .map_err(|e| EvalError::Internal(bound_message(format!("final dag: {e}"))))?;
-        let retry_count = final_dag
-            .as_ref()
-            .map(|d| u32::try_from(d.generation.saturating_sub(1)).unwrap_or(u32::MAX));
+            let runs = plane.runs();
+            let start_runs = Arc::clone(&runs);
+            let run_task = tokio::spawn(async move { start_runs.start(run_id).await });
 
-        let scripts_exhausted = provider.scripts_exhausted();
-        let unsafe_introduced = unsafe_introduced(&pre_source, &fixed_source);
-        let criteria = live_criteria(fixture, compile_clean, unsafe_introduced, scripts_exhausted);
-
-        let status = if !succeeded {
-            FixtureStatus::Fail
-        } else if criteria.iter().all(|c| c.passed) {
-            FixtureStatus::Pass
-        } else {
-            FixtureStatus::Fail
-        };
-
-        let trajectories = live_trajectories(fixture, &provider, status, Some(compile_clean));
-
+            // Auto-approve GateHuman when WaitingApproval so batch runs finish.
+            // Outer deadline is LIVE_RUN_TIMEOUT + slack so SchedConfig::run_timeout
+            // can surface first. After each approval, keep polling (cancel /
+            // subsequent gates / finish) instead of unbounded-awaiting run_task.
+            let deadline = tokio::time::Instant::now() + LIVE_RUN_TIMEOUT + LIVE_POLL_SLACK;
+            let mut human_interventions = 0u32;
+            loop {
+                if cancelled(cancel) {
+                    run_task.abort();
+                    return Ok(cancelled_output(fixture, started));
+                }
+                if run_task.is_finished() {
+                    // Ablation max_repair_generations=0: gen1 inert analyze/edit
+                    // fails verify and the run ends without opening GateHuman.
+                    run_task
+                        .await
+                        .map_err(|e| EvalError::Internal(bound_message(format!("run join: {e}"))))?
+                        .map_err(|e| {
+                            EvalError::Internal(bound_message(format!("run failed early: {e}")))
+                        })?;
+                    return assemble_live_control_output(
+                        fixture,
+                        started,
+                        &storage,
+                        run_id,
+                        dag_id,
+                        &workspace_root,
+                        &pre_source,
+                        &broker,
+                        &jail,
+                        &cost_meters,
+                        &provider,
+                        human_interventions,
+                    )
+                    .await;
+                }
+                let dag = storage
+                    .dags()
+                    .get(dag_id)
+                    .await
+                    .map_err(|e| EvalError::Internal(bound_message(format!("dag get: {e}"))))?
+                    .ok_or_else(|| EvalError::Internal("dag missing during poll".into()))?;
+                if dag.state == alloy_runtime::DagState::WaitingApproval {
+                    let gate_id = dag
+                        .nodes
+                        .values()
+                        .find(|n| n.kind == NodeKind::GateHuman)
+                        .and_then(|n| n.approval.as_ref())
+                        .map(|a| a.gate)
+                        .ok_or_else(|| {
+                            EvalError::Internal("gate node missing ApprovalSpec".into())
+                        })?;
+                    runs.approve(run_id, gate_id, Approval::Allow)
+                        .await
+                        .map_err(|e| EvalError::Internal(bound_message(format!("approve: {e}"))))?;
+                    human_interventions = human_interventions.saturating_add(1);
+                    // Continue polling so cancellation, a later gate, or finish are
+                    // observed under the same deadline (no unbounded join here).
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    run_task.abort();
+                    return Err(EvalError::Internal(
+                        "live stack-driver: poll deadline exceeded (beyond scheduler run_timeout)"
+                            .into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        .await;
         let _ = shutdown_runtime(rt, storage).await;
         // Keep tempdirs alive until shutdown completes.
         drop(homes_root);
         drop(work_dir);
         drop(runtime_dir);
-
-        Ok(FixtureRunOutput {
-            outcome: FixtureOutcome {
-                fixture_id: fixture.manifest.id.clone(),
-                set: fixture.manifest.set,
-                status,
-                criteria,
-                wall_ms: elapsed_ms(started),
-                model_calls,
-                tokens_in,
-                tokens_out,
-                cost_usd,
-                retry_count,
-                human_interventions: Some(human_interventions),
-                unsafe_introduced: Some(unsafe_introduced),
-                compile_clean: Some(compile_clean),
-                error: None,
-            },
-            trajectories,
-        })
+        result
     }
 }
 
@@ -837,6 +718,94 @@ async fn run_naive_live_inner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn assemble_live_control_output(
+    fixture: &LoadedFixture,
+    started: Instant,
+    storage: &AlloyStorage,
+    run_id: RunId,
+    dag_id: DagId,
+    workspace_root: &Path,
+    pre_source: &str,
+    broker: &Arc<NativeSandboxBroker>,
+    jail: &Path,
+    cost_meters: &Arc<ProcessCostMeterFactory>,
+    provider: &LiveModelProvider,
+    human_interventions: u32,
+) -> Result<FixtureRunOutput, EvalError> {
+    let run_row = storage
+        .sessions()
+        .get_run(run_id)
+        .await
+        .map_err(|e| EvalError::Internal(bound_message(format!("get_run: {e}"))))?
+        .ok_or_else(|| EvalError::Internal("run row missing".into()))?;
+    let succeeded = run_row.state == "succeeded";
+    let fixed_source =
+        std::fs::read_to_string(workspace_root.join(&fixture.manifest.naive_target_path))
+            .map_err(EvalError::Io)?;
+    let compile_clean = succeeded && live_compile_clean(broker, jail).await?;
+    let meter = cost_meters.meter_for(run_id).snapshot();
+    let model_calls = meter.model_calls.min(u32::MAX as u64) as u32;
+    let tokens_in = if meter.tokens_in > 0 {
+        Some(meter.tokens_in)
+    } else {
+        None
+    };
+    let tokens_out = if meter.tokens_out > 0 {
+        Some(meter.tokens_out)
+    } else {
+        None
+    };
+    let cost_usd = match (tokens_in, tokens_out) {
+        (Some(input_tokens), Some(output_tokens)) => derive_eval_usd(
+            &fixture.endpoint,
+            &Usage {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+            },
+        ),
+        _ => None,
+    };
+    let final_dag = storage
+        .dags()
+        .get(dag_id)
+        .await
+        .map_err(|e| EvalError::Internal(bound_message(format!("final dag: {e}"))))?;
+    let retry_count = final_dag
+        .as_ref()
+        .map(|d| u32::try_from(d.generation.saturating_sub(1)).unwrap_or(u32::MAX));
+    let scripts_exhausted = provider.scripts_exhausted();
+    let unsafe_introduced = unsafe_introduced(pre_source, &fixed_source);
+    let criteria = live_criteria(fixture, compile_clean, unsafe_introduced, scripts_exhausted);
+    let status = if !succeeded {
+        FixtureStatus::Fail
+    } else if criteria.iter().all(|c| c.passed) {
+        FixtureStatus::Pass
+    } else {
+        FixtureStatus::Fail
+    };
+    let trajectories = live_trajectories(fixture, provider, status, Some(compile_clean));
+    Ok(FixtureRunOutput {
+        outcome: FixtureOutcome {
+            fixture_id: fixture.manifest.id.clone(),
+            set: fixture.manifest.set,
+            status,
+            criteria,
+            wall_ms: elapsed_ms(started),
+            model_calls,
+            tokens_in,
+            tokens_out,
+            cost_usd,
+            retry_count,
+            human_interventions: Some(human_interventions),
+            unsafe_introduced: Some(unsafe_introduced),
+            compile_clean: Some(compile_clean),
+            error: None,
+        },
+        trajectories,
+    })
+}
+
 fn live_criteria(
     fixture: &LoadedFixture,
     compile_clean: bool,
@@ -898,24 +867,33 @@ fn live_trajectories(
     compile_clean: Option<bool>,
 ) -> Vec<EvalTrajectoryRecord> {
     let mut caps_seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let invocations: Vec<(ModelEndpoint, CompletionRequest, RequestFingerprint)> = match provider {
+    let turns: Vec<(
+        ModelEndpoint,
+        CompletionRequest,
+        RequestFingerprint,
+        Option<ModelResponse>,
+    )> = match provider {
         LiveModelProvider::Scripted(p) => p
             .recorded()
             .into_iter()
-            .map(|inv| (inv.endpoint, inv.request, inv.fingerprint))
+            .map(|inv| (inv.endpoint, inv.request, inv.fingerprint, inv.response))
             .collect(),
-        LiveModelProvider::Recording { provider, .. } => provider
+        LiveModelProvider::Recording {
+            provider,
+            responses,
+        } => provider
             .recorded()
             .into_iter()
-            .map(|(endpoint, request)| {
+            .zip(responses.iter().cloned())
+            .map(|((endpoint, request), response)| {
                 let fingerprint = RequestFingerprint::of(&request);
-                (endpoint, request, fingerprint)
+                (endpoint, request, fingerprint, Some(response))
             })
             .collect(),
     };
-    invocations
+    turns
         .into_iter()
-        .map(|(endpoint, request, fingerprint)| {
+        .map(|(endpoint, request, fingerprint, response)| {
             let capability = capability_from_request(&request);
             let ordinal = {
                 let entry = caps_seen.entry(capability.clone()).or_insert(0);
@@ -930,28 +908,31 @@ fn live_trajectories(
                 node: None,
                 ordinal,
             };
+            let empty = ModelResponse {
+                text: None,
+                structured: None,
+                tool_calls: vec![],
+                usage: Usage {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+                provider_request_id: None,
+                finish_reason: None,
+            };
             let mut row = EvalTrajectoryRecord::from_response(
                 fixture.manifest.id.clone(),
                 fixture.manifest.set,
                 turn_id,
                 fingerprint,
                 &endpoint,
-                &ModelResponse {
-                    text: None,
-                    structured: None,
-                    tool_calls: vec![],
-                    usage: Usage {
-                        input_tokens: None,
-                        output_tokens: None,
-                    },
-                    provider_request_id: None,
-                    finish_reason: None,
-                },
+                response.as_ref().unwrap_or(&empty),
                 None,
                 status,
                 compile_clean,
             );
-            row.complete_ok = true;
+            // Fixture-level completion: failed/error fixtures must not look
+            // like successfully completed turns.
+            row.complete_ok = status == FixtureStatus::Pass;
             row
         })
         .collect()
@@ -992,7 +973,7 @@ fn naive_live_trajectories(
         status,
         compile_clean,
     );
-    row.complete_ok = true;
+    row.complete_ok = status == FixtureStatus::Pass;
     vec![row]
 }
 
@@ -1014,18 +995,181 @@ fn capability_from_request(request: &CompletionRequest) -> String {
 }
 
 fn unsafe_introduced(pre: &str, post: &str) -> bool {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(^|\s)unsafe(\s|!|\(|\{)").expect("unsafe line regex is valid")
-    });
-    let count = |src: &str| src.lines().filter(|line| re.is_match(line)).count();
-    count(post) > count(pre)
+    // No LanguageBackend unsafe detector exists today; count keyword
+    // occurrences in code after stripping comments/string literals.
+    let pre_keys = unsafe_occurrence_keys(pre);
+    let post_keys = unsafe_occurrence_keys(post);
+    let mut remaining = std::collections::HashMap::<String, usize>::new();
+    for key in pre_keys {
+        *remaining.entry(key).or_insert(0) += 1;
+    }
+    for key in post_keys {
+        match remaining.get_mut(&key) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => return true, // new or replaced occurrence
+        }
+    }
+    false
+}
+
+/// Strip `//`, `/* */`, and string/char literals so comment/string `unsafe`
+/// does not count toward [`NoNewUnsafe`].
+fn strip_rust_comments_and_strings(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out.push(' ');
+            out.push(' ');
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+            }
+            continue;
+        }
+        if bytes[i] == b'"' {
+            out.push(' ');
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                let c = bytes[i];
+                out.push(if c == b'\n' { '\n' } else { ' ' });
+                i += 1;
+                if c == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            out.push(' ');
+            i += 1;
+            let start = i;
+            while i < bytes.len() && i - start < 4 {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                let c = bytes[i];
+                out.push(' ');
+                i += 1;
+                if c == b'\'' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn unsafe_occurrence_keys(src: &str) -> Vec<String> {
+    let cleaned = strip_rust_comments_and_strings(src);
+    let bytes = cleaned.as_bytes();
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'u'
+            && i + 6 <= bytes.len()
+            && &cleaned[i..i + 6] == "unsafe"
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && (i + 6 == bytes.len() || !is_ident_byte(bytes[i + 6]))
+            && (i == 0 || is_unsafe_predecessor(bytes[i - 1]))
+        {
+            let after = skip_ws(&cleaned, i + 6);
+            let (form, next) = read_form(&cleaned, after);
+            keys.push(match form.as_str() {
+                "fn" | "trait" | "impl" | "mod" | "extern" => {
+                    let ident = read_ident(&cleaned, skip_ws(&cleaned, next))
+                        .map(|(id, _)| id)
+                        .unwrap_or_default();
+                    format!("{form}:{ident}")
+                }
+                other => other.to_owned(),
+            });
+            i += 6;
+            continue;
+        }
+        i += 1;
+    }
+    keys
+}
+
+fn is_unsafe_predecessor(b: u8) -> bool {
+    matches!(b, b'(' | b',' | b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn skip_ws(s: &str, mut i: usize) -> usize {
+    let bytes = s.as_bytes();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn read_form(s: &str, i: usize) -> (String, usize) {
+    let bytes = s.as_bytes();
+    if i >= bytes.len() {
+        return ("bare".into(), i);
+    }
+    match bytes[i] {
+        b'{' => ("block".into(), i + 1),
+        b'(' => ("paren".into(), i + 1),
+        b'!' => ("macro".into(), i + 1),
+        _ => {
+            if let Some((word, j)) = read_ident(s, i) {
+                (word, j)
+            } else {
+                ("bare".into(), i)
+            }
+        }
+    }
+}
+
+fn read_ident(s: &str, i: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if i >= bytes.len() || !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < bytes.len() && is_ident_byte(bytes[j]) {
+        j += 1;
+    }
+    Some((s[i..j].to_owned(), j))
 }
 
 fn sandbox_unavailable(detail: &str) -> EvalError {
-    EvalError::Internal(bound_message(format!(
-        "stack_driver_sandbox_unavailable: {detail}"
-    )))
+    EvalError::SandboxUnavailable(bound_message(detail.to_owned()))
 }
 
 fn cancelled(cancel: &Option<CancellationToken>) -> bool {
@@ -1058,10 +1202,7 @@ fn cancelled_output(fixture: &LoadedFixture, started: Instant) -> FixtureRunOutp
 }
 
 fn error_output(fixture: &LoadedFixture, started: Instant, error: EvalError) -> FixtureRunOutput {
-    let mut report = ReportError::from_eval(&error);
-    if matches!(&error, EvalError::Internal(m) if m.contains("stack_driver_sandbox_unavailable")) {
-        report.kind = "stack_driver_sandbox_unavailable".to_owned();
-    }
+    let report = ReportError::from_eval(&error);
     FixtureRunOutput {
         outcome: FixtureOutcome {
             fixture_id: fixture.manifest.id.clone(),
@@ -1285,15 +1426,22 @@ async fn build_live_provider(
         let provider = Arc::new(RecordingModelProvider::new(
             ProviderId::new("provider").unwrap(),
         ));
-        let mut pushed = 0usize;
+        let mut responses = Vec::new();
         if let Some(plan) = planning {
-            provider.push(Ok(scripted_model_response(plan)));
-            pushed += 1;
+            let response = scripted_model_response(plan);
+            provider.push(Ok(response.clone()));
+            responses.push(response);
         }
-        provider.push(Ok(scripted_model_response(repair)));
-        provider.push(Ok(scripted_model_response(edit)));
-        pushed += 2;
-        return Ok(LiveModelProvider::Recording { provider, pushed });
+        let repair_response = scripted_model_response(repair);
+        provider.push(Ok(repair_response.clone()));
+        responses.push(repair_response);
+        let edit_response = scripted_model_response(edit);
+        provider.push(Ok(edit_response.clone()));
+        responses.push(edit_response);
+        return Ok(LiveModelProvider::Recording {
+            provider,
+            responses,
+        });
     }
 
     let endpoint = scripted_endpoint_for(fixture_endpoint);
@@ -1546,7 +1694,7 @@ fn build_scheduler(
         cost_meters: Arc::clone(cost_meters) as _,
         runtime_cancel: cancel.clone().unwrap_or_default(),
         budget_policy: BudgetPolicy::default(),
-        run_timeout: Duration::from_secs(300),
+        run_timeout: LIVE_RUN_TIMEOUT,
         config,
     })
     .map_err(|e| EvalError::Internal(bound_message(format!("scheduler: {e}"))))
@@ -1583,12 +1731,60 @@ async fn live_compile_clean(
 }
 
 async fn shutdown_runtime(rt: AlloyRuntime, storage: Arc<AlloyStorage>) -> Result<(), EvalError> {
-    storage
+    let storage_err = storage
         .close()
         .await
-        .map_err(|e| EvalError::Internal(bound_message(format!("storage close: {e}"))))?;
-    rt.shutdown()
+        .err()
+        .map(|e| EvalError::Internal(bound_message(format!("storage close: {e}"))));
+    let runtime_err = rt
+        .shutdown()
         .await
-        .map_err(|e| EvalError::Internal(bound_message(format!("runtime shutdown: {e}"))))?;
-    Ok(())
+        .err()
+        .map(|e| EvalError::Internal(bound_message(format!("runtime shutdown: {e}"))));
+    match (storage_err, runtime_err) {
+        (Some(e), _) => Err(e),
+        (None, Some(e)) => Err(e),
+        (None, None) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod unsafe_introduced_tests {
+    use super::{unsafe_introduced, unsafe_occurrence_keys};
+
+    #[test]
+    fn counts_multiple_unsafe_on_one_line() {
+        assert_eq!(
+            unsafe_occurrence_keys("fn a() { unsafe { let _ = unsafe { 1 }; } }\n").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn accepts_comma_and_paren_predecessors() {
+        assert_eq!(unsafe_occurrence_keys("f(unsafe { 1 })\n").len(), 1);
+        assert_eq!(unsafe_occurrence_keys("a,unsafe { 1 }\n").len(), 1);
+    }
+
+    #[test]
+    fn ignores_comment_and_string_unsafe() {
+        assert!(unsafe_occurrence_keys("// unsafe { }\n").is_empty());
+        assert!(unsafe_occurrence_keys("let s = \"unsafe { }\";\n").is_empty());
+    }
+
+    #[test]
+    fn replacement_of_one_unsafe_with_another_is_introduction() {
+        assert!(unsafe_introduced(
+            "unsafe fn a() {}\n",
+            "unsafe fn b() {}\n"
+        ));
+    }
+
+    #[test]
+    fn same_unsafe_form_is_not_introduction() {
+        assert!(!unsafe_introduced(
+            "fn a() { unsafe { 1 } }\n",
+            "fn a() { unsafe { 2 } }\n"
+        ));
+    }
 }

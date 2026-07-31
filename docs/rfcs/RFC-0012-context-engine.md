@@ -67,7 +67,7 @@ Each deferral names the seam that already exists to carry it, so nothing has to 
 | Summarization / "aggressive economy" compaction | `ContextEngine::compact` exists and is a **Stub** no-op (§3.3, A12) | Deferred (V2 §8.1 Deferred), measured in Eval |
 | Long-term memory / External Memory auto-retrieve | `DomainId::LongTerm` returns empty; no store is opened | Deferred (V2 §8.1, ADR F-23) |
 | Graph `SimilarFixes` / `Impls` in the WorkingSet | Queries are live store-side (A-0011-5 / A-0011-6); this engine never issues them (D14) | Wider WorkingSet injection deferred until precision measured. `Callers` / `Refs`: amendment **A-0012-1** issues them, bounded, and degrades to honest absence when the store has no edges |
-| `syn`-deep symbol bodies in the projection | `GraphView.fidelity` labels the projection; `GraphFidelity::SynDeep` reserved | RFC-0011 Beta / RFC-0014 |
+| Deeper-than-syn projection bodies / Analyzer fidelity | `GraphView.fidelity` labels the projection; `GraphFidelity::SynDeep` **landed** (RFC-0011 Beta deep) | Further depth / `GraphFidelity::Analyzer` deferred with RFC-0011 RA passthrough |
 | Real tokenizer counts | `TokenEstimator` is a trait with one impl (§6.2) | Deferred until a provider disagrees measurably |
 | Prompt caching / prefix reuse | `PromptPack` shape is frozen by V2 §8.1 Evolution "keep PromptPack shape stable for cache discipline" | Post-Beta |
 | A sixth crate, `unsafe`, or any new external dependency | none | Forbidden (§12) |
@@ -1348,7 +1348,7 @@ T5i serialises two packs assembled from the same fixture and compares bytes. T8h
 
 ### 14.1 MVP (this RFC, M7)
 
-`ContextEngine` trait verbatim · `DefaultContextEngine` + `NullContextEngine` · three live domains · `WorkingSet` = files + graph projection + diagnostics · `GraphViewHandle` consumption limited to `Symbol` / `Diagnostics` / `Subgraph` · fixed V2 Appendix B weights · byte-based budget with deterministic drop and mandatory markers · populated `citations` with digests · `domains` manifest · `GraphVersion`-keyed memo with `mark_stale` / `evict` · degrade-never-fail posture · untrusted-content fencing + redaction · spans + metrics snapshot.
+`ContextEngine` trait verbatim · `DefaultContextEngine` + `NullContextEngine` · three live domains · `WorkingSet` = files + graph projection + diagnostics · `GraphViewHandle` consumption of `Symbol` / `Diagnostics` / `Subgraph` plus bounded `Callers` / `Refs` impact reads (A-0012-1) · fixed V2 Appendix B weights · byte-based budget with deterministic drop and mandatory markers · populated `citations` with digests · `domains` manifest · `GraphVersion`-keyed memo with `mark_stale` / `evict` · degrade-never-fail posture · untrusted-content fencing + redaction · spans + metrics snapshot.
 
 ### 14.2 Deferred (with the seam that carries it)
 
@@ -1371,7 +1371,7 @@ Rule **C5** restated as the deepening contract: **Beta changes population, never
 
 ## 15. Acceptance criteria
 
-Each criterion is verifiable by a named test from §13, by a CI grep, or by a mechanical diff/compile check. All start unchecked.
+Each criterion is verifiable by a named test from §13, by a CI grep, or by a mechanical diff/compile check. Criteria marked `[x]` below are complete for the landed Beta-deep posture (including 9, 10, 22, 31, and 46); remaining items stay unchecked until their named tests are treated as closed.
 
 - [ ] 1. All new code lives in `alloy-runtime::context`; the workspace still has exactly five members (**C1**, **C6**).
 - [ ] 2. `Cargo.toml` gains **no** `[workspace.dependencies]` entry (**C6**).

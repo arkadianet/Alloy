@@ -294,7 +294,7 @@ impl EvalHarness {
     pub async fn run_live_with_options(
         &self,
         fixture: &LoadedFixture,
-        options: driver::stack_live_options::StackLiveOptions,
+        options: crate::StackLiveOptions,
     ) -> FixtureOutcome {
         driver::stack::run_live_with_options(fixture, self.config.cancel.clone(), options)
             .await

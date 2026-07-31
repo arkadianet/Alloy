@@ -1,5 +1,5 @@
 {
   "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,7 +1,6 @@\n-pub fn broken_total() -> i32 {\n-    let mut total = 10;\n-    let writer = &mut total;\n-    let snapshot = &total;\n-    *writer += 5;\n-    *snapshot\n-}\n+pub fn broken_total() -> i32 {\n+    let mut total = 10;\n+    let snapshot = total;\n+    total += 5;\n+    snapshot + total\n+}\n",
-  "summary": "apply committed fix to src/lib.rs",
+  "summary": "apply committed fix to src/lib.rs (compile-clean only; return value of broken_total is not asserted)",
   "confidence": 0.85
 }
