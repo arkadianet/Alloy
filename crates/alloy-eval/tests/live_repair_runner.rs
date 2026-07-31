@@ -200,6 +200,8 @@ fn runner_executes_every_fixture_and_records_structured_observations() {
     assert_eq!(passes.len(), 2);
     for observation in &passes {
         assert_eq!(observation.exit_code, 0);
+        assert_eq!(observation.compile_clean, Some(true));
+        assert_eq!(observation.cargo_check_exit, Some(0));
         assert_eq!(observation.retries, 1, "retry line must be counted");
     }
     let mut reps: Vec<u32> = passes.iter().map(|o| o.repetition).collect();
@@ -213,6 +215,8 @@ fn runner_executes_every_fixture_and_records_structured_observations() {
     assert_eq!(failures.len(), 2);
     for observation in &failures {
         assert_eq!(observation.exit_code, 1);
+        assert_eq!(observation.compile_clean, Some(true));
+        assert_eq!(observation.cargo_check_exit, Some(0));
         assert_eq!(observation.retries, 0);
     }
 

@@ -122,17 +122,35 @@ while IFS=$'\t' read -r id workspace goal; do
       "$ALLOY" --workspace "$ws" run "$goal" --yes >"$ws/run.log" 2>&1
     code=$?
     wall_ms=$(($(date +%s%3N) - start_ms))
+    compile_clean=false
+    cargo_check_exit=null
+    case "$code" in
+      124|126|127)
+        ;;
+      *)
+        if timeout "$TIMEOUT" cargo check --offline --quiet \
+          --manifest-path "$ws/Cargo.toml" >"$ws/cargo-check.log" 2>&1; then
+          compile_clean=true
+          cargo_check_exit=0
+        else
+          cargo_check_exit=$?
+        fi
+        ;;
+    esac
     retries=$(grep -c -- "$RETRY_PATTERN" "$ws/run.log" || true)
     total=$((total + 1))
-    [ "$code" -eq 0 ] && passed=$((passed + 1))
+    [ "$code" -eq 0 ] && [ "$compile_clean" = true ] &&
+      passed=$((passed + 1))
     case "$code" in
       126|127) unexecutable=$((unexecutable + 1));;
     esac
     # Every row carries the endpoint it was produced against, so rows from two
     # models or two temperatures can never be pooled into one pass rate.
-    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"retries":%d,"wall_ms":%d,"model":"%s","temperature":%s,"base_url":"%s"}\n' \
-      "$id" "$rep" "$code" "$retries" "$wall_ms" "$MODEL" "$TEMP" "$BASEURL" >>"$out"
-    echo "[$passed/$total] $id#$rep exit=$code retries=$retries ${wall_ms}ms"
+    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"compile_clean":%s,"cargo_check_exit":%s,"retries":%d,"wall_ms":%d,"model":"%s","temperature":%s,"base_url":"%s"}\n' \
+      "$id" "$rep" "$code" "$compile_clean" "$cargo_check_exit" "$retries" \
+      "$wall_ms" "$MODEL" "$TEMP" "$BASEURL" >>"$out"
+    echo "[$passed/$total] $id#$rep exit=$code compile_clean=$compile_clean \
+cargo_check_exit=$cargo_check_exit retries=$retries ${wall_ms}ms"
     rm -rf "$ws"
   done
 done <<<"$plan"
