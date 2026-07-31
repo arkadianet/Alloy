@@ -3,7 +3,7 @@
 //! Ports the production assembly proven by
 //! `alloy-tools/tests/scheduler_repair_e2e.rs`: Landlock jail, hermetic
 //! `CARGO_HOME`, `GitEditEngine`, MCP `cargo_check` / `apply_patch`,
-//! `SqliteProjectGraph` ingest (syn-deep), `CapabilityRegistry`,
+//! `SqliteProjectGraph` ingest (syn-deep) + diagnostic seed, `CapabilityRegistry`,
 //! `TomlModelRouter` + [`ScriptedProvider`], `GenerationDriver`,
 //! `TemplatePlanService` / `LlmPlanService` + [`CapabilityPlanProposer`]
 //! (LLM-arm smoke), and [`GenerationSwitchCapabilities`] (inert gen1
@@ -34,21 +34,21 @@ use alloy_runtime::storage::{
 use alloy_runtime::types::ids::{DagId, NodeId, ProfileId, RunId, SessionId};
 use alloy_runtime::SessionProvenance;
 use alloy_runtime::{
-    compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, Approval, BudgetPolicy,
-    CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityId,
-    CapabilityOutcome, CapabilityPlanProposer, CapabilityRegistry, ChatMessage, ChatRole,
-    CompletionRequest, ContextEngine, ContextProfile, CostMeterFactory, DefaultContextEngine,
-    EndpointId, GateHumanAdapter, GenerationDriver, GenerationDriverDeps, GenerationPolicy, Goal,
-    GraphViewHandle, LinearScheduler, LinearSchedulerDeps, LlmPlanService, McpVerifyCompileAdapter,
-    ModelEndpoint, ModelProvider, ModelResponse, ModelTier, NodeKind, NullContextEngine,
-    PlanContext, PlanFingerprints, PlanService, PlannerConfig, PlannerMode,
-    ProcessCostMeterFactory, ProcessRunRouterProvider, ProjectGraph, ProposerDeps, ProviderId,
-    RecordingDecisionLog, RecordingModelProvider, RegistryCapabilityExecutor, ResponseFormat,
-    RetentionPolicy, RouterConfig, RunControlState, RunGoalRecord, RunRow, RuntimeConfig,
-    SchedConfig, Session, SessionVerifyPermissions, SessionWorkerPermissions, TemplatePlanService,
-    Timestamp, ToolCaller, ToolChoice, ToolName, ToolSelector, ToolchainRecord,
-    UnavailableVerifyTest, Usage, Verifier, WorkerConfig, WorkerDeps, EDIT_SYSTEM, PLANNING_SYSTEM,
-    REPAIR_SYSTEM,
+    compiler_fingerprint_digest, policy_hash_digest, seed_graph_diagnostics, tool_versions_digest,
+    Approval, BudgetPolicy, CapabilityExecContext, CapabilityExecError, CapabilityExecutor,
+    CapabilityId, CapabilityOutcome, CapabilityPlanProposer, CapabilityRegistry, ChatMessage,
+    ChatRole, CompletionRequest, ContextEngine, ContextProfile, CostMeterFactory,
+    DefaultContextEngine, EndpointId, GateHumanAdapter, GenerationDriver, GenerationDriverDeps,
+    GenerationPolicy, Goal, GraphViewHandle, LinearScheduler, LinearSchedulerDeps, LlmPlanService,
+    McpVerifyCompileAdapter, ModelEndpoint, ModelProvider, ModelResponse, ModelTier,
+    NodeExecContext, NodeExecRef, NodeKind, NullContextEngine, PlanContext, PlanFingerprints,
+    PlanService, PlannerConfig, PlannerMode, ProcessCostMeterFactory, ProcessRunRouterProvider,
+    ProjectGraph, ProposerDeps, ProviderId, RecordingDecisionLog, RecordingModelProvider,
+    RegistryCapabilityExecutor, ResponseFormat, RetentionPolicy, RouterConfig, RunControlState,
+    RunGoalRecord, RunRow, RuntimeConfig, SchedConfig, Session, SessionVerifyPermissions,
+    SessionWorkerPermissions, TemplatePlanService, Timestamp, ToolCaller, ToolChoice, ToolName,
+    ToolSelector, ToolchainRecord, UnavailableVerifyTest, Usage, Verifier, WorkerConfig,
+    WorkerDeps, EDIT_SYSTEM, PLANNING_SYSTEM, REPAIR_SYSTEM,
 };
 use alloy_tools::mcp::{
     InProcessMcpHost, McpHostConfig, McpPlatform, ToolHandle, ToolHandleToolCaller,
@@ -406,6 +406,31 @@ async fn run_live_inner(
             ))));
         }
         let graph_handle = GraphViewHandle::new(Arc::clone(&graph_store) as Arc<dyn ProjectGraph>);
+        // CLI bootstrap_diagnostics parity: gen-1 WorkingSet/repair can read
+        // GraphQuery::Diagnostics instead of assembling with empty seeds only.
+        {
+            let exec_ctx = NodeExecContext {
+                meta: NodeExecRef {
+                    session_id,
+                    run_id,
+                    dag_id,
+                    node_id: NodeId::new(),
+                    workspace_root: workspace_root.clone(),
+                    attempt: 1,
+                },
+                cancellation: cancel.clone().unwrap_or_default(),
+            };
+            match seed_graph_diagnostics(verify_compile.as_ref(), graph_store.as_ref(), &exec_ctx)
+                .await
+            {
+                Ok(report) => tracing::info!(
+                    recorded = report.recorded,
+                    errors = report.errors,
+                    "stack-driver seeded diagnostics"
+                ),
+                Err(e) => tracing::warn!(error = %e, "stack-driver diagnostic seed skipped"),
+            }
+        }
         let context: Arc<dyn ContextEngine> = match &options.context_profile {
             Some(profile) => Arc::new(DefaultContextEngine::new(
                 profile.clone(),
