@@ -134,10 +134,14 @@ fn workspace() -> Workspace {
 }
 
 fn run_binary(ws: &Workspace, base_url: &str) -> std::process::Output {
+    run_binary_with_target(ws, base_url, "src/lib.rs")
+}
+
+fn run_binary_with_target(ws: &Workspace, base_url: &str, target: &str) -> std::process::Output {
     Command::new(BINARY)
         .arg("--workspace")
         .arg(ws.dir.path())
-        .args(["--target", "src/lib.rs"])
+        .args(["--target", target])
         .arg("--diagnostics")
         .arg(&ws.diagnostics)
         .args(["--goal", "fix the compile error"])
@@ -233,4 +237,36 @@ fn missing_api_key_fails_closed_without_a_request() {
         "no request should have been sent"
     );
     assert!(!ws.result.exists());
+}
+
+/// An absolute or traversal `--target` must be rejected before the file is
+/// even read, let alone embedded in a request sent to the endpoint — fix
+/// for the round-1 finding that `resolve_target` was only invoked from
+/// `write_replacement` after the network call.
+#[test]
+fn absolute_and_traversal_targets_are_rejected_before_any_request() {
+    for bad_target in ["/etc/passwd", "../escape.rs"] {
+        let (port, requests) = start_stub_server(&stub_response());
+        let ws = workspace();
+        let base_url = format!("http://127.0.0.1:{port}/v1/");
+        let output = run_binary_with_target(&ws, &base_url, bad_target);
+
+        assert!(
+            !output.status.success(),
+            "target {bad_target:?} must be rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("target"),
+            "target {bad_target:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "target {bad_target:?} must never reach the endpoint"
+        );
+        assert!(
+            !ws.result.exists(),
+            "target {bad_target:?} must not produce a telemetry result"
+        );
+    }
 }

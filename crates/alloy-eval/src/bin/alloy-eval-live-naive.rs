@@ -15,7 +15,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use alloy_eval::{build_naive_request, parse_replacement, write_replacement, NaiveRunTelemetry};
+use alloy_eval::{
+    build_naive_request, parse_replacement, resolve_target, write_resolved_replacement,
+    NaiveRunTelemetry,
+};
 use alloy_runtime::{
     EndpointId, ModelEndpoint, ModelProvider, ModelTier, OpenAiCompatibleProvider,
     OpenAiCompatibleSpec, ProviderId, SecretString,
@@ -79,7 +82,10 @@ fn run() -> Result<(), String> {
     let base_url = required(&options, "base-url")?.to_owned();
     let result_path = PathBuf::from(required(&options, "result")?);
 
-    let target_path = workspace.join(&target);
+    // Validate the target before it is read: an absolute or traversal path
+    // must never reach the network, even embedded read-only in the prompt.
+    let target_path =
+        resolve_target(&workspace, &target).map_err(|error| format!("target: {error}"))?;
     let target_source = fs::read_to_string(&target_path)
         .map_err(|error| format!("read target {}: {error}", target_path.display()))?;
     let diagnostics = fs::read_to_string(&diagnostics_path)
@@ -130,7 +136,7 @@ fn run() -> Result<(), String> {
         .text
         .ok_or_else(|| "provider returned no message content".to_owned())?;
     let replacement = parse_replacement(&text)?;
-    write_replacement(&workspace, &target, &replacement.replacement)?;
+    write_resolved_replacement(&target_path, &replacement.replacement)?;
 
     let telemetry = NaiveRunTelemetry {
         model_calls: 1,

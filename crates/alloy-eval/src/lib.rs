@@ -75,8 +75,9 @@ pub use live_holdout::{
 };
 #[cfg(feature = "live-naive")]
 pub use live_naive::{
-    build_naive_request, parse_replacement, write_replacement, NaiveReplacement, NaiveRunTelemetry,
-    MAX_REPLACEMENT_BYTES, NAIVE_SCHEMA_NAME,
+    build_naive_request, parse_replacement, resolve_target, write_replacement,
+    write_resolved_replacement, NaiveReplacement, NaiveRunTelemetry, MAX_REPLACEMENT_BYTES,
+    NAIVE_SCHEMA_NAME,
 };
 pub use live_repair::{
     parse_observations_jsonl, render_router_toml, wilson_interval, LiveRepairCorpus,

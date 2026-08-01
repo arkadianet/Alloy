@@ -170,27 +170,42 @@ pub fn resolve_target(workspace: &Path, target: &str) -> Result<PathBuf, String>
 /// Write `replacement` into `workspace`/`target` through a sibling temp file
 /// followed by `rename`, so a crash never leaves a partially written target.
 ///
+/// Resolves `target` itself; callers that already hold a path from
+/// [`resolve_target`] (for example because they read the target before
+/// writing it) should call [`write_resolved_replacement`] instead, so the
+/// same path is validated once and reused for both operations.
+///
 /// # Errors
 ///
 /// Returns `Err` for a rejected target (see [`resolve_target`]), an empty or
 /// oversized replacement, or an I/O failure.
 pub fn write_replacement(workspace: &Path, target: &str, replacement: &str) -> Result<(), String> {
-    validate_replacement_bytes(replacement)?;
     let resolved = resolve_target(workspace, target)?;
+    write_resolved_replacement(&resolved, replacement)
+}
+
+/// Write `replacement` to an already-[`resolve_target`]-validated path
+/// through a sibling temp file followed by `rename`.
+///
+/// # Errors
+///
+/// Returns `Err` for an empty or oversized replacement, or an I/O failure.
+pub fn write_resolved_replacement(resolved: &Path, replacement: &str) -> Result<(), String> {
+    validate_replacement_bytes(replacement)?;
     let parent = resolved
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
-        .ok_or_else(|| format!("target has no parent directory: {target}"))?;
+        .ok_or_else(|| format!("target has no parent directory: {}", resolved.display()))?;
     let file_name = resolved
         .file_name()
-        .ok_or_else(|| format!("target has no file name: {target}"))?;
+        .ok_or_else(|| format!("target has no file name: {}", resolved.display()))?;
     let mut tmp_name = OsString::from(".");
     tmp_name.push(file_name);
     tmp_name.push(".alloy-naive.tmp");
     let tmp_path = parent.join(tmp_name);
     fs::write(&tmp_path, replacement)
         .map_err(|error| format!("write {}: {error}", tmp_path.display()))?;
-    fs::rename(&tmp_path, &resolved).map_err(|error| {
+    fs::rename(&tmp_path, resolved).map_err(|error| {
         format!(
             "rename {} -> {}: {error}",
             tmp_path.display(),
