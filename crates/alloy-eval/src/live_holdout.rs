@@ -363,13 +363,20 @@ struct NaiveResult {
 
 /// Read `input` and extract the driver's model-call and token telemetry.
 ///
-/// A missing input file means the driver died before recording anything —
-/// that attempt is already a process failure, so usage stays unknown instead
-/// of failing the whole sweep. Malformed content is a harness error.
+/// Missing naive telemetry is a harness error: the one-shot driver must
+/// account for its one call. Alloy may report no events only when its runner
+/// explicitly retained a successful empty export.
 pub fn telemetry(driver: LiveHoldoutDriver, input: &Path) -> Result<RunTelemetry, String> {
     let raw = match fs::read_to_string(input) {
         Ok(raw) => raw,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(RunTelemetry::UNRECORDED),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return match driver {
+                LiveHoldoutDriver::Naive => {
+                    Err(format!("naive telemetry missing: {}", input.display()))
+                }
+                LiveHoldoutDriver::Alloy => Ok(RunTelemetry::UNRECORDED),
+            };
+        }
         Err(error) => return Err(format!("read {}: {error}", input.display())),
     };
     match driver {
@@ -542,11 +549,11 @@ pub fn score(
         if !endpoint_matches(row, &endpoint) {
             return Err(format!("harness identity mismatch for {}", row.fixture_id));
         }
-        // The naive arm is one completion with no retries; a failed attempt
-        // may record none, but two would make it a different driver.
-        if row.driver == LiveHoldoutDriver::Naive && row.model_calls > 1 {
+        // The naive arm is exactly one completion with no retries. Missing
+        // and extra calls both invalidate the attempted comparison.
+        if row.driver == LiveHoldoutDriver::Naive && row.model_calls != 1 {
             return Err(format!(
-                "naive driver recorded {} model calls for {}, expected at most one",
+                "naive driver recorded {} model calls for {}, expected exactly one",
                 row.model_calls, row.fixture_id
             ));
         }
@@ -917,22 +924,24 @@ mod tests {
     }
 
     #[test]
-    fn score_rejects_naive_rows_with_more_than_one_model_call() {
+    fn score_rejects_naive_rows_without_exactly_one_model_call() {
         let fixtures = fixtures_with(&["a"]);
         let endpoint = Endpoint {
             driver: LiveHoldoutDriver::Naive,
             profile: None,
             ..endpoint()
         };
-        let mut row = observation("a", 1);
-        row.driver = LiveHoldoutDriver::Naive;
-        row.profile = None;
-        row.model_calls = 2;
-        let error = score(fixtures.path(), vec![row], endpoint, 1).unwrap_err();
-        assert!(
-            error.contains("naive driver recorded 2 model calls"),
-            "{error}"
-        );
+        for model_calls in [0, 2] {
+            let mut row = observation("a", 1);
+            row.driver = LiveHoldoutDriver::Naive;
+            row.profile = None;
+            row.model_calls = model_calls;
+            let error = score(fixtures.path(), vec![row], endpoint.clone(), 1).unwrap_err();
+            assert!(
+                error.contains(&format!("naive driver recorded {model_calls} model calls")),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1009,11 +1018,16 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_treats_a_missing_evidence_file_as_unrecorded() {
+    fn telemetry_rejects_missing_naive_evidence_but_keeps_alloy_unrecorded() {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("naive-result.json");
+        let error = telemetry(LiveHoldoutDriver::Naive, &missing).unwrap_err();
+        assert!(
+            error.contains("naive telemetry missing") && error.contains("naive-result.json"),
+            "{error}"
+        );
         assert_eq!(
-            telemetry(LiveHoldoutDriver::Naive, &missing).unwrap(),
+            telemetry(LiveHoldoutDriver::Alloy, &missing).unwrap(),
             RunTelemetry::UNRECORDED
         );
     }

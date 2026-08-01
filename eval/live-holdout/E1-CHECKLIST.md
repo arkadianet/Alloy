@@ -19,8 +19,16 @@ modified. This also fixes the `source_revision` every observation will carry.
 ## 2. Endpoint health and exact model ID
 
 ```bash
+test -n "${ALLOY_API_KEY:-}" || {
+  echo "ALLOY_API_KEY must be a non-empty process environment variable" >&2
+  exit 2
+}
 curl -s http://127.0.0.1:8089/v1/models
 ```
+
+Set `ALLOY_API_KEY` in the calling shell before this check. A loopback endpoint
+that ignores authentication can use `ALLOY_API_KEY=local`; no arm supplies a
+fallback key, and neither script reads `.env`.
 
 Copy the served model id **verbatim** into the arms file's `model` column.
 Do not abbreviate a quantization suffix or assume the id matches a filename
@@ -62,12 +70,15 @@ Preflight is not a separate command; it is the first phase of `e1.sh` (step
 6). Before any arm runs, `e1.sh` reads every row of the arms file and refuses
 the whole run unless it finds **exactly one** `naive/none`, **exactly one**
 `alloy/default`, and **exactly one** `alloy/autonomous` role, all sharing one
-`model`, `temperature`, `base_url`, and `reps`. `matrix.sh` then re-verifies
-the bundle manifest, that this checkout's `HEAD` still matches
+`model`, `temperature`, `base_url`, and `reps`. The first data row must be
+`naive/none`, because `matrix.sh` treats its first report as the comparison
+baseline. `matrix.sh` then re-verifies the bundle manifest, that this
+checkout's `HEAD` still matches
 `SOURCE_REVISION`, and that `eval/live-holdout/`, `profiles/`, and
 `crates/alloy-eval/fixtures/holdout/` carry no uncommitted changes, before
-creating the output directory. A failure at any of these checks leaves no
-output directory behind — nothing has run yet.
+requiring a non-empty `ALLOY_API_KEY` and creating the output directory. A
+failure at any of these checks leaves no output directory behind — nothing
+has run yet.
 
 ## 6. Pilot execution at three repetitions
 
@@ -104,10 +115,10 @@ Before trusting a pilot result:
 - `$out/matrix.report.json` lists all three arms and a Wilson 95% interval
   per arm, not just a point estimate at `reps=3`.
 - A malformed or incomplete telemetry record (truncated event export, a
-  naive result that is not exactly one model call, unparsable JSON) makes
-  `run.sh` exit as a harness error, not a zero-result model score. Treat that
-  exit as "this pilot did not produce evidence," not as "the model scored
-  zero."
+  failed event export, a missing naive result, a naive result that is not
+  exactly one model call, or unparsable JSON) makes `run.sh` exit as a
+  harness error, not a zero-result model score. Treat that exit as "this
+  pilot did not produce evidence," not as "the model scored zero."
 - `$out.artifacts/` (per arm) holds model output, run logs, and local paths.
   Treat it as confidential and keep it alongside its `.jsonl`/`.report.json`
   siblings; do not publish it.

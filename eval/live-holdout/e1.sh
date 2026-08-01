@@ -69,6 +69,11 @@ done <"$arms"
   die "E1 needs exactly three arms — naive/none, alloy/default, alloy/autonomous \
 — got ${#roles[@]}"
 
+# `compare` treats the first report as its baseline, so an E1 matrix is only
+# interpretable when its raw-model control is the first data row.
+[ "${roles[0]}" = "naive/none" ] ||
+  die "E1 baseline must be the first data row: expected naive/none, got ${roles[0]}"
+
 for required in naive/none alloy/default alloy/autonomous; do
   found=0
   for role in "${roles[@]}"; do

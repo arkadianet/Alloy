@@ -332,14 +332,34 @@ impl Harness {
     }
 
     fn run(&self, name: &str, arms: &Path, out: &Path) -> Output {
-        Command::new("bash")
+        self.run_with_api_key(name, arms, out, Some("local-test-key"))
+    }
+
+    fn run_with_api_key(
+        &self,
+        name: &str,
+        arms: &Path,
+        out: &Path,
+        api_key: Option<&str>,
+    ) -> Output {
+        let mut command = Command::new("bash");
+        command
             .arg(self.repo.join("eval/live-holdout").join(name))
             .arg(arms)
             .arg(out)
             .arg(&self.bundle)
             .env("FIXTURES", &self.fixtures)
             .env("TMPDIR", &self.tmp)
-            .env("TIMEOUT", "120")
+            .env("TIMEOUT", "120");
+        match api_key {
+            Some(value) => {
+                command.env("ALLOY_API_KEY", value);
+            }
+            None => {
+                command.env_remove("ALLOY_API_KEY");
+            }
+        }
+        command
             .output()
             .unwrap_or_else(|error| panic!("{name}: {error}"))
     }
@@ -385,6 +405,37 @@ fn matrix_refuses_a_bundle_without_a_manifest() {
         describe(&output)
     );
     assert!(!out.exists(), "no arm may run without a bundle manifest");
+}
+
+#[test]
+fn matrix_requires_a_nonempty_api_key_before_creating_output() {
+    for (label, api_key) in [("missing", None), ("empty", Some(""))] {
+        let harness = Harness::new();
+        let arms = arms_file(
+            harness.root(),
+            "arms.tsv",
+            &[
+                &arm_row("a", "alloy", MODEL, "0.6", "default", "1"),
+                &arm_row("b", "alloy", MODEL, "0.6", "autonomous", "1"),
+            ],
+        );
+        let out = harness.root().join(format!("out-{label}"));
+
+        let output = harness.run_with_api_key("matrix.sh", &arms, &out, api_key);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{label} key must abort before model work: {}",
+            describe(&output)
+        );
+        assert!(
+            stderr_of(&output).contains("ALLOY_API_KEY"),
+            "{}",
+            describe(&output)
+        );
+        assert!(!out.exists(), "{label} key must precede output creation");
+    }
 }
 
 #[test]
@@ -713,6 +764,34 @@ fn e1_refuses_a_repeated_treatment_role() {
 
     assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
     assert!(!out.exists());
+}
+
+#[test]
+fn e1_requires_naive_to_be_the_first_data_row() {
+    let harness = Harness::new();
+    let arms = arms_file(
+        harness.root(),
+        "arms.tsv",
+        &[
+            &arm_row("alloy-default", "alloy", MODEL, "0.6", "default", "1"),
+            &arm_row("naive", "naive", MODEL, "0.6", "none", "1"),
+            &arm_row("alloy-autonomous", "alloy", MODEL, "0.6", "autonomous", "1"),
+        ],
+    );
+    let out = harness.root().join("out");
+
+    let output = harness.run("e1.sh", &arms, &out);
+
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(
+        stderr_of(&output).contains("first data row"),
+        "{}",
+        describe(&output)
+    );
+    assert!(
+        !out.exists(),
+        "baseline validation must precede output creation and model work"
+    );
 }
 
 #[test]

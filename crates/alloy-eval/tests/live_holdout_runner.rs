@@ -102,6 +102,10 @@ done
 [ -n "$ws" ] || { echo "missing workspace" >&2; exit 90; }
 if [ "$command" = "events" ]; then
   printf '%s\n' "$argv" >>"${EVENTS_ARGV_LOG:-/dev/null}"
+  if [ "${FAIL_EVENTS_EXPORT:-0}" = "1" ]; then
+    echo "stub event export failed" >&2
+    exit 94
+  fi
   printf '%s\n' '{"type":"model_call","payload":{"input_tokens":100,"output_tokens":20}}'
   printf '%s\n' '{"type":"model_call","payload":{"output_tokens":5}}'
   printf '%s\n' '{"type":"run_completed","payload":{"dag_state":"succeeded"}}'
@@ -159,9 +163,11 @@ done
 [ -s "$diagnostics" ] || { echo "no pre-run diagnostics at $diagnostics" >&2; exit 93; }
 grep -q '\.post' "$diagnostics" && { echo "diagnostics reference the oracle" >&2; exit 94; }
 printf '%s\n' 'pub fn repaired() -> i32 { 42 }' >"$ws/$target"
-printf '%s\n' \
-  '{"model_calls":1,"tokens_in":123,"tokens_out":45,"provider_request_id":"naive-1","finish_reason":"stop"}' \
-  >"$result"
+if [ "${OMIT_NAIVE_TELEMETRY:-0}" != "1" ]; then
+  printf '%s\n' \
+    '{"model_calls":1,"tokens_in":123,"tokens_out":45,"provider_request_id":"naive-1","finish_reason":"stop"}' \
+    >"$result"
+fi
 "#,
     )
     .unwrap();
@@ -245,6 +251,7 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
         .env("TEMP", "0.6")
         .env("PROFILE", "default")
         .env("BASEURL", "http://127.0.0.1:8089/v1/")
+        .env("ALLOY_API_KEY", "local-test-key")
         .env("REPS", "1")
         .env("TIMEOUT", "60")
         .env("TMPDIR", &tmp)
@@ -383,6 +390,7 @@ fn naive_driver_shares_the_strict_oracle_pipeline() {
         .env("MODEL", "stub-model")
         .env("TEMP", "0.6")
         .env("BASEURL", "http://127.0.0.1:8089/v1/")
+        .env("ALLOY_API_KEY", "local-test-key")
         .env("SOURCE_REVISION", NAIVE_SOURCE_REVISION)
         .env("BUNDLE_SHA256", NAIVE_BUNDLE_SHA256)
         .env("REPS", "1")
@@ -451,5 +459,105 @@ fn naive_driver_shares_the_strict_oracle_pipeline() {
     assert_eq!(
         fs::read_to_string(attempt.join("events.jsonl")).unwrap(),
         ""
+    );
+}
+
+#[test]
+fn runner_aborts_when_alloy_event_export_fails() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixtures = directory.path().join("fixtures");
+    let tmp = directory.path().join("tmp");
+    fs::create_dir_all(&fixtures).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
+    write_fixture(&fixtures, "pass_fixture");
+
+    let alloy = directory.path().join("stub-alloy");
+    write_stub_alloy(&alloy);
+    let observations = directory.path().join("observations.jsonl");
+    let output = Command::new("bash")
+        .arg(repo_root().join("eval/live-holdout/run.sh"))
+        .arg(&observations)
+        .env("FIXTURES", &fixtures)
+        .env("ALLOY", &alloy)
+        .env("SCORER", SCORER)
+        .env("EVAL_HOLDOUT", EVALUATOR)
+        .env("DRIVER", "alloy")
+        .env("MODEL", "stub-model")
+        .env("TEMP", "0.6")
+        .env("PROFILE", "default")
+        .env("BASEURL", "http://127.0.0.1:8089/v1/")
+        .env("ALLOY_API_KEY", "local-test-key")
+        .env("FAIL_EVENTS_EXPORT", "1")
+        .env("REPS", "1")
+        .env("TIMEOUT", "60")
+        .env("TMPDIR", &tmp)
+        .output()
+        .expect("live-holdout runner");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "runner must fail closed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("event export failed"), "{stderr}");
+    let attempt = directory
+        .path()
+        .join("observations.artifacts/pass_fixture/rep-1");
+    assert!(fs::read_to_string(attempt.join("events.stderr"))
+        .unwrap()
+        .contains("stub event export failed"));
+    assert!(
+        !directory.path().join("observations.report.json").exists(),
+        "failed telemetry must not produce a report"
+    );
+}
+
+#[test]
+fn runner_aborts_when_naive_telemetry_is_missing() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixtures = directory.path().join("fixtures");
+    let tmp = directory.path().join("tmp");
+    fs::create_dir_all(&fixtures).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
+    write_fixture(&fixtures, "pass_fixture");
+
+    let naive = directory.path().join("stub-naive");
+    write_stub_naive(&naive);
+    let observations = directory.path().join("observations.jsonl");
+    let output = Command::new("bash")
+        .arg(repo_root().join("eval/live-holdout/run.sh"))
+        .arg(&observations)
+        .env("FIXTURES", &fixtures)
+        .env("DRIVER", "naive")
+        .env("NAIVE", &naive)
+        .env("EVAL_HOLDOUT", EVALUATOR)
+        .env("MODEL", "stub-model")
+        .env("TEMP", "0.6")
+        .env("BASEURL", "http://127.0.0.1:8089/v1/")
+        .env("ALLOY_API_KEY", "local-test-key")
+        .env("SOURCE_REVISION", NAIVE_SOURCE_REVISION)
+        .env("BUNDLE_SHA256", NAIVE_BUNDLE_SHA256)
+        .env("OMIT_NAIVE_TELEMETRY", "1")
+        .env("REPS", "1")
+        .env("TIMEOUT", "60")
+        .env("TMPDIR", &tmp)
+        .output()
+        .expect("live-holdout runner");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "runner must fail closed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("naive-result.json"), "{stderr}");
+    assert!(
+        !directory.path().join("observations.report.json").exists(),
+        "missing telemetry must not produce a report"
     );
 }

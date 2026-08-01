@@ -112,6 +112,8 @@ case "$MODEL$BASEURL" in
 esac
 [[ "$TEMP" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "TEMP must be a number, got '$TEMP'"
 [ -d "$FIXTURES" ] || die "fixtures root missing: $FIXTURES"
+[ -n "${ALLOY_API_KEY:-}" ] ||
+  die "ALLOY_API_KEY must be set to a non-empty process environment variable before any repetition"
 
 # Only the agent arm reads router.toml; the naive driver takes the endpoint
 # on its command line.
@@ -208,8 +210,8 @@ for id in "${ids[@]}"; do
         fi
         ;;
       alloy)
-        if ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout "$TIMEOUT" \
-          "$driver_bin" --workspace "$ws" --profile "$PROFILE" run "$GOAL" --yes \
+        if timeout "$TIMEOUT" "$driver_bin" --workspace "$ws" --profile "$PROFILE" \
+          run "$GOAL" --yes \
           >"$ws/run.log" 2>&1; then
           code=0
         else
@@ -220,6 +222,9 @@ for id in "${ids[@]}"; do
     wall_ms=$(($(date +%s%3N) - start_ms))
     cp "$ws/run.log" "$evidence/run.log" ||
       die "could not retain run log for $id#$rep"
+    if [ "$DRIVER" = "naive" ] && [ ! -f "$evidence/naive-result.json" ]; then
+      die "naive driver did not persist naive-result.json for $id#$rep; telemetry is incomplete"
+    fi
     if [ -f "$ws/$target_path" ]; then
       cp "$ws/$target_path" "$evidence/final-target.rs" ||
         die "could not retain final target for $id#$rep"
@@ -283,9 +288,13 @@ for id in "${ids[@]}"; do
       alloy)
         # Ask for the runtime's whole page (1000); the extractor rejects an
         # export that fills it rather than counting a truncated run.
-        ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout 30 \
-          "$driver_bin" --workspace "$ws" --profile "$PROFILE" events --json --limit 1000 \
-          >"$evidence/events.jsonl" 2>"$evidence/events.stderr" || true
+        if timeout 30 "$driver_bin" --workspace "$ws" --profile "$PROFILE" \
+          events --json --limit 1000 >"$evidence/events.jsonl" 2>"$evidence/events.stderr"; then
+          :
+        else
+          events_exit=$?
+          die "Alloy event export failed for $id#$rep (exit $events_exit); see $evidence/events.stderr"
+        fi
         telemetry_input="$evidence/events.jsonl"
         ;;
     esac

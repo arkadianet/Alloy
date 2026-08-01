@@ -27,6 +27,7 @@ cargo build -p alloy-eval --bin alloy-eval-live-repair
 cargo build -p alloy-eval --bin alloy-eval-live-holdout
 
 # llama.cpp on :8089 (see router.toml.local-example), or Ollama on :11434
+ALLOY_API_KEY=local \
 MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf' \
   BASEURL='http://127.0.0.1:8089/v1/' \
   TEMP=0.6 PROFILE=default REPS=1 \
@@ -37,7 +38,8 @@ MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf' \
 
 ```bash
 cargo build -p alloy-eval --features live-naive --bin alloy-eval-live-naive
-DRIVER=naive MODEL='…' BASEURL='http://127.0.0.1:8089/v1/' TEMP=0.6 REPS=1 \
+ALLOY_API_KEY=local DRIVER=naive MODEL='…' BASEURL='http://127.0.0.1:8089/v1/' \
+  TEMP=0.6 REPS=1 \
   ./eval/live-holdout/run.sh /tmp/live-naive.jsonl
 ```
 
@@ -51,6 +53,15 @@ runs the real agent under `--profile default` or `--profile autonomous`.
 Both drivers share one independent cargo check, hidden-test, reference, and
 strict-oracle path, so their reports are comparable observation-for-
 observation.
+
+### API-key preflight
+
+Every live arm requires a non-empty `ALLOY_API_KEY` process environment
+variable before any repetition starts. `matrix.sh` checks it after parsing all
+arms but before it creates an output directory, and `run.sh` applies the same
+check for standalone runs. There is no implicit `local` fallback. For a
+loopback endpoint that ignores authentication, `ALLOY_API_KEY=local` is an
+appropriate non-secret placeholder. The scripts never load or write `.env`.
 
 Each repetition gets a fresh temp workspace copied from
 `crates/alloy-eval/fixtures/holdout/*/workspace`, a rendered `router.toml`,
@@ -102,10 +113,11 @@ binary_bundle_sha256}` — build provenance, described next — so a rebuild
 into a shared Cargo target directory can never be mistaken for the binaries
 that actually produced a report.
 
-A malformed or incomplete observation — a naive result that is not exactly
-one model call, an event export at the page limit, unparsable telemetry
-JSON — is a harness error (`run.sh` exits non-zero before scoring), not a
-zero-result model score. Do not record an aborted sweep as evidence.
+A malformed or incomplete observation — a missing naive result, a naive result
+that is not exactly one model call, a failed or page-limited Alloy event
+export, or unparsable telemetry JSON — is a harness error (`run.sh` exits
+non-zero before scoring), not a zero-result model score. Do not record an
+aborted sweep as evidence.
 
 Every attempt writes `<results-without-.jsonl>.artifacts/<fixture>/rep-N/` with
 the model run log, final target, patch, independent cargo logs, event export,
@@ -176,8 +188,9 @@ and that `eval/live-holdout/`, `profiles/`, and
 `crates/alloy-eval/fixtures/holdout/` have no uncommitted changes — the
 bundle pins the binaries, but this checkout still supplies the orchestration,
 profiles, and fixture oracles those binaries run against. It also refuses a
-non-empty output directory so a stale report is never silently overwritten.
-Any of these failing leaves no output directory behind.
+missing or empty `ALLOY_API_KEY`, or a non-empty output directory, so an
+incomplete sweep or stale report is never silently treated as evidence. Any
+of these failing leaves no output directory behind.
 
 The arms file is seven tab-separated columns:
 
@@ -200,8 +213,9 @@ by an aggregate score.
 operator checklist for: exactly one `naive`/`none` arm, one `alloy`/`default`
 arm, and one `alloy`/`autonomous` arm, sharing one `model`, `temperature`,
 `base_url`, and `reps` — the only thing allowed to vary is the treatment
-(driver + profile) itself. Arm ids are free-form; the role is derived from
-`driver`+`profile`, not the id.
+(driver + profile) itself. The first data row must be the `naive`/`none` arm:
+`matrix.sh` treats its first report as the comparison baseline. Arm ids are
+otherwise free-form; the role is derived from `driver`+`profile`, not the id.
 
 ```bash
 ./eval/live-holdout/e1.sh /path/to/e1-arms.tsv /tmp/e1-out /path/to/bundle

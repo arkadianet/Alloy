@@ -183,6 +183,8 @@ while IFS= read -r line || [ -n "$line" ]; do
 done <"$arms"
 
 [ "${#arm_ids[@]}" -ge 2 ] || die "at least two arms are required, got ${#arm_ids[@]}"
+[ -n "${ALLOY_API_KEY:-}" ] ||
+  die "ALLOY_API_KEY must be set to a non-empty process environment variable before any repetition"
 
 mkdir -p "$out_dir" || die "cannot create $out_dir"
 
