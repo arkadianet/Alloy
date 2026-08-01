@@ -14,7 +14,10 @@
 - Never read, create, or overwrite `.env`; use process environment and `example.env` documentation only.
 - Hidden `.post` references and `oracle-tests/*.rs` never enter a model-visible workspace before model execution completes.
 - Naive means exactly one model completion, no Alloy tools, no repository index, no replanning, and no retry.
-- Model, quantization, temperature, base URL, fixtures, and repetitions are identical across compared arms.
+- E1's `e1.sh` requires identical model, quantization, temperature, base URL,
+  fixtures, and repetitions across its three arms. Generic `matrix.sh` may
+  compare different models and temperatures while retaining one binary bundle,
+  fixture corpus, and repetition count.
 - Every matrix uses binaries built once from one clean Git commit in a dedicated Cargo target directory.
 - Process, compile, semantic-test, reference-match, and strict-oracle outcomes remain independent.
 - Tests are written and observed failing before production changes.
@@ -403,7 +406,7 @@ case "$DRIVER" in
       --result "$evidence/naive-result.json"
     ;;
   alloy)
-    ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout "$TIMEOUT" \
+    ALLOY_API_KEY="$ALLOY_API_KEY" timeout "$TIMEOUT" \
       "$ALLOY" --workspace "$ws" --profile "$PROFILE" run "$GOAL" --yes
     ;;
 esac

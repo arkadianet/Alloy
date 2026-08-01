@@ -162,6 +162,7 @@ done
 [ ! -e "$ws/tests" ] || { echo "hidden tests leaked into workspace" >&2; exit 92; }
 [ -s "$diagnostics" ] || { echo "no pre-run diagnostics at $diagnostics" >&2; exit 93; }
 grep -q '\.post' "$diagnostics" && { echo "diagnostics reference the oracle" >&2; exit 94; }
+[ -z "${NAIVE_SLEEP_SECONDS:-}" ] || sleep "$NAIVE_SLEEP_SECONDS"
 printf '%s\n' 'pub fn repaired() -> i32 { 42 }' >"$ws/$target"
 if [ "${OMIT_NAIVE_TELEMETRY:-0}" != "1" ]; then
   printf '%s\n' \
@@ -385,6 +386,7 @@ fn naive_driver_shares_the_strict_oracle_pipeline() {
         .arg(&observations)
         .env("FIXTURES", &fixtures)
         .env("DRIVER", "naive")
+        .env_remove("PROFILE")
         .env("NAIVE", &naive)
         .env("EVAL_HOLDOUT", EVALUATOR)
         .env("MODEL", "stub-model")
@@ -516,6 +518,67 @@ fn runner_aborts_when_alloy_event_export_fails() {
 }
 
 #[test]
+fn fallback_bundle_identity_includes_the_alloy_scorer() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixtures = directory.path().join("fixtures");
+    let tmp = directory.path().join("tmp");
+    fs::create_dir_all(&fixtures).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
+    write_fixture(&fixtures, "pass_fixture");
+
+    let alloy = directory.path().join("stub-alloy");
+    write_stub_alloy(&alloy);
+    let scorer_a = directory.path().join("scorer-a");
+    let scorer_b = directory.path().join("scorer-b");
+    fs::copy(SCORER, &scorer_a).unwrap();
+    fs::copy(SCORER, &scorer_b).unwrap();
+    let mut changed = fs::read(&scorer_b).unwrap();
+    changed.extend_from_slice(b"\n");
+    fs::write(&scorer_b, changed).unwrap();
+    make_executable(&scorer_a);
+    make_executable(&scorer_b);
+
+    let run = |name: &str, scorer: &Path| {
+        let observations = directory.path().join(format!("{name}.jsonl"));
+        let output = Command::new("bash")
+            .arg(repo_root().join("eval/live-holdout/run.sh"))
+            .arg(&observations)
+            .env("FIXTURES", &fixtures)
+            .env("ALLOY", &alloy)
+            .env("SCORER", scorer)
+            .env("EVAL_HOLDOUT", EVALUATOR)
+            .env("DRIVER", "alloy")
+            .env("MODEL", "stub-model")
+            .env("TEMP", "0.6")
+            .env("PROFILE", "default")
+            .env("BASEURL", "http://127.0.0.1:8089/v1/")
+            .env("ALLOY_API_KEY", "local-test-key")
+            .env("REPS", "1")
+            .env("TIMEOUT", "60")
+            .env("TMPDIR", &tmp)
+            .output()
+            .expect("live-holdout runner");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_str::<LiveHoldoutReport>(
+            &fs::read_to_string(directory.path().join(format!("{name}.report.json"))).unwrap(),
+        )
+        .unwrap()
+    };
+
+    let first = run("first", &scorer_a);
+    let second = run("second", &scorer_b);
+
+    assert_ne!(
+        first.endpoint.harness.binary_bundle_sha256,
+        second.endpoint.harness.binary_bundle_sha256
+    );
+}
+
+#[test]
 fn runner_aborts_when_naive_telemetry_is_missing() {
     let directory = tempfile::tempdir().unwrap();
     let fixtures = directory.path().join("fixtures");
@@ -532,6 +595,7 @@ fn runner_aborts_when_naive_telemetry_is_missing() {
         .arg(&observations)
         .env("FIXTURES", &fixtures)
         .env("DRIVER", "naive")
+        .env_remove("PROFILE")
         .env("NAIVE", &naive)
         .env("EVAL_HOLDOUT", EVALUATOR)
         .env("MODEL", "stub-model")
@@ -559,5 +623,46 @@ fn runner_aborts_when_naive_telemetry_is_missing() {
     assert!(
         !directory.path().join("observations.report.json").exists(),
         "missing telemetry must not produce a report"
+    );
+}
+
+#[test]
+fn naive_driver_is_bounded_by_the_attempt_timeout() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixtures = directory.path().join("fixtures");
+    let tmp = directory.path().join("tmp");
+    fs::create_dir_all(&fixtures).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
+    write_fixture(&fixtures, "pass_fixture");
+
+    let naive = directory.path().join("stub-naive");
+    write_stub_naive(&naive);
+    let observations = directory.path().join("observations.jsonl");
+    let output = Command::new("bash")
+        .arg(repo_root().join("eval/live-holdout/run.sh"))
+        .arg(&observations)
+        .env("FIXTURES", &fixtures)
+        .env("DRIVER", "naive")
+        .env_remove("PROFILE")
+        .env("NAIVE", &naive)
+        .env("EVAL_HOLDOUT", EVALUATOR)
+        .env("MODEL", "stub-model")
+        .env("TEMP", "0.6")
+        .env("BASEURL", "http://127.0.0.1:8089/v1/")
+        .env("ALLOY_API_KEY", "local-test-key")
+        .env("SOURCE_REVISION", NAIVE_SOURCE_REVISION)
+        .env("BUNDLE_SHA256", NAIVE_BUNDLE_SHA256)
+        .env("NAIVE_SLEEP_SECONDS", "3")
+        .env("REPS", "1")
+        .env("TIMEOUT", "1")
+        .env("TMPDIR", &tmp)
+        .output()
+        .expect("live-holdout runner");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("telemetry is incomplete"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

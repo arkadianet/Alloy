@@ -282,7 +282,7 @@ fn write_checkout(root: &Path) -> PathBuf {
     let repo = root.join("repo");
     let scripts = repo.join("eval/live-holdout");
     fs::create_dir_all(&scripts).unwrap();
-    for name in ["run.sh", "matrix.sh", "e1.sh"] {
+    for name in ["run.sh", "matrix.sh", "e1.sh", "lib.sh"] {
         fs::copy(script(name), scripts.join(name)).unwrap();
         make_executable(&scripts.join(name));
     }
@@ -342,13 +342,24 @@ impl Harness {
         out: &Path,
         api_key: Option<&str>,
     ) -> Output {
+        self.run_with_api_key_and_fixtures(name, arms, out, api_key, &self.fixtures)
+    }
+
+    fn run_with_api_key_and_fixtures(
+        &self,
+        name: &str,
+        arms: &Path,
+        out: &Path,
+        api_key: Option<&str>,
+        fixtures: &Path,
+    ) -> Output {
         let mut command = Command::new("bash");
         command
             .arg(self.repo.join("eval/live-holdout").join(name))
             .arg(arms)
             .arg(out)
             .arg(&self.bundle)
-            .env("FIXTURES", &self.fixtures)
+            .env("FIXTURES", fixtures)
             .env("TMPDIR", &self.tmp)
             .env("TIMEOUT", "120");
         match api_key {
@@ -520,6 +531,62 @@ fn matrix_refuses_duplicate_arm_ids_before_running_anything() {
         describe(&output)
     );
     assert!(!out.exists(), "arm validation must precede any model work");
+}
+
+#[test]
+fn matrix_refuses_a_fixture_corpus_outside_the_checkout() {
+    let harness = Harness::new();
+    let external = harness.root().join("external-fixtures");
+    write_fixture(&external, "pass_fixture");
+    let arms = arms_file(
+        harness.root(),
+        "arms.tsv",
+        &[
+            &arm_row("a", "alloy", MODEL, "0.6", "default", "1"),
+            &arm_row("b", "alloy", MODEL, "0.6", "autonomous", "1"),
+        ],
+    );
+    let out = harness.root().join("out");
+
+    let output = harness.run_with_api_key_and_fixtures(
+        "matrix.sh",
+        &arms,
+        &out,
+        Some("local-test-key"),
+        &external,
+    );
+
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(
+        stderr_of(&output).contains("inside the checkout"),
+        "{}",
+        describe(&output)
+    );
+    assert!(!out.exists(), "fixture validation must precede model work");
+}
+
+#[test]
+fn matrix_refuses_mismatched_repetitions_before_running_anything() {
+    let harness = Harness::new();
+    let arms = arms_file(
+        harness.root(),
+        "arms.tsv",
+        &[
+            &arm_row("a", "alloy", MODEL, "0.6", "default", "1"),
+            &arm_row("b", "alloy", MODEL, "0.6", "autonomous", "2"),
+        ],
+    );
+    let out = harness.root().join("out");
+
+    let output = harness.run("matrix.sh", &arms, &out);
+
+    assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+    assert!(
+        stderr_of(&output).contains("same reps"),
+        "{}",
+        describe(&output)
+    );
+    assert!(!out.exists(), "arm validation must precede model work");
 }
 
 #[test]
@@ -924,6 +991,7 @@ fn prepare_repo(root: &Path) -> PathBuf {
         repo.join("eval/live-holdout/prepare.sh"),
     )
     .unwrap();
+    fs::copy(script("lib.sh"), repo.join("eval/live-holdout/lib.sh")).unwrap();
     make_executable(&repo.join("eval/live-holdout/prepare.sh"));
     fs::write(repo.join("README.md"), "fake repo\n").unwrap();
     git(&repo, &["init", "-q"]);
@@ -1013,8 +1081,9 @@ fn prepare_refuses_a_bundle_inside_the_repository() {
 #[test]
 fn prepare_bundles_exactly_the_binaries_the_workspace_builds() {
     let text = fs::read_to_string(script("prepare.sh")).unwrap();
+    let helpers = fs::read_to_string(script("lib.sh")).unwrap();
     for binary in BUNDLE_BINARIES {
-        assert!(text.contains(binary), "prepare.sh must bundle {binary}");
+        assert!(helpers.contains(binary), "lib.sh must declare {binary}");
     }
     for built in [EVALUATOR, SCORER, NAIVE] {
         let path = Path::new(built);
@@ -1030,5 +1099,12 @@ fn prepare_bundles_exactly_the_binaries_the_workspace_builds() {
     for field in ["source_revision", "worktree", "binary"] {
         assert!(text.contains(field), "prepare.sh must write {field}");
         assert!(matrix.contains(field), "matrix.sh must verify {field}");
+    }
+    for name in ["prepare.sh", "matrix.sh", "e1.sh"] {
+        let text = fs::read_to_string(script(name)).unwrap();
+        assert!(
+            text.contains("source \"$here/lib.sh\""),
+            "{name} must source the shared manifest and row helpers"
+        );
     }
 }

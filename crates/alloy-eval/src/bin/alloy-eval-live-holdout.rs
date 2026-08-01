@@ -201,9 +201,13 @@ fn parse_hex_sha(
     expected_len: usize,
 ) -> Result<String, String> {
     let value = required(options, key)?.clone();
-    if value.len() != expected_len || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+    if value.len() != expected_len
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+    {
         return Err(format!(
-            "--{key} must be a {expected_len}-character hex string, got {value}"
+            "--{key} must be a {expected_len}-character lower-case hex string, got {value}"
         ));
     }
     Ok(value)
@@ -371,4 +375,21 @@ fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> St
         ));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_sha_rejects_uppercase_hex() {
+        for (key, len) in [("source-revision", 40), ("binary-bundle-sha256", 64)] {
+            let mut options = BTreeMap::new();
+            options.insert(key.to_owned(), vec!["A".repeat(len)]);
+
+            let error = parse_hex_sha(&options, key, len).unwrap_err();
+
+            assert!(error.contains("lower-case"), "{error}");
+        }
+    }
 }

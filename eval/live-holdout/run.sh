@@ -92,9 +92,14 @@ SOURCE_REVISION="${SOURCE_REVISION:-$(git -C "$repo" rev-parse HEAD 2>/dev/null 
 [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] ||
   die "SOURCE_REVISION must be a 40-hex commit sha, got '$SOURCE_REVISION'"
 content_sha() { sha256sum <"$1" | cut -d ' ' -f1; }
+bundle_binaries=("$driver_bin" "$EVAL_HOLDOUT")
+if [ "$DRIVER" = "alloy" ]; then
+  bundle_binaries+=("$SCORER")
+fi
 BUNDLE_SHA256="${BUNDLE_SHA256:-$(
-  printf '%s%s' "$(content_sha "$driver_bin")" "$(content_sha "$EVAL_HOLDOUT")" |
-    sha256sum | cut -d ' ' -f1
+  for binary in "${bundle_binaries[@]}"; do
+    content_sha "$binary"
+  done | tr -d '\n' | sha256sum | cut -d ' ' -f1
 )}"
 [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
   die "BUNDLE_SHA256 must be a 64-hex sha256, got '$BUNDLE_SHA256'"
@@ -194,7 +199,7 @@ for id in "${ids[@]}"; do
     start_ms=$(date +%s%3N)
     case "$DRIVER" in
       naive)
-        if "$driver_bin" \
+        if timeout "$TIMEOUT" "$driver_bin" \
           --workspace "$ws" \
           --target "$target_path" \
           --diagnostics "$evidence/initial-cargo.log" \

@@ -18,17 +18,13 @@
 # Author: arkadianet
 set -u
 
-repo="$(cd "$(dirname "$0")/../.." && pwd -P)"
+here="$(cd "$(dirname "$0")" && pwd -P)"
+repo="$(cd "$here/../.." && pwd -P)"
 bundle="${1:?usage: prepare.sh <bundle-dir>}"
 
 die() { echo "prepare.sh: $1" >&2; exit 2; }
 
-mapfile -t binaries < <(
-  printf '%s\n' alloy alloy-eval-live-holdout alloy-eval-live-naive \
-    alloy-eval-live-repair | LC_ALL=C sort
-)
-
-content_sha() { sha256sum <"$1" | cut -d ' ' -f1; }
+source "$here/lib.sh"
 
 # A bundle inside the repository would dirty the worktree with its own build
 # output — the very state this script refuses to build from. Reject the path

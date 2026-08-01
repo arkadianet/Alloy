@@ -23,7 +23,9 @@ test -n "${ALLOY_API_KEY:-}" || {
   echo "ALLOY_API_KEY must be a non-empty process environment variable" >&2
   exit 2
 }
-curl -s http://127.0.0.1:8089/v1/models
+curl --fail --show-error --silent \
+  --header "Authorization: Bearer $ALLOY_API_KEY" \
+  http://127.0.0.1:8089/v1/models
 ```
 
 Set `ALLOY_API_KEY` in the calling shell before this check. A loopback endpoint
@@ -94,15 +96,16 @@ that file specifies the Q4 30B **target** model, not a pilot model, and
 bundle=/tmp/alloy-e1-bundle
 out=/tmp/alloy-e1-pilot
 pilot_arms=/tmp/alloy-e1-pilot-arms.tsv
-./eval/live-holdout/prepare.sh "$bundle"
 ./eval/live-holdout/e1.sh \
   "$pilot_arms" \
   "$out" \
   "$bundle"
 ```
 
-(`prepare.sh` only needs to run once per bundle; re-run it here only if you
-skipped step 4 or the worktree moved since.)
+Use the bundle from step 4 while the worktree remains unchanged. If the
+worktree changes, choose a new, empty bundle directory and run `prepare.sh`
+against that path; never rerun it against an existing bundle. Each unchanged
+worktree needs only one `prepare.sh` run per bundle.
 
 ## 7. Report and artifact validation
 

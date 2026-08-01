@@ -29,16 +29,7 @@ bundle="${3:?usage: e1.sh <arms.tsv> <out-dir> <bundle-dir>}"
 
 die() { echo "e1.sh: $1" >&2; exit 2; }
 
-# Split on tabs without collapsing empty columns (see matrix.sh).
-split_row() {
-  local rest="$1"
-  fields=()
-  while [ "$rest" != "${rest#*$'\t'}" ]; do
-    fields+=("${rest%%$'\t'*}")
-    rest="${rest#*$'\t'}"
-  done
-  fields+=("$rest")
-}
+source "$here/lib.sh"
 
 fixtures="${FIXTURES:-$repo/crates/alloy-eval/fixtures/holdout}"
 [ -d "$fixtures" ] || die "fixtures root missing: $fixtures"

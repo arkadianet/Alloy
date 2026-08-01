@@ -14,31 +14,15 @@
 # Author: arkadianet
 set -u
 
-repo="$(cd "$(dirname "$0")/../.." && pwd)"
+here="$(cd "$(dirname "$0")" && pwd -P)"
+repo="$(cd "$here/../.." && pwd -P)"
 arms="${1:?usage: matrix.sh <arms.tsv> <out-dir> <bundle-dir>}"
 out_dir="${2:?usage: matrix.sh <arms.tsv> <out-dir> <bundle-dir>}"
 bundle="${3:?usage: matrix.sh <arms.tsv> <out-dir> <bundle-dir>}"
 
 die() { echo "matrix.sh: $1" >&2; exit 2; }
 
-mapfile -t binaries < <(
-  printf '%s\n' alloy alloy-eval-live-holdout alloy-eval-live-naive \
-    alloy-eval-live-repair | LC_ALL=C sort
-)
-
-content_sha() { sha256sum <"$1" | cut -d ' ' -f1; }
-
-# Split on tabs without collapsing empty columns, so a missing value is a
-# parse error instead of a silent column shift.
-split_row() {
-  local rest="$1"
-  fields=()
-  while [ "$rest" != "${rest#*$'\t'}" ]; do
-    fields+=("${rest%%$'\t'*}")
-    rest="${rest#*$'\t'}"
-  done
-  fields+=("$rest")
-}
+source "$here/lib.sh"
 
 # --- Bundle identity: verified before the arms file is even read. -----------
 
@@ -89,7 +73,15 @@ bundle_sha256="$(content_sha "$manifest")"
 # be the bundle's commit, or the arms are not the harness the manifest names.
 # Unrelated working-tree edits elsewhere in the repository are not the harness
 # and do not block a run.
-treatment_paths=(eval/live-holdout profiles crates/alloy-eval/fixtures/holdout)
+fixtures="${FIXTURES:-$repo/crates/alloy-eval/fixtures/holdout}"
+[ -d "$fixtures" ] || die "fixtures root missing: $fixtures"
+fixtures="$(cd "$fixtures" && pwd -P)" ||
+  die "cannot resolve fixtures root: $fixtures"
+case "$fixtures" in
+  "$repo"/*) fixtures_rel="${fixtures#"$repo"/}" ;;
+  *) die "fixtures root must be inside the checkout $repo, got $fixtures" ;;
+esac
+treatment_paths=(eval/live-holdout profiles "$fixtures_rel")
 head_revision="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
 [ -n "$head_revision" ] || die "cannot read the checkout revision at $repo"
 [ "$head_revision" = "$source_revision" ] ||
@@ -111,8 +103,6 @@ if [ -e "$out_dir" ]; then
     die "output directory must be empty, got existing entries in $out_dir"
 fi
 
-fixtures="${FIXTURES:-$repo/crates/alloy-eval/fixtures/holdout}"
-[ -d "$fixtures" ] || die "fixtures root missing: $fixtures"
 [ -f "$arms" ] || die "arms file missing: $arms"
 
 arm_ids=()
@@ -123,6 +113,7 @@ arm_profiles=()
 arm_urls=()
 arm_reps=()
 declare -A seen_arms=()
+expected_reps=""
 line_no=0
 while IFS= read -r line || [ -n "$line" ]; do
   line_no=$((line_no + 1))
@@ -172,6 +163,11 @@ while IFS= read -r line || [ -n "$line" ]; do
     '' | *[!0-9]*) die "arm $arm_id: reps must be a positive integer, got '$reps'" ;;
   esac
   [ "$reps" -ge 1 ] || die "arm $arm_id: reps must be at least 1"
+  if [ -z "$expected_reps" ]; then
+    expected_reps="$reps"
+  elif [ "$reps" != "$expected_reps" ]; then
+    die "all arms must use the same reps value; expected $expected_reps, got $reps for arm $arm_id"
+  fi
 
   arm_ids+=("$arm_id")
   arm_drivers+=("$driver")
