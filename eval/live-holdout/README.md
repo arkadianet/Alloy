@@ -41,13 +41,21 @@ a git commit, then:
 alloy --workspace <tmp> --profile <profile> run "fix the compile error in this crate" --yes
 ```
 
-The runner records two separate results:
+The runner records independent layers:
 
 * `process_pass` — `alloy` exited `0`.
+* `compile_clean` — an independent offline `cargo check --offline` passed.
+* `tests_pass` — hidden fixture-owned semantic tests, copied in only after the
+  model run, passed under `cargo test --offline`.
 * `oracle_pass` — the process exited `0`, an independent offline `cargo check
   --offline` is clean, and the final target file exactly matches the fixture's
   committed `<target>.post` reference. The reference is removed from the
   temporary workspace before the model runs, so it is not a hidden prompt.
+
+Semantic tests are diagnostic evidence and do not replace or relax the strict
+oracle. A compile-clean mismatch that fails tests is a detected likely morph; a
+mismatch that passes tests is a plausible alternate repair that still remains a
+strict-reference failure.
 
 The reference match is intentionally strict for this small RFC-0016 corpus. It
 is what exposes a compiling but semantically wrong morph such as changing E0502
@@ -55,17 +63,23 @@ into E0614. A reference mismatch is diagnostic evidence, not proof that all
 valid Rust repairs are impossible.
 
 JSONL rows and `<results>.report.json` are written outside the repo. Report
-schema v2 adds the explicit compile-clean reference-mismatch rate. The report
-validates dense repetition coverage and endpoint identity, and includes
-per-fixture and overall Wilson 95% intervals for process, compile, reference,
-strict-oracle, and compile-clean reference-mismatch rates. The mismatch rate
-counts code that independently compiles but does not match the fixture's
-intended repair; it is a morph warning, not proof that every alternate repair
-is semantically wrong. Exit `0` from `alloy` alone is no longer sufficient for
-the strict oracle, and each row also records `failure_class`, `compile_clean`,
-`reference_match`, cargo's post-check exit code, repair-generation count, and
-the selected `profile`. Profile is part of endpoint identity, so
+schema v3 adds independent semantic-test rates and durable evidence pointers.
+The report validates dense repetition coverage and endpoint identity, and
+includes per-fixture and overall Wilson 95% intervals for process, compile,
+tests, reference, strict-oracle, compile-clean mismatch, compile-clean test
+failure, and test-passing reference-mismatch rates. Exit `0` from `alloy` alone
+is no longer sufficient for the strict oracle, and each row also records
+`failure_class`, cargo's post-check/test exit codes, repair-generation count,
+and the selected `profile`. Profile is part of endpoint identity, so
 context/profile arms cannot be silently mixed in one report.
+
+Every attempt writes `<results-without-.jsonl>.artifacts/<fixture>/rep-N/` with
+the model run log, final target, patch, independent cargo logs, event export,
+and metadata. `evidence_relpath` in each observation points below that root.
+Temporary workspaces are removed after the evidence bundle is complete.
+These bundles contain model output and local paths; treat them as confidential
+operator artifacts and review them before sharing. Move the JSONL and its
+`.artifacts/` sibling together to preserve evidence pointers.
 Exit codes:
 
 | Exit | Meaning |
@@ -104,7 +118,7 @@ Run it with:
 ```
 
 The first arm is the descriptive baseline. `matrix.report.json` retains each
-arm's Wilson 95% interval, failure classes, compile-clean mismatch rate, and
+arm's Wilson 95% interval, failure classes, compile/test mismatch rates, and
 per-fixture deltas. A positive strict-oracle delta is evidence of improvement
 on this measured corpus; zero
 or negative deltas are retained as the documented "why not" result, not hidden

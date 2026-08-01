@@ -15,7 +15,7 @@ use crate::live_repair::{wilson_interval, WilsonInterval, WILSON_Z_95};
 
 const CORPUS: &str = "rfc0016-holdout-live";
 const TIMEOUT_EXIT_CODE: i32 = 124;
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const REPORT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Deserialize)]
 struct HoldoutManifest {
@@ -29,12 +29,15 @@ pub struct StrictObservation {
     pub exit_code: i32,
     pub process_pass: bool,
     pub compile_clean: bool,
+    pub tests_pass: bool,
     pub reference_match: bool,
     pub oracle_pass: bool,
     pub failure_class: String,
     pub cargo_check_exit: Option<i32>,
+    pub cargo_test_exit: Option<i32>,
     pub repair_generations: u32,
     pub wall_ms: u64,
+    pub evidence_relpath: String,
     pub model: String,
     pub temperature: f64,
     #[serde(default = "default_profile")]
@@ -56,7 +59,10 @@ pub struct FixtureSummary {
     pub fixture_id: String,
     pub process: Rate,
     pub compile_clean: Rate,
+    pub tests_pass: Rate,
     pub compile_clean_reference_mismatch: Rate,
+    pub compile_clean_tests_failed: Rate,
+    pub tests_pass_reference_mismatch: Rate,
     pub reference_match: Rate,
     pub oracle: Rate,
     pub failure_classes: BTreeMap<String, u32>,
@@ -105,7 +111,10 @@ pub struct ArmComparison {
     pub oracle: MetricDelta,
     pub process: MetricDelta,
     pub compile_clean: MetricDelta,
+    pub tests_pass: MetricDelta,
     pub compile_clean_reference_mismatch: MetricDelta,
+    pub compile_clean_tests_failed: MetricDelta,
+    pub tests_pass_reference_mismatch: MetricDelta,
     pub reference_match: MetricDelta,
     pub assessment: Assessment,
 }
@@ -156,6 +165,8 @@ pub fn oracle(
     exit_code: i32,
     compile_clean: bool,
     cargo_check_exit: Option<i32>,
+    tests_pass: bool,
+    cargo_test_exit: Option<i32>,
 ) -> Result<StrictObservationFields, String> {
     let relative_target = target_path(&fixture_dir.join("manifest.toml"))?;
     let actual = workspace.join(&relative_target);
@@ -174,14 +185,23 @@ pub fn oracle(
         false
     };
     let postcheck_clean = compile_clean && cargo_check_exit == Some(0);
-    let failure_class = classify(exit_code, &log, postcheck_clean, reference_match);
+    let posttest_clean = tests_pass && cargo_test_exit == Some(0);
+    let failure_class = classify(
+        exit_code,
+        &log,
+        postcheck_clean,
+        posttest_clean,
+        reference_match,
+    );
     Ok(StrictObservationFields {
         process_pass: exit_code == 0,
         compile_clean,
+        tests_pass,
         reference_match,
-        oracle_pass: failure_class == "pass",
+        oracle_pass: exit_code == 0 && postcheck_clean && reference_match,
         failure_class,
         cargo_check_exit,
+        cargo_test_exit,
         repair_generations: log.matches("repair generation replanned").count() as u32,
     })
 }
@@ -190,22 +210,40 @@ pub fn oracle(
 pub struct StrictObservationFields {
     pub process_pass: bool,
     pub compile_clean: bool,
+    pub tests_pass: bool,
     pub reference_match: bool,
     pub oracle_pass: bool,
     pub failure_class: String,
     pub cargo_check_exit: Option<i32>,
+    pub cargo_test_exit: Option<i32>,
     pub repair_generations: u32,
 }
 
-fn classify(exit_code: i32, log: &str, postcheck_clean: bool, reference_match: bool) -> String {
+fn classify(
+    exit_code: i32,
+    log: &str,
+    postcheck_clean: bool,
+    posttest_clean: bool,
+    reference_match: bool,
+) -> String {
     if exit_code == 0 && postcheck_clean && reference_match {
-        return "pass".to_owned();
+        return if posttest_clean {
+            "pass"
+        } else {
+            "strict_pass_tests_failed"
+        }
+        .to_owned();
     }
     if exit_code == 0 && !postcheck_clean {
         return "process_claimed_success_but_compile_failed".to_owned();
     }
     if exit_code == 0 && !reference_match {
-        return "reference_mismatch".to_owned();
+        return if posttest_clean {
+            "reference_mismatch_tests_passed"
+        } else {
+            "reference_mismatch_tests_failed"
+        }
+        .to_owned();
     }
     if exit_code == TIMEOUT_EXIT_CODE {
         return "timeout".to_owned();
@@ -279,9 +317,12 @@ fn summarize_fixture(id: &str, rows: &[StrictObservation]) -> FixtureSummary {
         fixture_id: id.to_owned(),
         process: rate(rows, |row| row.process_pass),
         compile_clean: rate(rows, |row| row.compile_clean),
+        tests_pass: rate(rows, |row| row.tests_pass),
         compile_clean_reference_mismatch: rate(rows, |row| {
             row.compile_clean && !row.reference_match
         }),
+        compile_clean_tests_failed: rate(rows, |row| row.compile_clean && !row.tests_pass),
+        tests_pass_reference_mismatch: rate(rows, |row| row.tests_pass && !row.reference_match),
         reference_match: rate(rows, |row| row.reference_match),
         oracle: rate(rows, |row| row.oracle_pass),
         failure_classes,
@@ -318,9 +359,18 @@ pub fn score(
         if row.process_pass != (row.exit_code == 0)
             || (row.compile_clean && row.cargo_check_exit != Some(0))
             || (!row.compile_clean && row.cargo_check_exit == Some(0))
+            || (row.tests_pass && row.cargo_test_exit != Some(0))
+            || (!row.tests_pass && row.cargo_test_exit == Some(0))
         {
             return Err(format!(
-                "process/compile evidence inconsistency for {}",
+                "process/compile/test evidence inconsistency for {}",
+                row.fixture_id
+            ));
+        }
+        let expected_evidence = format!("{}/rep-{}", row.fixture_id, row.repetition);
+        if row.evidence_relpath != expected_evidence {
+            return Err(format!(
+                "evidence path inconsistency for {}: expected {expected_evidence}",
                 row.fixture_id
             ));
         }
@@ -339,7 +389,14 @@ pub fn score(
             // Process-success classes are fully determined by compile/reference
             // evidence; reject spoofed labels such as timeout/reference swaps.
             let postcheck_clean = row.compile_clean && row.cargo_check_exit == Some(0);
-            let expected_class = classify(row.exit_code, "", postcheck_clean, row.reference_match);
+            let posttest_clean = row.tests_pass && row.cargo_test_exit == Some(0);
+            let expected_class = classify(
+                row.exit_code,
+                "",
+                postcheck_clean,
+                posttest_clean,
+                row.reference_match,
+            );
             if row.failure_class != expected_class {
                 return Err(format!(
                     "failure-class consistency violation for {}: expected {expected_class}, got {}",
@@ -456,9 +513,18 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
                     &baseline.overall.compile_clean,
                     &report.overall.compile_clean,
                 ),
+                tests_pass: delta(&baseline.overall.tests_pass, &report.overall.tests_pass),
                 compile_clean_reference_mismatch: delta(
                     &baseline.overall.compile_clean_reference_mismatch,
                     &report.overall.compile_clean_reference_mismatch,
+                ),
+                compile_clean_tests_failed: delta(
+                    &baseline.overall.compile_clean_tests_failed,
+                    &report.overall.compile_clean_tests_failed,
+                ),
+                tests_pass_reference_mismatch: delta(
+                    &baseline.overall.tests_pass_reference_mismatch,
+                    &report.overall.tests_pass_reference_mismatch,
                 ),
                 reference_match: delta(
                     &baseline.overall.reference_match,
@@ -512,12 +578,15 @@ mod tests {
             exit_code: 0,
             process_pass: true,
             compile_clean: true,
+            tests_pass: true,
             reference_match: true,
             oracle_pass: true,
             failure_class: "pass".to_owned(),
             cargo_check_exit: Some(0),
+            cargo_test_exit: Some(0),
             repair_generations: 0,
             wall_ms: 10,
+            evidence_relpath: format!("{fixture_id}/rep-{repetition}"),
             model: endpoint.model,
             temperature: endpoint.temperature,
             profile: endpoint.profile,
@@ -546,21 +615,32 @@ mod tests {
         if !oracle_pass {
             row.reference_match = false;
             row.oracle_pass = false;
-            row.failure_class = "reference_mismatch".to_owned();
+            row.failure_class = "reference_mismatch_tests_passed".to_owned();
         }
         score(fixtures.path(), vec![row], endpoint(), 1).unwrap()
     }
 
     #[test]
     fn classifies_strict_success_and_false_green() {
-        assert_eq!(classify(0, "", true, true), "pass");
-        assert_eq!(classify(0, "", true, false), "reference_mismatch");
+        assert_eq!(classify(0, "", true, true, true), "pass");
         assert_eq!(
-            classify(0, "", false, true),
+            classify(0, "", true, false, true),
+            "strict_pass_tests_failed"
+        );
+        assert_eq!(
+            classify(0, "", true, false, false),
+            "reference_mismatch_tests_failed"
+        );
+        assert_eq!(
+            classify(0, "", true, true, false),
+            "reference_mismatch_tests_passed"
+        );
+        assert_eq!(
+            classify(0, "", false, false, true),
             "process_claimed_success_but_compile_failed"
         );
         assert_eq!(
-            classify(5, "reason=\"kind\"", false, false),
+            classify(5, "reason=\"kind\"", false, false, false),
             "replan_declined_kind"
         );
     }
@@ -609,9 +689,26 @@ mod tests {
         row.failure_class = "process_claimed_success_but_compile_failed".to_owned();
         let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
         assert!(
-            error.contains("process/compile evidence inconsistency"),
+            error.contains("process/compile/test evidence inconsistency"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn score_rejects_test_and_evidence_inconsistency() {
+        let fixtures = fixtures_with(&["a"]);
+        let mut test_row = observation("a", 1);
+        test_row.cargo_test_exit = Some(101);
+        let error = score(fixtures.path(), vec![test_row], endpoint(), 1).unwrap_err();
+        assert!(
+            error.contains("process/compile/test evidence inconsistency"),
+            "{error}"
+        );
+
+        let mut path_row = observation("a", 1);
+        path_row.evidence_relpath = "../escape".to_owned();
+        let error = score(fixtures.path(), vec![path_row], endpoint(), 1).unwrap_err();
+        assert!(error.contains("evidence path inconsistency"), "{error}");
     }
 
     #[test]
@@ -624,7 +721,7 @@ mod tests {
         let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
         assert!(
             error.contains("failure-class consistency violation")
-                && error.contains("reference_mismatch"),
+                && error.contains("reference_mismatch_tests_passed"),
             "{error}"
         );
     }
@@ -684,6 +781,10 @@ mod tests {
         assert_eq!(matrix.comparisons[0].assessment.result, "why_not");
         assert_eq!(
             matrix.comparisons[0].compile_clean_reference_mismatch.delta,
+            Some(1.0)
+        );
+        assert_eq!(
+            matrix.comparisons[0].tests_pass_reference_mismatch.delta,
             Some(1.0)
         );
     }

@@ -24,6 +24,7 @@ fn repo_root() -> PathBuf {
 fn write_fixture(root: &Path, id: &str) {
     let fixture = root.join(id);
     fs::create_dir_all(fixture.join("workspace/src")).unwrap();
+    fs::create_dir_all(fixture.join("oracle-tests")).unwrap();
     fs::write(
         fixture.join("manifest.toml"),
         format!("naive_target_path = \"src/lib.rs\"\nid = \"{id}\"\n"),
@@ -46,6 +47,14 @@ fn write_fixture(root: &Path, id: &str) {
         "pub fn repaired() -> i32 { 42 }\n",
     )
     .unwrap();
+    fs::write(
+        fixture.join("oracle-tests/semantic.rs"),
+        format!(
+            "#[test]\nfn intended_result_is_preserved() {{\n    assert_eq!({id}::repaired(), {});\n}}\n",
+            if id == "test_fail_fixture" { 43 } else { 42 }
+        ),
+    )
+    .unwrap();
 }
 
 fn write_stub_alloy(path: &Path) {
@@ -54,17 +63,23 @@ fn write_stub_alloy(path: &Path) {
         r#"#!/usr/bin/env bash
 set -u
 ws=""
+command=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --workspace) ws="$2"; shift 2 ;;
+    events) command="events"; shift ;;
     *) shift ;;
   esac
 done
 [ -n "$ws" ] || { echo "missing workspace" >&2; exit 90; }
+if [ "$command" = "events" ]; then
+  printf '%s\n' '{"type":"run_completed","payload":{"dag_state":"succeeded"}}'
+  exit 0
+fi
 [ ! -e "$ws/src/lib.rs.post" ] || { echo "oracle leaked into workspace" >&2; exit 91; }
 package="$(awk -F'"' '/^name = / { print $2; exit }' "$ws/Cargo.toml")"
 case "$package" in
-  pass_fixture)
+  pass_fixture|test_fail_fixture)
     printf '%s\n' 'pub fn repaired() -> i32 { 42 }' >"$ws/src/lib.rs"
     ;;
   mismatch_fixture)
@@ -95,7 +110,12 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
     let tmp = directory.path().join("tmp");
     fs::create_dir_all(&fixtures).unwrap();
     fs::create_dir_all(&tmp).unwrap();
-    for id in ["compile_fail_fixture", "mismatch_fixture", "pass_fixture"] {
+    for id in [
+        "compile_fail_fixture",
+        "mismatch_fixture",
+        "pass_fixture",
+        "test_fail_fixture",
+    ] {
         write_fixture(&fixtures, id);
     }
 
@@ -130,11 +150,14 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
     let report: LiveHoldoutReport =
         serde_json::from_str(&fs::read_to_string(report_path).unwrap()).unwrap();
     assert_eq!(report.schema_version, LIVE_HOLDOUT_REPORT_VERSION);
-    assert_eq!(report.overall.process.passes, 3);
-    assert_eq!(report.overall.compile_clean.passes, 2);
-    assert_eq!(report.overall.reference_match.passes, 1);
-    assert_eq!(report.overall.oracle.passes, 1);
+    assert_eq!(report.overall.process.passes, 4);
+    assert_eq!(report.overall.compile_clean.passes, 3);
+    assert_eq!(report.overall.tests_pass.passes, 1);
+    assert_eq!(report.overall.reference_match.passes, 2);
+    assert_eq!(report.overall.oracle.passes, 2);
     assert_eq!(report.overall.compile_clean_reference_mismatch.passes, 1);
+    assert_eq!(report.overall.compile_clean_tests_failed.passes, 2);
+    assert_eq!(report.overall.tests_pass_reference_mismatch.passes, 0);
 
     let by_id = report
         .observations
@@ -144,16 +167,45 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
     assert_eq!(by_id["pass_fixture"].failure_class, "pass");
     assert_eq!(
         by_id["mismatch_fixture"].failure_class,
-        "reference_mismatch"
+        "reference_mismatch_tests_failed"
     );
     assert_eq!(
         by_id["compile_fail_fixture"].failure_class,
         "process_claimed_success_but_compile_failed"
     );
+    assert_eq!(
+        by_id["test_fail_fixture"].failure_class,
+        "strict_pass_tests_failed"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("compile_clean_reference_mismatch=1/3"),
+        stdout.contains("compile_clean_reference_mismatch=1/4"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("compile_clean_tests_failed=2/4"),
+        "{stdout}"
+    );
+
+    let evidence = directory.path().join("observations.artifacts");
+    for id in [
+        "compile_fail_fixture",
+        "mismatch_fixture",
+        "pass_fixture",
+        "test_fail_fixture",
+    ] {
+        let attempt = evidence.join(id).join("rep-1");
+        for name in [
+            "run.log",
+            "final-target.rs",
+            "patch.diff",
+            "cargo-check.log",
+            "cargo-test.log",
+            "events.jsonl",
+            "metadata.json",
+        ] {
+            assert!(attempt.join(name).is_file(), "missing {id}/{name}");
+        }
+    }
 }
