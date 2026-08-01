@@ -18,7 +18,7 @@
 # Author: arkadianet
 set -u
 
-repo="$(cd "$(dirname "$0")/../.." && pwd)"
+repo="$(cd "$(dirname "$0")/../.." && pwd -P)"
 bundle="${1:?usage: prepare.sh <bundle-dir>}"
 
 die() { echo "prepare.sh: $1" >&2; exit 2; }
@@ -29,6 +29,22 @@ mapfile -t binaries < <(
 )
 
 content_sha() { sha256sum <"$1" | cut -d ' ' -f1; }
+
+# A bundle inside the repository would dirty the worktree with its own build
+# output — the very state this script refuses to build from. Reject the path
+# before anything is created or compiled.
+if [ -d "$bundle" ]; then
+  bundle_path="$(cd "$bundle" && pwd -P)"
+else
+  parent="$(dirname "$bundle")"
+  [ -d "$parent" ] || die "bundle parent directory does not exist: $parent"
+  bundle_path="$(cd "$parent" && pwd -P)/$(basename "$bundle")"
+fi
+case "$bundle_path" in
+  "$repo" | "$repo"/*)
+    die "bundle must live outside the repository $repo, got $bundle_path"
+    ;;
+esac
 
 # Refuse before creating anything: an existing bundle may still be the
 # provenance of a published matrix.

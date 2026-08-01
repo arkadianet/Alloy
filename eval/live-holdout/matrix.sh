@@ -84,14 +84,24 @@ for name in "${binaries[@]}"; do
 done
 bundle_sha256="$(content_sha "$manifest")"
 
-# The bundle pins the binaries; this checkout still supplies run.sh. Every arm
-# of one matrix shares that orchestration, so drift is a cross-matrix warning
-# rather than a within-matrix comparability failure.
+# The bundle pins the binaries, but this checkout still supplies run.sh, the
+# profiles, and the fixture corpus — the treatment and the oracle. Those must
+# be the bundle's commit, or the arms are not the harness the manifest names.
+# Unrelated working-tree edits elsewhere in the repository are not the harness
+# and do not block a run.
+treatment_paths=(eval/live-holdout profiles crates/alloy-eval/fixtures/holdout)
 head_revision="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
-if [ "$head_revision" != "$source_revision" ]; then
-  echo "matrix.sh: warning: orchestration checkout is at ${head_revision:-unknown}," \
-    "bundle was built from $source_revision" >&2
-fi
+[ -n "$head_revision" ] || die "cannot read the checkout revision at $repo"
+[ "$head_revision" = "$source_revision" ] ||
+  die "checkout is at revision $head_revision but the bundle was built from \
+$source_revision; check out that commit or rebuild the bundle"
+drift="$(git -C "$repo" status --porcelain --untracked-files=all \
+  -- "${treatment_paths[@]}" 2>/dev/null)" ||
+  die "cannot inspect ${treatment_paths[*]} for uncommitted changes"
+[ -z "$drift" ] ||
+  die "uncommitted changes to the harness (${treatment_paths[*]}) make this \
+checkout differ from $source_revision:
+$drift"
 
 # --- Output and arms: validated before any model work. ----------------------
 
