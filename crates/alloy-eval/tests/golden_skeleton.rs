@@ -58,7 +58,12 @@ async fn golden_train_control_plane_multi_turn_pass() {
 #[tokio::test]
 async fn golden_holdout_control_plane_pass() {
     let harness = EvalHarness::new(EvalHarnessConfig::milestone_holdout(fixture_root())).unwrap();
-    for (id, model_calls) in [("e0502_holdout_01", 1), ("e0502_holdout_02", 2)] {
+    for (id, model_calls) in [
+        ("e0308_holdout_01", 1),
+        ("e0382_holdout_01", 1),
+        ("e0502_holdout_01", 1),
+        ("e0502_holdout_02", 2),
+    ] {
         let id = FixtureId::new(id).unwrap();
         let fixture = harness.load_fixture(FixtureSet::Holdout, &id).unwrap();
         assert_eq!(fixture.manifest().driver, FixtureDriverKind::ControlPlane);
@@ -139,6 +144,8 @@ async fn turn_node_absent_in_day1_fixtures() {
     for (set, id) in [
         (FixtureSet::Train, "e0502_local_borrow"),
         (FixtureSet::Train, "e0502_train_control_01"),
+        (FixtureSet::Holdout, "e0308_holdout_01"),
+        (FixtureSet::Holdout, "e0382_holdout_01"),
         (FixtureSet::Holdout, "e0502_holdout_01"),
         (FixtureSet::Holdout, "e0502_holdout_02"),
     ] {

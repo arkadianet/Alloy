@@ -167,8 +167,9 @@ MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf' \
 Alloy is not aiming to become a chat-first general coding assistant. The
 roadmap after the vertical slice is:
 
-1. **Prove the control-plane thesis** — live holdout on E0502-class fixtures
-   with independent model outputs; offline scripted success is not enough.
+1. **Prove the control-plane thesis** — live holdout across borrow, move, and
+   type diagnostics with independent model outputs; offline scripted success
+   is not enough.
 2. **Reliability on the repair loop** — retries, escalation, line-ops,
    schema-constrained decoding, repair generations — measured via
    `eval/live-repair`, not vibes.

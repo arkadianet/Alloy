@@ -1,0 +1,13 @@
+{
+  "summary": "repair src/lib.rs so the crate compiles cleanly",
+  "target_files": ["src/lib.rs"],
+  "steps": [
+    {
+      "file": "src/lib.rs",
+      "rationale": "capture the vector length before consuming it",
+      "anchor_line": 1
+    }
+  ],
+  "needs_replan": false,
+  "confidence": 0.9
+}

@@ -1,0 +1,5 @@
+{
+  "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,4 +1,5 @@\n pub fn first_and_len(items: Vec<String>) -> (String, usize) {\n+    let len = items.len();\n     let first = items.into_iter().next().unwrap_or_default();\n-    (first, items.len())\n+    (first, len)\n }\n",
+  "summary": "capture the length before consuming the vector",
+  "confidence": 0.9
+}
