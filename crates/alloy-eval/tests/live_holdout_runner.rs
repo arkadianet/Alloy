@@ -1,7 +1,8 @@
 //! Offline integration coverage for the live-holdout shell contract.
 //!
-//! A stub replaces `alloy`; no model endpoint is contacted. The real runner,
-//! independent cargo post-check, Rust oracle, and scorer still execute.
+//! Stubs replace the `alloy` and naive drivers; no model endpoint is
+//! contacted. The real runner, independent cargo post-check, Rust oracle, and
+//! scorer still execute for both driver arms.
 
 #![cfg(unix)]
 
@@ -9,10 +10,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use alloy_eval::{live_holdout_target_path_text, LiveHoldoutReport, LIVE_HOLDOUT_REPORT_VERSION};
+use alloy_eval::{
+    live_holdout_target_path_text, LiveHoldoutDriver, LiveHoldoutReport,
+    LIVE_HOLDOUT_REPORT_VERSION,
+};
 
 const EVALUATOR: &str = env!("CARGO_BIN_EXE_alloy-eval-live-holdout");
 const SCORER: &str = env!("CARGO_BIN_EXE_alloy-eval-live-repair");
+const NAIVE_SOURCE_REVISION: &str = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
+const NAIVE_BUNDLE_SHA256: &str =
+    "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -70,6 +77,13 @@ fn write_fixture(root: &Path, id: &str) {
     .unwrap();
 }
 
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
 fn write_stub_alloy(path: &Path) {
     fs::write(
         path,
@@ -86,10 +100,13 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$ws" ] || { echo "missing workspace" >&2; exit 90; }
 if [ "$command" = "events" ]; then
+  printf '%s\n' '{"type":"model_call","payload":{"input_tokens":100,"output_tokens":20}}'
+  printf '%s\n' '{"type":"model_call","payload":{"output_tokens":5}}'
   printf '%s\n' '{"type":"run_completed","payload":{"dag_state":"succeeded"}}'
   exit 0
 fi
 [ ! -e "$ws/src/lib.rs.post" ] || { echo "oracle leaked into workspace" >&2; exit 91; }
+[ ! -e "$ws/tests" ] || { echo "hidden tests leaked into workspace" >&2; exit 93; }
 package="$(awk -F'"' '/^name = / { print $2; exit }' "$ws/Cargo.toml")"
 case "$package" in
   pass_fixture|test_fail_fixture)
@@ -109,11 +126,48 @@ esac
 "#,
     )
     .unwrap();
+    make_executable(path);
+}
 
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
+/// Stub for `alloy-eval-live-naive`: proves the runner hands the driver a
+/// clean workspace and pre-run diagnostics, then records one model call.
+fn write_stub_naive(path: &Path) {
+    fs::write(
+        path,
+        r#"#!/usr/bin/env bash
+set -u
+ws=""
+target=""
+diagnostics=""
+result=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --workspace) ws="$2"; shift 2 ;;
+    --target) target="$2"; shift 2 ;;
+    --diagnostics) diagnostics="$2"; shift 2 ;;
+    --result) result="$2"; shift 2 ;;
+    --goal|--model|--temperature|--base-url) shift 2 ;;
+    *) echo "unexpected argument $1" >&2; exit 90 ;;
+  esac
+done
+[ -n "$ws" ] && [ -n "$target" ] && [ -n "$diagnostics" ] && [ -n "$result" ] ||
+  { echo "missing required option" >&2; exit 90; }
+[ ! -e "$ws/$target.post" ] || { echo "oracle leaked into workspace" >&2; exit 91; }
+[ ! -e "$ws/tests" ] || { echo "hidden tests leaked into workspace" >&2; exit 92; }
+[ -s "$diagnostics" ] || { echo "no pre-run diagnostics at $diagnostics" >&2; exit 93; }
+grep -q '\.post' "$diagnostics" && { echo "diagnostics reference the oracle" >&2; exit 94; }
+printf '%s\n' 'pub fn repaired() -> i32 { 42 }' >"$ws/$target"
+printf '%s\n' \
+  '{"model_calls":1,"tokens_in":123,"tokens_out":45,"provider_request_id":"naive-1","finish_reason":"stop"}' \
+  >"$result"
+"#,
+    )
+    .unwrap();
+    make_executable(path);
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len && value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
 #[test]
@@ -182,6 +236,7 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
         .env("ALLOY", &alloy)
         .env("SCORER", SCORER)
         .env("EVAL_HOLDOUT", EVALUATOR)
+        .env("DRIVER", "alloy")
         .env("MODEL", "stub-model")
         .env("TEMP", "0.6")
         .env("PROFILE", "default")
@@ -211,6 +266,24 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
     assert_eq!(report.overall.compile_clean_reference_mismatch.passes, 1);
     assert_eq!(report.overall.compile_clean_tests_failed.passes, 2);
     assert_eq!(report.overall.tests_pass_reference_mismatch.passes, 0);
+
+    assert_eq!(report.endpoint.driver, LiveHoldoutDriver::Alloy);
+    assert_eq!(report.endpoint.profile.as_deref(), Some("default"));
+    assert!(
+        is_lower_hex(&report.endpoint.harness.source_revision, 40),
+        "{:?}",
+        report.endpoint.harness.source_revision
+    );
+    assert!(
+        is_lower_hex(&report.endpoint.harness.binary_bundle_sha256, 64),
+        "{:?}",
+        report.endpoint.harness.binary_bundle_sha256
+    );
+    // Two stub `model_call` events per attempt; the second reports output
+    // tokens only, so present fields sum and absent ones stay unknown.
+    assert_eq!(report.overall.model_calls_total, 8);
+    assert_eq!(report.overall.tokens_in_total, 400);
+    assert_eq!(report.overall.tokens_out_total, 100);
 
     let by_id = report
         .observations
@@ -251,6 +324,7 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
     ] {
         let attempt = evidence.join(id).join("rep-1");
         for name in [
+            "initial-cargo.log",
             "run.log",
             "final-target.rs",
             "patch.diff",
@@ -261,5 +335,102 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
         ] {
             assert!(attempt.join(name).is_file(), "missing {id}/{name}");
         }
+        assert!(
+            !attempt.join("naive-result.json").exists(),
+            "{id} must not carry naive evidence"
+        );
     }
+}
+
+#[test]
+fn naive_driver_shares_the_strict_oracle_pipeline() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixtures = directory.path().join("fixtures");
+    let tmp = directory.path().join("tmp");
+    fs::create_dir_all(&fixtures).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
+    write_fixture(&fixtures, "pass_fixture");
+
+    let naive = directory.path().join("stub-naive");
+    write_stub_naive(&naive);
+    let observations = directory.path().join("observations.jsonl");
+    let output = Command::new("bash")
+        .arg(repo_root().join("eval/live-holdout/run.sh"))
+        .arg(&observations)
+        .env("FIXTURES", &fixtures)
+        .env("DRIVER", "naive")
+        .env("NAIVE", &naive)
+        .env("EVAL_HOLDOUT", EVALUATOR)
+        .env("MODEL", "stub-model")
+        .env("TEMP", "0.6")
+        .env("BASEURL", "http://127.0.0.1:8089/v1/")
+        .env("SOURCE_REVISION", NAIVE_SOURCE_REVISION)
+        .env("BUNDLE_SHA256", NAIVE_BUNDLE_SHA256)
+        .env("REPS", "1")
+        .env("TIMEOUT", "60")
+        .env("TMPDIR", &tmp)
+        .output()
+        .expect("live-holdout runner");
+
+    assert!(
+        output.status.success(),
+        "naive runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: LiveHoldoutReport = serde_json::from_str(
+        &fs::read_to_string(directory.path().join("observations.report.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report.schema_version, LIVE_HOLDOUT_REPORT_VERSION);
+    assert_eq!(report.endpoint.driver, LiveHoldoutDriver::Naive);
+    assert_eq!(report.endpoint.profile, None);
+    assert_eq!(
+        report.endpoint.harness.source_revision,
+        NAIVE_SOURCE_REVISION
+    );
+    assert_eq!(
+        report.endpoint.harness.binary_bundle_sha256,
+        NAIVE_BUNDLE_SHA256
+    );
+    assert_eq!(report.overall.oracle.passes, 1);
+    assert_eq!(report.overall.tests_pass.passes, 1);
+    assert_eq!(report.overall.model_calls_total, 1);
+    assert_eq!(report.overall.tokens_in_total, 123);
+    assert_eq!(report.overall.tokens_out_total, 45);
+
+    let row = &report.observations[0];
+    assert_eq!(row.driver, LiveHoldoutDriver::Naive);
+    assert_eq!(row.profile, None);
+    assert_eq!(row.model_calls, 1);
+    assert_eq!(row.evidence_relpath, "pass_fixture/rep-1");
+    assert_eq!(row.failure_class, "pass");
+
+    let attempt = directory
+        .path()
+        .join("observations.artifacts")
+        .join(&row.evidence_relpath);
+    for name in [
+        "initial-cargo.log",
+        "run.log",
+        "final-target.rs",
+        "patch.diff",
+        "cargo-check.log",
+        "cargo-test.log",
+        "events.jsonl",
+        "naive-result.json",
+        "metadata.json",
+    ] {
+        assert!(
+            attempt.join(name).is_file(),
+            "missing naive evidence {name}"
+        );
+    }
+    // The naive arm has no event stream; the file exists so both arms keep
+    // one evidence layout.
+    assert_eq!(
+        fs::read_to_string(attempt.join("events.jsonl")).unwrap(),
+        ""
+    );
 }

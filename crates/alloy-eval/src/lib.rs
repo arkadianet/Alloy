@@ -66,9 +66,10 @@ pub use harness::{EvalHarness, EvalHarnessConfig, LoadedFixture, EVAL_MAX_CONCUR
 pub use live_holdout::{
     compare as compare_live_holdout, load_observations as load_live_holdout_observations,
     oracle as inspect_live_holdout, score as score_live_holdout,
-    target_path_text as live_holdout_target_path_text, Endpoint as LiveHoldoutEndpoint,
-    HarnessIdentity as LiveHoldoutHarnessIdentity, LiveHoldoutDriver,
-    MatrixComparison as LiveHoldoutMatrixComparison, OracleEvidence as LiveHoldoutOracleEvidence,
+    target_path_text as live_holdout_target_path_text, telemetry as live_holdout_telemetry,
+    Endpoint as LiveHoldoutEndpoint, HarnessIdentity as LiveHoldoutHarnessIdentity,
+    LiveHoldoutDriver, MatrixComparison as LiveHoldoutMatrixComparison,
+    OracleEvidence as LiveHoldoutOracleEvidence, RunTelemetry as LiveHoldoutRunTelemetry,
     StrictObservation as LiveHoldoutObservation,
     StrictObservationFields as LiveHoldoutObservationFields, StrictReport as LiveHoldoutReport,
     REPORT_SCHEMA_VERSION as LIVE_HOLDOUT_REPORT_VERSION,

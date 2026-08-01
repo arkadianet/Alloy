@@ -12,8 +12,8 @@ use std::process::ExitCode;
 
 use alloy_eval::{
     compare_live_holdout, inspect_live_holdout, live_holdout_target_path_text,
-    load_live_holdout_observations, score_live_holdout, LiveHoldoutDriver, LiveHoldoutEndpoint,
-    LiveHoldoutHarnessIdentity, LiveHoldoutOracleEvidence, LiveHoldoutReport,
+    live_holdout_telemetry, load_live_holdout_observations, score_live_holdout, LiveHoldoutDriver,
+    LiveHoldoutEndpoint, LiveHoldoutHarnessIdentity, LiveHoldoutOracleEvidence, LiveHoldoutReport,
     LIVE_HOLDOUT_REPORT_VERSION,
 };
 
@@ -26,6 +26,8 @@ USAGE:
       --run-log <path> --exit-code <n> --compile-clean <bool>
       --cargo-check-exit <n|null> --tests-pass <bool>
       --cargo-test-exit <n|null>
+  alloy-eval-live-holdout telemetry --driver <naive|alloy>
+      --input <naive-result.json|events.jsonl>
   alloy-eval-live-holdout score --fixtures <dir> --observations <path>
       --model <model> --temperature <n> --driver <naive|alloy>
       --profile <none|default|autonomous> --base-url <url>
@@ -59,6 +61,7 @@ fn run() -> Result<String, String> {
             ))
         }
         "oracle" => oracle(&options),
+        "telemetry" => telemetry(&options),
         "score" => score(&options),
         "compare" => compare(&options),
         "-h" | "--help" | "help" => Ok(format!("{USAGE}\n")),
@@ -151,6 +154,25 @@ fn oracle(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
         fields.repair_generations,
+    ))
+}
+
+fn optional_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_owned(), |count| count.to_string())
+}
+
+fn telemetry(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
+    let extracted = live_holdout_telemetry(
+        parse_driver(options)?,
+        &PathBuf::from(required(options, "input")?),
+    )?;
+    // Three-field TSV consumed by eval/live-holdout/run.sh, in order:
+    // model_calls, tokens_in, tokens_out. Unreported usage stays `null`.
+    Ok(format!(
+        "{}\t{}\t{}\n",
+        extracted.model_calls,
+        optional_count(extracted.tokens_in),
+        optional_count(extracted.tokens_out),
     ))
 }
 

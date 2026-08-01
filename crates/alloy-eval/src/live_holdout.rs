@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -63,8 +64,10 @@ pub struct StrictObservation {
     pub harness: HarnessIdentity,
     pub corpus: String,
     pub model_calls: u32,
-    pub tokens_in: u64,
-    pub tokens_out: u64,
+    /// Provider-reported usage, absent when the provider did not report it.
+    /// Unknown usage stays `null`; it never collapses to zero.
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -330,6 +333,103 @@ fn classify(
     "process_failed".to_owned()
 }
 
+/// Per-attempt model usage extracted from one driver's evidence file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunTelemetry {
+    pub model_calls: u32,
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
+}
+
+impl RunTelemetry {
+    /// No telemetry was recorded at all.
+    const UNRECORDED: Self = Self {
+        model_calls: 0,
+        tokens_in: None,
+        tokens_out: None,
+    };
+}
+
+#[derive(Debug, Deserialize)]
+struct NaiveResult {
+    model_calls: u32,
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
+}
+
+/// Read `input` and extract the driver's model-call and token telemetry.
+///
+/// A missing input file means the driver died before recording anything —
+/// that attempt is already a process failure, so usage stays unknown instead
+/// of failing the whole sweep. Malformed content is a harness error.
+pub fn telemetry(driver: LiveHoldoutDriver, input: &Path) -> Result<RunTelemetry, String> {
+    let raw = match fs::read_to_string(input) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(RunTelemetry::UNRECORDED),
+        Err(error) => return Err(format!("read {}: {error}", input.display())),
+    };
+    match driver {
+        LiveHoldoutDriver::Naive => naive_telemetry(&raw),
+        LiveHoldoutDriver::Alloy => alloy_telemetry(&raw),
+    }
+}
+
+fn naive_telemetry(raw: &str) -> Result<RunTelemetry, String> {
+    let result: NaiveResult =
+        serde_json::from_str(raw).map_err(|error| format!("parse naive telemetry: {error}"))?;
+    if result.model_calls != 1 {
+        return Err(format!(
+            "naive telemetry must record exactly one model call, got {}",
+            result.model_calls
+        ));
+    }
+    Ok(RunTelemetry {
+        model_calls: result.model_calls,
+        tokens_in: result.tokens_in,
+        tokens_out: result.tokens_out,
+    })
+}
+
+/// Count `model_call` events and sum the token fields the provider reported.
+/// An empty export means the event dump produced nothing; it is reported as
+/// zero calls with unknown usage rather than invented numbers.
+fn alloy_telemetry(raw: &str) -> Result<RunTelemetry, String> {
+    let mut telemetry = RunTelemetry::UNRECORDED;
+    for (index, line) in raw
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+    {
+        let number = index + 1;
+        let event: serde_json::Value =
+            serde_json::from_str(line).map_err(|error| format!("event line {number}: {error}"))?;
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("model_call") {
+            continue;
+        }
+        telemetry.model_calls = telemetry.model_calls.saturating_add(1);
+        let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+        add_usage(&mut telemetry.tokens_in, payload, "input_tokens", number)?;
+        add_usage(&mut telemetry.tokens_out, payload, "output_tokens", number)?;
+    }
+    Ok(telemetry)
+}
+
+fn add_usage(
+    total: &mut Option<u64>,
+    payload: &serde_json::Value,
+    field: &str,
+    line: usize,
+) -> Result<(), String> {
+    let Some(value) = payload.get(field).filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let count = value
+        .as_u64()
+        .ok_or_else(|| format!("event line {line}: {field} must be a non-negative integer"))?;
+    *total = Some(total.unwrap_or(0).saturating_add(count));
+    Ok(())
+}
+
 pub fn load_observations(path: &Path) -> Result<Vec<StrictObservation>, String> {
     let source =
         fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -395,8 +495,10 @@ fn summarize_fixture(id: &str, rows: &[StrictObservation]) -> FixtureSummary {
         repair_generations_total: rows.iter().map(|row| row.repair_generations).sum(),
         wall_ms_total: rows.iter().map(|row| row.wall_ms).sum(),
         model_calls_total: rows.iter().map(|row| u64::from(row.model_calls)).sum(),
-        tokens_in_total: rows.iter().map(|row| row.tokens_in).sum(),
-        tokens_out_total: rows.iter().map(|row| row.tokens_out).sum(),
+        // Totals sum reported usage only; rows with unknown usage contribute
+        // nothing rather than a fabricated zero.
+        tokens_in_total: rows.iter().filter_map(|row| row.tokens_in).sum(),
+        tokens_out_total: rows.iter().filter_map(|row| row.tokens_out).sum(),
     }
 }
 
@@ -423,6 +525,14 @@ pub fn score(
         }
         if !endpoint_matches(row, &endpoint) {
             return Err(format!("harness identity mismatch for {}", row.fixture_id));
+        }
+        // The naive arm is one completion with no retries; a failed attempt
+        // may record none, but two would make it a different driver.
+        if row.driver == LiveHoldoutDriver::Naive && row.model_calls > 1 {
+            return Err(format!(
+                "naive driver recorded {} model calls for {}, expected at most one",
+                row.model_calls, row.fixture_id
+            ));
         }
         if row.process_pass != (row.exit_code == 0)
             || (row.compile_clean && row.cargo_check_exit != Some(0))
@@ -682,8 +792,8 @@ mod tests {
             harness: endpoint.harness,
             corpus: CORPUS.to_owned(),
             model_calls: 1,
-            tokens_in: 100,
-            tokens_out: 50,
+            tokens_in: Some(100),
+            tokens_out: Some(50),
         }
     }
 
@@ -776,6 +886,103 @@ mod tests {
         assert_eq!(report.overall.model_calls_total, 4);
         assert_eq!(report.overall.tokens_in_total, 400);
         assert_eq!(report.overall.tokens_out_total, 200);
+    }
+
+    #[test]
+    fn score_totals_skip_unreported_usage_without_inventing_zero() {
+        let fixtures = fixtures_with(&["a"]);
+        let mut row = observation("a", 1);
+        row.tokens_in = None;
+        row.tokens_out = None;
+        let report = score(fixtures.path(), vec![row], endpoint(), 1).unwrap();
+        assert_eq!(report.overall.model_calls_total, 1);
+        assert_eq!(report.overall.tokens_in_total, 0);
+        assert_eq!(report.observations[0].tokens_in, None);
+    }
+
+    #[test]
+    fn score_rejects_naive_rows_with_more_than_one_model_call() {
+        let fixtures = fixtures_with(&["a"]);
+        let endpoint = Endpoint {
+            driver: LiveHoldoutDriver::Naive,
+            profile: None,
+            ..endpoint()
+        };
+        let mut row = observation("a", 1);
+        row.driver = LiveHoldoutDriver::Naive;
+        row.profile = None;
+        row.model_calls = 2;
+        let error = score(fixtures.path(), vec![row], endpoint, 1).unwrap_err();
+        assert!(
+            error.contains("naive driver recorded 2 model calls"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn alloy_telemetry_counts_calls_and_sums_reported_usage() {
+        let events = concat!(
+            r#"{"type":"model_call","payload":{"input_tokens":100,"output_tokens":20}}"#,
+            "\n",
+            r#"{"type":"model_call","payload":{"output_tokens":5,"input_tokens":null}}"#,
+            "\n",
+            r#"{"type":"run_completed","payload":{"dag_state":"succeeded"}}"#,
+            "\n",
+        );
+        assert_eq!(
+            alloy_telemetry(events).unwrap(),
+            RunTelemetry {
+                model_calls: 2,
+                tokens_in: Some(100),
+                tokens_out: Some(25),
+            }
+        );
+    }
+
+    #[test]
+    fn alloy_telemetry_keeps_absent_usage_unknown_and_rejects_malformed_events() {
+        let without_usage = "{\"type\":\"model_call\",\"payload\":{}}\n";
+        assert_eq!(
+            alloy_telemetry(without_usage).unwrap(),
+            RunTelemetry {
+                model_calls: 1,
+                tokens_in: None,
+                tokens_out: None,
+            }
+        );
+        assert_eq!(alloy_telemetry("").unwrap(), RunTelemetry::UNRECORDED);
+        assert!(alloy_telemetry("not json\n").is_err());
+        assert!(
+            alloy_telemetry("{\"type\":\"model_call\",\"payload\":{\"input_tokens\":-3}}\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn naive_telemetry_requires_exactly_one_model_call() {
+        let one = r#"{"model_calls":1,"tokens_in":123,"tokens_out":45,"finish_reason":"stop"}"#;
+        assert_eq!(
+            naive_telemetry(one).unwrap(),
+            RunTelemetry {
+                model_calls: 1,
+                tokens_in: Some(123),
+                tokens_out: Some(45),
+            }
+        );
+        let unknown_usage = r#"{"model_calls":1,"tokens_in":null,"tokens_out":null}"#;
+        assert_eq!(naive_telemetry(unknown_usage).unwrap().tokens_in, None);
+        assert!(naive_telemetry(r#"{"model_calls":2}"#).is_err());
+        assert!(naive_telemetry("{}").is_err());
+    }
+
+    #[test]
+    fn telemetry_treats_a_missing_evidence_file_as_unrecorded() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("naive-result.json");
+        assert_eq!(
+            telemetry(LiveHoldoutDriver::Naive, &missing).unwrap(),
+            RunTelemetry::UNRECORDED
+        );
     }
 
     #[test]
