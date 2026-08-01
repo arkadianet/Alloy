@@ -56,3 +56,9 @@ required-features = ["live-naive"]
 [[test]]
 name = "live_naive_runner"
 required-features = ["live-naive"]
+
+# The bundle contract names the feature-gated naive binary, so the shell
+# matrix suite runs in the same configuration operators build.
+[[test]]
+name = "live_holdout_matrix"
+required-features = ["live-naive"]
