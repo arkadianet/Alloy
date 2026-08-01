@@ -64,8 +64,8 @@ pub use adapters::{
 // EditAppliedPayload`) is deliberately not re-exported here: the crate root
 // already exports RFC-0008's session-event payload of the same name.
 pub use capabilities::{
-    system_instruction_digest, truncation_marker, Capability, CapabilityContext,
-    CapabilityDescriptor, CapabilityRegistry, CapabilityVersion, EditWorker,
+    repair_response_schema, system_instruction_digest, truncation_marker, Capability,
+    CapabilityContext, CapabilityDescriptor, CapabilityRegistry, CapabilityVersion, EditWorker,
     PlanningProposalPayload, PlanningWorker, ProcessRunRouterProvider, RegError,
     RegistryCapabilityExecutor, RepairPlanPayload, RepairStep, RepairWorker, ResolveHints,
     ReviewFinding, ReviewPayload, ReviewSeverity, ReviewVerdict, ReviewWorker, RunRouterProvider,
@@ -138,8 +138,8 @@ pub use router::{
     JsonSchemaSpec, ModelEndpoint, ModelProvider, ModelResponse, ModelRouter, PromptPack,
     ProviderConfig, ProviderError, ProviderKind, RecordingModelProvider, ResponseFormat,
     RoutedModel, RouterConfig, RouterError, RouterMetricsSnapshot, RouterPolicy,
-    RouterShutdownReport, RoutingRequest, ScoringWeights, SecretString, TomlModelRouter,
-    TomlModelRouterParts, ToolChoice, Usage,
+    RouterShutdownReport, RoutingRequest, ScoringWeights, SecretString, TimeoutStage,
+    TomlModelRouter, TomlModelRouterParts, ToolChoice, Usage,
 };
 #[cfg(feature = "http-provider")]
 pub use router::{OpenAiCompatibleProvider, OpenAiCompatibleSpec};

@@ -22,6 +22,9 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+/// Exact-contract BYOM preflight (E2): both arms' wire contracts, live.
+#[cfg(feature = "live-naive")]
+mod byom_preflight;
 /// Cost claim envelope and USD derivation.
 mod cost_claim;
 mod driver;
@@ -55,6 +58,13 @@ mod scripted;
 /// Eval-local trajectory retention.
 mod trajectory;
 
+#[cfg(feature = "live-naive")]
+pub use byom_preflight::{
+    alloy_contract as byom_alloy_contract, evaluate as evaluate_byom_preflight,
+    naive_contract as byom_naive_contract, run as run_byom_preflight, schema_digest, spec_digest,
+    ArmContract, ContractArm, ContractProbe, PreflightFailure, PreflightReport, PreflightSpec,
+    ProviderFailure, WireMode, PREFLIGHT_SCHEMA_VERSION,
+};
 pub use cost_claim::{CostClaimEnvelope, CostClaimGrade, COST_DISCLAIMER};
 pub use error::{EvalError, ReportError};
 pub use fingerprint::RequestFingerprint;
@@ -77,8 +87,8 @@ pub use live_holdout::{
 #[cfg(feature = "live-naive")]
 pub use live_naive::{
     build_naive_request, parse_replacement, resolve_target, write_replacement,
-    write_resolved_replacement, NaiveReplacement, NaiveRunTelemetry, MAX_REPLACEMENT_BYTES,
-    NAIVE_SCHEMA_NAME,
+    write_resolved_replacement, NaiveReplacement, NaiveRunTelemetry, DEFAULT_CONNECT_TIMEOUT_MS,
+    DEFAULT_REQUEST_TIMEOUT_MS, MAX_REPLACEMENT_BYTES, NAIVE_SCHEMA_NAME,
 };
 pub use live_repair::{
     parse_observations_jsonl, render_router_toml, wilson_interval, LiveRepairCorpus,

@@ -9,14 +9,29 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
-use alloy_runtime::{ChatMessage, ChatRole, CompletionRequest, ResponseFormat, ToolChoice};
+use alloy_runtime::{
+    ChatMessage, ChatRole, CompletionRequest, ModelResponse, ProviderError, ResponseFormat,
+    ToolChoice,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::byom_preflight::{ProviderFailure, WireMode};
 
 /// Wire schema name carried on `response_format.json_schema.name`.
 pub const NAIVE_SCHEMA_NAME: &str = "alloy_naive_replacement";
 /// Replacement content must not exceed this many bytes.
 pub const MAX_REPLACEMENT_BYTES: usize = 1024 * 1024;
+/// Default whole-request deadline for the one permitted call.
+///
+/// Matches the Alloy arm's rendered `router.toml` deadline so a slow but
+/// healthy model is not aborted by the baseline arm alone. The previous
+/// hardcoded 120 s was shorter than the shell harness's 600 s budget, so a
+/// slow 30B answer surfaced as "telemetry incomplete" instead of a timeout.
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = crate::live_repair::LIVE_REPAIR_REQUEST_TIMEOUT_MS;
+/// Default connect deadline for the one permitted call.
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 const SYSTEM_PROMPT: &str = "You are given one Rust source file to repair. \
 You have exactly one attempt: no tools, no repository access beyond what is \
@@ -31,18 +46,76 @@ pub struct NaiveReplacement {
 }
 
 /// Bounded telemetry recorded from the one permitted model call.
+///
+/// One record is written for **every** attempt that reached the provider,
+/// successful or not. A timeout is a spent call, so it is reported as a
+/// timeout with its stage rather than as missing telemetry (E2 §d).
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NaiveRunTelemetry {
-    /// Always 1: exactly one completion is permitted.
+    /// Always 1: exactly one completion is permitted, and an attempt that
+    /// timed out still consumed it.
     pub model_calls: u32,
-    /// Provider-reported input token count, when present.
+    /// Provider-reported input token count. `None` means unknown — the
+    /// provider omitted or malformed it — and is never rendered as zero.
     pub tokens_in: Option<u64>,
-    /// Provider-reported output token count, when present.
+    /// Provider-reported output token count. `None` means unknown.
     pub tokens_out: Option<u64>,
     /// Redacted, bounded provider request identifier.
     pub provider_request_id: Option<String>,
     /// Redacted, bounded provider finish reason.
     pub finish_reason: Option<String>,
+    /// Wire `response_format` mode this attempt actually used.
+    #[serde(default = "default_wire_mode")]
+    pub wire_mode: String,
+    /// Whole-request deadline the attempt ran under, in milliseconds.
+    #[serde(default)]
+    pub request_timeout_ms: u64,
+    /// Populated when the single call failed; `None` on success.
+    #[serde(default)]
+    pub failure: Option<ProviderFailure>,
+}
+
+fn default_wire_mode() -> String {
+    WireMode::JsonSchema.as_str().to_owned()
+}
+
+impl NaiveRunTelemetry {
+    /// Record the one successful call.
+    #[must_use]
+    pub fn from_response(response: &ModelResponse, request_timeout: Duration) -> Self {
+        Self {
+            model_calls: 1,
+            tokens_in: response.usage.input_tokens,
+            tokens_out: response.usage.output_tokens,
+            provider_request_id: response.provider_request_id.clone(),
+            finish_reason: response.finish_reason.clone(),
+            wire_mode: default_wire_mode(),
+            request_timeout_ms: millis(request_timeout),
+            failure: None,
+        }
+    }
+
+    /// Record the one call that failed.
+    ///
+    /// Usage stays unknown: a failed attempt reports no tokens, and inventing
+    /// zeros would read as a measured zero-token call.
+    #[must_use]
+    pub fn from_failure(error: &ProviderError, request_timeout: Duration) -> Self {
+        Self {
+            model_calls: 1,
+            tokens_in: None,
+            tokens_out: None,
+            provider_request_id: None,
+            finish_reason: None,
+            wire_mode: default_wire_mode(),
+            request_timeout_ms: millis(request_timeout),
+            failure: Some(ProviderFailure::classify(error)),
+        }
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn replacement_schema() -> serde_json::Value {
@@ -303,6 +376,103 @@ mod tests {
             .filter_map(Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().contains(".tmp"));
         assert!(!leftover, "no sibling temp file must remain");
+    }
+
+    /// E2 (b) — a provider that omits usage must leave `tokens_in` /
+    /// `tokens_out` null all the way into the result file. A zero there would
+    /// be read as a measured zero-token call.
+    #[test]
+    fn absent_usage_stays_null_in_the_result_file() {
+        let response = ModelResponse {
+            text: Some("{\"replacement\":\"x\"}".to_owned()),
+            structured: None,
+            tool_calls: vec![],
+            usage: alloy_runtime::Usage {
+                input_tokens: None,
+                output_tokens: None,
+            },
+            provider_request_id: None,
+            finish_reason: Some("stop".to_owned()),
+        };
+        let telemetry = NaiveRunTelemetry::from_response(&response, Duration::from_secs(600));
+        assert_eq!(telemetry.model_calls, 1);
+        assert_eq!(telemetry.tokens_in, None);
+        assert_eq!(telemetry.tokens_out, None);
+        assert_eq!(telemetry.request_timeout_ms, 600_000);
+        assert!(telemetry.failure.is_none());
+
+        let json = serde_json::to_value(&telemetry).unwrap();
+        assert!(json["tokens_in"].is_null());
+        assert!(json["tokens_out"].is_null());
+        assert_eq!(json["wire_mode"], "json_schema");
+
+        // A provider that genuinely reports usage keeps it verbatim.
+        let measured = ModelResponse {
+            usage: alloy_runtime::Usage {
+                input_tokens: Some(0),
+                output_tokens: Some(7),
+            },
+            ..response
+        };
+        let telemetry = NaiveRunTelemetry::from_response(&measured, Duration::from_secs(600));
+        assert_eq!(telemetry.tokens_in, Some(0));
+        assert_eq!(telemetry.tokens_out, Some(7));
+    }
+
+    /// E2 (d) — a timed-out attempt still spent the one permitted call, so it
+    /// is recorded as one call that timed out, naming the stage. Reporting it
+    /// as missing telemetry would blame the harness for a provider deadline.
+    #[test]
+    fn timeout_is_recorded_as_a_spent_call_with_its_stage() {
+        let telemetry = NaiveRunTelemetry::from_failure(
+            &ProviderError::TimeoutAt {
+                stage: alloy_runtime::TimeoutStage::Read,
+            },
+            Duration::from_millis(600_000),
+        );
+        assert_eq!(
+            telemetry.model_calls, 1,
+            "the call was spent even though it produced nothing"
+        );
+        assert_eq!(telemetry.tokens_in, None);
+        assert_eq!(telemetry.tokens_out, None);
+        let failure = telemetry.failure.as_ref().expect("failure is recorded");
+        assert_eq!(failure.kind, "timeout");
+        assert_eq!(failure.error_class, "timeout");
+        assert_eq!(failure.timeout_stage.as_deref(), Some("read"));
+        assert_eq!(telemetry.request_timeout_ms, 600_000);
+
+        // The document round-trips, and remains parseable by the holdout
+        // reader, which requires exactly one model call.
+        let text = serde_json::to_string(&telemetry).unwrap();
+        let parsed: NaiveRunTelemetry = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed, telemetry);
+        let loose: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(loose["model_calls"], 1);
+
+        // An HTTP failure keeps its status instead of collapsing to a timeout.
+        let http = NaiveRunTelemetry::from_failure(
+            &ProviderError::HttpStatus {
+                status: 503,
+                message: "unavailable".to_owned(),
+            },
+            Duration::from_secs(600),
+        );
+        let failure = http.failure.as_ref().unwrap();
+        assert_eq!(failure.kind, "http_status");
+        assert_eq!(failure.http_status, Some(503));
+        assert_eq!(failure.timeout_stage, None);
+    }
+
+    /// The naive arm's default deadline must not be tighter than the Alloy
+    /// arm's, or the baseline aborts on responses the agent arm tolerates.
+    #[test]
+    fn default_request_timeout_matches_the_alloy_arm() {
+        assert_eq!(
+            DEFAULT_REQUEST_TIMEOUT_MS,
+            crate::LIVE_REPAIR_REQUEST_TIMEOUT_MS
+        );
+        const { assert!(DEFAULT_CONNECT_TIMEOUT_MS < DEFAULT_REQUEST_TIMEOUT_MS) };
     }
 
     #[test]

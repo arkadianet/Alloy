@@ -8,7 +8,7 @@ use alloy_runtime::{
     CompletionRequest, ModelEndpoint, ModelProvider, ModelRouter, ModelTier, ModelUsdSource,
     OpenAiCompatibleProvider, OpenAiCompatibleSpec, PromptPack, ProviderError, ProviderId,
     RecordingDecisionLog, ResponseFormat, RetentionPolicy, RouterConfig, RouterError,
-    RoutingRequest, RunId, SecretString, SessionId, SharedCostMeter, TomlModelRouter,
+    RoutingRequest, RunId, SecretString, SessionId, SharedCostMeter, TimeoutStage, TomlModelRouter,
     TomlModelRouterParts, ToolChoice,
 };
 use serde_json::json;
@@ -285,12 +285,15 @@ async fn openai_timeout() {
         .await;
     let provider = http_provider(format!("{}/v1", server.uri()), Duration::from_millis(20));
 
-    assert!(matches!(
-        provider
-            .complete(&endpoint(), completion_request(ResponseFormat::Text))
-            .await,
-        Err(ProviderError::Timeout)
-    ));
+    // E2 (a): the connection succeeded and the deadline expired waiting for
+    // response headers, so the retained error must name the REQUEST stage
+    // rather than an unattributed "timeout".
+    let error = provider
+        .complete(&endpoint(), completion_request(ResponseFormat::Text))
+        .await
+        .expect_err("delayed response must time out");
+    assert!(error.is_timeout(), "{error}");
+    assert_eq!(error.timeout_stage(), Some(TimeoutStage::Request));
 }
 
 #[tokio::test]

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use alloy_eval::{
     build_naive_request, parse_replacement, resolve_target, write_resolved_replacement,
-    NaiveRunTelemetry,
+    NaiveRunTelemetry, DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS,
 };
 use alloy_runtime::{
     EndpointId, ModelEndpoint, ModelProvider, ModelTier, OpenAiCompatibleProvider,
@@ -30,17 +30,42 @@ alloy-eval-live-naive — one-shot, tool-free naive replacement driver
 USAGE:
   alloy-eval-live-naive --workspace <dir> --target <relative-path> \\
     --diagnostics <path> --goal <text> --model <id> --temperature <f64> \\
-    --base-url <url> --result <json-path>
+    --base-url <url> --result <json-path> \\
+    [--request-timeout-ms <u64>] [--connect-timeout-ms <u64>]
+
+Deadlines default to the Alloy arm's rendered router.toml values so the two
+arms tolerate the same response latency. A provider failure still writes the
+result file — the call was spent — and exits 3; usage/exit 2 problems exit 2.
 
 Reads ALLOY_API_KEY from the process environment; never logs it.";
+
+/// The single call reached the provider and failed. Telemetry was written.
+const EXIT_PROVIDER_FAILED: u8 = 3;
 
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
+        Err(Failure::Harness(error)) => {
             eprintln!("alloy-eval-live-naive: {error}");
             ExitCode::from(2)
         }
+        Err(Failure::Provider(error)) => {
+            eprintln!("alloy-eval-live-naive: {error}");
+            ExitCode::from(EXIT_PROVIDER_FAILED)
+        }
+    }
+}
+
+/// Separates "the harness could not run the attempt" from "the attempt ran
+/// and the provider failed". Only the latter has spent telemetry to report.
+enum Failure {
+    Harness(String),
+    Provider(String),
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::Harness(message)
     }
 }
 
@@ -69,7 +94,32 @@ fn required<'a>(options: &'a BTreeMap<String, String>, key: &str) -> Result<&'a 
         .ok_or_else(|| format!("missing required option --{key}\n{USAGE}"))
 }
 
-fn run() -> Result<(), String> {
+fn write_telemetry(path: &PathBuf, telemetry: &NaiveRunTelemetry) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(telemetry)
+        .map_err(|error| format!("serialize telemetry: {error}"))?;
+    fs::write(path, format!("{json}\n"))
+        .map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+/// Parse an optional millisecond deadline, defaulting when absent.
+fn optional_millis(
+    options: &BTreeMap<String, String>,
+    key: &str,
+    default_ms: u64,
+) -> Result<Duration, String> {
+    let Some(raw) = options.get(key) else {
+        return Ok(Duration::from_millis(default_ms));
+    };
+    let millis: u64 = raw
+        .parse()
+        .map_err(|_| format!("--{key} must be a non-negative integer of milliseconds"))?;
+    if millis == 0 {
+        return Err(format!("--{key} must be greater than zero"));
+    }
+    Ok(Duration::from_millis(millis))
+}
+
+fn run() -> Result<(), Failure> {
     let options = parse_options(std::env::args().skip(1).collect())?;
     let workspace = PathBuf::from(required(&options, "workspace")?);
     let target = required(&options, "target")?.to_owned();
@@ -81,6 +131,10 @@ fn run() -> Result<(), String> {
         .map_err(|_| "--temperature must be a number".to_owned())?;
     let base_url = required(&options, "base-url")?.to_owned();
     let result_path = PathBuf::from(required(&options, "result")?);
+    let request_timeout =
+        optional_millis(&options, "request-timeout-ms", DEFAULT_REQUEST_TIMEOUT_MS)?;
+    let connect_timeout =
+        optional_millis(&options, "connect-timeout-ms", DEFAULT_CONNECT_TIMEOUT_MS)?;
 
     // Validate the target before it is read: an absolute or traversal path
     // must never reach the network, even embedded read-only in the prompt.
@@ -121,32 +175,44 @@ fn run() -> Result<(), String> {
         id: endpoint.provider.clone(),
         base_url,
         api_key: SecretString::new(api_key),
-        connect_timeout: Duration::from_secs(10),
-        request_timeout: Duration::from_secs(120),
+        connect_timeout,
+        request_timeout,
     })
     .map_err(|error| format!("provider: {error}"))?;
 
-    let response = tokio::runtime::Builder::new_current_thread()
+    let outcome = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("build async runtime: {error}"))?
-        .block_on(provider.complete(&endpoint, request))
-        .map_err(|error| format!("completion: {error}"))?;
+        .block_on(provider.complete(&endpoint, request));
 
     // The call is spent — and billed — the moment it returns, so record it
-    // before anything that can still fail. A malformed reply must not make a
-    // real model call disappear from the arm's telemetry.
-    let telemetry = NaiveRunTelemetry {
-        model_calls: 1,
-        tokens_in: response.usage.input_tokens,
-        tokens_out: response.usage.output_tokens,
-        provider_request_id: response.provider_request_id,
-        finish_reason: response.finish_reason,
+    // before anything that can still fail. A malformed reply, and a deadline
+    // that expired mid-flight, must not make a real model call disappear from
+    // the arm's telemetry: a timeout is reported as a timeout with its stage,
+    // never as "telemetry incomplete".
+    let response = match outcome {
+        Ok(response) => {
+            write_telemetry(
+                &result_path,
+                &NaiveRunTelemetry::from_response(&response, request_timeout),
+            )?;
+            response
+        }
+        Err(error) => {
+            let telemetry = NaiveRunTelemetry::from_failure(&error, request_timeout);
+            let stage = telemetry
+                .failure
+                .as_ref()
+                .and_then(|failure| failure.timeout_stage.clone())
+                .unwrap_or_else(|| "n/a".to_owned());
+            write_telemetry(&result_path, &telemetry)?;
+            return Err(Failure::Provider(format!(
+                "completion failed after {}ms budget: {error} (timeout_stage={stage})",
+                request_timeout.as_millis()
+            )));
+        }
     };
-    let json = serde_json::to_string_pretty(&telemetry)
-        .map_err(|error| format!("serialize telemetry: {error}"))?;
-    fs::write(&result_path, format!("{json}\n"))
-        .map_err(|error| format!("write {}: {error}", result_path.display()))?;
 
     let text = response
         .text
