@@ -508,6 +508,33 @@ fn yes_auto_approves_and_completes() {
     assert!(main_rs.contains("let x: i32 = 42;"));
 }
 
+#[test]
+fn compile_clean_intended_fix_mismatch_is_not_reported_as_verified() {
+    let Some(e2e) = setup() else { return };
+
+    let (code, doc, stderr) = e2e.run_json(&[
+        "run",
+        "change src/main.rs to use the integer 41",
+        "--yes",
+        "--json",
+    ]);
+    if is_environment_skip(code, &stderr) {
+        return;
+    }
+    assert_eq!(code, Some(0), "repair run failed: {stderr}\n{doc}");
+    assert_eq!(doc["verification"]["compile"], "passed");
+    assert_eq!(
+        doc["verification"]["intended_fix"],
+        "not_independently_verified"
+    );
+
+    let main_rs = std::fs::read_to_string(e2e.ws.path().join("src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains("let x: i32 = 42;"),
+        "scripted repair unexpectedly satisfied the requested value: {main_rs}"
+    );
+}
+
 /// AM-0013-1: the line-ops form of `edit_response_json` — no hunk headers,
 /// just the 1-based line numbers of the fixture's `src/main.rs` with the
 /// replaced line repeated in `expect` as the honesty guard. The

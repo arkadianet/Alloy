@@ -86,7 +86,9 @@ fn missing_profile_names_both_recovery_paths() {
         .args(["index", "--stats"])
         .assert()
         .code(3)
-        .stderr(predicate::str::contains("profiles/"))
+        .stderr(predicate::str::contains(
+            "copy the shipped profiles/ directory into the workspace or set ALLOY_PROFILE to an absolute profile path",
+        ))
         .stderr(predicate::str::contains("ALLOY_PROFILE"))
-        .stderr(predicate::str::contains("./profiles/default.toml"));
+        .stderr(predicate::str::contains("profiles/default.toml"));
 }

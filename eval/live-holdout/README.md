@@ -47,15 +47,15 @@ The runner records independent layers:
 * `compile_clean` — an independent offline `cargo check --offline` passed.
 * `tests_pass` — hidden fixture-owned semantic tests, copied in only after the
   model run, passed under `cargo test --offline`.
-* `oracle_pass` — the process exited `0`, an independent offline `cargo check
-  --offline` is clean, and the final target file exactly matches the fixture's
-  committed `<target>.post` reference. The reference is removed from the
-  temporary workspace before the model runs, so it is not a hidden prompt.
+* `oracle_pass` — the process exited `0`, independent offline `cargo check` and
+  hidden semantic tests passed, and the final target file exactly matches the
+  fixture's committed `<target>.post` reference. The reference is removed from
+  the temporary workspace before the model runs, so it is not a hidden prompt.
 
-Semantic tests are diagnostic evidence and do not replace or relax the strict
-oracle. A compile-clean mismatch that fails tests is a detected likely morph; a
-mismatch that passes tests is a plausible alternate repair that still remains a
-strict-reference failure.
+Semantic tests are required independent evidence and do not replace or relax
+the strict reference match. A compile-clean mismatch that fails tests is a
+detected likely morph; a mismatch that passes tests is a plausible alternate
+repair that still remains a strict-reference failure.
 
 The reference match is intentionally strict for this small RFC-0016 corpus. It
 is what exposes a compiling but semantically wrong morph such as changing E0502

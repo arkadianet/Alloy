@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use alloy_eval::{LiveHoldoutReport, LIVE_HOLDOUT_REPORT_VERSION};
+use alloy_eval::{live_holdout_target_path_text, LiveHoldoutReport, LIVE_HOLDOUT_REPORT_VERSION};
 
 const EVALUATOR: &str = env!("CARGO_BIN_EXE_alloy-eval-live-holdout");
 const SCORER: &str = env!("CARGO_BIN_EXE_alloy-eval-live-repair");
@@ -19,6 +19,19 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("repository root")
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }
 
 fn write_fixture(root: &Path, id: &str) {
@@ -104,6 +117,46 @@ esac
 }
 
 #[test]
+fn committed_post_references_pass_hidden_oracles() {
+    let fixtures = repo_root().join("crates/alloy-eval/fixtures/holdout");
+    let mut fixture_dirs = fs::read_dir(&fixtures)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    fixture_dirs.sort();
+
+    for fixture in fixture_dirs {
+        let manifest = fixture.join("manifest.toml");
+        let target =
+            PathBuf::from(live_holdout_target_path_text(&manifest).expect("fixture target path"));
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        copy_tree(&fixture.join("workspace"), &workspace);
+        fs::copy(
+            workspace.join(format!("{}.post", target.display())),
+            workspace.join(&target),
+        )
+        .unwrap();
+        fs::remove_file(workspace.join(format!("{}.post", target.display()))).unwrap();
+        copy_tree(&fixture.join("oracle-tests"), &workspace.join("tests"));
+
+        let output = Command::new("cargo")
+            .args(["test", "--offline", "--quiet"])
+            .current_dir(&workspace)
+            .env("CARGO_TARGET_DIR", directory.path().join("target"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} hidden oracle failed for its committed .post\n{}",
+            fixture.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn runner_preserves_process_compile_reference_and_strict_results() {
     let directory = tempfile::tempdir().unwrap();
     let fixtures = directory.path().join("fixtures");
@@ -154,7 +207,7 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
     assert_eq!(report.overall.compile_clean.passes, 3);
     assert_eq!(report.overall.tests_pass.passes, 1);
     assert_eq!(report.overall.reference_match.passes, 2);
-    assert_eq!(report.overall.oracle.passes, 2);
+    assert_eq!(report.overall.oracle.passes, 1);
     assert_eq!(report.overall.compile_clean_reference_mismatch.passes, 1);
     assert_eq!(report.overall.compile_clean_tests_failed.passes, 2);
     assert_eq!(report.overall.tests_pass_reference_mismatch.passes, 0);
@@ -177,6 +230,7 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
         by_id["test_fail_fixture"].failure_class,
         "strict_pass_tests_failed"
     );
+    assert!(!by_id["test_fail_fixture"].oracle_pass);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(

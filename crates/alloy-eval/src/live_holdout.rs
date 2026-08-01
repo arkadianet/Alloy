@@ -201,7 +201,7 @@ pub fn oracle(
         compile_clean,
         tests_pass,
         reference_match,
-        oracle_pass: exit_code == 0 && postcheck_clean && reference_match,
+        oracle_pass: exit_code == 0 && postcheck_clean && posttest_clean && reference_match,
         failure_class,
         cargo_check_exit,
         cargo_test_exit,
@@ -390,6 +390,8 @@ pub fn score(
             != (row.process_pass
                 && row.compile_clean
                 && row.cargo_check_exit == Some(0)
+                && row.tests_pass
+                && row.cargo_test_exit == Some(0)
                 && row.reference_match)
         {
             return Err(format!(
@@ -721,6 +723,18 @@ mod tests {
         path_row.evidence_relpath = "../escape".to_owned();
         let error = score(fixtures.path(), vec![path_row], endpoint(), 1).unwrap_err();
         assert!(error.contains("evidence path inconsistency"), "{error}");
+    }
+
+    #[test]
+    fn score_rejects_oracle_pass_when_hidden_tests_fail() {
+        let fixtures = fixtures_with(&["a"]);
+        let mut row = observation("a", 1);
+        row.tests_pass = false;
+        row.cargo_test_exit = Some(101);
+        row.failure_class = "strict_pass_tests_failed".to_owned();
+
+        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        assert!(error.contains("oracle derivation inconsistency"), "{error}");
     }
 
     #[test]
