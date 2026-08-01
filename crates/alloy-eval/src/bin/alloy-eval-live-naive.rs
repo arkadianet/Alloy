@@ -1,10 +1,10 @@
 //! One-shot, tool-free naive replacement driver (E1 three-arm holdout, arm B).
 //!
 //! Reads the target file and diagnostics from disk, sends exactly one
-//! OpenAI-compatible completion with no tools, writes the model's
-//! replacement back through a sibling temp file + rename, and records
-//! bounded telemetry. `ALLOY_API_KEY` is read from the process environment
-//! and never logged or serialized.
+//! OpenAI-compatible completion with no tools, records bounded telemetry for
+//! that call, then writes the model's replacement back through a sibling temp
+//! file + rename. `ALLOY_API_KEY` is read from the process environment and
+//! never logged or serialized.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -133,12 +133,9 @@ fn run() -> Result<(), String> {
         .block_on(provider.complete(&endpoint, request))
         .map_err(|error| format!("completion: {error}"))?;
 
-    let text = response
-        .text
-        .ok_or_else(|| "provider returned no message content".to_owned())?;
-    let replacement = parse_replacement(&text)?;
-    write_resolved_replacement(&target_path, &replacement.replacement)?;
-
+    // The call is spent — and billed — the moment it returns, so record it
+    // before anything that can still fail. A malformed reply must not make a
+    // real model call disappear from the arm's telemetry.
     let telemetry = NaiveRunTelemetry {
         model_calls: 1,
         tokens_in: response.usage.input_tokens,
@@ -150,6 +147,12 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("serialize telemetry: {error}"))?;
     fs::write(&result_path, format!("{json}\n"))
         .map_err(|error| format!("write {}: {error}", result_path.display()))?;
+
+    let text = response
+        .text
+        .ok_or_else(|| "provider returned no message content".to_owned())?;
+    let replacement = parse_replacement(&text)?;
+    write_resolved_replacement(&target_path, &replacement.replacement)?;
 
     println!(
         "alloy-eval-live-naive: replaced {} ({} bytes)",

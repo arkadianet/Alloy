@@ -239,6 +239,60 @@ fn missing_api_key_fails_closed_without_a_request() {
     assert!(!ws.result.exists());
 }
 
+/// A spent model call must be recorded even when its reply is unusable —
+/// telemetry is persisted before the reply is parsed or written, so a
+/// billed call can never be reported as `model_calls: 0`.
+#[test]
+fn unusable_model_output_still_records_the_spent_call() {
+    let cases = [
+        (
+            "schema-invalid content",
+            serde_json::json!({
+                "id": "naive-2",
+                "choices": [{
+                    "message": { "content": "{\"not_a_replacement\":true}" },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 100, "completion_tokens": 20 }
+            }),
+            (Some(100), Some(20)),
+        ),
+        (
+            "empty replacement, usage omitted",
+            serde_json::json!({
+                "id": "naive-3",
+                "choices": [{
+                    "message": { "content": "{\"replacement\":\"\"}" },
+                    "finish_reason": "length"
+                }]
+            }),
+            (None, None),
+        ),
+    ];
+
+    for (label, response, (tokens_in, tokens_out)) in cases {
+        let (port, requests) = start_stub_server(&response.to_string());
+        let ws = workspace();
+        let output = run_binary(&ws, &format!("http://127.0.0.1:{port}/v1/"));
+
+        assert!(!output.status.success(), "{label} must fail the attempt");
+        assert_eq!(requests.lock().unwrap().len(), 1, "{label}: one call only");
+        // The unusable reply must not reach the target file.
+        assert_eq!(
+            std::fs::read_to_string(ws.dir.path().join("src/lib.rs")).unwrap(),
+            "pub fn broken() { missing }\n",
+            "{label}: target must be untouched"
+        );
+
+        let telemetry: NaiveRunTelemetry =
+            serde_json::from_str(&std::fs::read_to_string(&ws.result).unwrap())
+                .unwrap_or_else(|error| panic!("{label}: telemetry must be written: {error}"));
+        assert_eq!(telemetry.model_calls, 1, "{label}");
+        assert_eq!(telemetry.tokens_in, tokens_in, "{label}");
+        assert_eq!(telemetry.tokens_out, tokens_out, "{label}");
+    }
+}
+
 /// An absolute or traversal `--target` must be rejected before the file is
 /// even read, let alone embedded in a request sent to the endpoint — fix
 /// for the round-1 finding that `resolve_target` was only invoked from

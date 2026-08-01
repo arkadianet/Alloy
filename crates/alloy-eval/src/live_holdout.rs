@@ -16,6 +16,10 @@ use crate::live_repair::{wilson_interval, WilsonInterval, WILSON_Z_95};
 
 const CORPUS: &str = "rfc0016-holdout-live";
 const TIMEOUT_EXIT_CODE: i32 = 124;
+/// Page size `eval/live-holdout/run.sh` requests from `alloy events`, which
+/// is also the runtime's maximum page. An export this long is treated as
+/// truncated rather than complete.
+const EVENT_EXPORT_PAGE_LIMIT: usize = 1_000;
 pub const REPORT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize)]
@@ -393,8 +397,13 @@ fn naive_telemetry(raw: &str) -> Result<RunTelemetry, String> {
 /// Count `model_call` events and sum the token fields the provider reported.
 /// An empty export means the event dump produced nothing; it is reported as
 /// zero calls with unknown usage rather than invented numbers.
+///
+/// An export that fills the page limit is rejected: `alloy events` returns
+/// one page, so a full page means the run may have emitted more events than
+/// were exported and any count taken from it would silently under-report.
 fn alloy_telemetry(raw: &str) -> Result<RunTelemetry, String> {
     let mut telemetry = RunTelemetry::UNRECORDED;
+    let mut events = 0usize;
     for (index, line) in raw
         .lines()
         .enumerate()
@@ -403,6 +412,7 @@ fn alloy_telemetry(raw: &str) -> Result<RunTelemetry, String> {
         let number = index + 1;
         let event: serde_json::Value =
             serde_json::from_str(line).map_err(|error| format!("event line {number}: {error}"))?;
+        events += 1;
         if event.get("type").and_then(serde_json::Value::as_str) != Some("model_call") {
             continue;
         }
@@ -410,6 +420,12 @@ fn alloy_telemetry(raw: &str) -> Result<RunTelemetry, String> {
         let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
         add_usage(&mut telemetry.tokens_in, payload, "input_tokens", number)?;
         add_usage(&mut telemetry.tokens_out, payload, "output_tokens", number)?;
+    }
+    if events >= EVENT_EXPORT_PAGE_LIMIT {
+        return Err(format!(
+            "event export holds {events} events, at the {EVENT_EXPORT_PAGE_LIMIT}-event page \
+             limit; telemetry may be truncated"
+        ));
     }
     Ok(telemetry)
 }
@@ -955,6 +971,23 @@ mod tests {
         assert!(
             alloy_telemetry("{\"type\":\"model_call\",\"payload\":{\"input_tokens\":-3}}\n")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn alloy_telemetry_rejects_an_export_at_the_page_limit() {
+        let event = "{\"type\":\"model_call\",\"payload\":{\"input_tokens\":1}}\n";
+        let at_cap = event.repeat(EVENT_EXPORT_PAGE_LIMIT);
+        let error = alloy_telemetry(&at_cap).unwrap_err();
+        assert!(
+            error.contains("page limit") && error.contains("truncated"),
+            "{error}"
+        );
+
+        let below_cap = event.repeat(EVENT_EXPORT_PAGE_LIMIT - 1);
+        assert_eq!(
+            alloy_telemetry(&below_cap).unwrap().model_calls,
+            (EVENT_EXPORT_PAGE_LIMIT - 1) as u32
         );
     }
 

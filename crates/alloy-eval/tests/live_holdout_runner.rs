@@ -89,6 +89,7 @@ fn write_stub_alloy(path: &Path) {
         path,
         r#"#!/usr/bin/env bash
 set -u
+argv="$*"
 ws=""
 command=""
 while [ "$#" -gt 0 ]; do
@@ -100,6 +101,7 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$ws" ] || { echo "missing workspace" >&2; exit 90; }
 if [ "$command" = "events" ]; then
+  printf '%s\n' "$argv" >>"${EVENTS_ARGV_LOG:-/dev/null}"
   printf '%s\n' '{"type":"model_call","payload":{"input_tokens":100,"output_tokens":20}}'
   printf '%s\n' '{"type":"model_call","payload":{"output_tokens":5}}'
   printf '%s\n' '{"type":"run_completed","payload":{"dag_state":"succeeded"}}'
@@ -228,12 +230,14 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
 
     let alloy = directory.path().join("stub-alloy");
     write_stub_alloy(&alloy);
+    let events_argv = directory.path().join("events-argv.log");
     let observations = directory.path().join("observations.jsonl");
     let output = Command::new("bash")
         .arg(repo_root().join("eval/live-holdout/run.sh"))
         .arg(&observations)
         .env("FIXTURES", &fixtures)
         .env("ALLOY", &alloy)
+        .env("EVENTS_ARGV_LOG", &events_argv)
         .env("SCORER", SCORER)
         .env("EVAL_HOLDOUT", EVALUATOR)
         .env("DRIVER", "alloy")
@@ -284,6 +288,21 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
     assert_eq!(report.overall.model_calls_total, 8);
     assert_eq!(report.overall.tokens_in_total, 400);
     assert_eq!(report.overall.tokens_out_total, 100);
+
+    // The export must request the runtime's whole page, not the 100-event
+    // default, or long runs would be counted from a truncated export.
+    let events_invocations = fs::read_to_string(&events_argv).unwrap();
+    assert_eq!(
+        events_invocations.lines().count(),
+        4,
+        "{events_invocations}"
+    );
+    for invocation in events_invocations.lines() {
+        assert!(
+            invocation.contains("--limit 1000"),
+            "events export must request the full page: {invocation}"
+        );
+    }
 
     let by_id = report
         .observations

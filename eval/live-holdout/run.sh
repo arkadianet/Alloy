@@ -281,8 +281,10 @@ for id in "${ids[@]}"; do
         telemetry_input="$evidence/naive-result.json"
         ;;
       alloy)
+        # Ask for the runtime's whole page (1000); the extractor rejects an
+        # export that fills it rather than counting a truncated run.
         ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout 30 \
-          "$driver_bin" --workspace "$ws" --profile "$PROFILE" events --json \
+          "$driver_bin" --workspace "$ws" --profile "$PROFILE" events --json --limit 1000 \
           >"$evidence/events.jsonl" 2>"$evidence/events.stderr" || true
         telemetry_input="$evidence/events.jsonl"
         ;;
