@@ -10,6 +10,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// Just enough of a report to decide whether this build can score it.
+#[derive(serde::Deserialize)]
+struct SchemaVersionPeek {
+    schema_version: u32,
+}
+
 use alloy_eval::{
     compare_live_holdout, inspect_live_holdout, live_holdout_target_path_text,
     live_holdout_telemetry, load_live_holdout_observations, score_live_holdout, LiveHoldoutDriver,
@@ -134,14 +140,17 @@ fn oracle(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
             cargo_test_exit: parse_optional_exit(options, "cargo-test-exit")?,
         },
     )?;
-    // Nine-field TSV consumed by eval/live-holdout/run.sh, in order:
-    // process_pass, compile_clean, tests_pass, reference_match, oracle_pass,
-    // failure_class, cargo_check_exit, cargo_test_exit, repair_generations.
+    // Eleven-field TSV consumed by eval/live-holdout/run.sh, in order:
+    // process_pass, compile_clean, tests_pass, safety_clean, semantic_pass,
+    // reference_match, oracle_pass, failure_class, cargo_check_exit,
+    // cargo_test_exit, repair_generations.
     Ok(format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         fields.process_pass,
         fields.compile_clean,
         fields.tests_pass,
+        fields.safety_clean,
+        fields.semantic_pass,
         fields.reference_match,
         fields.oracle_pass,
         fields.failure_class,
@@ -264,14 +273,22 @@ fn compare(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
             .ok_or_else(|| format!("--arm must be id=report, got {path}"))?;
         let raw = std::fs::read_to_string(report_path)
             .map_err(|error| format!("read {report_path}: {error}"))?;
-        let report: LiveHoldoutReport =
-            serde_json::from_str(&raw).map_err(|error| format!("parse {report_path}: {error}"))?;
-        if report.schema_version != LIVE_HOLDOUT_REPORT_VERSION {
+        // Read the version before the body: a v4 report lacks the v5 semantic
+        // fields, and a bare serde error would read as a corrupt file rather
+        // than as legacy evidence.
+        let version = serde_json::from_str::<SchemaVersionPeek>(&raw)
+            .map_err(|error| format!("parse {report_path}: {error}"))?
+            .schema_version;
+        if version != LIVE_HOLDOUT_REPORT_VERSION {
             return Err(format!(
-                "unsupported schema_version {} in {report_path}; expected {LIVE_HOLDOUT_REPORT_VERSION}",
-                report.schema_version,
+                "unsupported schema_version {version} in {report_path}; expected \
+                 {LIVE_HOLDOUT_REPORT_VERSION}. Reports below v{LIVE_HOLDOUT_REPORT_VERSION} \
+                 predate semantic-first scoring and carry no semantic_pass evidence; they are \
+                 preserved as legacy evidence and must not be rescored or compared under v5.",
             ));
         }
+        let report: LiveHoldoutReport =
+            serde_json::from_str(&raw).map_err(|error| format!("parse {report_path}: {error}"))?;
         reports.push((name.to_owned(), report));
     }
     let comparison = compare_live_holdout(reports)?;

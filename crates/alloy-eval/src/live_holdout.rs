@@ -20,7 +20,13 @@ const TIMEOUT_EXIT_CODE: i32 = 124;
 /// is also the runtime's maximum page. An export this long is treated as
 /// truncated rather than complete.
 const EVENT_EXPORT_PAGE_LIMIT: usize = 1_000;
-pub const REPORT_SCHEMA_VERSION: u32 = 4;
+/// v5 makes `semantic_pass` the primary outcome and demotes byte-exact
+/// `reference_match` to canonicality telemetry.
+///
+/// v4 evidence carries no semantic measurement, so it is readable as an
+/// archive but is refused for scoring and comparison with an explicit legacy
+/// message rather than being silently reinterpreted under the v5 contract.
+pub const REPORT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Deserialize)]
 struct HoldoutManifest {
@@ -52,6 +58,12 @@ pub struct StrictObservation {
     pub process_pass: bool,
     pub compile_clean: bool,
     pub tests_pass: bool,
+    /// Manifest safety and diff-policy criteria held (no new `unsafe`).
+    pub safety_clean: bool,
+    /// Primary v5 outcome: the repair ran, compiled independently, passed the
+    /// hidden tests, and violated no safety criterion. Deliberately free of
+    /// byte-canonicality.
+    pub semantic_pass: bool,
     pub reference_match: bool,
     pub oracle_pass: bool,
     pub failure_class: String,
@@ -88,6 +100,11 @@ pub struct FixtureSummary {
     pub process: Rate,
     pub compile_clean: Rate,
     pub tests_pass: Rate,
+    /// Primary v5 metric.
+    pub semantic: Rate,
+    pub safety_clean: Rate,
+    /// Compiled and claimed success, but the hidden tests disagreed.
+    pub semantic_false_green: Rate,
     pub compile_clean_reference_mismatch: Rate,
     pub compile_clean_tests_failed: Rate,
     pub tests_pass_reference_mismatch: Rate,
@@ -99,6 +116,11 @@ pub struct FixtureSummary {
     pub model_calls_total: u64,
     pub tokens_in_total: u64,
     pub tokens_out_total: u64,
+    /// Attempts whose provider reported no usage. Totals above sum only what
+    /// was reported, so these counts are what stops a silent zero from
+    /// reading as a measured zero.
+    pub tokens_in_unknown: u32,
+    pub tokens_out_unknown: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -136,10 +158,34 @@ pub struct MetricDelta {
     pub delta: Option<f64>,
 }
 
+/// Per-family macro effect, so a headline cannot be carried by one family.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FamilyDelta {
+    pub family: String,
+    pub fixtures: u32,
+    pub baseline_rate: Option<f64>,
+    pub arm_rate: Option<f64>,
+    pub delta: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ArmComparison {
     pub baseline: String,
     pub arm: String,
+    /// Primary v5 treatment effect, pooled over attempts.
+    pub semantic: MetricDelta,
+    /// The same effect with fixtures as the unit of analysis. The E2 gate is
+    /// stated on this bound, not on the pooled one.
+    pub semantic_clustered: ClusteredDelta,
+    /// Macro-averaged over families, so families count equally regardless of
+    /// how many fixtures each contributes.
+    pub semantic_family_macro: Option<f64>,
+    pub families: Vec<FamilyDelta>,
+    /// The smallest family-macro delta obtainable by dropping any one family.
+    /// If this is not positive, the headline depends on a single family.
+    pub leave_one_family_out_min: Option<f64>,
+    pub safety_clean: MetricDelta,
+    pub semantic_false_green: MetricDelta,
     pub oracle: MetricDelta,
     pub process: MetricDelta,
     pub compile_clean: MetricDelta,
@@ -160,6 +206,116 @@ pub struct MatrixComparison {
     pub arms: BTreeMap<String, StrictReport>,
     pub comparisons: Vec<ArmComparison>,
     pub notes: Vec<String>,
+}
+
+/// A treatment effect with fixtures, not attempts, as the unit of analysis.
+///
+/// Repetitions of one fixture are correlated, so pooling them as i.i.d.
+/// understates uncertainty. Arms share the corpus, so the difference is paired
+/// per fixture and summarised across fixtures — deterministic, no resampling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClusteredDelta {
+    pub fixtures: u32,
+    pub mean_delta: Option<f64>,
+    pub lower95: Option<f64>,
+    pub upper95: Option<f64>,
+}
+
+/// Two-sided 95% Student-t critical values. The corpus has tens of fixtures,
+/// not thousands, so the normal approximation is not safe at these degrees of
+/// freedom.
+fn t_critical_95(df: usize) -> f64 {
+    const TABLE: [f64; 30] = [
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+        2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+        2.052, 2.048, 2.045, 2.042,
+    ];
+    TABLE.get(df.saturating_sub(1)).copied().unwrap_or(1.960)
+}
+
+/// Pairs `(rate, attempts)` per fixture, in matching fixture order.
+fn clustered_delta(baseline: &[(f64, u32)], arm: &[(f64, u32)]) -> ClusteredDelta {
+    let deltas: Vec<f64> = baseline
+        .iter()
+        .zip(arm)
+        .map(|((base, _), (treated, _))| treated - base)
+        .collect();
+    let k = deltas.len();
+    if k == 0 {
+        return ClusteredDelta {
+            fixtures: 0,
+            mean_delta: None,
+            lower95: None,
+            upper95: None,
+        };
+    }
+    let mean = deltas.iter().sum::<f64>() / k as f64;
+    if k < 2 {
+        // One cluster carries no between-fixture variance to estimate.
+        return ClusteredDelta {
+            fixtures: k as u32,
+            mean_delta: Some(mean),
+            lower95: None,
+            upper95: None,
+        };
+    }
+    let variance = deltas
+        .iter()
+        .map(|delta| (delta - mean).powi(2))
+        .sum::<f64>()
+        / (k - 1) as f64;
+    let half_width = t_critical_95(k - 1) * (variance / k as f64).sqrt();
+    ClusteredDelta {
+        fixtures: k as u32,
+        mean_delta: Some(mean),
+        lower95: Some(mean - half_width),
+        upper95: Some(mean + half_width),
+    }
+}
+
+/// Repair family for macro-averaging and leave-one-family-out checks. Fixture
+/// ids lead with their rustc error code, so that prefix is the family.
+fn fixture_family(fixture_id: &str) -> String {
+    let head = fixture_id.split('_').next().unwrap_or(fixture_id);
+    let is_error_code =
+        head.len() == 5 && head.starts_with('e') && head[1..].chars().all(|c| c.is_ascii_digit());
+    if is_error_code {
+        head.to_owned()
+    } else {
+        fixture_id.to_owned()
+    }
+}
+
+/// Macro-averages each family's fixture rates, then differences them. Families
+/// count equally, so a family with many fixtures cannot dominate the headline.
+fn family_deltas(baseline: &[FixtureSummary], arm: &[FixtureSummary]) -> Vec<FamilyDelta> {
+    let mut grouped: BTreeMap<String, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for (base, treated) in baseline.iter().zip(arm) {
+        let entry = grouped.entry(fixture_family(&base.fixture_id)).or_default();
+        if let Some(rate) = base.semantic.rate {
+            entry.0.push(rate);
+        }
+        if let Some(rate) = treated.semantic.rate {
+            entry.1.push(rate);
+        }
+    }
+    let mean = |values: &[f64]| -> Option<f64> {
+        (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+    };
+    grouped
+        .into_iter()
+        .map(|(family, (base_rates, arm_rates))| {
+            let baseline_rate = mean(&base_rates);
+            let arm_rate = mean(&arm_rates);
+            FamilyDelta {
+                family,
+                fixtures: base_rates.len() as u32,
+                baseline_rate,
+                arm_rate,
+                delta: baseline_rate.zip(arm_rate).map(|(b, a)| a - b),
+            }
+        })
+        .collect()
 }
 
 /// A naive-vs-alloy arm identity check that only differs on driver, profile,
@@ -250,6 +406,8 @@ pub fn oracle(
     };
     let postcheck_clean = compile_clean && cargo_check_exit == Some(0);
     let posttest_clean = tests_pass && cargo_test_exit == Some(0);
+    let original = fixture_dir.join("workspace").join(&relative_target);
+    let safety_clean = no_new_unsafe(&original, &actual)?;
     let failure_class = classify(
         exit_code,
         &log,
@@ -261,6 +419,9 @@ pub fn oracle(
         process_pass: exit_code == 0,
         compile_clean,
         tests_pass,
+        safety_clean,
+        // Primary outcome. Byte canonicality is deliberately absent.
+        semantic_pass: exit_code == 0 && postcheck_clean && posttest_clean && safety_clean,
         reference_match,
         oracle_pass: exit_code == 0 && postcheck_clean && posttest_clean && reference_match,
         failure_class,
@@ -275,6 +436,8 @@ pub struct StrictObservationFields {
     pub process_pass: bool,
     pub compile_clean: bool,
     pub tests_pass: bool,
+    pub safety_clean: bool,
+    pub semantic_pass: bool,
     pub reference_match: bool,
     pub oracle_pass: bool,
     pub failure_class: String,
@@ -292,6 +455,33 @@ pub struct OracleEvidence {
     pub cargo_test_exit: Option<i32>,
 }
 
+/// `no_new_unsafe`: a repair may keep `unsafe` the fixture already had, but
+/// may never introduce it. A missing repaired file is not a safety verdict —
+/// the compile and test gates already fail that attempt.
+fn no_new_unsafe(original: &Path, repaired: &Path) -> Result<bool, String> {
+    if !repaired.is_file() {
+        return Ok(true);
+    }
+    let after = fs::read_to_string(repaired)
+        .map_err(|error| format!("read repaired {}: {error}", repaired.display()))?;
+    let before = if original.is_file() {
+        fs::read_to_string(original)
+            .map_err(|error| format!("read original {}: {error}", original.display()))?
+    } else {
+        String::new()
+    };
+    Ok(unsafe_blocks(&after) <= unsafe_blocks(&before))
+}
+
+/// Counts `unsafe` as a Rust keyword, not as a substring of identifiers or
+/// prose, so `is_unsafe_mode` and a doc comment do not read as violations.
+fn unsafe_blocks(source: &str) -> usize {
+    source
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|token| *token == "unsafe")
+        .count()
+}
+
 fn classify(
     exit_code: i32,
     log: &str,
@@ -299,24 +489,22 @@ fn classify(
     posttest_clean: bool,
     reference_match: bool,
 ) -> String {
-    if exit_code == 0 && postcheck_clean && reference_match {
-        return if posttest_clean {
+    if exit_code == 0 && postcheck_clean && posttest_clean {
+        return if reference_match {
             "pass"
         } else {
-            "strict_pass_tests_failed"
+            // Behaviour is correct; only byte canonicality differs. This is
+            // the E0308 trailing-newline case, not a repair failure.
+            "pass_reference_mismatch"
         }
         .to_owned();
     }
     if exit_code == 0 && !postcheck_clean {
         return "process_claimed_success_but_compile_failed".to_owned();
     }
-    if exit_code == 0 && !reference_match {
-        return if posttest_clean {
-            "reference_mismatch_tests_passed"
-        } else {
-            "reference_mismatch_tests_failed"
-        }
-        .to_owned();
+    // Compiled and claimed success, but the hidden tests disagreed.
+    if exit_code == 0 && postcheck_clean && !posttest_clean {
+        return "semantic_false_green".to_owned();
     }
     if exit_code == TIMEOUT_EXIT_CODE {
         return "timeout".to_owned();
@@ -507,6 +695,11 @@ fn summarize_fixture(id: &str, rows: &[StrictObservation]) -> FixtureSummary {
         process: rate(rows, |row| row.process_pass),
         compile_clean: rate(rows, |row| row.compile_clean),
         tests_pass: rate(rows, |row| row.tests_pass),
+        semantic: rate(rows, |row| row.semantic_pass),
+        safety_clean: rate(rows, |row| row.safety_clean),
+        semantic_false_green: rate(rows, |row| {
+            row.process_pass && row.compile_clean && !row.tests_pass
+        }),
         compile_clean_reference_mismatch: rate(rows, |row| {
             row.compile_clean && !row.reference_match
         }),
@@ -522,6 +715,8 @@ fn summarize_fixture(id: &str, rows: &[StrictObservation]) -> FixtureSummary {
         // nothing rather than a fabricated zero.
         tokens_in_total: rows.iter().filter_map(|row| row.tokens_in).sum(),
         tokens_out_total: rows.iter().filter_map(|row| row.tokens_out).sum(),
+        tokens_in_unknown: rows.iter().filter(|row| row.tokens_in.is_none()).count() as u32,
+        tokens_out_unknown: rows.iter().filter(|row| row.tokens_out.is_none()).count() as u32,
     }
 }
 
@@ -572,6 +767,19 @@ pub fn score(
         if row.evidence_relpath != expected_evidence {
             return Err(format!(
                 "evidence path inconsistency for {}: expected {expected_evidence}",
+                row.fixture_id
+            ));
+        }
+        if row.semantic_pass
+            != (row.process_pass
+                && row.compile_clean
+                && row.cargo_check_exit == Some(0)
+                && row.tests_pass
+                && row.cargo_test_exit == Some(0)
+                && row.safety_clean)
+        {
+            return Err(format!(
+                "semantic derivation inconsistency for {}",
                 row.fixture_id
             ));
         }
@@ -698,26 +906,70 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
         .iter()
         .map(|(name, report)| {
             let oracle = delta(&baseline.overall.oracle, &report.overall.oracle);
-            let (result, why_not, basis) = match oracle.delta {
+            // v5 assesses on semantics. `oracle` stays in the report as
+            // canonicality telemetry but no longer decides the verdict.
+            let semantic = delta(&baseline.overall.semantic, &report.overall.semantic);
+            let (result, why_not, basis) = match semantic.delta {
                 Some(value) if value > 0.0 => (
                     "improved".to_owned(),
                     None,
-                    "strict_oracle_rate_delta_positive".to_owned(),
+                    "semantic_rate_delta_positive".to_owned(),
                 ),
                 Some(value) if value < 0.0 => (
                     "why_not".to_owned(),
-                    Some("strict_oracle_rate_decreased".to_owned()),
-                    "strict_oracle_rate_delta_negative".to_owned(),
+                    Some("semantic_rate_decreased".to_owned()),
+                    "semantic_rate_delta_negative".to_owned(),
                 ),
                 _ => (
                     "why_not".to_owned(),
-                    Some("no_strict_oracle_rate_change".to_owned()),
-                    "strict_oracle_rate_delta_zero".to_owned(),
+                    Some("no_semantic_rate_change".to_owned()),
+                    "semantic_rate_delta_zero".to_owned(),
                 ),
             };
+            let paired = |summaries: &[FixtureSummary]| -> Vec<(f64, u32)> {
+                summaries
+                    .iter()
+                    .map(|f| (f.semantic.rate.unwrap_or(0.0), f.semantic.attempts))
+                    .collect()
+            };
+            let semantic_clustered =
+                clustered_delta(&paired(&baseline.fixtures), &paired(&report.fixtures));
+            let families = family_deltas(&baseline.fixtures, &report.fixtures);
+            let family_deltas_only: Vec<f64> = families.iter().filter_map(|f| f.delta).collect();
+            let macro_mean = |values: &[f64]| -> Option<f64> {
+                (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+            };
+            let semantic_family_macro = macro_mean(&family_deltas_only);
+            // Drop each family in turn; the worst result shows how much the
+            // headline leans on any single family.
+            let leave_one_family_out_min = (family_deltas_only.len() > 1)
+                .then(|| {
+                    (0..family_deltas_only.len())
+                        .filter_map(|skip| {
+                            let kept: Vec<f64> = family_deltas_only
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| *i != skip)
+                                .map(|(_, v)| *v)
+                                .collect();
+                            macro_mean(&kept)
+                        })
+                        .fold(f64::INFINITY, f64::min)
+                })
+                .filter(|value| value.is_finite());
             ArmComparison {
                 baseline: baseline_name.clone(),
                 arm: name.clone(),
+                semantic,
+                semantic_clustered,
+                semantic_family_macro,
+                families,
+                leave_one_family_out_min,
+                safety_clean: delta(&baseline.overall.safety_clean, &report.overall.safety_clean),
+                semantic_false_green: delta(
+                    &baseline.overall.semantic_false_green,
+                    &report.overall.semantic_false_green,
+                ),
                 oracle,
                 process: delta(&baseline.overall.process, &report.overall.process),
                 compile_clean: delta(
@@ -799,6 +1051,8 @@ mod tests {
             process_pass: true,
             compile_clean: true,
             tests_pass: true,
+            safety_clean: true,
+            semantic_pass: true,
             reference_match: true,
             oracle_pass: true,
             failure_class: "pass".to_owned(),
@@ -817,6 +1071,38 @@ mod tests {
             model_calls: 1,
             tokens_in: Some(100),
             tokens_out: Some(50),
+        }
+    }
+
+    /// Derives observation fields the same way `oracle` does, without needing
+    /// a workspace on disk, so the scoring rules can be tested directly.
+    fn observation_fields(
+        exit_code: i32,
+        compile_clean: bool,
+        tests_pass: bool,
+        reference_match: bool,
+        safety_clean: bool,
+    ) -> StrictObservationFields {
+        let postcheck_clean = compile_clean;
+        let posttest_clean = tests_pass;
+        StrictObservationFields {
+            process_pass: exit_code == 0,
+            compile_clean,
+            tests_pass,
+            safety_clean,
+            semantic_pass: exit_code == 0 && postcheck_clean && posttest_clean && safety_clean,
+            reference_match,
+            oracle_pass: exit_code == 0 && postcheck_clean && posttest_clean && reference_match,
+            failure_class: classify(
+                exit_code,
+                "",
+                postcheck_clean,
+                posttest_clean,
+                reference_match,
+            ),
+            cargo_check_exit: Some(i32::from(!compile_clean)),
+            cargo_test_exit: Some(i32::from(!tests_pass)),
+            repair_generations: 0,
         }
     }
 
@@ -840,7 +1126,7 @@ mod tests {
         if !oracle_pass {
             row.reference_match = false;
             row.oracle_pass = false;
-            row.failure_class = "reference_mismatch_tests_passed".to_owned();
+            row.failure_class = "pass_reference_mismatch".to_owned();
         }
         score(fixtures.path(), vec![row], endpoint(), 1).unwrap()
     }
@@ -861,17 +1147,13 @@ mod tests {
     #[test]
     fn classifies_strict_success_and_false_green() {
         assert_eq!(classify(0, "", true, true, true), "pass");
-        assert_eq!(
-            classify(0, "", true, false, true),
-            "strict_pass_tests_failed"
-        );
-        assert_eq!(
-            classify(0, "", true, false, false),
-            "reference_mismatch_tests_failed"
-        );
+        // Tests failing is the headline whether or not bytes matched.
+        assert_eq!(classify(0, "", true, false, true), "semantic_false_green");
+        assert_eq!(classify(0, "", true, false, false), "semantic_false_green");
+        // Correct behaviour, non-canonical bytes: a pass, not a mismatch.
         assert_eq!(
             classify(0, "", true, true, false),
-            "reference_mismatch_tests_passed"
+            "pass_reference_mismatch"
         );
         assert_eq!(
             classify(0, "", false, false, true),
@@ -880,6 +1162,171 @@ mod tests {
         assert_eq!(
             classify(5, "reason=\"kind\"", false, false, false),
             "replan_declined_kind"
+        );
+    }
+
+    #[test]
+    fn schema_version_is_five() {
+        assert_eq!(REPORT_SCHEMA_VERSION, 5);
+    }
+
+    /// The E1 headline was an artefact: naive repaired E0308 correctly but
+    /// dropped the trailing newline, so raw-byte matching failed. Semantic
+    /// success must not depend on canonicality.
+    #[test]
+    fn semantic_pass_ignores_reference_match() {
+        let fields = observation_fields(
+            0, true,  /* compile */
+            true,  /* tests */
+            false, /* reference */
+            true,  /* safety */
+        );
+        assert!(
+            fields.semantic_pass,
+            "byte mismatch must not fail semantics"
+        );
+        assert!(!fields.oracle_pass, "oracle still requires canonicality");
+    }
+
+    #[test]
+    fn semantic_pass_requires_process_compile_tests_and_safety() {
+        assert!(observation_fields(0, true, true, true, true).semantic_pass);
+        assert!(!observation_fields(1, true, true, true, true).semantic_pass);
+        assert!(!observation_fields(0, false, true, true, true).semantic_pass);
+        assert!(!observation_fields(0, true, false, true, true).semantic_pass);
+        assert!(
+            !observation_fields(0, true, true, true, false).semantic_pass,
+            "a safety or diff-policy violation is never a semantic pass"
+        );
+    }
+
+    #[test]
+    fn score_rejects_semantic_derivation_inconsistency() {
+        let fixtures = fixtures_with(&["shared"]);
+        let mut row = observation("shared", 1);
+        row.semantic_pass = false; // contradicts its own evidence
+        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        assert!(error.contains("semantic derivation"), "got {error}");
+    }
+
+    #[test]
+    fn score_rejects_semantic_pass_without_safety() {
+        let fixtures = fixtures_with(&["shared"]);
+        let mut row = observation("shared", 1);
+        row.safety_clean = false;
+        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        assert!(error.contains("semantic derivation"), "got {error}");
+    }
+
+    #[test]
+    fn summary_reports_semantic_rate_and_counts_unknown_usage() {
+        let fixtures = fixtures_with(&["shared"]);
+        let mut known = observation("shared", 1);
+        known.tokens_in = Some(100);
+        known.tokens_out = Some(50);
+        let mut unknown = observation("shared", 2);
+        unknown.tokens_in = None;
+        unknown.tokens_out = None;
+        let report = score(fixtures.path(), vec![known, unknown], endpoint(), 2).unwrap();
+        let summary = &report.overall;
+        assert_eq!(summary.semantic.passes, 2);
+        assert_eq!(summary.semantic.attempts, 2);
+        // Unknown usage is counted, never summed as zero.
+        assert_eq!(summary.tokens_in_total, 100);
+        assert_eq!(summary.tokens_in_unknown, 1);
+        assert_eq!(summary.tokens_out_unknown, 1);
+    }
+
+    /// An arm that fixes behaviour but not byte-canonicality must register as
+    /// uplift; under the v4 oracle metric it registered as no change.
+    #[test]
+    fn compare_assesses_on_semantic_delta_not_reference() {
+        let fixtures = fixtures_with(&["shared"]);
+        let mut base_row = observation("shared", 1);
+        base_row.tests_pass = false;
+        base_row.cargo_test_exit = Some(101);
+        base_row.reference_match = false;
+        base_row.oracle_pass = false;
+        base_row.semantic_pass = false;
+        base_row.failure_class = "semantic_false_green".to_owned();
+        let baseline = score(fixtures.path(), vec![base_row], endpoint(), 1).unwrap();
+
+        let mut arm_row = observation("shared", 1);
+        arm_row.reference_match = false; // still not byte-canonical
+        arm_row.oracle_pass = false;
+        arm_row.failure_class = "pass_reference_mismatch".to_owned();
+        let arm = score(fixtures.path(), vec![arm_row], endpoint(), 1).unwrap();
+
+        let matrix = compare(vec![
+            ("naive".to_owned(), baseline),
+            ("alloy".to_owned(), arm),
+        ])
+        .unwrap();
+        let comparison = &matrix.comparisons[0];
+        assert_eq!(comparison.semantic.delta, Some(1.0));
+        assert_eq!(comparison.oracle.delta, Some(0.0));
+        assert!(
+            comparison.assessment.basis.contains("semantic"),
+            "assessment must be based on semantics, got {}",
+            comparison.assessment.basis
+        );
+    }
+
+    /// Pooling fixture x repetition as i.i.d. understates uncertainty: ten
+    /// repetitions of one fixture are not ten independent observations. The
+    /// gate is stated on a fixture-clustered bound, so it must be computed
+    /// that way — paired per fixture, since every arm sees the same corpus.
+    #[test]
+    fn clustered_delta_pairs_by_fixture_and_is_wider_than_pooled() {
+        // Two fixtures, one arm strictly better on one of them.
+        let baseline = vec![(0.5_f64, 10_u32), (0.5, 10)];
+        let arm = vec![(1.0_f64, 10_u32), (0.5, 10)];
+        let clustered = clustered_delta(&baseline, &arm);
+        assert_eq!(clustered.fixtures, 2);
+        assert_eq!(clustered.mean_delta, Some(0.25));
+        // Per-fixture deltas are 0.5 and 0.0, so the interval must straddle
+        // zero at k=2 — a pooled interval would wrongly exclude it.
+        let lower = clustered.lower95.unwrap();
+        assert!(lower < 0.0, "k=2 must not certify uplift, got {lower}");
+    }
+
+    #[test]
+    fn clustered_delta_is_none_without_enough_clusters() {
+        let single = clustered_delta(&[(0.5, 10)], &[(1.0, 10)]);
+        assert_eq!(single.fixtures, 1);
+        assert_eq!(single.lower95, None, "one fixture cannot bound variance");
+    }
+
+    #[test]
+    fn clustered_delta_certifies_a_consistent_effect() {
+        // Six fixtures, each improving by 0.3: a real, consistent effect.
+        let baseline: Vec<(f64, u32)> = (0..6).map(|_| (0.3, 10)).collect();
+        let arm: Vec<(f64, u32)> = (0..6).map(|_| (0.6, 10)).collect();
+        let clustered = clustered_delta(&baseline, &arm);
+        assert_eq!(clustered.mean_delta, Some(0.3));
+        assert!(
+            clustered.lower95.unwrap() > 0.0,
+            "a consistent effect across six fixtures must clear zero"
+        );
+    }
+
+    #[test]
+    fn family_is_the_leading_error_code_of_the_fixture_id() {
+        assert_eq!(fixture_family("e0502_preserve_old_01"), "e0502");
+        assert_eq!(fixture_family("e0308_holdout_01"), "e0308");
+        // Anything that is not a leading error code is its own family rather
+        // than being silently lumped together.
+        assert_eq!(fixture_family("weird-fixture"), "weird-fixture");
+    }
+
+    #[test]
+    fn classifies_semantic_false_green() {
+        // Exit 0 and compile clean, but the hidden tests failed: the process
+        // claimed success on code that does not behave correctly.
+        assert_eq!(
+            classify(0, "", true, false, false),
+            "semantic_false_green",
+            "compile-clean-but-tests-failed is the false-green class"
         );
     }
 
@@ -1118,7 +1565,8 @@ mod tests {
         let mut row = observation("a", 1);
         row.tests_pass = false;
         row.cargo_test_exit = Some(101);
-        row.failure_class = "strict_pass_tests_failed".to_owned();
+        row.semantic_pass = false;
+        row.failure_class = "semantic_false_green".to_owned();
 
         let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
         assert!(error.contains("oracle derivation inconsistency"), "{error}");
@@ -1134,7 +1582,7 @@ mod tests {
         let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
         assert!(
             error.contains("failure-class consistency violation")
-                && error.contains("reference_mismatch_tests_passed"),
+                && error.contains("pass_reference_mismatch"),
             "{error}"
         );
     }

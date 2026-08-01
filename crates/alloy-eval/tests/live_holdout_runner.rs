@@ -318,19 +318,25 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
         .map(|row| (row.fixture_id.as_str(), row))
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(by_id["pass_fixture"].failure_class, "pass");
+    assert!(by_id["pass_fixture"].semantic_pass);
+    // Compiled and claimed success, but the hidden tests disagreed. Under v5
+    // that is a false green regardless of byte canonicality.
     assert_eq!(
         by_id["mismatch_fixture"].failure_class,
-        "reference_mismatch_tests_failed"
+        "semantic_false_green"
     );
+    assert!(!by_id["mismatch_fixture"].semantic_pass);
     assert_eq!(
         by_id["compile_fail_fixture"].failure_class,
         "process_claimed_success_but_compile_failed"
     );
+    assert!(!by_id["compile_fail_fixture"].semantic_pass);
     assert_eq!(
         by_id["test_fail_fixture"].failure_class,
-        "strict_pass_tests_failed"
+        "semantic_false_green"
     );
     assert!(!by_id["test_fail_fixture"].oracle_pass);
+    assert!(!by_id["test_fail_fixture"].semantic_pass);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
