@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use alloy_runtime::{
     compiler_fingerprint_digest, policy_hash_digest, tool_versions_digest, Approval, Constraint,
-    CreateSession, DecisionKind, DecisionLog, DecisionRecord, EventSeq, Goal, LanguageId,
-    PlanContext, PlanService, ProfileId, RunGoalRecord, RunId, SessionEvent, SessionEventType,
-    SessionId, SessionRows, TemplateId,
+    CreateSession, DagStore, DecisionKind, DecisionLog, DecisionRecord, EventSeq, Goal, LanguageId,
+    NodeKind, NodeState, PlanContext, PlanService, ProfileId, RunGoalRecord, RunId, SessionEvent,
+    SessionEventType, SessionId, SessionRows, TemplateId,
 };
 use serde_json::json;
 
@@ -418,6 +418,79 @@ fn parse_template(t: &str) -> Result<TemplateId, CliError> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompileVerification {
+    Passed,
+    Failed,
+    NotProven,
+}
+
+impl CompileVerification {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::NotProven => "not_proven",
+        }
+    }
+
+    const fn human(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::NotProven => "not proven",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunVerification {
+    compile: CompileVerification,
+}
+
+impl RunVerification {
+    const INTENDED_FIX: &'static str = "not_independently_verified";
+    const INTENDED_FIX_HUMAN: &'static str = "not independently verified";
+}
+
+fn verification_from_nodes(
+    nodes: impl IntoIterator<Item = (NodeKind, NodeState)>,
+) -> RunVerification {
+    let mut saw_compile = false;
+    let mut all_compile_passed = true;
+    let mut compile_failed = false;
+    for (kind, state) in nodes {
+        if kind != NodeKind::VerifyCompile {
+            continue;
+        }
+        saw_compile = true;
+        compile_failed |= state == NodeState::Failed;
+        all_compile_passed &= matches!(state, NodeState::Succeeded | NodeState::CachedHit);
+    }
+    let compile = if compile_failed {
+        CompileVerification::Failed
+    } else if saw_compile && all_compile_passed {
+        CompileVerification::Passed
+    } else {
+        CompileVerification::NotProven
+    };
+    RunVerification { compile }
+}
+
+async fn final_verification(full: &FullAssembly, run: RunId) -> Result<RunVerification, CliError> {
+    let dag_id = dag_id_for_run(full, run).await?;
+    let dag = full
+        .base
+        .storage
+        .dags()
+        .get(dag_id)
+        .await?
+        .ok_or_else(|| CliError::new(Exit::Internal, format!("dag {dag_id} not found")))?;
+    Ok(verification_from_nodes(
+        dag.nodes.values().map(|node| (node.kind, node.state)),
+    ))
+}
+
 /// Steps 7–10 shared by `run` and `resume`: dispatch through
 /// `RunController::start` (SQ2), render progress from the event log, answer
 /// gates (§8), map the terminal state (§9.3).
@@ -570,6 +643,7 @@ pub(crate) async fn execute_and_render(
             Exit::Internal
         }
     });
+    let terminal_reason = super::terminal_reason(&events, run).map(str::to_owned);
     // CR18 — an operator signal is a cancellation even when the interrupted
     // node's failure was classified before the cancel reached it.
     if full.base.handle.cancellation().is_cancelled()
@@ -587,9 +661,14 @@ pub(crate) async fn execute_and_render(
     }
     if exit == Exit::Replan {
         eprintln!(
-            "replan required; MVP does not auto-replan (SQ3): alloy resume --session {session}"
+            "automatic repair stopped before success; inspect the durable events before starting another attempt"
         );
     }
+    let inspect_command = format!("alloy events --session {session} --run {run}");
+    if !ctx.quiet {
+        eprintln!("inspect: {inspect_command}");
+    }
+    let verification = final_verification(full, run).await?;
 
     let cost = super::cost_summary(full.base.storage.events().as_ref(), session, run).await;
     if let Some(cost) = &cost {
@@ -607,12 +686,22 @@ pub(crate) async fn execute_and_render(
                 "session": session.to_string(),
                 "run": run.to_string(),
                 "cost": cost,
+                "terminal_reason": terminal_reason,
+                "verification": {
+                    "compile": verification.compile.as_str(),
+                    "intended_fix": RunVerification::INTENDED_FIX,
+                },
+                "inspect_command": inspect_command,
             }),
         );
         println!("{doc}");
     } else {
+        let reason = terminal_reason
+            .as_deref()
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
         println!(
-            "run {run} {}",
+            "run {run} {}{reason}; cargo check {}; intended fix {}",
             match exit {
                 Exit::Ok => "succeeded",
                 Exit::Cancelled => "cancelled",
@@ -621,7 +710,9 @@ pub(crate) async fn execute_and_render(
                 Exit::Budget => "stopped at budget ceiling",
                 Exit::Timeout => "timed out",
                 _ => "failed",
-            }
+            },
+            verification.compile.human(),
+            RunVerification::INTENDED_FIX_HUMAN,
         );
     }
     Ok(exit)
@@ -677,5 +768,32 @@ async fn answer_gate(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compile_verification_comes_from_final_verify_nodes() {
+        use alloy_runtime::{NodeKind, NodeState};
+
+        assert_eq!(
+            verification_from_nodes([
+                (NodeKind::Edit, NodeState::Succeeded),
+                (NodeKind::VerifyCompile, NodeState::Succeeded),
+            ])
+            .compile,
+            CompileVerification::Passed
+        );
+        assert_eq!(
+            verification_from_nodes([(NodeKind::VerifyCompile, NodeState::Failed)]).compile,
+            CompileVerification::Failed
+        );
+        assert_eq!(
+            verification_from_nodes([(NodeKind::VerifyCompile, NodeState::Ready)]).compile,
+            CompileVerification::NotProven
+        );
     }
 }

@@ -12,7 +12,8 @@ use std::process::ExitCode;
 
 use alloy_eval::{
     compare_live_holdout, inspect_live_holdout, live_holdout_target_path_text,
-    load_live_holdout_observations, score_live_holdout, LiveHoldoutEndpoint, LiveHoldoutReport,
+    load_live_holdout_observations, score_live_holdout, LiveHoldoutEndpoint,
+    LiveHoldoutOracleEvidence, LiveHoldoutReport, LIVE_HOLDOUT_REPORT_VERSION,
 };
 
 const USAGE: &str = "\
@@ -22,7 +23,8 @@ USAGE:
   alloy-eval-live-holdout target-path --manifest <path>
   alloy-eval-live-holdout oracle --fixture-dir <dir> --workspace <dir>
       --run-log <path> --exit-code <n> --compile-clean <bool>
-      --cargo-check-exit <n|null>
+      --cargo-check-exit <n|null> --tests-pass <bool>
+      --cargo-test-exit <n|null>
   alloy-eval-live-holdout score --fixtures <dir> --observations <path>
       --model <model> --temperature <n> --profile <profile>
       --base-url <url> --reps <n> --out <path>
@@ -96,15 +98,18 @@ fn parse_bool(options: &BTreeMap<String, Vec<String>>, key: &str) -> Result<bool
     }
 }
 
-fn parse_cargo_exit(options: &BTreeMap<String, Vec<String>>) -> Result<Option<i32>, String> {
-    let value = required(options, "cargo-check-exit")?;
+fn parse_optional_exit(
+    options: &BTreeMap<String, Vec<String>>,
+    key: &str,
+) -> Result<Option<i32>, String> {
+    let value = required(options, key)?;
     if value == "null" {
         Ok(None)
     } else {
         value
             .parse()
             .map(Some)
-            .map_err(|_| "--cargo-check-exit must be an integer or null".to_owned())
+            .map_err(|_| format!("--{key} must be an integer or null"))
     }
 }
 
@@ -113,24 +118,33 @@ fn oracle(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
         &PathBuf::from(required(options, "fixture-dir")?),
         &PathBuf::from(required(options, "workspace")?),
         &PathBuf::from(required(options, "run-log")?),
-        required(options, "exit-code")?
-            .parse()
-            .map_err(|_| "--exit-code must be an integer".to_owned())?,
-        parse_bool(options, "compile-clean")?,
-        parse_cargo_exit(options)?,
+        LiveHoldoutOracleEvidence {
+            exit_code: required(options, "exit-code")?
+                .parse()
+                .map_err(|_| "--exit-code must be an integer".to_owned())?,
+            compile_clean: parse_bool(options, "compile-clean")?,
+            cargo_check_exit: parse_optional_exit(options, "cargo-check-exit")?,
+            tests_pass: parse_bool(options, "tests-pass")?,
+            cargo_test_exit: parse_optional_exit(options, "cargo-test-exit")?,
+        },
     )?;
-    // Seven-field TSV consumed by eval/live-holdout/run.sh, in order:
-    // process_pass, compile_clean, reference_match, oracle_pass,
-    // failure_class, cargo_check_exit, repair_generations.
+    // Nine-field TSV consumed by eval/live-holdout/run.sh, in order:
+    // process_pass, compile_clean, tests_pass, reference_match, oracle_pass,
+    // failure_class, cargo_check_exit, cargo_test_exit, repair_generations.
     Ok(format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         fields.process_pass,
         fields.compile_clean,
+        fields.tests_pass,
         fields.reference_match,
         fields.oracle_pass,
         fields.failure_class,
         fields
             .cargo_check_exit
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_owned()),
+        fields
+            .cargo_test_exit
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_owned()),
         fields.repair_generations,
@@ -185,10 +199,10 @@ fn compare(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
             .map_err(|error| format!("read {report_path}: {error}"))?;
         let report: LiveHoldoutReport =
             serde_json::from_str(&raw).map_err(|error| format!("parse {report_path}: {error}"))?;
-        if report.schema_version != 1 {
+        if report.schema_version != LIVE_HOLDOUT_REPORT_VERSION {
             return Err(format!(
-                "unsupported schema_version {} in {report_path}; expected 1",
-                report.schema_version
+                "unsupported schema_version {} in {report_path}; expected {LIVE_HOLDOUT_REPORT_VERSION}",
+                report.schema_version,
             ));
         }
         reports.push((name.to_owned(), report));
@@ -210,7 +224,7 @@ fn render_report(report: &LiveHoldoutReport) -> String {
         .map(|value| value.render())
         .unwrap_or_else(|| "unmeasured".to_owned());
     format!(
-        "overall oracle={}/{} rate={} wilson95={} process={}/{} compile={}/{} reference={}/{}\n",
+        "overall oracle={}/{} rate={} wilson95={} process={}/{} compile={}/{} tests={}/{} compile_clean_reference_mismatch={}/{} compile_clean_tests_failed={}/{} tests_pass_reference_mismatch={}/{} reference={}/{}\n",
         overall.oracle.passes,
         overall.oracle.attempts,
         overall
@@ -223,6 +237,14 @@ fn render_report(report: &LiveHoldoutReport) -> String {
         overall.process.attempts,
         overall.compile_clean.passes,
         overall.compile_clean.attempts,
+        overall.tests_pass.passes,
+        overall.tests_pass.attempts,
+        overall.compile_clean_reference_mismatch.passes,
+        overall.compile_clean_reference_mismatch.attempts,
+        overall.compile_clean_tests_failed.passes,
+        overall.compile_clean_tests_failed.attempts,
+        overall.tests_pass_reference_mismatch.passes,
+        overall.tests_pass_reference_mismatch.attempts,
         overall.reference_match.passes,
         overall.reference_match.attempts,
     )
@@ -230,7 +252,7 @@ fn render_report(report: &LiveHoldoutReport) -> String {
 
 fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> String {
     let mut output = format!(
-        "baseline={} repetitions={}\narm\toracle\toracle_wilson95\n",
+        "baseline={} repetitions={}\narm\toracle\ttests\tcompile_clean_reference_mismatch\tcompile_clean_tests_failed\ttests_pass_reference_mismatch\toracle_wilson95\n",
         comparison.baseline, comparison.repetitions
     );
     for (name, report) in &comparison.arms {
@@ -241,8 +263,17 @@ fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> St
             .map(|value| value.render())
             .unwrap_or_else(|| "unmeasured".to_owned());
         output.push_str(&format!(
-            "{name}\t{}/{}\t{interval}\n",
-            report.overall.oracle.passes, report.overall.oracle.attempts
+            "{name}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{interval}\n",
+            report.overall.oracle.passes,
+            report.overall.oracle.attempts,
+            report.overall.tests_pass.passes,
+            report.overall.tests_pass.attempts,
+            report.overall.compile_clean_reference_mismatch.passes,
+            report.overall.compile_clean_reference_mismatch.attempts,
+            report.overall.compile_clean_tests_failed.passes,
+            report.overall.compile_clean_tests_failed.attempts,
+            report.overall.tests_pass_reference_mismatch.passes,
+            report.overall.tests_pass_reference_mismatch.attempts,
         ));
     }
     for item in &comparison.comparisons {

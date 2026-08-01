@@ -18,7 +18,7 @@ max_in_flight = 2
 [[providers]]
 id = "local"
 kind = "openai_compatible"
-# llama.cpp (serve.sh). For Ollama use http://127.0.0.1:11434/v1/
+# llama.cpp example. For Ollama use http://127.0.0.1:11434/v1/
 base_url = "http://127.0.0.1:8089/v1/"
 # Provider ignores the key but Alloy requires the env var to exist and never
 # invents one: export ALLOY_API_KEY=local

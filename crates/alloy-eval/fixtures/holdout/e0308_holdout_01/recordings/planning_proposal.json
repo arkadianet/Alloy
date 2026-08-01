@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "nodes": [
+    { "name": "analyze", "kind": "analyze", "approval_reason": null },
+    { "name": "edit", "kind": "edit", "approval_reason": null },
+    { "name": "verify", "kind": "verify_compile", "approval_reason": null },
+    {
+      "name": "gate",
+      "kind": "gate_human",
+      "approval_reason": "Approve before completion"
+    }
+  ],
+  "rationale": "stack-driver llm holdout: repair_local_diagnostic shape",
+  "confidence": 0.9
+}

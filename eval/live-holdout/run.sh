@@ -11,6 +11,7 @@ set -u
 
 repo="$(cd "$(dirname "$0")/../.." && pwd)"
 out="${1:?usage: run.sh <out.jsonl>}"
+artifacts="${out%.jsonl}.artifacts"
 
 FIXTURES="${FIXTURES:-$repo/crates/alloy-eval/fixtures/holdout}"
 MODEL="${MODEL:-Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf}"
@@ -94,6 +95,10 @@ for id in "${ids[@]}"; do
     die "fixture $id manifest has no naive_target_path"
   [ -f "$fixture_dir/workspace/$target_path.post" ] ||
     die "fixture $id missing strict oracle workspace/$target_path.post"
+  [ -d "$fixture_dir/oracle-tests" ] ||
+    die "fixture $id missing hidden semantic oracle directory oracle-tests/"
+  compgen -G "$fixture_dir/oracle-tests/*.rs" >/dev/null ||
+    die "fixture $id has no hidden semantic oracle Rust tests"
 done
 
 # Exclusive lock on the observations file so two sweeps cannot interleave rows.
@@ -101,6 +106,7 @@ mkdir -p "$(dirname -- "$out")"
 exec 9>"$out.lock" || die "could not open lock $out.lock"
 flock -n 9 || die "another live-holdout sweep holds $out.lock"
 : > "$out" || die "could not initialize observations file: $out"
+mkdir -p "$artifacts" || die "could not create evidence root: $artifacts"
 total=0
 process_passed=0
 oracle_passed=0
@@ -136,6 +142,17 @@ for id in "${ids[@]}"; do
       code=$?
     fi
     wall_ms=$(($(date +%s%3N) - start_ms))
+    evidence_relpath="$id/rep-$rep"
+    evidence="$artifacts/$evidence_relpath"
+    mkdir -p "$evidence" || die "could not create evidence directory for $id#$rep"
+    cp "$ws/run.log" "$evidence/run.log" ||
+      die "could not retain run log for $id#$rep"
+    if [ -f "$ws/$target_path" ]; then
+      cp "$ws/$target_path" "$evidence/final-target.rs" ||
+        die "could not retain final target for $id#$rep"
+      git -C "$ws" --no-pager diff -- "$target_path" >"$evidence/patch.diff" ||
+        die "could not retain patch for $id#$rep"
+    fi
     compile_clean=false
     cargo_check_exit=null
     case "$code" in
@@ -143,12 +160,30 @@ for id in "${ids[@]}"; do
       *)
         if [ -f "$ws/$target_path" ]; then
           if (cd "$ws" && timeout "$TIMEOUT" cargo check --offline --quiet) \
-            >"$ws/oracle-cargo.log" 2>&1; then
+            >"$evidence/cargo-check.log" 2>&1; then
             compile_clean=true
             cargo_check_exit=0
           else
             cargo_check_exit=$?
           fi
+        fi
+        ;;
+    esac
+    tests_pass=false
+    cargo_test_exit=null
+    case "$code" in
+      124|126|127) ;;
+      *)
+        mkdir -p "$ws/tests" ||
+          die "could not stage semantic tests for $id#$rep"
+        cp -a "$FIXTURES/$id/oracle-tests"/. "$ws/tests/" ||
+          die "semantic test copy failed for $id#$rep"
+        if (cd "$ws" && timeout "$TIMEOUT" cargo test --offline --quiet) \
+          >"$evidence/cargo-test.log" 2>&1; then
+          tests_pass=true
+          cargo_test_exit=0
+        else
+          cargo_test_exit=$?
         fi
         ;;
     esac
@@ -158,34 +193,40 @@ for id in "${ids[@]}"; do
       --run-log "$ws/run.log" \
       --exit-code "$code" \
       --compile-clean "$compile_clean" \
-      --cargo-check-exit "$cargo_check_exit")" ||
+      --cargo-check-exit "$cargo_check_exit" \
+      --tests-pass "$tests_pass" \
+      --cargo-test-exit "$cargo_test_exit")" ||
       die "oracle failed for $id#$rep"
-    read -r process_pass compile_clean reference_match oracle_pass failure_class \
-      cargo_check_exit generations <<<"$oracle_out" ||
+    read -r process_pass compile_clean tests_pass reference_match oracle_pass failure_class \
+      cargo_check_exit cargo_test_exit generations <<<"$oracle_out" ||
       die "oracle parse failed for $id#$rep"
+    ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout 30 \
+      "$ALLOY" --workspace "$ws" --profile "$PROFILE" events --json \
+      >"$evidence/events.jsonl" 2>"$evidence/events.stderr" || true
+    printf '{"fixture_id":"%s","repetition":%d,"run_exit":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"reference_match":%s,"strict_oracle":%s,"failure_class":"%s"}\n' \
+      "$id" "$rep" "$code" "$process_pass" "$compile_clean" "$tests_pass" \
+      "$reference_match" "$oracle_pass" "$failure_class" >"$evidence/metadata.json"
     total=$((total + 1))
     [ "$process_pass" = "true" ] && process_passed=$((process_passed + 1))
     [ "$oracle_pass" = "true" ] && oracle_passed=$((oracle_passed + 1))
     case "$code" in
       126|127) unexecutable=$((unexecutable + 1));;
     esac
-    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"process_pass":%s,"compile_clean":%s,"reference_match":%s,"oracle_pass":%s,"failure_class":"%s","cargo_check_exit":%s,"repair_generations":%d,"wall_ms":%d,"model":"%s","temperature":%s,"profile":"%s","base_url":"%s","corpus":"rfc0016-holdout-live"}\n' \
+    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"reference_match":%s,"oracle_pass":%s,"failure_class":"%s","cargo_check_exit":%s,"cargo_test_exit":%s,"repair_generations":%d,"wall_ms":%d,"evidence_relpath":"%s","model":"%s","temperature":%s,"profile":"%s","base_url":"%s","corpus":"rfc0016-holdout-live"}\n' \
       "$id" "$rep" "$code" "${process_pass,,}" "${compile_clean,,}" \
-      "${reference_match,,}" "${oracle_pass,,}" "$failure_class" "$cargo_check_exit" \
-      "$generations" "$wall_ms" "$MODEL" "$TEMP" "$PROFILE" "$BASEURL" >>"$out"
+      "${tests_pass,,}" "${reference_match,,}" "${oracle_pass,,}" "$failure_class" \
+      "$cargo_check_exit" "$cargo_test_exit" "$generations" "$wall_ms" \
+      "$evidence_relpath" "$MODEL" "$TEMP" "$PROFILE" "$BASEURL" >>"$out"
     echo "[$oracle_passed/$total oracle; $process_passed process] $id#$rep \
-oracle=$oracle_pass class=$failure_class generations=$generations ${wall_ms}ms"
-    # Keep non-oracle logs under /tmp for diagnosis; wipe strict passes.
-    if [ "$oracle_pass" = "true" ]; then
-      rm -rf "$ws"
-    else
-      echo "  log: $ws/run.log" >&2
-    fi
+oracle=$oracle_pass tests=$tests_pass class=$failure_class generations=$generations ${wall_ms}ms"
+    echo "  evidence: $evidence" >&2
+    rm -rf "$ws"
   done
 done
 
 echo "DONE oracle=$oracle_passed/$total process=$process_passed/$total -> $out \
 (live-BYOM holdout; not an offline gate)"
+echo "EVIDENCE $artifacts"
 
 if [ "$total" -eq 0 ]; then
   die "no repetitions ran — the sweep is broken, not the fixtures"

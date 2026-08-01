@@ -1,0 +1,22 @@
+{
+  "recording_format_version": 1,
+  "toolchain": {
+    "channel": "1.97.1",
+    "rustc_version": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo_version": "cargo 1.97.1 (c980f4866 2026-06-30)"
+  },
+  "argv": [
+    "cargo",
+    "check",
+    "--message-format=json",
+    "-p",
+    "e0382_holdout_01"
+  ],
+  "exit_code": 101,
+  "stdout_lines": [
+    "{\"reason\":\"compiler-message\",\"message\":{\"code\":{\"code\":\"E0382\"},\"level\":\"error\",\"message\":\"borrow of moved value: `items`\"}}",
+    "{\"reason\":\"build-finished\",\"success\":false}"
+  ],
+  "stderr": "",
+  "content_digest": "4a9fc62004162c2b056909949297afad02bf4f8a7e891df45d92abeadfe54b10"
+}

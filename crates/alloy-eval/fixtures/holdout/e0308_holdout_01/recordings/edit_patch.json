@@ -1,0 +1,5 @@
+{
+  "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -2,6 +2,6 @@\n     if enabled {\n         3\n     } else {\n-        \"0\"\n+        0\n     }\n }\n",
+  "summary": "replace the string disabled limit with a u32",
+  "confidence": 0.95
+}

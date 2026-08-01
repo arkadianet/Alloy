@@ -83,6 +83,16 @@ pub(crate) fn exit_from_run_events(events: &[SessionEvent], run: RunId) -> Optio
     Some(exit)
 }
 
+/// Human-readable terminal reason recorded by the control plane, when present.
+pub(crate) fn terminal_reason(events: &[SessionEvent], run: RunId) -> Option<&str> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.run_id == Some(run) && event.type_ == SessionEventType::RunCompleted)
+        .and_then(|event| event.payload.get("reason"))
+        .and_then(serde_json::Value::as_str)
+}
+
 /// CR19 — RFC-0010 FOW5's workspace-modified inference: an `EditApplied`
 /// event (or an edit-node success recorded in the log) means the workspace
 /// may be modified. Absence proves nothing and is not printed as clean.

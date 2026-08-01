@@ -1,0 +1,22 @@
+{
+  "recording_format_version": 1,
+  "toolchain": {
+    "channel": "1.97.1",
+    "rustc_version": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo_version": "cargo 1.97.1 (c980f4866 2026-06-30)"
+  },
+  "argv": [
+    "cargo",
+    "check",
+    "--message-format=json",
+    "-p",
+    "e0308_holdout_01"
+  ],
+  "exit_code": 101,
+  "stdout_lines": [
+    "{\"reason\":\"compiler-message\",\"message\":{\"code\":{\"code\":\"E0308\"},\"level\":\"error\",\"message\":\"`if` and `else` have incompatible types\"}}",
+    "{\"reason\":\"build-finished\",\"success\":false}"
+  ],
+  "stderr": "",
+  "content_digest": "7f29ffd4a52f84d23732da0dff1a799007f627db1e8bf473fb19187305fc7d7a"
+}

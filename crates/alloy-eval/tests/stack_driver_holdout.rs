@@ -35,8 +35,10 @@ fn pass_rate(outcomes: &[FixtureOutcome]) -> f64 {
     passes as f64 / n as f64
 }
 
-fn holdout_ids() -> [FixtureId; 2] {
+fn holdout_ids() -> [FixtureId; 4] {
     [
+        FixtureId::new("e0308_holdout_01").unwrap(),
+        FixtureId::new("e0382_holdout_01").unwrap(),
         FixtureId::new("e0502_holdout_01").unwrap(),
         FixtureId::new("e0502_holdout_02").unwrap(),
     ]

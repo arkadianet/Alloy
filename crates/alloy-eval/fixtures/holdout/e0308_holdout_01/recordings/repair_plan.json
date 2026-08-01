@@ -1,0 +1,13 @@
+{
+  "summary": "repair src/lib.rs so the crate compiles cleanly",
+  "target_files": ["src/lib.rs"],
+  "steps": [
+    {
+      "file": "src/lib.rs",
+      "rationale": "return the numeric disabled limit required by the function signature",
+      "anchor_line": 5
+    }
+  ],
+  "needs_replan": false,
+  "confidence": 0.95
+}
