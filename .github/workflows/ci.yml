@@ -57,6 +57,16 @@ jobs:
             exit 1
           fi
 
+      # Shell-contract coverage for eval/live-holdout/{run,matrix,e1,prepare}.sh.
+      # Stubs replace the model drivers; no live endpoint or secret is used.
+      - name: Live-holdout harness contract (offline, no endpoint)
+        run: |
+          unset ALLOY_API_KEY
+          cargo test -p alloy-eval --features live-naive \
+            --test live_naive_runner --locked
+          cargo test -p alloy-eval --features live-naive \
+            --test live_holdout_matrix --locked
+
       - name: Router without HTTP feature (RFC-0007 §11.7)
         run: cargo test -p alloy-runtime --no-default-features --locked
 

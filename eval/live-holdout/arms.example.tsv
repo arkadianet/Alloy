@@ -1,4 +1,8 @@
-# arm_id	model	temperature	profile	base_url	reps
-# Keep repetitions equal across arms so the comparison has one denominator per fixture.
-baseline	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	30
-autonomous-profile	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	30
+# arm_id	driver	model	temperature	profile	base_url	reps
+# This is the E1 target contract: one naive arm and both alloy profiles on
+# the same model/temperature/endpoint/repetitions. See ./e1.sh and
+# ./E1-CHECKLIST.md. Do not run this file as the pilot — the pilot uses an
+# operator-supplied smaller model at reps=3; see the checklist.
+naive	naive	Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf	0.6	none	http://127.0.0.1:8089/v1/	10
+alloy-default	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	10
+alloy-autonomous	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	10
