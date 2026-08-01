@@ -98,7 +98,8 @@ fn run() -> Result<(), String> {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            "environment variable ALLOY_API_KEY is unset or empty (see example.env)".to_owned()
+            "environment variable ALLOY_API_KEY is unset or empty (export it in the calling shell)"
+                .to_owned()
         })?;
 
     let endpoint = ModelEndpoint {
