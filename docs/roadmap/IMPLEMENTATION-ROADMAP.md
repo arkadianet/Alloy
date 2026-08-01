@@ -5,17 +5,104 @@
 | **Document** | Canonical implementation roadmap |
 | **Product** | Alloy — AI Engineering Runtime |
 | **Author** | arkadianet |
-| **Date** | 2026-07-25 |
+| **Date** | 2026-08-01 |
 | **Status** | Canonical for sequencing |
 | **Architecture (frozen)** | [`docs/architecture/alloy-architecture-v2.md`](../architecture/alloy-architecture-v2.md) |
-| **RFC backlog** | [`docs/rfcs/`](../rfcs/) (RFC-0001 … RFC-0016) |
+| **RFC backlog** | [`docs/rfcs/`](../rfcs/) (RFC-0001 … RFC-0017) |
 | **MVP posture** | [`docs/architecture/rfc-architect-response.md`](../architecture/rfc-architect-response.md) §6 / §10 |
 
-**Rules:** Do not redesign Architecture V2. RFCs 0001–0016 are the unit of completion. Every milestone ships a **usable** system. Prefer vertical slices; delay complexity until justified. Sandbox before dogfood. Eval week-1 posture. An RFC is not “completed” for milestone accounting until it meets the series **[Definition of Done](../rfcs/README.md#definition-of-done-merge-gate)** (architecture PASS, 100% acceptance criteria, tests, docs, stable public APIs, clippy/fmt clean, no in-scope TODOs/placeholders, code review approved). Do not merge without that checklist.
+**Rules:** Do not redesign Architecture V2. RFCs 0001–0017 are the unit of completion. Every milestone ships a **usable** system. Prefer vertical slices; delay complexity until justified. Sandbox before dogfood. Eval week-1 posture. An RFC is not “completed” for milestone accounting until it meets the series **[Definition of Done](../rfcs/README.md#definition-of-done-merge-gate)** (architecture PASS, 100% acceptance criteria, tests, docs, stable public APIs, clippy/fmt clean, no in-scope TODOs/placeholders, code review approved). Do not merge without that checklist.
 
 **V2 MVP posture (binding):** single-binary · ≤5 crates · hardcoded DAG templates · TextPatch EditEngine · thin ProjectGraph · in-process MCP builtins · sandbox-first · eval week 1 · ≤4 LLM capabilities · TOML tier map · `example.env` only (never overwrite `.env`).
 
-**Current phase (2026-07-31):** Substrate + Beta-depth RFCs are in tree (0001–0017). The product is a **vertical-slice pre-alpha**, not finished. Next work is measurement and reliability — live-BYOM holdout, live-repair telemetry, planner-mode holdout (RFC-0017 §12.4) — not a new architecture wave. Sign MVP only when early-adopter docs and live holdout honesty are green; then close Beta measurement; Production (alloyd / ACP / ops) only when eval warrants.
+**Current phase (2026-08-01):** Substrate + Beta-depth RFCs are in tree (0001–0017), and PR #79 made live holdout results fail closed on independent compile, semantic-test, and strict-reference evidence. The product remains a **vertical-slice pre-alpha**, not finished. The active work is trustworthy uplift measurement, followed by bounded repair-reliability work driven by those results—not a new architecture wave. Sign MVP only when early-adopter docs and a comparable live three-arm measurement are green.
+
+---
+
+## Current execution plan (post-M7)
+
+This section is the active work queue. The detailed M1–M7, MVP, Beta, and Production sections below remain the architecture and completion history. Stages advance on evidence, not calendar dates.
+
+| Stage | Focus | Status | Binary exit gate |
+| --- | --- | --- | --- |
+| **E1 — Now** | Trustworthy uplift measurement | **Active** | Comparable naive/default/autonomous reports on pilot and target models |
+| **E2 — Next** | Evidence-driven repair reliability | Pending E1 | Repeatable strict-semantic uplift or an explicit stop/reposition decision |
+| **E3 — Later** | Broaden engineering capabilities | Pending E2 | Each promoted capability proves measured value against a naive baseline |
+| **E4 — Beta** | Early-adopter usability | Pending E3 | External user completes a useful task without architect assistance |
+| **E5 — Production** | Operational hardening | Pending E4 | Stable, supportable release with calibrated claims |
+
+### E1 — Trustworthy uplift measurement
+
+**Question:** Does Alloy improve the same model's effective repair success over naive execution, and does the autonomous profile improve on the default profile?
+
+**Work:**
+- Freeze one holdout corpus before running; hidden references and semantic tests remain unavailable to model workspaces.
+- Run three equal arms: **naive/raw model**, **Alloy default**, and **Alloy autonomous**.
+- Keep model, quantization, temperature, endpoint, fixtures, and repetitions identical across arms.
+- Build runner and evaluator binaries once from the same commit into a dedicated target directory; record that commit in the evidence bundle.
+- Run a fast pilot with a smaller capable model at **3 repetitions per fixture**.
+- Confirm with the target Q4 30B model at **10 repetitions per fixture**; extend toward 30 only when the Wilson intervals or failure mix leave the result ambiguous.
+- Retain per-attempt logs, final targets, diffs, cargo check/test output, events, endpoint identity, timing, and model-call counts.
+
+**Exit gate:**
+- [ ] All three arms have complete, dense, schema-compatible reports with no endpoint, binary-version, or repetition mixing.
+- [ ] Process, compile, semantic-test, strict-reference, and strict-oracle results are reported separately.
+- [ ] Wilson intervals, elapsed time, model calls, and failure classes are documented.
+- [ ] The result states either measured uplift or a specific evidence-backed “why not.”
+- [ ] An independent rerun command and operator checklist are documented.
+
+**Current evidence:** A discarded Q4 sweep completed a `0/60` strict-reference baseline but the autonomous arm then used an incompatible evaluator binary. It is useful only as a harness failure report; it is not valid comparative product evidence and must not be cited as an Alloy result.
+
+### E2 — Evidence-driven repair reliability
+
+**Question:** Which measured failure boundary prevents uplift: context, edit quality, verification, or replanning?
+
+**Work:**
+- Rank E1 failure classes by frequency and impact.
+- Change one bounded subsystem at a time; do not tune against hidden holdout references.
+- Re-run the frozen E1 comparison after each change.
+- Preserve sandbox, quarantine, approval, durability, and honest-verification guarantees.
+
+**Exit gate:**
+- [ ] At least one Alloy arm shows a positive strict-oracle delta over naive execution on the target model without compile, safety, or evidence regressions.
+- [ ] The uplift repeats on a second frozen-corpus run or model seed.
+- [ ] No claim relies on process exit or compile success alone.
+
+**Stop rule:** After two bounded, evidence-driven intervention cycles without uplift, write the “why not,” stop tuning this slice, and make an explicit product decision: reposition the repair claim, change the target model/task class, or pause repair before starting E3.
+
+### E3 — Broaden engineering capabilities
+
+Promote one capability at a time in this order unless E2 evidence justifies a change:
+
+1. Multi-file repair.
+2. Diff review with actionable findings.
+3. Repository navigation and context selection.
+4. Planning for bounded multi-step changes.
+
+Each capability requires a naive baseline, Alloy arm, hidden acceptance oracle, retained evidence, and explicit cost/time reporting. A capability moves from “implemented” to “product-supported” only when it demonstrates repeatable value.
+
+**Exit gate:**
+- [ ] Every promoted capability has a frozen benchmark and independent oracle.
+- [ ] At least one Alloy configuration beats its naive baseline on the supported task class.
+- [ ] Unsupported task boundaries are documented and fail honestly.
+
+### E4 — Early-adopter Beta
+
+**Work:** installation, BYOM setup, example configuration, small real repositories, interruption/resume, evidence inspection, and support workflow.
+
+**Exit gate:**
+- [ ] At least one external user installs Alloy and completes a useful supported task using only published documentation.
+- [ ] Failures produce actionable evidence without requiring database or source inspection.
+- [ ] Upgrade, rollback, security contact, and support boundaries are documented.
+
+### E5 — Production readiness
+
+**Work:** release automation, security review, SBOM/signing, crash/resume soak tests, performance budgets, compatibility policy, operational runbooks, and calibrated product claims.
+
+**Exit gate:**
+- [ ] Release, security, durability, and support checklists are green.
+- [ ] Performance and cost claims come from frozen, reproducible evaluation.
+- [ ] Deferred architecture items remain gated by measured need.
 
 ---
 
@@ -367,7 +454,7 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 - [ ] README / example.env sufficient for external early adopter without architect consult *(README status banner corrected 2026-07-31; still pre-alpha, not an adopter pitch)*
 - [x] Dogfood policy: allowed after M7 *(in progress; not Alloy-on-Alloy as a product claim)*
 
-**Status (2026-07-31):** M1–M7 code is in tree and offline holdout CI is green. **MVP is not signed.** Remaining bar is honest early-adopter docs + a live-BYOM holdout measurement that is not scripted-recording theater. Operator entry point: [`eval/live-holdout/`](../../eval/live-holdout/) (independent model outputs on the holdout workspaces). Beta deep RFCs (0011/0012/0014) and RFC-0017 landed ahead of that signature — depth is present; the certification gate is measurement, not more substrate.
+**Status (2026-08-01):** M1–M7 code is in tree, offline holdout CI is green, and PR #79 made live observations require independent compile, semantic-test, and strict-reference evidence. **MVP is not signed.** Remaining bar is honest early-adopter docs plus E1's comparable naive/default/autonomous live-BYOM measurement. Operator entry point: [`eval/live-holdout/`](../../eval/live-holdout/). Beta deep RFCs (0011/0012/0014) and RFC-0017 landed ahead of that signature—the certification gate is measurement, not more substrate.
 
 **Demo scenario:** Same as M7 demo, run by someone outside the core team using only docs + `example.env`.
 
@@ -401,7 +488,7 @@ cargo test -p alloy-eval -- holdout_local_diagnostic
 - [x] ProjectGraph thin→deep without changing trait; Callers/Refs/Impls live at syn-grade (A-0011-6); SimilarFixes reads recorded fixes (A-0011-5) — wider auto-retrieve still deferred pending precision
 - [x] Context WorkingSet includes graph projections; still exactly three live domains
 - [x] LanguageBackend Rust-only; no PY/TS/cdylib
-- [ ] Holdout re-run shows improvement **or** written “why not” with metrics — `eval/live-holdout` now reports independent process, compile, strict-reference, failure-class, and Wilson-interval results. The first Qwen3-Coder `REPS=3` baseline was process `5/6` but strict `0/6` (one `replan_declined_kind`, five semantic reference mismatches), so this is diagnostic evidence, not a Beta sign-off. Next comparisons must repeat across model/context arms before changing `DomainWeights::v2_defaults()`; committed-recording outputs still cannot produce that differential signal (RFC-0012 §14.2).
+- [ ] Holdout re-run shows improvement **or** written “why not” with metrics — `eval/live-holdout` reports independent process, compile, semantic-test, strict-reference, failure-class, and Wilson-interval results. Earlier single-arm Qwen3-Coder runs and the discarded mixed-binary Q4 sweep are diagnostic harness evidence, not a Beta sign-off. E1 requires equal naive/default/autonomous arms before changing `DomainWeights::v2_defaults()`; committed-recording outputs still cannot produce that differential signal (RFC-0012 §14.2).
 - [ ] Still `max_parallel=1`; still git-only checkpoints
 - [ ] No External Memory auto-retrieve; no typed call/lifetime layers
 
