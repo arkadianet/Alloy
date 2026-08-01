@@ -37,6 +37,9 @@ mod harness;
 mod license;
 /// Strict live holdout oracle and arm comparison.
 mod live_holdout;
+/// One-shot, tool-free naive driver (E1 three-arm holdout, arm B).
+#[cfg(feature = "live-naive")]
+mod live_naive;
 /// Live-endpoint repair benchmark (operator tooling; never a holdout gate).
 mod live_repair;
 /// Strict fixture manifest loading.
@@ -69,6 +72,11 @@ pub use live_holdout::{
     StrictObservation as LiveHoldoutObservation,
     StrictObservationFields as LiveHoldoutObservationFields, StrictReport as LiveHoldoutReport,
     REPORT_SCHEMA_VERSION as LIVE_HOLDOUT_REPORT_VERSION,
+};
+#[cfg(feature = "live-naive")]
+pub use live_naive::{
+    build_naive_request, parse_replacement, write_replacement, NaiveReplacement, NaiveRunTelemetry,
+    MAX_REPLACEMENT_BYTES, NAIVE_SCHEMA_NAME,
 };
 pub use live_repair::{
     parse_observations_jsonl, render_router_toml, wilson_interval, LiveRepairCorpus,
