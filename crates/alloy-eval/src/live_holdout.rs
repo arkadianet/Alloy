@@ -15,11 +15,28 @@ use crate::live_repair::{wilson_interval, WilsonInterval, WILSON_Z_95};
 
 const CORPUS: &str = "rfc0016-holdout-live";
 const TIMEOUT_EXIT_CODE: i32 = 124;
-pub const REPORT_SCHEMA_VERSION: u32 = 3;
+pub const REPORT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize)]
 struct HoldoutManifest {
     naive_target_path: String,
+}
+
+/// Which driver produced an observation: the naive single-shot baseline or
+/// the Alloy orchestrated agent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveHoldoutDriver {
+    Naive,
+    Alloy,
+}
+
+/// Build provenance for the harness that produced an observation. Reports
+/// from different builds must never be treated as the same arm.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarnessIdentity {
+    pub source_revision: String,
+    pub binary_bundle_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,10 +57,14 @@ pub struct StrictObservation {
     pub evidence_relpath: String,
     pub model: String,
     pub temperature: f64,
-    #[serde(default = "default_profile")]
-    pub profile: String,
+    pub driver: LiveHoldoutDriver,
+    pub profile: Option<String>,
     pub base_url: String,
+    pub harness: HarnessIdentity,
     pub corpus: String,
+    pub model_calls: u32,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -68,15 +89,19 @@ pub struct FixtureSummary {
     pub failure_classes: BTreeMap<String, u32>,
     pub repair_generations_total: u32,
     pub wall_ms_total: u64,
+    pub model_calls_total: u64,
+    pub tokens_in_total: u64,
+    pub tokens_out_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Endpoint {
     pub model: String,
     pub temperature: f64,
-    #[serde(default = "default_profile")]
-    pub profile: String,
+    pub driver: LiveHoldoutDriver,
+    pub profile: Option<String>,
     pub base_url: String,
+    pub harness: HarnessIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -130,8 +155,37 @@ pub struct MatrixComparison {
     pub notes: Vec<String>,
 }
 
-fn default_profile() -> String {
-    "default".to_owned()
+/// A naive-vs-alloy arm identity check that only differs on driver, profile,
+/// or build provenance — not the raw model endpoint. Used to separate
+/// "wrong endpoint" from "wrong arm/build" in error messages.
+fn endpoint_matches(row: &StrictObservation, endpoint: &Endpoint) -> bool {
+    row.model == endpoint.model
+        && row.temperature == endpoint.temperature
+        && row.base_url == endpoint.base_url
+        && row.driver == endpoint.driver
+        && row.profile == endpoint.profile
+        && row.harness == endpoint.harness
+}
+
+fn core_endpoint_matches(row: &StrictObservation, endpoint: &Endpoint) -> bool {
+    row.model == endpoint.model
+        && row.temperature == endpoint.temperature
+        && row.base_url == endpoint.base_url
+}
+
+/// Naive observations carry no profile; Alloy observations must declare one
+/// of the two shipped profiles. Fails closed on anything else.
+fn validate_driver_profile(driver: LiveHoldoutDriver, profile: Option<&str>) -> Result<(), String> {
+    match (driver, profile) {
+        (LiveHoldoutDriver::Naive, None) => Ok(()),
+        (LiveHoldoutDriver::Naive, Some(_)) => {
+            Err("naive driver must not declare a profile".to_owned())
+        }
+        (LiveHoldoutDriver::Alloy, Some("default" | "autonomous")) => Ok(()),
+        (LiveHoldoutDriver::Alloy, _) => {
+            Err("alloy driver requires profile default or autonomous".to_owned())
+        }
+    }
 }
 
 fn target_path(manifest: &Path) -> Result<PathBuf, String> {
@@ -340,6 +394,9 @@ fn summarize_fixture(id: &str, rows: &[StrictObservation]) -> FixtureSummary {
         failure_classes,
         repair_generations_total: rows.iter().map(|row| row.repair_generations).sum(),
         wall_ms_total: rows.iter().map(|row| row.wall_ms).sum(),
+        model_calls_total: rows.iter().map(|row| u64::from(row.model_calls)).sum(),
+        tokens_in_total: rows.iter().map(|row| row.tokens_in).sum(),
+        tokens_out_total: rows.iter().map(|row| row.tokens_out).sum(),
     }
 }
 
@@ -352,6 +409,7 @@ pub fn score(
     if repetitions == 0 {
         return Err("repetitions must be at least one".to_owned());
     }
+    validate_driver_profile(endpoint.driver, endpoint.profile.as_deref())?;
     let ids = fixture_ids(fixtures)?;
     let expected: BTreeSet<_> = ids.iter().cloned().collect();
     let mut grouped: BTreeMap<String, Vec<StrictObservation>> =
@@ -360,13 +418,11 @@ pub fn score(
         if !expected.contains(&row.fixture_id) {
             return Err(format!("unknown fixture id {}", row.fixture_id));
         }
-        if row.corpus != CORPUS
-            || row.model != endpoint.model
-            || row.base_url != endpoint.base_url
-            || row.profile != endpoint.profile
-            || row.temperature != endpoint.temperature
-        {
+        if row.corpus != CORPUS || !core_endpoint_matches(row, &endpoint) {
             return Err(format!("endpoint identity mismatch for {}", row.fixture_id));
+        }
+        if !endpoint_matches(row, &endpoint) {
+            return Err(format!("harness identity mismatch for {}", row.fixture_id));
         }
         if row.process_pass != (row.exit_code == 0)
             || (row.compile_clean && row.cargo_check_exit != Some(0))
@@ -493,6 +549,14 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
                 baseline.repetitions
             ));
         }
+        if report.endpoint.harness != baseline.endpoint.harness {
+            // Arms may differ by model/temperature/driver/profile, but must
+            // share build provenance — otherwise the comparison is between
+            // two different codebases, not two arms of the same evaluation.
+            return Err(format!(
+                "arm {name} harness identity mismatch with {baseline_name}"
+            ));
+        }
         if arms.insert(name.clone(), report.clone()).is_some() {
             return Err(format!("duplicate arm identity {name}"));
         }
@@ -575,12 +639,21 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
 mod tests {
     use super::*;
 
+    fn harness_identity() -> HarnessIdentity {
+        HarnessIdentity {
+            source_revision: "a".repeat(40),
+            binary_bundle_sha256: "b".repeat(64),
+        }
+    }
+
     fn endpoint() -> Endpoint {
         Endpoint {
             model: "stub-model".to_owned(),
             temperature: 0.6,
-            profile: "default".to_owned(),
+            driver: LiveHoldoutDriver::Alloy,
+            profile: Some("default".to_owned()),
             base_url: "http://127.0.0.1:8089/v1/".to_owned(),
+            harness: harness_identity(),
         }
     }
 
@@ -603,9 +676,14 @@ mod tests {
             evidence_relpath: format!("{fixture_id}/rep-{repetition}"),
             model: endpoint.model,
             temperature: endpoint.temperature,
+            driver: endpoint.driver,
             profile: endpoint.profile,
             base_url: endpoint.base_url,
+            harness: endpoint.harness,
             corpus: CORPUS.to_owned(),
+            model_calls: 1,
+            tokens_in: 100,
+            tokens_out: 50,
         }
     }
 
@@ -632,6 +710,19 @@ mod tests {
             row.failure_class = "reference_mismatch_tests_passed".to_owned();
         }
         score(fixtures.path(), vec![row], endpoint(), 1).unwrap()
+    }
+
+    fn report_for_driver(driver: LiveHoldoutDriver, profile: Option<String>) -> StrictReport {
+        let fixtures = fixtures_with(&["shared"]);
+        let endpoint = Endpoint {
+            driver,
+            profile,
+            ..endpoint()
+        };
+        let mut row = observation("shared", 1);
+        row.driver = endpoint.driver;
+        row.profile = endpoint.profile.clone();
+        score(fixtures.path(), vec![row], endpoint, 1).unwrap()
     }
 
     #[test]
@@ -682,6 +773,9 @@ mod tests {
         assert_eq!(report.overall.oracle.attempts, 4);
         assert_eq!(report.overall.compile_clean_reference_mismatch.passes, 0);
         assert_eq!(report.fixtures.len(), 2);
+        assert_eq!(report.overall.model_calls_total, 4);
+        assert_eq!(report.overall.tokens_in_total, 400);
+        assert_eq!(report.overall.tokens_out_total, 200);
     }
 
     #[test]
@@ -691,6 +785,45 @@ mod tests {
         row.temperature = 0.7;
         let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
         assert!(error.contains("endpoint identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn score_rejects_driver_or_harness_mixing() {
+        let fixtures = fixtures_with(&["a"]);
+        let mut row = observation("a", 1);
+        row.harness.source_revision = "other".to_owned();
+        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        assert!(error.contains("harness identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn score_rejects_naive_endpoint_with_profile() {
+        let fixtures = fixtures_with(&["a"]);
+        let endpoint = Endpoint {
+            driver: LiveHoldoutDriver::Naive,
+            profile: Some("default".to_owned()),
+            ..endpoint()
+        };
+        let error = score(fixtures.path(), vec![], endpoint, 1).unwrap_err();
+        assert!(
+            error.contains("naive") && error.contains("profile"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn score_rejects_alloy_endpoint_without_recognized_profile() {
+        let fixtures = fixtures_with(&["a"]);
+        let endpoint = Endpoint {
+            driver: LiveHoldoutDriver::Alloy,
+            profile: None,
+            ..endpoint()
+        };
+        let error = score(fixtures.path(), vec![], endpoint, 1).unwrap_err();
+        assert!(
+            error.contains("alloy") && error.contains("default") && error.contains("autonomous"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -778,6 +911,31 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.contains("duplicate arm identity"), "{error}");
+    }
+
+    #[test]
+    fn compare_requires_same_harness_identity() {
+        let baseline = report_for_driver(LiveHoldoutDriver::Naive, None);
+        let mut candidate = report_for_driver(LiveHoldoutDriver::Alloy, Some("default".to_owned()));
+        candidate.endpoint.harness.source_revision = "other".to_owned();
+        let error = compare(vec![
+            ("naive".to_owned(), baseline),
+            ("alloy-default".to_owned(), candidate),
+        ])
+        .unwrap_err();
+        assert!(error.contains("harness identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn compare_allows_differing_driver_and_profile_with_same_harness() {
+        let baseline = report_for_driver(LiveHoldoutDriver::Naive, None);
+        let candidate = report_for_driver(LiveHoldoutDriver::Alloy, Some("autonomous".to_owned()));
+        let matrix = compare(vec![
+            ("naive".to_owned(), baseline),
+            ("alloy-autonomous".to_owned(), candidate),
+        ])
+        .unwrap();
+        assert_eq!(matrix.comparisons.len(), 1);
     }
 
     #[test]
