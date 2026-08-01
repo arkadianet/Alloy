@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,11 +16,32 @@ use crate::live_repair::{wilson_interval, WilsonInterval, WILSON_Z_95};
 
 const CORPUS: &str = "rfc0016-holdout-live";
 const TIMEOUT_EXIT_CODE: i32 = 124;
-pub const REPORT_SCHEMA_VERSION: u32 = 3;
+/// Page size `eval/live-holdout/run.sh` requests from `alloy events`, which
+/// is also the runtime's maximum page. An export this long is treated as
+/// truncated rather than complete.
+const EVENT_EXPORT_PAGE_LIMIT: usize = 1_000;
+pub const REPORT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize)]
 struct HoldoutManifest {
     naive_target_path: String,
+}
+
+/// Which driver produced an observation: the naive single-shot baseline or
+/// the Alloy orchestrated agent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveHoldoutDriver {
+    Naive,
+    Alloy,
+}
+
+/// Build provenance for the harness that produced an observation. Reports
+/// from different builds must never be treated as the same arm.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarnessIdentity {
+    pub source_revision: String,
+    pub binary_bundle_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,10 +62,16 @@ pub struct StrictObservation {
     pub evidence_relpath: String,
     pub model: String,
     pub temperature: f64,
-    #[serde(default = "default_profile")]
-    pub profile: String,
+    pub driver: LiveHoldoutDriver,
+    pub profile: Option<String>,
     pub base_url: String,
+    pub harness: HarnessIdentity,
     pub corpus: String,
+    pub model_calls: u32,
+    /// Provider-reported usage, absent when the provider did not report it.
+    /// Unknown usage stays `null`; it never collapses to zero.
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -68,15 +96,19 @@ pub struct FixtureSummary {
     pub failure_classes: BTreeMap<String, u32>,
     pub repair_generations_total: u32,
     pub wall_ms_total: u64,
+    pub model_calls_total: u64,
+    pub tokens_in_total: u64,
+    pub tokens_out_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Endpoint {
     pub model: String,
     pub temperature: f64,
-    #[serde(default = "default_profile")]
-    pub profile: String,
+    pub driver: LiveHoldoutDriver,
+    pub profile: Option<String>,
     pub base_url: String,
+    pub harness: HarnessIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -130,8 +162,37 @@ pub struct MatrixComparison {
     pub notes: Vec<String>,
 }
 
-fn default_profile() -> String {
-    "default".to_owned()
+/// A naive-vs-alloy arm identity check that only differs on driver, profile,
+/// or build provenance — not the raw model endpoint. Used to separate
+/// "wrong endpoint" from "wrong arm/build" in error messages.
+fn endpoint_matches(row: &StrictObservation, endpoint: &Endpoint) -> bool {
+    row.model == endpoint.model
+        && row.temperature == endpoint.temperature
+        && row.base_url == endpoint.base_url
+        && row.driver == endpoint.driver
+        && row.profile == endpoint.profile
+        && row.harness == endpoint.harness
+}
+
+fn core_endpoint_matches(row: &StrictObservation, endpoint: &Endpoint) -> bool {
+    row.model == endpoint.model
+        && row.temperature == endpoint.temperature
+        && row.base_url == endpoint.base_url
+}
+
+/// Naive observations carry no profile; Alloy observations must declare one
+/// of the two shipped profiles. Fails closed on anything else.
+fn validate_driver_profile(driver: LiveHoldoutDriver, profile: Option<&str>) -> Result<(), String> {
+    match (driver, profile) {
+        (LiveHoldoutDriver::Naive, None) => Ok(()),
+        (LiveHoldoutDriver::Naive, Some(_)) => {
+            Err("naive driver must not declare a profile".to_owned())
+        }
+        (LiveHoldoutDriver::Alloy, Some("default" | "autonomous")) => Ok(()),
+        (LiveHoldoutDriver::Alloy, _) => {
+            Err("alloy driver requires profile default or autonomous".to_owned())
+        }
+    }
 }
 
 fn target_path(manifest: &Path) -> Result<PathBuf, String> {
@@ -276,6 +337,122 @@ fn classify(
     "process_failed".to_owned()
 }
 
+/// Per-attempt model usage extracted from one driver's evidence file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunTelemetry {
+    pub model_calls: u32,
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
+}
+
+impl RunTelemetry {
+    /// No telemetry was recorded at all.
+    const UNRECORDED: Self = Self {
+        model_calls: 0,
+        tokens_in: None,
+        tokens_out: None,
+    };
+}
+
+#[derive(Debug, Deserialize)]
+struct NaiveResult {
+    model_calls: u32,
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
+}
+
+/// Read `input` and extract the driver's model-call and token telemetry.
+///
+/// Missing naive telemetry is a harness error: the one-shot driver must
+/// account for its one call. Alloy may report no events only when its runner
+/// explicitly retained a successful empty export.
+pub fn telemetry(driver: LiveHoldoutDriver, input: &Path) -> Result<RunTelemetry, String> {
+    let raw = match fs::read_to_string(input) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return match driver {
+                LiveHoldoutDriver::Naive => {
+                    Err(format!("naive telemetry missing: {}", input.display()))
+                }
+                LiveHoldoutDriver::Alloy => Ok(RunTelemetry::UNRECORDED),
+            };
+        }
+        Err(error) => return Err(format!("read {}: {error}", input.display())),
+    };
+    match driver {
+        LiveHoldoutDriver::Naive => naive_telemetry(&raw),
+        LiveHoldoutDriver::Alloy => alloy_telemetry(&raw),
+    }
+}
+
+fn naive_telemetry(raw: &str) -> Result<RunTelemetry, String> {
+    let result: NaiveResult =
+        serde_json::from_str(raw).map_err(|error| format!("parse naive telemetry: {error}"))?;
+    if result.model_calls != 1 {
+        return Err(format!(
+            "naive telemetry must record exactly one model call, got {}",
+            result.model_calls
+        ));
+    }
+    Ok(RunTelemetry {
+        model_calls: result.model_calls,
+        tokens_in: result.tokens_in,
+        tokens_out: result.tokens_out,
+    })
+}
+
+/// Count `model_call` events and sum the token fields the provider reported.
+/// An empty export means the event dump produced nothing; it is reported as
+/// zero calls with unknown usage rather than invented numbers.
+///
+/// An export that fills the page limit is rejected: `alloy events` returns
+/// one page, so a full page means the run may have emitted more events than
+/// were exported and any count taken from it would silently under-report.
+fn alloy_telemetry(raw: &str) -> Result<RunTelemetry, String> {
+    let mut telemetry = RunTelemetry::UNRECORDED;
+    let mut events = 0usize;
+    for (index, line) in raw
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+    {
+        let number = index + 1;
+        let event: serde_json::Value =
+            serde_json::from_str(line).map_err(|error| format!("event line {number}: {error}"))?;
+        events += 1;
+        if event.get("type").and_then(serde_json::Value::as_str) != Some("model_call") {
+            continue;
+        }
+        telemetry.model_calls = telemetry.model_calls.saturating_add(1);
+        let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
+        add_usage(&mut telemetry.tokens_in, payload, "input_tokens", number)?;
+        add_usage(&mut telemetry.tokens_out, payload, "output_tokens", number)?;
+    }
+    if events >= EVENT_EXPORT_PAGE_LIMIT {
+        return Err(format!(
+            "event export holds {events} events, at the {EVENT_EXPORT_PAGE_LIMIT}-event page \
+             limit; telemetry may be truncated"
+        ));
+    }
+    Ok(telemetry)
+}
+
+fn add_usage(
+    total: &mut Option<u64>,
+    payload: &serde_json::Value,
+    field: &str,
+    line: usize,
+) -> Result<(), String> {
+    let Some(value) = payload.get(field).filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let count = value
+        .as_u64()
+        .ok_or_else(|| format!("event line {line}: {field} must be a non-negative integer"))?;
+    *total = Some(total.unwrap_or(0).saturating_add(count));
+    Ok(())
+}
+
 pub fn load_observations(path: &Path) -> Result<Vec<StrictObservation>, String> {
     let source =
         fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
@@ -340,6 +517,11 @@ fn summarize_fixture(id: &str, rows: &[StrictObservation]) -> FixtureSummary {
         failure_classes,
         repair_generations_total: rows.iter().map(|row| row.repair_generations).sum(),
         wall_ms_total: rows.iter().map(|row| row.wall_ms).sum(),
+        model_calls_total: rows.iter().map(|row| u64::from(row.model_calls)).sum(),
+        // Totals sum reported usage only; rows with unknown usage contribute
+        // nothing rather than a fabricated zero.
+        tokens_in_total: rows.iter().filter_map(|row| row.tokens_in).sum(),
+        tokens_out_total: rows.iter().filter_map(|row| row.tokens_out).sum(),
     }
 }
 
@@ -352,6 +534,7 @@ pub fn score(
     if repetitions == 0 {
         return Err("repetitions must be at least one".to_owned());
     }
+    validate_driver_profile(endpoint.driver, endpoint.profile.as_deref())?;
     let ids = fixture_ids(fixtures)?;
     let expected: BTreeSet<_> = ids.iter().cloned().collect();
     let mut grouped: BTreeMap<String, Vec<StrictObservation>> =
@@ -360,13 +543,19 @@ pub fn score(
         if !expected.contains(&row.fixture_id) {
             return Err(format!("unknown fixture id {}", row.fixture_id));
         }
-        if row.corpus != CORPUS
-            || row.model != endpoint.model
-            || row.base_url != endpoint.base_url
-            || row.profile != endpoint.profile
-            || row.temperature != endpoint.temperature
-        {
+        if row.corpus != CORPUS || !core_endpoint_matches(row, &endpoint) {
             return Err(format!("endpoint identity mismatch for {}", row.fixture_id));
+        }
+        if !endpoint_matches(row, &endpoint) {
+            return Err(format!("harness identity mismatch for {}", row.fixture_id));
+        }
+        // The naive arm is exactly one completion with no retries. Missing
+        // and extra calls both invalidate the attempted comparison.
+        if row.driver == LiveHoldoutDriver::Naive && row.model_calls != 1 {
+            return Err(format!(
+                "naive driver recorded {} model calls for {}, expected exactly one",
+                row.model_calls, row.fixture_id
+            ));
         }
         if row.process_pass != (row.exit_code == 0)
             || (row.compile_clean && row.cargo_check_exit != Some(0))
@@ -493,6 +682,14 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
                 baseline.repetitions
             ));
         }
+        if report.endpoint.harness != baseline.endpoint.harness {
+            // Arms may differ by model/temperature/driver/profile, but must
+            // share build provenance — otherwise the comparison is between
+            // two different codebases, not two arms of the same evaluation.
+            return Err(format!(
+                "arm {name} harness identity mismatch with {baseline_name}"
+            ));
+        }
         if arms.insert(name.clone(), report.clone()).is_some() {
             return Err(format!("duplicate arm identity {name}"));
         }
@@ -575,12 +772,21 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
 mod tests {
     use super::*;
 
+    fn harness_identity() -> HarnessIdentity {
+        HarnessIdentity {
+            source_revision: "a".repeat(40),
+            binary_bundle_sha256: "b".repeat(64),
+        }
+    }
+
     fn endpoint() -> Endpoint {
         Endpoint {
             model: "stub-model".to_owned(),
             temperature: 0.6,
-            profile: "default".to_owned(),
+            driver: LiveHoldoutDriver::Alloy,
+            profile: Some("default".to_owned()),
             base_url: "http://127.0.0.1:8089/v1/".to_owned(),
+            harness: harness_identity(),
         }
     }
 
@@ -603,9 +809,14 @@ mod tests {
             evidence_relpath: format!("{fixture_id}/rep-{repetition}"),
             model: endpoint.model,
             temperature: endpoint.temperature,
+            driver: endpoint.driver,
             profile: endpoint.profile,
             base_url: endpoint.base_url,
+            harness: endpoint.harness,
             corpus: CORPUS.to_owned(),
+            model_calls: 1,
+            tokens_in: Some(100),
+            tokens_out: Some(50),
         }
     }
 
@@ -632,6 +843,19 @@ mod tests {
             row.failure_class = "reference_mismatch_tests_passed".to_owned();
         }
         score(fixtures.path(), vec![row], endpoint(), 1).unwrap()
+    }
+
+    fn report_for_driver(driver: LiveHoldoutDriver, profile: Option<String>) -> StrictReport {
+        let fixtures = fixtures_with(&["shared"]);
+        let endpoint = Endpoint {
+            driver,
+            profile,
+            ..endpoint()
+        };
+        let mut row = observation("shared", 1);
+        row.driver = endpoint.driver;
+        row.profile = endpoint.profile.clone();
+        score(fixtures.path(), vec![row], endpoint, 1).unwrap()
     }
 
     #[test]
@@ -682,6 +906,130 @@ mod tests {
         assert_eq!(report.overall.oracle.attempts, 4);
         assert_eq!(report.overall.compile_clean_reference_mismatch.passes, 0);
         assert_eq!(report.fixtures.len(), 2);
+        assert_eq!(report.overall.model_calls_total, 4);
+        assert_eq!(report.overall.tokens_in_total, 400);
+        assert_eq!(report.overall.tokens_out_total, 200);
+    }
+
+    #[test]
+    fn score_totals_skip_unreported_usage_without_inventing_zero() {
+        let fixtures = fixtures_with(&["a"]);
+        let mut row = observation("a", 1);
+        row.tokens_in = None;
+        row.tokens_out = None;
+        let report = score(fixtures.path(), vec![row], endpoint(), 1).unwrap();
+        assert_eq!(report.overall.model_calls_total, 1);
+        assert_eq!(report.overall.tokens_in_total, 0);
+        assert_eq!(report.observations[0].tokens_in, None);
+    }
+
+    #[test]
+    fn score_rejects_naive_rows_without_exactly_one_model_call() {
+        let fixtures = fixtures_with(&["a"]);
+        let endpoint = Endpoint {
+            driver: LiveHoldoutDriver::Naive,
+            profile: None,
+            ..endpoint()
+        };
+        for model_calls in [0, 2] {
+            let mut row = observation("a", 1);
+            row.driver = LiveHoldoutDriver::Naive;
+            row.profile = None;
+            row.model_calls = model_calls;
+            let error = score(fixtures.path(), vec![row], endpoint.clone(), 1).unwrap_err();
+            assert!(
+                error.contains(&format!("naive driver recorded {model_calls} model calls")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn alloy_telemetry_counts_calls_and_sums_reported_usage() {
+        let events = concat!(
+            r#"{"type":"model_call","payload":{"input_tokens":100,"output_tokens":20}}"#,
+            "\n",
+            r#"{"type":"model_call","payload":{"output_tokens":5,"input_tokens":null}}"#,
+            "\n",
+            r#"{"type":"run_completed","payload":{"dag_state":"succeeded"}}"#,
+            "\n",
+        );
+        assert_eq!(
+            alloy_telemetry(events).unwrap(),
+            RunTelemetry {
+                model_calls: 2,
+                tokens_in: Some(100),
+                tokens_out: Some(25),
+            }
+        );
+    }
+
+    #[test]
+    fn alloy_telemetry_keeps_absent_usage_unknown_and_rejects_malformed_events() {
+        let without_usage = "{\"type\":\"model_call\",\"payload\":{}}\n";
+        assert_eq!(
+            alloy_telemetry(without_usage).unwrap(),
+            RunTelemetry {
+                model_calls: 1,
+                tokens_in: None,
+                tokens_out: None,
+            }
+        );
+        assert_eq!(alloy_telemetry("").unwrap(), RunTelemetry::UNRECORDED);
+        assert!(alloy_telemetry("not json\n").is_err());
+        assert!(
+            alloy_telemetry("{\"type\":\"model_call\",\"payload\":{\"input_tokens\":-3}}\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn alloy_telemetry_rejects_an_export_at_the_page_limit() {
+        let event = "{\"type\":\"model_call\",\"payload\":{\"input_tokens\":1}}\n";
+        let at_cap = event.repeat(EVENT_EXPORT_PAGE_LIMIT);
+        let error = alloy_telemetry(&at_cap).unwrap_err();
+        assert!(
+            error.contains("page limit") && error.contains("truncated"),
+            "{error}"
+        );
+
+        let below_cap = event.repeat(EVENT_EXPORT_PAGE_LIMIT - 1);
+        assert_eq!(
+            alloy_telemetry(&below_cap).unwrap().model_calls,
+            (EVENT_EXPORT_PAGE_LIMIT - 1) as u32
+        );
+    }
+
+    #[test]
+    fn naive_telemetry_requires_exactly_one_model_call() {
+        let one = r#"{"model_calls":1,"tokens_in":123,"tokens_out":45,"finish_reason":"stop"}"#;
+        assert_eq!(
+            naive_telemetry(one).unwrap(),
+            RunTelemetry {
+                model_calls: 1,
+                tokens_in: Some(123),
+                tokens_out: Some(45),
+            }
+        );
+        let unknown_usage = r#"{"model_calls":1,"tokens_in":null,"tokens_out":null}"#;
+        assert_eq!(naive_telemetry(unknown_usage).unwrap().tokens_in, None);
+        assert!(naive_telemetry(r#"{"model_calls":2}"#).is_err());
+        assert!(naive_telemetry("{}").is_err());
+    }
+
+    #[test]
+    fn telemetry_rejects_missing_naive_evidence_but_keeps_alloy_unrecorded() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("naive-result.json");
+        let error = telemetry(LiveHoldoutDriver::Naive, &missing).unwrap_err();
+        assert!(
+            error.contains("naive telemetry missing") && error.contains("naive-result.json"),
+            "{error}"
+        );
+        assert_eq!(
+            telemetry(LiveHoldoutDriver::Alloy, &missing).unwrap(),
+            RunTelemetry::UNRECORDED
+        );
     }
 
     #[test]
@@ -691,6 +1039,45 @@ mod tests {
         row.temperature = 0.7;
         let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
         assert!(error.contains("endpoint identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn score_rejects_driver_or_harness_mixing() {
+        let fixtures = fixtures_with(&["a"]);
+        let mut row = observation("a", 1);
+        row.harness.source_revision = "other".to_owned();
+        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        assert!(error.contains("harness identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn score_rejects_naive_endpoint_with_profile() {
+        let fixtures = fixtures_with(&["a"]);
+        let endpoint = Endpoint {
+            driver: LiveHoldoutDriver::Naive,
+            profile: Some("default".to_owned()),
+            ..endpoint()
+        };
+        let error = score(fixtures.path(), vec![], endpoint, 1).unwrap_err();
+        assert!(
+            error.contains("naive") && error.contains("profile"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn score_rejects_alloy_endpoint_without_recognized_profile() {
+        let fixtures = fixtures_with(&["a"]);
+        let endpoint = Endpoint {
+            driver: LiveHoldoutDriver::Alloy,
+            profile: None,
+            ..endpoint()
+        };
+        let error = score(fixtures.path(), vec![], endpoint, 1).unwrap_err();
+        assert!(
+            error.contains("alloy") && error.contains("default") && error.contains("autonomous"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -778,6 +1165,31 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.contains("duplicate arm identity"), "{error}");
+    }
+
+    #[test]
+    fn compare_requires_same_harness_identity() {
+        let baseline = report_for_driver(LiveHoldoutDriver::Naive, None);
+        let mut candidate = report_for_driver(LiveHoldoutDriver::Alloy, Some("default".to_owned()));
+        candidate.endpoint.harness.source_revision = "other".to_owned();
+        let error = compare(vec![
+            ("naive".to_owned(), baseline),
+            ("alloy-default".to_owned(), candidate),
+        ])
+        .unwrap_err();
+        assert!(error.contains("harness identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn compare_allows_differing_driver_and_profile_with_same_harness() {
+        let baseline = report_for_driver(LiveHoldoutDriver::Naive, None);
+        let candidate = report_for_driver(LiveHoldoutDriver::Alloy, Some("autonomous".to_owned()));
+        let matrix = compare(vec![
+            ("naive".to_owned(), baseline),
+            ("alloy-autonomous".to_owned(), candidate),
+        ])
+        .unwrap();
+        assert_eq!(matrix.comparisons.len(), 1);
     }
 
     #[test]

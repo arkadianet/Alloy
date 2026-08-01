@@ -12,8 +12,9 @@ use std::process::ExitCode;
 
 use alloy_eval::{
     compare_live_holdout, inspect_live_holdout, live_holdout_target_path_text,
-    load_live_holdout_observations, score_live_holdout, LiveHoldoutEndpoint,
-    LiveHoldoutOracleEvidence, LiveHoldoutReport, LIVE_HOLDOUT_REPORT_VERSION,
+    live_holdout_telemetry, load_live_holdout_observations, score_live_holdout, LiveHoldoutDriver,
+    LiveHoldoutEndpoint, LiveHoldoutHarnessIdentity, LiveHoldoutOracleEvidence, LiveHoldoutReport,
+    LIVE_HOLDOUT_REPORT_VERSION,
 };
 
 const USAGE: &str = "\
@@ -25,9 +26,13 @@ USAGE:
       --run-log <path> --exit-code <n> --compile-clean <bool>
       --cargo-check-exit <n|null> --tests-pass <bool>
       --cargo-test-exit <n|null>
+  alloy-eval-live-holdout telemetry --driver <naive|alloy>
+      --input <naive-result.json|events.jsonl>
   alloy-eval-live-holdout score --fixtures <dir> --observations <path>
-      --model <model> --temperature <n> --profile <profile>
-      --base-url <url> --reps <n> --out <path>
+      --model <model> --temperature <n> --driver <naive|alloy>
+      --profile <none|default|autonomous> --base-url <url>
+      --source-revision <40-hex-sha> --binary-bundle-sha256 <64-hex-sha>
+      --reps <n> --out <path>
   alloy-eval-live-holdout compare --arm <id=report> --arm <id=report> --out <path>";
 
 fn main() -> ExitCode {
@@ -56,6 +61,7 @@ fn run() -> Result<String, String> {
             ))
         }
         "oracle" => oracle(&options),
+        "telemetry" => telemetry(&options),
         "score" => score(&options),
         "compare" => compare(&options),
         "-h" | "--help" | "help" => Ok(format!("{USAGE}\n")),
@@ -151,6 +157,62 @@ fn oracle(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
     ))
 }
 
+fn optional_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "null".to_owned(), |count| count.to_string())
+}
+
+fn telemetry(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
+    let extracted = live_holdout_telemetry(
+        parse_driver(options)?,
+        &PathBuf::from(required(options, "input")?),
+    )?;
+    // Three-field TSV consumed by eval/live-holdout/run.sh, in order:
+    // model_calls, tokens_in, tokens_out. Unreported usage stays `null`.
+    Ok(format!(
+        "{}\t{}\t{}\n",
+        extracted.model_calls,
+        optional_count(extracted.tokens_in),
+        optional_count(extracted.tokens_out),
+    ))
+}
+
+fn parse_driver(options: &BTreeMap<String, Vec<String>>) -> Result<LiveHoldoutDriver, String> {
+    match required(options, "driver")?.as_str() {
+        "naive" => Ok(LiveHoldoutDriver::Naive),
+        "alloy" => Ok(LiveHoldoutDriver::Alloy),
+        other => Err(format!("--driver must be naive or alloy, got {other}")),
+    }
+}
+
+fn parse_profile(options: &BTreeMap<String, Vec<String>>) -> Result<Option<String>, String> {
+    let value = required(options, "profile")?;
+    match value.as_str() {
+        "none" => Ok(None),
+        "default" | "autonomous" => Ok(Some(value.clone())),
+        other => Err(format!(
+            "--profile must be none, default, or autonomous, got {other}"
+        )),
+    }
+}
+
+fn parse_hex_sha(
+    options: &BTreeMap<String, Vec<String>>,
+    key: &str,
+    expected_len: usize,
+) -> Result<String, String> {
+    let value = required(options, key)?.clone();
+    if value.len() != expected_len
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f'))
+    {
+        return Err(format!(
+            "--{key} must be a {expected_len}-character lower-case hex string, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
 fn endpoint(options: &BTreeMap<String, Vec<String>>) -> Result<LiveHoldoutEndpoint, String> {
     let temperature: f64 = required(options, "temperature")?
         .parse()
@@ -161,8 +223,13 @@ fn endpoint(options: &BTreeMap<String, Vec<String>>) -> Result<LiveHoldoutEndpoi
     Ok(LiveHoldoutEndpoint {
         model: required(options, "model")?.clone(),
         temperature,
-        profile: required(options, "profile")?.clone(),
+        driver: parse_driver(options)?,
+        profile: parse_profile(options)?,
         base_url: required(options, "base-url")?.clone(),
+        harness: LiveHoldoutHarnessIdentity {
+            source_revision: parse_hex_sha(options, "source-revision", 40)?,
+            binary_bundle_sha256: parse_hex_sha(options, "binary-bundle-sha256", 64)?,
+        },
     })
 }
 
@@ -216,6 +283,17 @@ fn compare(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
     Ok(render_comparison(&comparison))
 }
 
+fn driver_label(driver: LiveHoldoutDriver) -> &'static str {
+    match driver {
+        LiveHoldoutDriver::Naive => "naive",
+        LiveHoldoutDriver::Alloy => "alloy",
+    }
+}
+
+fn profile_label(profile: Option<&str>) -> &str {
+    profile.unwrap_or("none")
+}
+
 fn render_report(report: &LiveHoldoutReport) -> String {
     let overall = &report.overall;
     let interval = overall
@@ -224,7 +302,10 @@ fn render_report(report: &LiveHoldoutReport) -> String {
         .map(|value| value.render())
         .unwrap_or_else(|| "unmeasured".to_owned());
     format!(
-        "overall oracle={}/{} rate={} wilson95={} process={}/{} compile={}/{} tests={}/{} compile_clean_reference_mismatch={}/{} compile_clean_tests_failed={}/{} tests_pass_reference_mismatch={}/{} reference={}/{}\n",
+        "driver={} profile={} harness={} overall oracle={}/{} rate={} wilson95={} process={}/{} compile={}/{} tests={}/{} compile_clean_reference_mismatch={}/{} compile_clean_tests_failed={}/{} tests_pass_reference_mismatch={}/{} reference={}/{} model_calls={} tokens_in={} tokens_out={}\n",
+        driver_label(report.endpoint.driver),
+        profile_label(report.endpoint.profile.as_deref()),
+        report.endpoint.harness.source_revision,
         overall.oracle.passes,
         overall.oracle.attempts,
         overall
@@ -247,12 +328,15 @@ fn render_report(report: &LiveHoldoutReport) -> String {
         overall.tests_pass_reference_mismatch.attempts,
         overall.reference_match.passes,
         overall.reference_match.attempts,
+        overall.model_calls_total,
+        overall.tokens_in_total,
+        overall.tokens_out_total,
     )
 }
 
 fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> String {
     let mut output = format!(
-        "baseline={} repetitions={}\narm\toracle\ttests\tcompile_clean_reference_mismatch\tcompile_clean_tests_failed\ttests_pass_reference_mismatch\toracle_wilson95\n",
+        "baseline={} repetitions={}\narm\tdriver\tprofile\toracle\ttests\tcompile_clean_reference_mismatch\tcompile_clean_tests_failed\ttests_pass_reference_mismatch\toracle_wilson95\tmodel_calls\n",
         comparison.baseline, comparison.repetitions
     );
     for (name, report) in &comparison.arms {
@@ -263,7 +347,9 @@ fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> St
             .map(|value| value.render())
             .unwrap_or_else(|| "unmeasured".to_owned());
         output.push_str(&format!(
-            "{name}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{interval}\n",
+            "{name}\t{}\t{}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{interval}\t{}\n",
+            driver_label(report.endpoint.driver),
+            profile_label(report.endpoint.profile.as_deref()),
             report.overall.oracle.passes,
             report.overall.oracle.attempts,
             report.overall.tests_pass.passes,
@@ -274,6 +360,7 @@ fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> St
             report.overall.compile_clean_tests_failed.attempts,
             report.overall.tests_pass_reference_mismatch.passes,
             report.overall.tests_pass_reference_mismatch.attempts,
+            report.overall.model_calls_total,
         ));
     }
     for item in &comparison.comparisons {
@@ -288,4 +375,21 @@ fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> St
         ));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_sha_rejects_uppercase_hex() {
+        for (key, len) in [("source-revision", 40), ("binary-bundle-sha256", 64)] {
+            let mut options = BTreeMap::new();
+            options.insert(key.to_owned(), vec!["A".repeat(len)]);
+
+            let error = parse_hex_sha(&options, key, len).unwrap_err();
+
+            assert!(error.contains("lower-case"), "{error}");
+        }
+    }
 }

@@ -27,11 +27,41 @@ cargo build -p alloy-eval --bin alloy-eval-live-repair
 cargo build -p alloy-eval --bin alloy-eval-live-holdout
 
 # llama.cpp on :8089 (see router.toml.local-example), or Ollama on :11434
+ALLOY_API_KEY=local \
 MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf' \
   BASEURL='http://127.0.0.1:8089/v1/' \
   TEMP=0.6 PROFILE=default REPS=1 \
   ./eval/live-holdout/run.sh /tmp/live-holdout.jsonl
 ```
+
+`DRIVER` selects which harness runs against the endpoint (default `alloy`):
+
+```bash
+cargo build -p alloy-eval --features live-naive --bin alloy-eval-live-naive
+ALLOY_API_KEY=local DRIVER=naive MODEL='…' BASEURL='http://127.0.0.1:8089/v1/' \
+  TEMP=0.6 REPS=1 \
+  ./eval/live-holdout/run.sh /tmp/live-naive.jsonl
+```
+
+`DRIVER=naive` is a **one-shot, tool-free baseline**: exactly one completion
+per fixture, no tools, no repository index, no replanning, no retry, and no
+profile (its `profile` field is always `null`). It exists to give `alloy`'s
+orchestration something to be measured against on the same corpus and
+endpoint. It is not a second product mode and its low ceiling on a
+multi-error or multi-file repair is expected, not a driver bug. `DRIVER=alloy`
+runs the real agent under `--profile default` or `--profile autonomous`.
+Both drivers share one independent cargo check, hidden-test, reference, and
+strict-oracle path, so their reports are comparable observation-for-
+observation.
+
+### API-key preflight
+
+Every live arm requires a non-empty `ALLOY_API_KEY` process environment
+variable before any repetition starts. `matrix.sh` checks it after parsing all
+arms but before it creates an output directory, and `run.sh` applies the same
+check for standalone runs. There is no implicit `local` fallback. For a
+loopback endpoint that ignores authentication, `ALLOY_API_KEY=local` is an
+appropriate non-secret placeholder. The scripts never load or write `.env`.
 
 Each repetition gets a fresh temp workspace copied from
 `crates/alloy-eval/fixtures/holdout/*/workspace`, a rendered `router.toml`,
@@ -63,15 +93,31 @@ into E0614. A reference mismatch is diagnostic evidence, not proof that all
 valid Rust repairs are impossible.
 
 JSONL rows and `<results>.report.json` are written outside the repo. Report
-schema v3 adds independent semantic-test rates and durable evidence pointers.
-The report validates dense repetition coverage and endpoint identity, and
-includes per-fixture and overall Wilson 95% intervals for process, compile,
-tests, reference, strict-oracle, compile-clean mismatch, compile-clean test
-failure, and test-passing reference-mismatch rates. Exit `0` from `alloy` alone
-is no longer sufficient for the strict oracle, and each row also records
+schema v4 adds independent semantic-test rates, durable evidence pointers,
+`driver` identity, and build provenance. The report validates dense
+repetition coverage and endpoint identity, and includes per-fixture and
+overall Wilson 95% intervals for process, compile, tests, reference,
+strict-oracle, compile-clean mismatch, compile-clean test failure, and
+test-passing reference-mismatch rates. Exit `0` from `alloy` alone is no
+longer sufficient for the strict oracle, and each row also records
 `failure_class`, cargo's post-check/test exit codes, repair-generation count,
-and the selected `profile`. Profile is part of endpoint identity, so
-context/profile arms cannot be silently mixed in one report.
+model-call/token telemetry, and the selected `profile`.
+
+Endpoint identity — the fields that must match for two reports to be one
+arm — is `model`, `temperature`, `base_url`, `driver`, `profile`, and
+`harness`. `driver` (`naive` or `alloy`) and `profile` (`none` for naive,
+`default`/`autonomous` for alloy) are both part of that identity, so a naive
+run and an agent run, or two agent runs on different profiles, are never
+silently pooled into one report. `harness` is `{source_revision,
+binary_bundle_sha256}` — build provenance, described next — so a rebuild
+into a shared Cargo target directory can never be mistaken for the binaries
+that actually produced a report.
+
+A malformed or incomplete observation — a missing naive result, a naive result
+that is not exactly one model call, a failed or page-limited Alloy event
+export, or unparsable telemetry JSON — is a harness error (`run.sh` exits
+non-zero before scoring), not a zero-result model score. Do not record an
+aborted sweep as evidence.
 
 Every attempt writes `<results-without-.jsonl>.artifacts/<fixture>/rep-N/` with
 the model run log, final target, patch, independent cargo logs, event export,
@@ -89,32 +135,69 @@ Exit codes:
 | `3` | At least one repetition could not execute `alloy` |
 
 The strict-oracle score is still operator telemetry only — do not cite it as
-the RFC-0016 offline holdout score. `REPS=3` is useful for fast direction
-checks; use a larger repetition count when estimating reliability and report
-both process and oracle rates. A malformed or incomplete observation file is a
-harness error, not a zero-result model score.
+the RFC-0016 offline holdout score. Three repetitions are useful for fast
+direction checks; use a larger repetition count when estimating reliability
+and report both process and oracle rates.
+
+## Bundle identity
+
+`matrix.sh` and `e1.sh` never resolve binaries by searching a Cargo target
+directory — every arm of a matrix must run the exact same four binaries, or
+"two arms" could silently be two codebases. `prepare.sh` builds that
+guarantee once, from one commit:
+
+```bash
+./eval/live-holdout/prepare.sh /path/to/bundle
+```
+
+`prepare.sh` requires a clean worktree at a resolvable `HEAD`, and the bundle
+path must be outside the repository (its parent directory must already
+exist) — a bundle built inside the repo would dirty the very worktree the
+script requires to be clean. It builds `alloy`, `alloy-eval-live-holdout`,
+`alloy-eval-live-naive`, and `alloy-eval-live-repair` into
+`<bundle>/target/debug/`, re-confirms `HEAD` did not move and the worktree
+stayed clean during the build, then writes `<bundle>/manifest.tsv`: the
+40-hex `source_revision`, a `worktree clean` marker, and one sha256 per
+binary. That manifest's own sha256 is `binary_bundle_sha256`. A manifest is
+written only for a complete bundle, so an interrupted build leaves nothing
+that `matrix.sh` will accept.
 
 ## Matrix runs
 
-Use `matrix.sh` to compare model, temperature, or profile/context arms. Each
-arm writes a separate JSONL observation file and validated report. The matrix
+Use `matrix.sh` to compare model, temperature, driver, or profile arms — any
+mix is comparable; it is the generic comparator. `e1.sh` (next section) adds
+the stricter naive-vs-default-vs-autonomous contract on top of it. Each arm
+writes a separate JSONL observation file and validated report. The matrix
 refuses to compare arms with different fixture sets, corpora, or repetition
 counts, and never pools incompatible denominators.
 
-The arms file is tab-separated:
-
-```text
-arm_id	model	temperature	profile	base_url	reps
-baseline	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	30
-context	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	30
-```
-
-Run it with:
+Every arm now also runs from one verified binary bundle, so `matrix.sh` takes
+a third argument:
 
 ```bash
 ./eval/live-holdout/matrix.sh \
   /path/to/arms.tsv \
-  /tmp/live-holdout-matrix
+  /tmp/live-holdout-matrix \
+  /path/to/bundle
+```
+
+Before opening the arms file, `matrix.sh` verifies the bundle manifest
+(revision, clean-worktree marker, and every binary's sha256), then checks
+that this checkout's `HEAD` still matches `manifest.tsv`'s `source_revision`
+and that `eval/live-holdout/`, `profiles/`, and
+`crates/alloy-eval/fixtures/holdout/` have no uncommitted changes — the
+bundle pins the binaries, but this checkout still supplies the orchestration,
+profiles, and fixture oracles those binaries run against. It also refuses a
+missing or empty `ALLOY_API_KEY`, or a non-empty output directory, so an
+incomplete sweep or stale report is never silently treated as evidence. Any
+of these failing leaves no output directory behind.
+
+The arms file is seven tab-separated columns:
+
+```text
+arm_id	driver	model	temperature	profile	base_url	reps
+baseline	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	30
+autonomous-profile	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	30
 ```
 
 The first arm is the descriptive baseline. `matrix.report.json` retains each
@@ -123,6 +206,27 @@ per-fixture deltas. A positive strict-oracle delta is evidence of improvement
 on this measured corpus; zero
 or negative deltas are retained as the documented "why not" result, not hidden
 by an aggregate score.
+
+## E1: the three-arm operator contract
+
+`e1.sh` wraps `matrix.sh` with the one contract this repository ships an
+operator checklist for: exactly one `naive`/`none` arm, one `alloy`/`default`
+arm, and one `alloy`/`autonomous` arm, sharing one `model`, `temperature`,
+`base_url`, and `reps` — the only thing allowed to vary is the treatment
+(driver + profile) itself. The first data row must be the `naive`/`none` arm:
+`matrix.sh` treats its first report as the comparison baseline. Arm ids are
+otherwise free-form; the role is derived from `driver`+`profile`, not the id.
+
+```bash
+./eval/live-holdout/e1.sh /path/to/e1-arms.tsv /tmp/e1-out /path/to/bundle
+```
+
+`arms.example.tsv` is the committed target contract for this comparison
+(Q4 30B model, `reps=10`). Follow `./E1-CHECKLIST.md` end to end before
+running it: it covers endpoint health, hidden-oracle corpus validation, the
+pilot run (an operator-supplied smaller model at `reps=3` — never the
+target model silently substituted), report/artifact review, the target run,
+and when to extend for more evidence.
 
 ## Separation from live-repair
 

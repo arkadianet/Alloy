@@ -3,9 +3,9 @@
 | Field | Value |
 | --- | --- |
 | **Author** | arkadianet |
-| **Date** | 2026-07-25 |
+| **Date** | 2026-08-01 |
 
-Canonical sequencing for implementing Alloy from frozen Architecture V2 and the RFC-0001…0016 backlog:
+Canonical sequencing for implementing Alloy from frozen Architecture V2 and the RFC-0001…0017 backlog:
 
 **→ [IMPLEMENTATION-ROADMAP.md](./IMPLEMENTATION-ROADMAP.md)**
 

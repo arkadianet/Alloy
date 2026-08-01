@@ -14,6 +14,10 @@ default = []
 # committed recordings/* worker JSON (not thesis citation — needs independent
 # model outputs). Default `cargo test -p alloy-eval` stays offline (no alloy-tools).
 stack-driver = ["dep:alloy-tools", "dep:tempfile", "dep:alloy-index"]
+# Live one-shot naive driver (E1 three-arm holdout, arm B): exactly one
+# OpenAI-compatible completion, no tools, no index. Pulls in alloy-runtime's
+# HTTP provider only when this feature is enabled; default builds stay offline.
+live-naive = ["alloy-runtime/http-provider"]
 
 [dependencies]
 alloy-runtime = { workspace = true, default-features = false }
@@ -43,3 +47,18 @@ trybuild = { workspace = true }
 [[bench]]
 name = "fingerprint"
 harness = false
+
+[[bin]]
+name = "alloy-eval-live-naive"
+path = "src/bin/alloy-eval-live-naive.rs"
+required-features = ["live-naive"]
+
+[[test]]
+name = "live_naive_runner"
+required-features = ["live-naive"]
+
+# The bundle contract names the feature-gated naive binary, so the shell
+# matrix suite runs in the same configuration operators build.
+[[test]]
+name = "live_holdout_matrix"
+required-features = ["live-naive"]

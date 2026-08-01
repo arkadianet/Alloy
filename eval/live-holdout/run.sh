@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Live holdout executor — real `alloy` + live OpenAI-compatible endpoint on
-# the RFC-0016 holdout workspaces. NOT an offline gate. See ./README.md.
+# Live holdout executor — one model driver + live OpenAI-compatible endpoint
+# on the RFC-0016 holdout workspaces. NOT an offline gate. See ./README.md.
+#
+# DRIVER=alloy runs the real agent; DRIVER=naive runs the one-shot, tool-free
+# baseline. Both arms then share one independent cargo check, hidden-test,
+# reference, and strict-oracle path.
 #
 # Usage:
 #   MODEL=… BASEURL=http://127.0.0.1:8089/v1/ PROFILE=default REPS=1 \
 #     ./eval/live-holdout/run.sh /tmp/live-holdout.jsonl
+#   DRIVER=naive MODEL=… BASEURL=… REPS=1 \
+#     ./eval/live-holdout/run.sh /tmp/live-naive.jsonl
 #
 # Author: arkadianet
 set -u
@@ -14,10 +20,11 @@ out="${1:?usage: run.sh <out.jsonl>}"
 artifacts="${out%.jsonl}.artifacts"
 
 FIXTURES="${FIXTURES:-$repo/crates/alloy-eval/fixtures/holdout}"
+DRIVER="${DRIVER:-alloy}"
 MODEL="${MODEL:-Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf}"
 TEMP="${TEMP:-0.6}"
 REPS="${REPS:-1}"
-PROFILE="${PROFILE:-default}"
+PROFILE="${PROFILE:-}"
 BASEURL="${BASEURL:-http://127.0.0.1:8089/v1/}"
 TIMEOUT="${TIMEOUT:-600}"
 GOAL="${GOAL:-fix the compile error in this crate}"
@@ -47,15 +54,55 @@ resolve_bin() {
   die "missing $name (cargo build -p …); looked under configured target directories"
 }
 
-ALLOY="$(resolve_bin alloy "${ALLOY:-}")"
-SCORER="$(resolve_bin alloy-eval-live-repair "${SCORER:-}")"
 EVAL_HOLDOUT="$(resolve_bin alloy-eval-live-holdout "$EVAL_HOLDOUT")"
 
-"$ALLOY" --version >/dev/null 2>&1
-probe=$?
-case "$probe" in
-  126|127) die "alloy at $ALLOY could not be executed (exit $probe)";;
+# Each arm resolves only the driver it runs, and only the naive arm may omit
+# a profile — the report schema treats driver+profile as arm identity.
+case "$DRIVER" in
+  naive)
+    driver_bin="$(resolve_bin alloy-eval-live-naive "${NAIVE:-}")"
+    PROFILE="${PROFILE:-none}"
+    [ "$PROFILE" = "none" ] ||
+      die "DRIVER=naive runs no profile; unset PROFILE or set it to none, got '$PROFILE'"
+    profile_json=null
+    ;;
+  alloy)
+    driver_bin="$(resolve_bin alloy "${ALLOY:-}")"
+    SCORER="$(resolve_bin alloy-eval-live-repair "${SCORER:-}")"
+    PROFILE="${PROFILE:-default}"
+    case "$PROFILE" in
+      default|autonomous) ;;
+      *) die "PROFILE must be default or autonomous, got '$PROFILE'";;
+    esac
+    profile_json="\"$PROFILE\""
+    "$driver_bin" --version >/dev/null 2>&1
+    probe=$?
+    case "$probe" in
+      126|127) die "alloy at $driver_bin could not be executed (exit $probe)";;
+    esac
+    ;;
+  *) die "DRIVER must be naive or alloy, got '$DRIVER'";;
 esac
+
+# Build provenance: two reports are the same arm only if they came from the
+# same source and the same binaries. A multi-arm wrapper computes one bundle
+# digest over every arm's binaries and passes it in; the fallback below only
+# covers the binaries this single sweep runs.
+SOURCE_REVISION="${SOURCE_REVISION:-$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)}"
+[[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] ||
+  die "SOURCE_REVISION must be a 40-hex commit sha, got '$SOURCE_REVISION'"
+content_sha() { sha256sum <"$1" | cut -d ' ' -f1; }
+bundle_binaries=("$driver_bin" "$EVAL_HOLDOUT")
+if [ "$DRIVER" = "alloy" ]; then
+  bundle_binaries+=("$SCORER")
+fi
+BUNDLE_SHA256="${BUNDLE_SHA256:-$(
+  for binary in "${bundle_binaries[@]}"; do
+    content_sha "$binary"
+  done | tr -d '\n' | sha256sum | cut -d ' ' -f1
+)}"
+[[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+  die "BUNDLE_SHA256 must be a 64-hex sha256, got '$BUNDLE_SHA256'"
 
 case "$REPS" in
   ''|*[!0-9]*) die "REPS must be a positive integer, got '$REPS'";;
@@ -69,14 +116,17 @@ case "$MODEL$BASEURL" in
   *[\"\\]*) die "MODEL and BASEURL must not contain quotes or backslashes";;
 esac
 [[ "$TEMP" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "TEMP must be a number, got '$TEMP'"
-case "$PROFILE" in
-  default|autonomous) ;;
-  *) die "PROFILE must be default or autonomous, got '$PROFILE'";;
-esac
 [ -d "$FIXTURES" ] || die "fixtures root missing: $FIXTURES"
+[ -n "${ALLOY_API_KEY:-}" ] ||
+  die "ALLOY_API_KEY must be set to a non-empty process environment variable before any repetition"
 
-router="$("$SCORER" render-router --model "$MODEL" --temperature "$TEMP" --base-url "$BASEURL")" \
-  || die "render-router failed"
+# Only the agent arm reads router.toml; the naive driver takes the endpoint
+# on its command line.
+router=""
+if [ "$DRIVER" = "alloy" ]; then
+  router="$("$SCORER" render-router --model "$MODEL" --temperature "$TEMP" --base-url "$BASEURL")" \
+    || die "render-router failed"
+fi
 
 mapfile -t ids < <(
   find "$FIXTURES" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort
@@ -124,29 +174,62 @@ for id in "${ids[@]}"; do
     # The golden reference is an oracle input, never model-visible workspace
     # content.
     rm -f "$ws/$target_path.post"
-    cp -a "$repo/profiles" "$ws/profiles" ||
-      die "profile copy failed for $id#$rep"
-    printf '%s' "$router" >"$ws/router.toml" ||
-      die "router write failed for $id#$rep"
+    if [ "$DRIVER" = "alloy" ]; then
+      cp -a "$repo/profiles" "$ws/profiles" ||
+        die "profile copy failed for $id#$rep"
+      printf '%s' "$router" >"$ws/router.toml" ||
+        die "router write failed for $id#$rep"
+    fi
     git -C "$ws" init -q || die "git init failed for $id#$rep"
     git -C "$ws" add -A || die "git add failed for $id#$rep"
     git -C "$ws" -c user.name=live-holdout \
       -c user.email=live-holdout@localhost commit -qm fixture ||
       die "git commit failed for $id#$rep"
-    start_ms=$(date +%s%3N)
-    if ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout "$TIMEOUT" \
-      "$ALLOY" --workspace "$ws" --profile "$PROFILE" run "$GOAL" --yes \
-      >"$ws/run.log" 2>&1; then
-      code=0
-    else
-      code=$?
-    fi
-    wall_ms=$(($(date +%s%3N) - start_ms))
     evidence_relpath="$id/rep-$rep"
     evidence="$artifacts/$evidence_relpath"
+    # Start each attempt from an empty bundle so a previous arm's evidence
+    # can never be read as this one's.
+    rm -rf "$evidence"
     mkdir -p "$evidence" || die "could not create evidence directory for $id#$rep"
+    # Pre-run diagnostics for every arm. The naive prompt is the only path
+    # that shows this file to a model; it holds no golden or hidden-test data.
+    (cd "$ws" && timeout "$TIMEOUT" \
+      cargo check --offline --message-format=short) \
+      >"$evidence/initial-cargo.log" 2>&1 || true
+    start_ms=$(date +%s%3N)
+    case "$DRIVER" in
+      naive)
+        if timeout "$TIMEOUT" "$driver_bin" \
+          --workspace "$ws" \
+          --target "$target_path" \
+          --diagnostics "$evidence/initial-cargo.log" \
+          --goal "$GOAL" \
+          --model "$MODEL" \
+          --temperature "$TEMP" \
+          --base-url "$BASEURL" \
+          --result "$evidence/naive-result.json" \
+          >"$ws/run.log" 2>&1; then
+          code=0
+        else
+          code=$?
+        fi
+        ;;
+      alloy)
+        if timeout "$TIMEOUT" "$driver_bin" --workspace "$ws" --profile "$PROFILE" \
+          run "$GOAL" --yes \
+          >"$ws/run.log" 2>&1; then
+          code=0
+        else
+          code=$?
+        fi
+        ;;
+    esac
+    wall_ms=$(($(date +%s%3N) - start_ms))
     cp "$ws/run.log" "$evidence/run.log" ||
       die "could not retain run log for $id#$rep"
+    if [ "$DRIVER" = "naive" ] && [ ! -f "$evidence/naive-result.json" ]; then
+      die "naive driver did not persist naive-result.json for $id#$rep; telemetry is incomplete"
+    fi
     if [ -f "$ws/$target_path" ]; then
       cp "$ws/$target_path" "$evidence/final-target.rs" ||
         die "could not retain final target for $id#$rep"
@@ -200,23 +283,48 @@ for id in "${ids[@]}"; do
     read -r process_pass compile_clean tests_pass reference_match oracle_pass failure_class \
       cargo_check_exit cargo_test_exit generations <<<"$oracle_out" ||
       die "oracle parse failed for $id#$rep"
-    ALLOY_API_KEY="${ALLOY_API_KEY:-local}" timeout 30 \
-      "$ALLOY" --workspace "$ws" --profile "$PROFILE" events --json \
-      >"$evidence/events.jsonl" 2>"$evidence/events.stderr" || true
-    printf '{"fixture_id":"%s","repetition":%d,"run_exit":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"reference_match":%s,"strict_oracle":%s,"failure_class":"%s"}\n' \
-      "$id" "$rep" "$code" "$process_pass" "$compile_clean" "$tests_pass" \
-      "$reference_match" "$oracle_pass" "$failure_class" >"$evidence/metadata.json"
+    case "$DRIVER" in
+      naive)
+        # No event stream; the empty file keeps one evidence layout per arm.
+        : >"$evidence/events.jsonl" ||
+          die "could not create events placeholder for $id#$rep"
+        telemetry_input="$evidence/naive-result.json"
+        ;;
+      alloy)
+        # Ask for the runtime's whole page (1000); the extractor rejects an
+        # export that fills it rather than counting a truncated run.
+        if timeout 30 "$driver_bin" --workspace "$ws" --profile "$PROFILE" \
+          events --json --limit 1000 >"$evidence/events.jsonl" 2>"$evidence/events.stderr"; then
+          :
+        else
+          events_exit=$?
+          die "Alloy event export failed for $id#$rep (exit $events_exit); see $evidence/events.stderr"
+        fi
+        telemetry_input="$evidence/events.jsonl"
+        ;;
+    esac
+    telemetry_out="$("$EVAL_HOLDOUT" telemetry \
+      --driver "$DRIVER" --input "$telemetry_input")" ||
+      die "telemetry extraction failed for $id#$rep"
+    read -r model_calls tokens_in tokens_out <<<"$telemetry_out" ||
+      die "telemetry parse failed for $id#$rep"
+    printf '{"fixture_id":"%s","repetition":%d,"driver":"%s","run_exit":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"reference_match":%s,"strict_oracle":%s,"failure_class":"%s","model_calls":%s,"tokens_in":%s,"tokens_out":%s}\n' \
+      "$id" "$rep" "$DRIVER" "$code" "$process_pass" "$compile_clean" "$tests_pass" \
+      "$reference_match" "$oracle_pass" "$failure_class" \
+      "$model_calls" "$tokens_in" "$tokens_out" >"$evidence/metadata.json"
     total=$((total + 1))
     [ "$process_pass" = "true" ] && process_passed=$((process_passed + 1))
     [ "$oracle_pass" = "true" ] && oracle_passed=$((oracle_passed + 1))
     case "$code" in
       126|127) unexecutable=$((unexecutable + 1));;
     esac
-    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"reference_match":%s,"oracle_pass":%s,"failure_class":"%s","cargo_check_exit":%s,"cargo_test_exit":%s,"repair_generations":%d,"wall_ms":%d,"evidence_relpath":"%s","model":"%s","temperature":%s,"profile":"%s","base_url":"%s","corpus":"rfc0016-holdout-live"}\n' \
+    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"reference_match":%s,"oracle_pass":%s,"failure_class":"%s","cargo_check_exit":%s,"cargo_test_exit":%s,"repair_generations":%d,"wall_ms":%d,"evidence_relpath":"%s","model":"%s","temperature":%s,"driver":"%s","profile":%s,"base_url":"%s","harness":{"source_revision":"%s","binary_bundle_sha256":"%s"},"corpus":"rfc0016-holdout-live","model_calls":%s,"tokens_in":%s,"tokens_out":%s}\n' \
       "$id" "$rep" "$code" "${process_pass,,}" "${compile_clean,,}" \
       "${tests_pass,,}" "${reference_match,,}" "${oracle_pass,,}" "$failure_class" \
       "$cargo_check_exit" "$cargo_test_exit" "$generations" "$wall_ms" \
-      "$evidence_relpath" "$MODEL" "$TEMP" "$PROFILE" "$BASEURL" >>"$out"
+      "$evidence_relpath" "$MODEL" "$TEMP" "$DRIVER" "$profile_json" "$BASEURL" \
+      "$SOURCE_REVISION" "$BUNDLE_SHA256" \
+      "$model_calls" "$tokens_in" "$tokens_out" >>"$out"
     echo "[$oracle_passed/$total oracle; $process_passed process] $id#$rep \
 oracle=$oracle_pass tests=$tests_pass class=$failure_class generations=$generations ${wall_ms}ms"
     echo "  evidence: $evidence" >&2
@@ -224,7 +332,7 @@ oracle=$oracle_pass tests=$tests_pass class=$failure_class generations=$generati
   done
 done
 
-echo "DONE oracle=$oracle_passed/$total process=$process_passed/$total -> $out \
+echo "DONE driver=$DRIVER oracle=$oracle_passed/$total process=$process_passed/$total -> $out \
 (live-BYOM holdout; not an offline gate)"
 echo "EVIDENCE $artifacts"
 
@@ -239,15 +347,18 @@ if [ "$SCORE" = "1" ]; then
     --observations "$out" \
     --model "$MODEL" \
     --temperature "$TEMP" \
+    --driver "$DRIVER" \
     --profile "$PROFILE" \
     --base-url "$BASEURL" \
+    --source-revision "$SOURCE_REVISION" \
+    --binary-bundle-sha256 "$BUNDLE_SHA256" \
     --reps "$REPS" \
     --out "${out%.jsonl}.report.json"
   status=$?
 fi
 
 if [ "$unexecutable" -gt 0 ]; then
-  echo "live-holdout/run.sh: $unexecutable/$total repetition(s) could not execute $ALLOY;" \
+  echo "live-holdout/run.sh: $unexecutable/$total repetition(s) could not execute $driver_bin;" \
     "harness failures — do not publish" >&2
   exit 3
 fi

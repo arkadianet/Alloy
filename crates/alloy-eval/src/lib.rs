@@ -37,6 +37,9 @@ mod harness;
 mod license;
 /// Strict live holdout oracle and arm comparison.
 mod live_holdout;
+/// One-shot, tool-free naive driver (E1 three-arm holdout, arm B).
+#[cfg(feature = "live-naive")]
+mod live_naive;
 /// Live-endpoint repair benchmark (operator tooling; never a holdout gate).
 mod live_repair;
 /// Strict fixture manifest loading.
@@ -63,11 +66,19 @@ pub use harness::{EvalHarness, EvalHarnessConfig, LoadedFixture, EVAL_MAX_CONCUR
 pub use live_holdout::{
     compare as compare_live_holdout, load_observations as load_live_holdout_observations,
     oracle as inspect_live_holdout, score as score_live_holdout,
-    target_path_text as live_holdout_target_path_text, Endpoint as LiveHoldoutEndpoint,
-    MatrixComparison as LiveHoldoutMatrixComparison, OracleEvidence as LiveHoldoutOracleEvidence,
+    target_path_text as live_holdout_target_path_text, telemetry as live_holdout_telemetry,
+    Endpoint as LiveHoldoutEndpoint, HarnessIdentity as LiveHoldoutHarnessIdentity,
+    LiveHoldoutDriver, MatrixComparison as LiveHoldoutMatrixComparison,
+    OracleEvidence as LiveHoldoutOracleEvidence, RunTelemetry as LiveHoldoutRunTelemetry,
     StrictObservation as LiveHoldoutObservation,
     StrictObservationFields as LiveHoldoutObservationFields, StrictReport as LiveHoldoutReport,
     REPORT_SCHEMA_VERSION as LIVE_HOLDOUT_REPORT_VERSION,
+};
+#[cfg(feature = "live-naive")]
+pub use live_naive::{
+    build_naive_request, parse_replacement, resolve_target, write_replacement,
+    write_resolved_replacement, NaiveReplacement, NaiveRunTelemetry, MAX_REPLACEMENT_BYTES,
+    NAIVE_SCHEMA_NAME,
 };
 pub use live_repair::{
     parse_observations_jsonl, render_router_toml, wilson_interval, LiveRepairCorpus,
