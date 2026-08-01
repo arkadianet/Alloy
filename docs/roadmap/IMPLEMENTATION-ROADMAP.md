@@ -25,8 +25,8 @@ This section is the active work queue. The detailed M1–M7, MVP, Beta, and Prod
 
 | Stage | Focus | Status | Binary exit gate |
 | --- | --- | --- | --- |
-| **E1 — Now** | Trustworthy uplift measurement | **Active** | Comparable naive/default/autonomous reports on pilot and target models |
-| **E2 — Next** | Evidence-driven repair reliability | Pending E1 | Repeatable strict-semantic uplift or an explicit stop/reposition decision |
+| **E1 — Done** | Trustworthy uplift measurement | **Complete** | Comparable naive/default/autonomous reports on pilot and target models |
+| **E2 — Now** | Evidence-driven repair reliability | **Active** | Repeatable semantic uplift on hidden tests, or an explicit stop/reposition decision |
 | **E3 — Later** | Broaden engineering capabilities | Pending E2 | Each promoted capability proves measured value against a naive baseline |
 | **E4 — Beta** | Early-adopter usability | Pending E3 | External user completes a useful task without architect assistance |
 | **E5 — Production** | Operational hardening | Pending E4 | Stable, supportable release with calibrated claims |
@@ -45,28 +45,51 @@ This section is the active work queue. The detailed M1–M7, MVP, Beta, and Prod
 - Retain per-attempt logs, final targets, diffs, cargo check/test output, events, endpoint identity, timing, and model-call counts.
 
 **Exit gate:**
-- [ ] All three arms have complete, dense, schema-compatible reports with no endpoint, binary-version, or repetition mixing.
-- [ ] Process, compile, semantic-test, strict-reference, and strict-oracle results are reported separately.
-- [ ] Wilson intervals, elapsed time, model calls, and failure classes are documented.
-- [ ] The result states either measured uplift or a specific evidence-backed “why not.”
-- [ ] An independent rerun command and operator checklist are documented.
+- [x] All three arms have complete, dense, schema-compatible reports with no endpoint, binary-version, or repetition mixing.
+- [x] Process, compile, semantic-test, strict-reference, and strict-oracle results are reported separately.
+- [x] Wilson intervals, elapsed time, model calls, and failure classes are documented.
+- [x] The result states either measured uplift or a specific evidence-backed “why not.”
+- [x] An independent rerun command and operator checklist are documented.
 
-**Current evidence:** A discarded Q4 sweep completed a `0/60` strict-reference baseline but the autonomous arm then used an incompatible evaluator binary. It is useful only as a harness failure report; it is not valid comparative product evidence and must not be cited as an Alloy result.
+**Superseded evidence:** A discarded Q4 sweep completed a `0/60` strict-reference baseline but the autonomous arm then used an incompatible evaluator binary. It is useful only as a harness failure report; it is not valid comparative product evidence and must not be cited as an Alloy result.
+
+**E1 result (source revision `25e2a04`, bundle `2621871e…f38b28`, Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL, temp 0.6, 4 fixtures × 3 arms × 10 repetitions = 120 attempts).** E1 measured what it set out to measure; the honest reading is that it did **not** establish product uplift.
+
+| Arm | Semantic (hidden tests) | Compile | Exact reference | Model calls | Tokens in/out |
+| --- | --- | --- | --- | --- | --- |
+| Naive | 15/40 (37.5%) | 28/40 | 0/40 | 40 | 7,485 / 2,312 |
+| Alloy default | 19/40 (47.5%) | 33/40 | 10/40 | 189 | 305,709 / 32,959 |
+| Alloy autonomous | 19/40 (47.5%) | 37/40 | 10/40 | 170 | 255,028 / 29,600 |
+
+- **The `+25 pp` exact-reference gap is not product uplift.** It is entirely E0308 output canonicality: naive repaired the behaviour correctly but omitted the trailing newline, so raw-byte comparison failed. Exact-reference matching is canonicality telemetry from E2 onward, never the primary gate.
+- **The defensible semantic result is `+10 pp`** (37.5% → 47.5%), and it is concentrated in one repair family: E0382 improved from 2/10 to 9/10, where Alloy typically cloned the vector instead of moving `len()` ahead of consumption — valid but neither canonical nor efficient.
+- **Autonomous did not beat default.** Both arms scored identically on semantics; `--yes` neutralises the gate-policy difference that separates the profiles, so E1 carries no evidence for the autonomous profile.
+- **E0502 did not improve, and one of its two fixtures carried no signal at all.** `e0502_holdout_01`'s hidden oracle asserted `broken_total() == 25`, a value no faithful repair can produce: the broken function returns a single `i32` and never sums, so `25` was back-derived from a scripted recording that invented `+ total`. All three arms scored 0/10 there. The winnable `e0502_holdout_02` is the real signal, and it is negative — naive 3/10 versus 0/10 for both Alloy arms.
+- **Cost of the semantic gain:** roughly 4.7× the model calls and 40× the input tokens of naive, for four additional correct repairs.
+
+**Legacy status:** E1 reports are immutable evidence. They are not rescored under the E2 contract, and the four E1 fixtures are retained unchanged as the `legacy-e1` panel. The `e0502_holdout_01` oracle correction lands only in the new `e2-semantic-v1` corpus.
 
 ### E2 — Evidence-driven repair reliability
 
 **Question:** Which measured failure boundary prevents uplift: context, edit quality, verification, or replanning?
 
 **Work:**
-- Rank E1 failure classes by frequency and impact.
-- Change one bounded subsystem at a time; do not tune against hidden holdout references.
-- Re-run the frozen E1 comparison after each change.
+- Make the measurement trustworthy before changing behaviour: semantic-first report schema v5, protocol/corpus/evaluator identity separated from treatment binary/profile identity, deterministic interleaved arm execution, and exact-contract BYOM preflight.
+- Freeze a broader `e2-semantic-v1` corpus of 16–24 single-file fixtures across at least six repair families, with no family above 25%. Retain the four E1 fixtures unchanged as `legacy-e1`.
+- Derive every hidden oracle from what the broken code implies, never from a scripted recording's answer. `e0502_holdout_01` is corrected under the new corpus version and requires a full rerun.
+- Rank E1 failure classes by frequency and impact; change one bounded subsystem at a time and do not tune against hidden holdout references.
+- Re-run the frozen comparison after each change. Stop after two bounded intervention cycles.
 - Preserve sandbox, quarantine, approval, durability, and honest-verification guarantees.
 
 **Exit gate:**
-- [ ] At least one Alloy arm shows a positive strict-oracle delta over naive execution on the target model without compile, safety, or evidence regressions.
-- [ ] The uplift repeats on a second frozen-corpus run or model seed.
-- [ ] No claim relies on process exit or compile success alone.
+- [ ] At least **+10 pp** semantic uplift over naive on hidden tests, where semantic success requires process success, independent compile, hidden tests, and manifest safety/diff criteria together.
+- [ ] Clustered 95% lower confidence bound above zero, clustering by fixture rather than pooling attempts as i.i.d.
+- [ ] The uplift repeats on a second independent frozen-corpus run.
+- [ ] Uplift is not driven by a single repair family; per-family macro rates and leave-one-family-out both stay positive.
+- [ ] Zero safety violations.
+- [ ] Process, compile, false-green rate, exact-reference rate, model calls, tokens, wall time, and timeouts are reported per semantic success.
+- [ ] No claim relies on process exit, compile success, or exact-reference matching alone.
+- [ ] No autonomous-over-default claim unless that direct comparison clears its own uncertainty gate.
 
 **Stop rule:** After two bounded, evidence-driven intervention cycles without uplift, write the “why not,” stop tuning this slice, and make an explicit product decision: reposition the repair claim, change the target model/task class, or pause repair before starting E3.
 
