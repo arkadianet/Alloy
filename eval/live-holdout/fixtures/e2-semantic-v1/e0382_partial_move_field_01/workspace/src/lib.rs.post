@@ -1,0 +1,15 @@
+/// A parsed command line.
+pub struct Command {
+    /// The command name, without arguments.
+    pub name: String,
+    /// The arguments that followed the name, in order.
+    pub args: Vec<String>,
+}
+
+/// Consumes `command` and returns its name together with a summary of the
+/// form `<name> takes <n> arg(s)`, where `<n>` is the number of arguments.
+pub fn describe(command: Command) -> (String, String) {
+    let summary = format!("{} takes {} arg(s)", command.name, command.args.len());
+    let name = command.name;
+    (name, summary)
+}

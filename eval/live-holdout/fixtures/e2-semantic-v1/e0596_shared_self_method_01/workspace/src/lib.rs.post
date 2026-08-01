@@ -1,0 +1,34 @@
+/// An append-only log of recorded events.
+#[derive(Debug, Default)]
+pub struct EventLog {
+    entries: Vec<String>,
+}
+
+impl EventLog {
+    /// Creates a log with no entries.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Appends `entry` to the end of the log.
+    pub fn record(&mut self, entry: &str) {
+        self.entries.push(entry.to_string());
+    }
+
+    /// Returns the number of recorded entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true when nothing has been recorded yet.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the entries in the order they were recorded.
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+}

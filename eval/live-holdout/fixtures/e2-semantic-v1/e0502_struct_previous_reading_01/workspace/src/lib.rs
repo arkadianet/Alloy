@@ -1,0 +1,34 @@
+/// A single labelled sensor reading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reading {
+    pub label: String,
+    pub value: i64,
+}
+
+/// A sensor that keeps every reading it is given, oldest first.
+#[derive(Debug, Default)]
+pub struct Sensor {
+    history: Vec<Reading>,
+}
+
+impl Sensor {
+    /// A sensor with no readings yet.
+    pub fn new() -> Self {
+        Sensor {
+            history: Vec::new(),
+        }
+    }
+
+    /// Records `reading` and returns the reading that was the latest one
+    /// before this call, or `None` when this is the first reading.
+    pub fn record(&mut self, reading: Reading) -> Option<Reading> {
+        let previous = self.history.last();
+        self.history.push(reading);
+        previous.cloned()
+    }
+
+    /// Every reading recorded so far, oldest first.
+    pub fn history(&self) -> &[Reading] {
+        &self.history
+    }
+}

@@ -1,0 +1,35 @@
+//! Sensor channels that record a reading and report both sides of the write.
+
+/// What a channel looked like immediately before and after a reading landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Update {
+    /// The channel's value before the reading was written.
+    pub previous: i32,
+    /// The channel's value after the reading was written.
+    pub current: i32,
+}
+
+impl Update {
+    /// How far the channel moved: `current - previous`.
+    pub fn delta(&self) -> i32 {
+        self.current - self.previous
+    }
+}
+
+/// Writes `reading` into `channel`, capping the stored value at `ceiling`, and
+/// reports the channel's value on both sides of that write.
+///
+/// Callers must pass a channel index that is in range.
+pub fn record(channels: &mut [i32], channel: usize, reading: i32, ceiling: i32) -> Update {
+    let previous = channels[channel];
+    write_capped(channels, channel, reading, ceiling);
+    Update {
+        previous,
+        current: channels[channel],
+    }
+}
+
+/// Stores the capped reading in place.
+fn write_capped(channels: &mut [i32], channel: usize, reading: i32, ceiling: i32) {
+    channels[channel] = reading.min(ceiling);
+}

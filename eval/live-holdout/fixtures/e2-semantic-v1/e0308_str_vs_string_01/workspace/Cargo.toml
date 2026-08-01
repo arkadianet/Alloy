@@ -1,0 +1,9 @@
+[package]
+name = "e0308_str_vs_string_01"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Empty table: this fixture is its own workspace root, so `cargo check` works
+# in place inside the Alloy repo and inside the harness scratch copy.
+[workspace]

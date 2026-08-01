@@ -1,0 +1,15 @@
+use std::collections::BTreeMap;
+
+/// Parses `config` into a map from setting name to setting value.
+///
+/// Each line is `key=value`, split at its first `=`; everything before that
+/// `=` is the key and everything after it is the value, both trimmed of
+/// surrounding whitespace. Lines with no `=` are skipped. When a key is given
+/// more than once, the last line wins.
+pub fn parse_config(config: &str) -> BTreeMap<String, String> {
+    config
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, _value)| key.trim().to_string())
+        .collect()
+}

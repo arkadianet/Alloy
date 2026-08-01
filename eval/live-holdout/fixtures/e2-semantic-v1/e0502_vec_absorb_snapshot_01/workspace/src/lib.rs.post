@@ -1,0 +1,9 @@
+/// Appends every task in `incoming` to the end of `queue` and returns the
+/// tasks the queue held before the append, in their original order.
+///
+/// An empty queue and an empty `incoming` are both ordinary inputs.
+pub fn absorb(queue: &mut Vec<String>, incoming: &[String]) -> Vec<String> {
+    let previous = queue.clone();
+    queue.extend_from_slice(incoming);
+    previous
+}

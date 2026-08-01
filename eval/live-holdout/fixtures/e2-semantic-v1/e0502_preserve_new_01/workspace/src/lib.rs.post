@@ -1,0 +1,19 @@
+//! Rate counters that saturate at a caller-supplied ceiling.
+
+/// Adds `delta` to the counter at `index`, clamping the stored result at
+/// `limit`, and returns the value that is now stored in the counter.
+///
+/// Because the clamp is applied before the value is reported, the returned
+/// value is never greater than `limit`.
+///
+/// Callers must pass an index that is in range, and a `delta` whose sum with
+/// the existing counter does not overflow.
+pub fn bump(counters: &mut [i64], index: usize, delta: i64, limit: i64) -> i64 {
+    clamp_add(counters, index, delta, limit);
+    counters[index]
+}
+
+/// Performs the clamped accumulation in place.
+fn clamp_add(counters: &mut [i64], index: usize, delta: i64, limit: i64) {
+    counters[index] = (counters[index] + delta).min(limit);
+}

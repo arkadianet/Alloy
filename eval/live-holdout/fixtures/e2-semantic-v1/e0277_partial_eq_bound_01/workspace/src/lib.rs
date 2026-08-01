@@ -1,0 +1,13 @@
+/// Returns the items that do not appear anywhere in `blocked`.
+///
+/// The surviving items keep their original relative order, and repeats are
+/// kept: this filters, it never sorts and never de-duplicates.
+pub fn retain_allowed<T: Clone>(items: &[T], blocked: &[T]) -> Vec<T> {
+    let mut allowed = Vec::new();
+    for item in items {
+        if !blocked.contains(item) {
+            allowed.push(item.clone());
+        }
+    }
+    allowed
+}

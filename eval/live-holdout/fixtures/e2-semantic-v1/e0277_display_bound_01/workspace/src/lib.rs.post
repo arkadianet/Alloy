@@ -1,0 +1,14 @@
+use std::fmt::Display;
+
+/// Renders every item of `items` as one `label[index] = item` line.
+///
+/// Lines are emitted in slice order, indices start at zero, and each line —
+/// including the last — ends with a newline. Items are shown the way a user
+/// would read them, not as a debug dump.
+pub fn render_labeled<T: Display>(label: &str, items: &[T]) -> String {
+    let mut out = String::new();
+    for (index, item) in items.iter().enumerate() {
+        out.push_str(&format!("{label}[{index}] = {item}\n"));
+    }
+    out
+}

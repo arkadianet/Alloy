@@ -1,0 +1,18 @@
+//! A tiny account ledger held in a caller-owned slice of balances.
+
+/// Adds `amount` to the account at `index` and returns the *opening* balance:
+/// the balance the account held before this deposit was applied.
+///
+/// Callers must pass an index that is in range, and an `amount` whose sum with
+/// the existing balance does not overflow.
+pub fn deposit(balances: &mut [i64], index: usize, amount: i64) -> i64 {
+    let opening = balances[index];
+    credit(balances, index, amount);
+    opening
+}
+
+/// Applies a credit in place. Kept separate so the deposit path reads as
+/// "observe, then mutate".
+fn credit(balances: &mut [i64], index: usize, amount: i64) {
+    balances[index] += amount;
+}
