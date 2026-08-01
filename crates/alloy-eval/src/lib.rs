@@ -64,7 +64,8 @@ pub use live_holdout::{
     compare as compare_live_holdout, load_observations as load_live_holdout_observations,
     oracle as inspect_live_holdout, score as score_live_holdout,
     target_path_text as live_holdout_target_path_text, Endpoint as LiveHoldoutEndpoint,
-    MatrixComparison as LiveHoldoutMatrixComparison, StrictObservation as LiveHoldoutObservation,
+    MatrixComparison as LiveHoldoutMatrixComparison, OracleEvidence as LiveHoldoutOracleEvidence,
+    StrictObservation as LiveHoldoutObservation,
     StrictObservationFields as LiveHoldoutObservationFields, StrictReport as LiveHoldoutReport,
     REPORT_SCHEMA_VERSION as LIVE_HOLDOUT_REPORT_VERSION,
 };

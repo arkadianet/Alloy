@@ -12,8 +12,8 @@ use std::process::ExitCode;
 
 use alloy_eval::{
     compare_live_holdout, inspect_live_holdout, live_holdout_target_path_text,
-    load_live_holdout_observations, score_live_holdout, LiveHoldoutEndpoint, LiveHoldoutReport,
-    LIVE_HOLDOUT_REPORT_VERSION,
+    load_live_holdout_observations, score_live_holdout, LiveHoldoutEndpoint,
+    LiveHoldoutOracleEvidence, LiveHoldoutReport, LIVE_HOLDOUT_REPORT_VERSION,
 };
 
 const USAGE: &str = "\
@@ -118,13 +118,15 @@ fn oracle(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
         &PathBuf::from(required(options, "fixture-dir")?),
         &PathBuf::from(required(options, "workspace")?),
         &PathBuf::from(required(options, "run-log")?),
-        required(options, "exit-code")?
-            .parse()
-            .map_err(|_| "--exit-code must be an integer".to_owned())?,
-        parse_bool(options, "compile-clean")?,
-        parse_optional_exit(options, "cargo-check-exit")?,
-        parse_bool(options, "tests-pass")?,
-        parse_optional_exit(options, "cargo-test-exit")?,
+        LiveHoldoutOracleEvidence {
+            exit_code: required(options, "exit-code")?
+                .parse()
+                .map_err(|_| "--exit-code must be an integer".to_owned())?,
+            compile_clean: parse_bool(options, "compile-clean")?,
+            cargo_check_exit: parse_optional_exit(options, "cargo-check-exit")?,
+            tests_pass: parse_bool(options, "tests-pass")?,
+            cargo_test_exit: parse_optional_exit(options, "cargo-test-exit")?,
+        },
     )?;
     // Nine-field TSV consumed by eval/live-holdout/run.sh, in order:
     // process_pass, compile_clean, tests_pass, reference_match, oracle_pass,

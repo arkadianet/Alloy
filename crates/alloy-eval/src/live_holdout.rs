@@ -162,12 +162,15 @@ pub fn oracle(
     fixture_dir: &Path,
     workspace: &Path,
     run_log: &Path,
-    exit_code: i32,
-    compile_clean: bool,
-    cargo_check_exit: Option<i32>,
-    tests_pass: bool,
-    cargo_test_exit: Option<i32>,
+    evidence: OracleEvidence,
 ) -> Result<StrictObservationFields, String> {
+    let OracleEvidence {
+        exit_code,
+        compile_clean,
+        cargo_check_exit,
+        tests_pass,
+        cargo_test_exit,
+    } = evidence;
     let relative_target = target_path(&fixture_dir.join("manifest.toml"))?;
     let actual = workspace.join(&relative_target);
     let expected = fixture_dir
@@ -217,6 +220,15 @@ pub struct StrictObservationFields {
     pub cargo_check_exit: Option<i32>,
     pub cargo_test_exit: Option<i32>,
     pub repair_generations: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleEvidence {
+    pub exit_code: i32,
+    pub compile_clean: bool,
+    pub cargo_check_exit: Option<i32>,
+    pub tests_pass: bool,
+    pub cargo_test_exit: Option<i32>,
 }
 
 fn classify(
