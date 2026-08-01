@@ -685,6 +685,118 @@ fn matrix_compares_two_generic_model_arms_from_one_bundle() {
     assert_eq!(matrix.arms["hotter"].endpoint.model, "stub-model-b");
 }
 
+/// Running whole arms back-to-back lets endpoint drift land unevenly across
+/// arms. The schedule interleaves them per (fixture, repetition) block and
+/// rotates who goes first, and it must be reproducible from the seed alone.
+#[test]
+fn matrix_interleaves_arms_by_block_with_a_reproducible_schedule() {
+    let harness = Harness::new();
+    let arms = arms_file(
+        harness.root(),
+        "arms.tsv",
+        &[
+            &arm_row("baseline", "alloy", "stub-model-a", "0.6", "default", "2"),
+            &arm_row("hotter", "alloy", "stub-model-b", "0.6", "default", "2"),
+        ],
+    );
+    let out = harness.root().join("out");
+
+    let output = harness.run("matrix.sh", &arms, &out);
+    assert!(output.status.success(), "{}", describe(&output));
+
+    let schedule = fs::read_to_string(out.join("schedule.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = schedule
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split('\t').collect())
+        .collect();
+    // One fixture x 2 repetitions x 2 arms.
+    assert_eq!(rows.len(), 4, "schedule:\n{schedule}");
+
+    // Each block runs every arm before the next block begins.
+    for block in ["0", "1"] {
+        let in_block: Vec<&str> = rows
+            .iter()
+            .filter(|row| row[0] == block)
+            .map(|row| row[3])
+            .collect();
+        assert_eq!(in_block.len(), 2, "block {block} in:\n{schedule}");
+        assert_ne!(in_block[0], in_block[1], "an arm ran twice in one block");
+    }
+
+    // Rotation: whoever leads block 0 must not lead block 1.
+    let first_of = |block: &str| {
+        rows.iter()
+            .find(|row| row[0] == block)
+            .map(|row| row[3].to_owned())
+            .unwrap()
+    };
+    assert_ne!(
+        first_of("0"),
+        first_of("1"),
+        "arm order must rotate between blocks:\n{schedule}"
+    );
+
+    // Interleaving must not change what each arm is credited with.
+    for arm in ["baseline", "hotter"] {
+        let report = read_report(&out.join(format!("{arm}.report.json")));
+        assert_eq!(report.overall.semantic.attempts, 2, "{arm} attempts");
+        assert_eq!(report.overall.semantic.passes, 2, "{arm} semantic");
+    }
+}
+
+/// A harness failure in one arm voids the comparison, so the matrix must stop
+/// before spending budget on arms that can no longer be compared. Previously
+/// it recorded the failure and carried on to the next arm.
+#[test]
+fn matrix_aborts_the_whole_run_when_one_arm_fails() {
+    let harness = Harness::new();
+    // Sorts before "pass_fixture", so it is reached in the very first block.
+    let broken = harness
+        .root()
+        .join("repo")
+        .join(FIXTURES_RELPATH)
+        .join("aa_unrunnable_fixture");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(
+        broken.join("manifest.toml"),
+        "naive_target_path = \"src/lib.rs\"\nid = \"aa_unrunnable_fixture\"\n",
+    )
+    .unwrap();
+    git_commit(&harness.root().join("repo"), "add an unrunnable fixture");
+
+    let arms = arms_file(
+        harness.root(),
+        "arms.tsv",
+        &[
+            &arm_row("baseline", "alloy", "stub-model-a", "0.6", "default", "1"),
+            &arm_row("hotter", "alloy", "stub-model-b", "0.6", "default", "1"),
+        ],
+    );
+    let out = harness.root().join("out");
+
+    let output = harness.run("matrix.sh", &arms, &out);
+    assert!(
+        !output.status.success(),
+        "matrix must fail when an arm fails: {}",
+        describe(&output)
+    );
+    // The second arm of the failing block must never have been started.
+    let started: Vec<&str> = ["baseline", "hotter"]
+        .into_iter()
+        .filter(|arm| out.join(format!("{arm}.jsonl")).exists())
+        .collect();
+    assert!(
+        started.len() < 2,
+        "the matrix ran every arm despite a failure: {started:?}\n{}",
+        describe(&output)
+    );
+    assert!(
+        !out.join("matrix.report.json").exists(),
+        "a comparison was published from an aborted matrix"
+    );
+}
+
 #[test]
 fn matrix_refuses_a_checkout_that_is_not_the_bundle_commit() {
     let harness = Harness::new();

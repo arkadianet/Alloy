@@ -28,7 +28,7 @@ cargo build -p alloy-eval --bin alloy-eval-live-holdout
 
 # llama.cpp on :8089 (see router.toml.local-example), or Ollama on :11434
 ALLOY_API_KEY=local \
-MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf' \
+MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf' \
   BASEURL='http://127.0.0.1:8089/v1/' \
   TEMP=0.6 PROFILE=default REPS=1 \
   ./eval/live-holdout/run.sh /tmp/live-holdout.jsonl
@@ -196,8 +196,8 @@ The arms file is seven tab-separated columns:
 
 ```text
 arm_id	driver	model	temperature	profile	base_url	reps
-baseline	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	30
-autonomous-profile	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	30
+baseline	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	30
+autonomous-profile	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	30
 ```
 
 The first arm is the descriptive baseline. `matrix.report.json` retains each
