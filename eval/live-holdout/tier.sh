@@ -41,8 +41,10 @@ case "$tier" in
 esac
 [ -d "$fixtures" ] || die "corpus missing for tier $tier: $fixtures"
 
-arms="$out_dir/arms.tsv"
-mkdir -p "$out_dir" || die "cannot create $out_dir"
+# matrix.sh requires the output directory to be empty, so the generated arms
+# file must live beside it, never inside it.
+arms="$(mktemp -t "alloy-tier-${tier}-arms.XXXXXX")" || die "cannot create arms file"
+trap 'rm -f "$arms"' EXIT
 {
   printf '# arm_id\tdriver\tmodel\ttemperature\tprofile\tbase_url\treps\n'
   printf 'naive\tnaive\t%s\t%s\tnone\t%s\t%s\n' "$MODEL" "$TEMP" "$BASEURL" "$reps"
@@ -55,4 +57,5 @@ echo "TIER $tier: $count fixture(s) x 3 arms x $reps rep(s) = $((count * 3 * rep
 [ "$tier" = "gate" ] ||
   echo "TIER $tier is for iteration only — do not cite it as evidence"
 
-FIXTURES="$fixtures" exec "$here/matrix.sh" "$arms" "$out_dir" "$bundle"
+FIXTURES="$fixtures" "$here/matrix.sh" "$arms" "$out_dir" "$bundle"
+exit $?
