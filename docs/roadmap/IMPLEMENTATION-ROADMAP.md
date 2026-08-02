@@ -91,6 +91,25 @@ This section is the active work queue. The detailed M1–M7, MVP, Beta, and Prod
 - [ ] No claim relies on process exit, compile success, or exact-reference matching alone.
 - [ ] No autonomous-over-default claim unless that direct comparison clears its own uncertainty gate.
 
+**First E2 measurement (source revision `a701ae3`, bundle `5b794db2…`, corpus `e2-semantic-v1` digest `cc04c829…`, Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL, temp 0.6, 24 fixtures x 3 arms x 3 repetitions = 216 attempts, interleaved by block, seed 1).**
+
+| Arm | Semantic | Compile | Exact reference | Model calls/attempt |
+| --- | --- | --- | --- | --- |
+| Naive (one call) | **58/72 (80.6%)** | 64/72 | 1/72 | 1.0 |
+| Alloy autonomous | 27/72 (37.5%) | 28/72 | 11/72 | 9.5 |
+| Alloy default | 19/72 (26.4%) | 22/72 | 10/72 | 7.7 |
+
+Clustered over 24 fixtures: naive → default `-54.2 pp` (95% CI `[-73.6, -34.8]`); naive → autonomous `-43.1 pp` (95% CI `[-60.9, -25.2]`). Both intervals lie entirely below zero.
+
+**The E2 gate is red.** It requires at least `+10 pp` with a clustered lower bound above zero. Alloy makes the same model substantially *worse* at single-file repair than calling it once, at roughly eight times the model calls.
+
+- **The deficit is not carried by one family.** Alloy loses in all seven; leave-one-family-out bottoms at `-46 pp`. It scores **zero** on E0106 (lifetimes, naive 0.89) and E0499 (naive 0.33), and loses 0.67 on E0596 and 0.56 on E0502.
+- **Autonomous versus default is `+11.1 pp`, 95% CI `[-4.8, +27.0]`.** The interval crosses zero, so no autonomous claim is permitted.
+- **Alloy is more canonical when it succeeds** — 10-11 exact-reference matches against naive's 1 — so the failure is not an inability to write correct Rust. It is a failure to finish: `repair_budget_exhausted` is the dominant class.
+- **An earlier sweep of this corpus is void.** A machine-wide `~/.cargo/config.toml` target-dir plus `cp -a` mtime preservation let cargo replay cached results, so 100 of 199 attempts recorded a clean build for code that does not compile — asymmetrically, since an arm that rewrites the whole file gets fresh mtimes. It is retained as a harness failure report only and must not be cited as an Alloy result.
+
+**Not yet established:** intervention one's effect is unmeasured — there is no pre-intervention baseline on this corpus — and the cause of `repair_budget_exhausted` has not been diagnosed on uncontaminated evidence. The prior diagnosis (unanchored `insert_lines` duplication) was derived from the void sweep and does not survive here: only two attempts show `E0428`.
+
 **Stop rule:** After two bounded, evidence-driven intervention cycles without uplift, write the “why not,” stop tuning this slice, and make an explicit product decision: reposition the repair claim, change the target model/task class, or pause repair before starting E3.
 
 ### E3 — Broaden engineering capabilities
