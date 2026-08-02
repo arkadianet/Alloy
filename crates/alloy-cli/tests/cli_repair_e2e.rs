@@ -698,17 +698,21 @@ fn start_wrong_first_server() -> u16 {
 }
 
 const WRONG_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = \"not a number\";\n+    let x: i32 = true;\n     println!(\"{}\", x);\n }\n";
-/// Deliberately anchored on the *wrong-fixed* `true` line: it can only
-/// apply to the tree generation 1's failed edit left behind — the in-run
-/// generation loop patches forward, it never rolls back (RFC-0017 MG6).
-const SECOND_FIX_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = true;\n+    let x: i32 = 42;\n     println!(\"{}\", x);\n }\n";
+/// Anchored on the ORIGINAL broken line. GN13 restores the workspace before
+/// replanning, so generation 2 sees the tree as it was, not as generation 1
+/// damaged it. A diff anchored on the wrong-fixed `true` line would no longer
+/// apply — which is the point: without a restore, each generation edits the
+/// previous generation's damage, and measured over 144 live attempts the pass
+/// rate fell 71.2% (one applied edit) -> 33.3% (two) -> 2.3% (three).
+const SECOND_FIX_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,4 +1,4 @@\n fn main() {\n-    let x: i32 = \"not a number\";\n+    let x: i32 = 42;\n     println!(\"{}\", x);\n }\n";
 
 /// RFC-0017 in-run repair generations, end to end through the real CLI: a
 /// wrong first patch fails verify with a genuine E0308, the
 /// `GenerationDriver` admits the failure inside the *same*
 /// `RunController::start`, replans with the seeded diagnostics, and
-/// generation 2 patches the tree as generation 1 left it. One `alloy run`
-/// invocation, one run, exit 0 — no CLI retry, no rollback (MG3/MG4).
+/// generation 2 patches the RESTORED tree. One `alloy run` invocation, one
+/// run, exit 0 — no CLI-level retry (MG3/MG4). The in-run workspace restore
+/// (GN13) is expected and is what lets generation 2 start from clean source.
 #[test]
 fn wrong_first_patch_is_repaired_by_a_second_generation() {
     let Some(e2e) = setup_with(start_wrong_first_server()) else {
@@ -734,14 +738,16 @@ fn wrong_first_patch_is_repaired_by_a_second_generation() {
         stderr.contains("replan_resumed"),
         "in-run resume marker missing: {stderr}"
     );
-    // The CLI never announced a retry or a rollback — those paths are gone.
+    // The CLI-level retry path is still gone; the in-run restore is not it.
     assert!(!stderr.contains("retrying"), "CLI retry survived: {stderr}");
+    // GN13 must actually have restored before replanning, or generation 2
+    // would be editing generation 1's damage.
     assert!(
-        !stderr.contains("rolled back"),
-        "CLI rollback survived: {stderr}"
+        stderr.contains("GN13: restored newest edit checkpoint"),
+        "in-run workspace restore missing: {stderr}"
     );
-    // Only reachable if generation 2 patched the wrong-fixed tree in place:
-    // `SECOND_FIX_DIFF` does not apply to the original content.
+    // Only reachable if generation 2 patched the RESTORED tree:
+    // `SECOND_FIX_DIFF` does not apply to the wrong-fixed content.
     let main_rs = std::fs::read_to_string(e2e.ws.path().join("src/main.rs")).unwrap();
     assert!(main_rs.contains("let x: i32 = 42;"), "{main_rs}");
     assert!(!main_rs.contains("true"), "wrong patch survived: {main_rs}");
