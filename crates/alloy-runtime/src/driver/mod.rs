@@ -26,7 +26,12 @@
 //! `lineage: "absent"` and annotates the terminal `FailureIr` so the run
 //! does not exit shaped like a repair that fought and lost (live E2
 //! finding: 25/144 attempts burned the whole edit budget this way and
-//! exited silently).
+//! exited silently). Declines additionally carry `failure_notes` — the
+//! terminal `FailureIr`'s bounded notes — because the decision row is the
+//! only durable channel the E2 evidence export keeps: on dev-gn13, 7/48
+//! attempts died exactly here with the edit validator's violation text
+//! living solely in a CAS `failure_ref` the export drops, leaving the
+//! whole never-edited bucket unattributable to a cause.
 //!
 //! Author: arkadianet
 
@@ -45,7 +50,9 @@ use crate::dag::NodeKind;
 use crate::edit::{transactions_of_run, EditContext, EditEngine};
 use crate::error::{RunError, RuntimeError};
 use crate::events::{SessionEvent, SessionEventType};
-use crate::obs::{BudgetCheck, CostMeterFactory, DecisionKind, DecisionLog, DecisionRecord};
+use crate::obs::{
+    truncate_utf8_bytes, BudgetCheck, CostMeterFactory, DecisionKind, DecisionLog, DecisionRecord,
+};
 use crate::planner::seed::seed_projection_is_empty;
 use crate::planner::{PlanContext, PlanError, PlanProducedPayload, PlanService, PlanSource};
 use crate::scheduler::{DagOutcome, DagState};
@@ -344,40 +351,7 @@ impl GenerationDriver {
         outcome: &DagOutcome,
         decision: ReplanDecisionMeta<'_>,
     ) {
-        let seed_or_outcome = decision.seed.or(outcome.failure.as_ref());
-        let mut metadata = json!({
-            "run_id": ctx.run_id,
-            "dag_id": ctx.dag_id,
-            "from_generation": outcome.generation,
-            "failed_node": outcome.failed_node,
-            "error_class": outcome.failure.as_ref().map(|f| f.error_class),
-            "diagnostic_count": seed_or_outcome.map_or(0, |f| f.diagnostics.len()),
-            "admitted": decision.admitted,
-        });
-        if let Some(map) = metadata.as_object_mut() {
-            if decision.admitted {
-                map.insert("to_generation".into(), json!(outcome.generation + 1));
-            }
-            if let Some(reason) = decision.reason {
-                map.insert("reason".into(), json!(reason));
-            }
-            if decision.missing_lineage {
-                // AM-0017-1 near-miss: right kind, right class, no in-run
-                // lineage seed (every generation 1). Additive to §9.2 —
-                // `reason` keeps AC 23b's "kind".
-                map.insert("lineage".into(), json!("absent"));
-            }
-            if let Some((used, max)) = decision.bumps {
-                map.insert("bumps_used".into(), json!(used));
-                map.insert("max_repair_generations".into(), json!(max));
-            }
-            if let Some(provenance) = decision.provenance {
-                map.insert("provenance".into(), json!(provenance));
-            }
-            if let Some(seed_source) = decision.seed_source {
-                map.insert("seed_source".into(), json!(seed_source));
-            }
-        }
+        let metadata = replan_decision_metadata(ctx, outcome, &decision);
         let record = DecisionRecord {
             session: ctx.session_id,
             run: Some(ctx.run_id),
@@ -543,6 +517,73 @@ impl GenerationDriver {
             prior_proposal_artifact: provenance.prior_proposal_artifact,
         })
     }
+}
+
+/// Byte bound on the `failure_notes` a §9.2 decline record carries. The
+/// worker-side FM15 bound is 2 KiB; a decision row is not a log sink, and
+/// every observed edit-validator violation fits well inside this.
+const MAX_DECLINE_NOTE_BYTES: usize = 512;
+
+/// §9.2 `Replan` decision metadata, pure so the record surface is testable
+/// without the full driver assembly.
+fn replan_decision_metadata(
+    ctx: &RunExecCtx,
+    outcome: &DagOutcome,
+    decision: &ReplanDecisionMeta<'_>,
+) -> serde_json::Value {
+    let seed_or_outcome = decision.seed.or(outcome.failure.as_ref());
+    let mut metadata = json!({
+        "run_id": ctx.run_id,
+        "dag_id": ctx.dag_id,
+        "from_generation": outcome.generation,
+        "failed_node": outcome.failed_node,
+        "error_class": outcome.failure.as_ref().map(|f| f.error_class),
+        "diagnostic_count": seed_or_outcome.map_or(0, |f| f.diagnostics.len()),
+        "admitted": decision.admitted,
+    });
+    if let Some(map) = metadata.as_object_mut() {
+        if decision.admitted {
+            map.insert("to_generation".into(), json!(outcome.generation + 1));
+        }
+        if let Some(reason) = decision.reason {
+            map.insert("reason".into(), json!(reason));
+        }
+        if decision.missing_lineage {
+            // AM-0017-1 near-miss: right kind, right class, no in-run
+            // lineage seed (every generation 1). Additive to §9.2 —
+            // `reason` keeps AC 23b's "kind".
+            map.insert("lineage".into(), json!("absent"));
+        }
+        if let Some((used, max)) = decision.bumps {
+            map.insert("bumps_used".into(), json!(used));
+            map.insert("max_repair_generations".into(), json!(max));
+        }
+        // Declines are terminal for the dispatch, and the E2 evidence export
+        // carries decision rows but not the CAS `failure_ref` bodies —
+        // without this, the measured never-edited bucket (7/48 on dev-gn13)
+        // ends with the edit validator's violation text nowhere on disk.
+        // Worker notes are already FM15-redacted; this only re-bounds them.
+        if !decision.admitted {
+            if let Some(notes) = outcome
+                .failure
+                .as_ref()
+                .map(|f| f.notes.as_str())
+                .filter(|n| !n.is_empty())
+            {
+                map.insert(
+                    "failure_notes".into(),
+                    json!(truncate_utf8_bytes(notes, MAX_DECLINE_NOTE_BYTES)),
+                );
+            }
+        }
+        if let Some(provenance) = decision.provenance {
+            map.insert("provenance".into(), json!(provenance));
+        }
+        if let Some(seed_source) = decision.seed_source {
+            map.insert("seed_source".into(), json!(seed_source));
+        }
+    }
+    metadata
 }
 
 async fn list_all_session_events(
@@ -832,7 +873,114 @@ mod tests {
     use crate::dag::TemplateId;
     use crate::events::{EventSink, NewSessionEvent};
     use crate::storage::{AlloyStorage, StorageOpenOptions};
-    use crate::types::ids::ArtifactId;
+    use crate::types::ids::{ArtifactId, NodeId, RunId};
+
+    fn exec_ctx() -> RunExecCtx {
+        RunExecCtx {
+            run_id: RunId::new(),
+            session_id: SessionId::new(),
+            dag_id: DagId::new(),
+            deadline: Instant::now(),
+        }
+    }
+
+    fn failed_outcome(dag_id: DagId, notes: &str) -> DagOutcome {
+        let node = NodeId::new();
+        DagOutcome {
+            dag_id,
+            generation: 1,
+            state: DagState::Failed,
+            failed_node: Some(node),
+            failure: Some(FailureIr {
+                node,
+                error_class: ErrorClass::Model,
+                retry: RetryDisposition::Retryable,
+                diagnostics: vec![],
+                notes: notes.into(),
+            }),
+        }
+    }
+
+    fn decline(reason: &'static str, missing_lineage: bool) -> ReplanDecisionMeta<'static> {
+        ReplanDecisionMeta {
+            admitted: false,
+            reason: Some(reason),
+            missing_lineage,
+            bumps: Some((0, 2)),
+            provenance: None,
+            seed: None,
+            seed_source: None,
+        }
+    }
+
+    /// E2 residual (dev-gn13, 7/48 attempts): a run that never applied an
+    /// edit dies on the AM-0017-1 decline with the edit worker's validator
+    /// violation living only in the CAS-backed `failure_ref`, which the
+    /// evidence export does not carry — the measured bucket was
+    /// unattributable to a cause. The §9.2 decline record is the durable
+    /// channel, so it must carry the terminal failure's notes.
+    #[test]
+    fn declined_replan_record_carries_terminal_failure_notes() {
+        let ctx = exec_ctx();
+        let notes =
+            "invalid model response after repair turn: expect lists 2 line(s) but start..=end \
+             covers 4; expect must repeat every current line in the range";
+        let outcome = failed_outcome(ctx.dag_id, notes);
+        let metadata = replan_decision_metadata(&ctx, &outcome, &decline("kind", true));
+        assert_eq!(
+            metadata["failure_notes"].as_str(),
+            Some(notes),
+            "decline records must carry the terminal failure notes"
+        );
+        // The pre-existing decline fields survive the refactor.
+        assert_eq!(metadata["reason"], json!("kind"));
+        assert_eq!(metadata["lineage"], json!("absent"));
+        assert_eq!(metadata["bumps_used"], json!(0));
+        assert_eq!(metadata["max_repair_generations"], json!(2));
+        assert_eq!(metadata["admitted"], json!(false));
+    }
+
+    /// The notes ride only the decline path (terminal for the dispatch) and
+    /// stay bounded: an admitted record describes a seed the planner will
+    /// consume, and a §9.2 row is not a log sink.
+    #[test]
+    fn replan_record_notes_are_decline_only_and_bounded() {
+        let ctx = exec_ctx();
+        // Bounded on a UTF-8 boundary: 2-byte 'é' repeated past the cap.
+        let long = "é".repeat(MAX_DECLINE_NOTE_BYTES);
+        let outcome = failed_outcome(ctx.dag_id, &long);
+        let metadata = replan_decision_metadata(&ctx, &outcome, &decline("kind", false));
+        let stored = metadata["failure_notes"].as_str().expect("notes recorded");
+        assert!(
+            stored.len() <= MAX_DECLINE_NOTE_BYTES,
+            "notes must be bounded"
+        );
+        assert!(
+            long.starts_with(stored),
+            "bounding must truncate, not rewrite"
+        );
+
+        // Admitted record: no failure_notes.
+        let admitted = ReplanDecisionMeta {
+            admitted: true,
+            reason: None,
+            missing_lineage: false,
+            bumps: None,
+            provenance: Some("preserved"),
+            seed: outcome.failure.as_ref(),
+            seed_source: Some("outcome"),
+        };
+        let metadata = replan_decision_metadata(&ctx, &outcome, &admitted);
+        assert!(
+            metadata.get("failure_notes").is_none(),
+            "admitted records must not carry failure notes"
+        );
+
+        // Empty notes: field omitted rather than recorded as "".
+        let outcome = failed_outcome(ctx.dag_id, "");
+        let metadata = replan_decision_metadata(&ctx, &outcome, &decline("no_diagnostics", false));
+        assert!(metadata.get("failure_notes").is_none());
+    }
 
     async fn store() -> (tempfile::TempDir, AlloyStorage) {
         let dir = tempfile::tempdir().unwrap();
