@@ -278,10 +278,6 @@ fn arm_row(
 /// orchestration scripts, the profiles, and the holdout corpus. Unrelated
 /// documents are left deliberately uncommitted — a real operator's roadmap
 /// edits must never block a run.
-fn write_checkout(root: &Path) -> PathBuf {
-    write_checkout_with(root, &[], &[])
-}
-
 /// A fixture with a manifest but no workspace: run.sh dies on it, which is how
 /// a test forces an arm to fail *during execution* rather than at a preflight
 /// guard.
@@ -711,13 +707,21 @@ fn matrix_compares_two_generic_model_arms_from_one_bundle() {
     let expected = bundle_sha256(&harness.bundle);
     for arm in ["baseline", "hotter"] {
         let report = read_report(&out.join(format!("{arm}.report.json")));
-        assert_eq!(report.endpoint.harness.source_revision, harness.revision);
-        assert_eq!(report.endpoint.harness.binary_bundle_sha256, expected);
+        assert_eq!(report.treatment.build.source_revision, harness.revision);
+        assert_eq!(report.treatment.build.binary_bundle_sha256, expected);
         assert_eq!(report.overall.oracle.passes, 1, "{arm} strict oracle");
         assert_eq!(report.overall.oracle.attempts, 1, "{arm} attempts");
+        // Every arm was scored under one protocol — that is why they may be
+        // compared at all — and the comparison records which one.
+        assert_eq!(report.protocol, matrix.protocol, "{arm} protocol identity");
     }
+    assert_eq!(matrix.protocol.corpus_digest.len(), 64);
+    assert_eq!(matrix.protocol.evaluator_revision, harness.revision);
     assert_eq!(matrix.arms["baseline"].endpoint.model, "stub-model-a");
     assert_eq!(matrix.arms["hotter"].endpoint.model, "stub-model-b");
+    // Both arms run the default profile, so there is no autonomous comparison
+    // to make: it is absent rather than reported as a zero effect.
+    assert!(matrix.autonomous_vs_default.is_none());
 }
 
 /// Running whole arms back-to-back lets endpoint drift land unevenly across
@@ -1162,14 +1166,14 @@ fn e1_runs_exactly_three_equal_arms_through_the_generic_matrix() {
         ("alloy-autonomous", Some("autonomous")),
     ] {
         let report = read_report(&out.join(format!("{arm}.report.json")));
-        assert_eq!(report.endpoint.profile.as_deref(), profile, "{arm}");
+        assert_eq!(report.treatment.profile.as_deref(), profile, "{arm}");
         assert_eq!(report.endpoint.model, MODEL, "{arm}");
         assert_eq!(
-            report.endpoint.harness.source_revision, harness.revision,
+            report.treatment.build.source_revision, harness.revision,
             "{arm}"
         );
         assert_eq!(
-            report.endpoint.harness.binary_bundle_sha256, expected,
+            report.treatment.build.binary_bundle_sha256, expected,
             "{arm}"
         );
         // Every arm ran the shared oracle path, not just a report writer.
@@ -1181,6 +1185,33 @@ fn e1_runs_exactly_three_equal_arms_through_the_generic_matrix() {
             "{arm} must retain independent test evidence"
         );
     }
+
+    // Naive is the baseline for the primary metric, so the two Alloy profiles
+    // are only ever compared to each other by the dedicated contrast.
+    assert_eq!(matrix.comparisons.len(), 2);
+    let contrast = matrix
+        .autonomous_vs_default
+        .as_ref()
+        .expect("one default arm and one autonomous arm ran");
+    assert_eq!(contrast.comparison.baseline, "alloy-default");
+    assert_eq!(contrast.comparison.arm, "alloy-autonomous");
+    // One fixture cannot bound a between-fixture effect, and "cannot bound"
+    // is never a pass.
+    assert_eq!(contrast.comparison.semantic_clustered.lower95, None);
+    assert!(!contrast.clears_gate, "{}", contrast.gate_basis);
+    assert!(!matrix.autonomous_uplift_is_claimable());
+    // The operator sees the verdict on the terminal, not only in the JSON.
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        printed.contains("autonomous_gate\talloy-autonomous\tvs\talloy-default\tblocked"),
+        "{}",
+        describe(&output)
+    );
+    assert!(
+        printed.contains("clustered_lower95_unbounded"),
+        "{}",
+        describe(&output)
+    );
 }
 
 /// A minimal committed repository carrying the real `prepare.sh`, so its

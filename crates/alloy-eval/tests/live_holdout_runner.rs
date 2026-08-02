@@ -179,6 +179,22 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
     value.len() == len && value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
+/// The corpus digest as the operator CLI reports it, so the shell can record
+/// and verify protocol identity without reimplementing the hash.
+fn corpus_digest(fixtures: &Path) -> String {
+    let output = Command::new(EVALUATOR)
+        .args(["corpus-digest", "--fixtures"])
+        .arg(fixtures)
+        .output()
+        .expect("corpus-digest");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 #[test]
 fn committed_post_references_pass_hidden_oracles() {
     let fixtures = repo_root().join("crates/alloy-eval/fixtures/holdout");
@@ -279,18 +295,39 @@ fn runner_preserves_process_compile_reference_and_strict_results() {
     assert_eq!(report.overall.compile_clean_tests_failed.passes, 2);
     assert_eq!(report.overall.tests_pass_reference_mismatch.passes, 0);
 
-    assert_eq!(report.endpoint.driver, LiveHoldoutDriver::Alloy);
-    assert_eq!(report.endpoint.profile.as_deref(), Some("default"));
+    assert_eq!(report.treatment.driver, LiveHoldoutDriver::Alloy);
+    assert_eq!(report.treatment.profile.as_deref(), Some("default"));
     assert!(
-        is_lower_hex(&report.endpoint.harness.source_revision, 40),
+        is_lower_hex(&report.treatment.build.source_revision, 40),
         "{:?}",
-        report.endpoint.harness.source_revision
+        report.treatment.build.source_revision
     );
     assert!(
-        is_lower_hex(&report.endpoint.harness.binary_bundle_sha256, 64),
+        is_lower_hex(&report.treatment.build.binary_bundle_sha256, 64),
         "{:?}",
-        report.endpoint.harness.binary_bundle_sha256
+        report.treatment.build.binary_bundle_sha256
     );
+
+    // Protocol identity is recorded beside the treatment, not merged into it.
+    // The runner passes no --evaluator-revision, so it falls back to the
+    // checkout revision; the corpus digest is computed by the evaluator from
+    // the fixtures themselves, so the shell cannot misreport it.
+    assert_eq!(report.protocol.corpus, "rfc0016-holdout-live");
+    assert_eq!(report.protocol.schema_version, LIVE_HOLDOUT_REPORT_VERSION);
+    assert_eq!(
+        report.protocol.evaluator_revision,
+        report.treatment.build.source_revision
+    );
+    assert_eq!(report.protocol.corpus_digest, corpus_digest(&fixtures));
+    // A corpus edit after scoring is visible as a different digest, which is
+    // what stops a silently changed corpus from passing as the same protocol.
+    fs::write(
+        fixtures.join("pass_fixture/oracle-tests/semantic.rs"),
+        "#[test]\nfn edited() { assert!(true); }\n",
+    )
+    .unwrap();
+    assert_ne!(report.protocol.corpus_digest, corpus_digest(&fixtures));
+
     // Two stub `model_call` events per attempt; the second reports output
     // tokens only, so present fields sum and absent ones stay unknown.
     assert_eq!(report.overall.model_calls_total, 8);
@@ -419,14 +456,14 @@ fn naive_driver_shares_the_strict_oracle_pipeline() {
     )
     .unwrap();
     assert_eq!(report.schema_version, LIVE_HOLDOUT_REPORT_VERSION);
-    assert_eq!(report.endpoint.driver, LiveHoldoutDriver::Naive);
-    assert_eq!(report.endpoint.profile, None);
+    assert_eq!(report.treatment.driver, LiveHoldoutDriver::Naive);
+    assert_eq!(report.treatment.profile, None);
     assert_eq!(
-        report.endpoint.harness.source_revision,
+        report.treatment.build.source_revision,
         NAIVE_SOURCE_REVISION
     );
     assert_eq!(
-        report.endpoint.harness.binary_bundle_sha256,
+        report.treatment.build.binary_bundle_sha256,
         NAIVE_BUNDLE_SHA256
     );
     assert_eq!(report.overall.oracle.passes, 1);
@@ -579,8 +616,8 @@ fn fallback_bundle_identity_includes_the_alloy_scorer() {
     let second = run("second", &scorer_b);
 
     assert_ne!(
-        first.endpoint.harness.binary_bundle_sha256,
-        second.endpoint.harness.binary_bundle_sha256
+        first.treatment.build.binary_bundle_sha256,
+        second.treatment.build.binary_bundle_sha256
     );
 }
 

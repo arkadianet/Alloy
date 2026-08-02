@@ -10,6 +10,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
+use alloy_runtime::DigestHasher;
 use serde::{Deserialize, Serialize};
 
 use crate::live_repair::{wilson_interval, WilsonInterval, WILSON_Z_95};
@@ -20,13 +21,21 @@ const TIMEOUT_EXIT_CODE: i32 = 124;
 /// is also the runtime's maximum page. An export this long is treated as
 /// truncated rather than complete.
 const EVENT_EXPORT_PAGE_LIMIT: usize = 1_000;
-/// v5 makes `semantic_pass` the primary outcome and demotes byte-exact
-/// `reference_match` to canonicality telemetry.
+/// v6 splits the single conflated harness identity into a [`ProtocolIdentity`]
+/// (which corpus, which evaluator, which schema scored this) and a
+/// [`TreatmentIdentity`] (which product build, driver, and profile produced
+/// it). Arms are comparable when the protocol is identical and the treatment
+/// differs — the treatment difference is the measurement.
 ///
-/// v4 evidence carries no semantic measurement, so it is readable as an
-/// archive but is refused for scoring and comparison with an explicit legacy
-/// message rather than being silently reinterpreted under the v5 contract.
-pub const REPORT_SCHEMA_VERSION: u32 = 5;
+/// v5 made `semantic_pass` the primary outcome; v4 carries no semantic
+/// measurement at all. Both are readable as archives but are refused for
+/// scoring and comparison with an explicit legacy message rather than being
+/// silently reinterpreted under the v6 contract. Their raw observations, which
+/// carry no schema version, re-score cleanly under v6.
+pub const REPORT_SCHEMA_VERSION: u32 = 6;
+/// Domain separator for [`corpus_digest`], so a digest can never be confused
+/// with a hash of some other structure.
+const CORPUS_DIGEST_DOMAIN: &[u8] = b"alloy-live-holdout-corpus-v1\n";
 
 #[derive(Debug, Deserialize)]
 struct HoldoutManifest {
@@ -42,12 +51,51 @@ pub enum LiveHoldoutDriver {
     Alloy,
 }
 
-/// Build provenance for the harness that produced an observation. Reports
-/// from different builds must never be treated as the same arm.
+/// Build provenance of the product under test: the commit its binaries were
+/// built from, and the digest of the exact bundle that ran.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HarnessIdentity {
+pub struct TreatmentBuild {
     pub source_revision: String,
     pub binary_bundle_sha256: String,
+}
+
+/// What produced the repairs: which build, driven how, under which profile.
+///
+/// This is the thing an experiment is allowed to change. Two arms that differ
+/// here and nowhere else are exactly what a comparison measures.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreatmentIdentity {
+    pub build: TreatmentBuild,
+    pub driver: LiveHoldoutDriver,
+    pub profile: Option<String>,
+}
+
+/// What scored an observation set: which corpus (by name and by content),
+/// which evaluator, and under which schema.
+///
+/// This is the thing an experiment must NOT change between arms. It is a
+/// property of the scoring act rather than of the run, so re-scoring old
+/// observations with one fixed evaluator puts every arm under one protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProtocolIdentity {
+    pub corpus: String,
+    /// Digest over the corpus's oracle inputs, so a silently edited fixture
+    /// scores under a visibly different protocol instead of passing as the
+    /// same one.
+    pub corpus_digest: String,
+    /// Revision of the evaluator and corpus checkout that did the scoring —
+    /// not of the product binaries, which live in [`TreatmentBuild`].
+    pub evaluator_revision: String,
+    pub schema_version: u32,
+}
+
+/// Everything the scorer must be told about one arm: which evaluator is
+/// scoring it, which endpoint it talked to, and which treatment produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArmIdentity {
+    pub evaluator_revision: String,
+    pub endpoint: Endpoint,
+    pub treatment: TreatmentIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -77,7 +125,11 @@ pub struct StrictObservation {
     pub driver: LiveHoldoutDriver,
     pub profile: Option<String>,
     pub base_url: String,
-    pub harness: HarnessIdentity,
+    /// Build provenance of the treatment that produced this attempt. v5
+    /// evidence spells this field `harness`; the alias keeps those raw
+    /// observations re-scorable instead of stranding them.
+    #[serde(alias = "harness")]
+    pub build: TreatmentBuild,
     pub corpus: String,
     pub model_calls: u32,
     /// Provider-reported usage, absent when the provider did not report it.
@@ -123,20 +175,22 @@ pub struct FixtureSummary {
     pub tokens_out_unknown: u32,
 }
 
+/// The raw model endpoint an arm talked to. Driver and profile are treatment,
+/// not endpoint, so they live in [`TreatmentIdentity`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Endpoint {
     pub model: String,
     pub temperature: f64,
-    pub driver: LiveHoldoutDriver,
-    pub profile: Option<String>,
     pub base_url: String,
-    pub harness: HarnessIdentity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StrictReport {
     pub schema_version: u32,
-    pub corpus: String,
+    /// Must be identical across compared arms.
+    pub protocol: ProtocolIdentity,
+    /// Expected to differ across compared arms.
+    pub treatment: TreatmentIdentity,
     pub endpoint: Endpoint,
     pub repetitions: u32,
     pub fixtures: Vec<FixtureSummary>,
@@ -197,15 +251,76 @@ pub struct ArmComparison {
     pub assessment: Assessment,
 }
 
+/// The direct default-versus-autonomous contrast, with its own gate answered.
+///
+/// The primary metric is baselined on the first arm (naive, in E2), so the two
+/// Alloy profiles are never compared to each other by that path. This carries
+/// that comparison separately and states the verdict instead of leaving a
+/// reader to derive it from the interval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutonomousContrast {
+    /// Default-baselined comparison carrying the same clustered and
+    /// per-family evidence as the primary comparisons.
+    pub comparison: ArmComparison,
+    /// Whether autonomous uplift over default may be claimed at all.
+    pub clears_gate: bool,
+    /// Why `clears_gate` reads as it does.
+    pub gate_basis: String,
+}
+
+impl AutonomousContrast {
+    fn new(comparison: ArmComparison) -> Self {
+        let clears_gate = clears_autonomous_gate(&comparison.semantic_clustered);
+        let gate_basis = match comparison.semantic_clustered.lower95 {
+            Some(lower) if lower > 0.0 => "clustered_lower95_above_zero",
+            Some(_) => "clustered_lower95_not_above_zero",
+            None => "clustered_lower95_unbounded",
+        }
+        .to_owned();
+        Self {
+            comparison,
+            clears_gate,
+            gate_basis,
+        }
+    }
+}
+
+/// The E2 autonomous gate: uplift over the default profile counts only when
+/// the fixture-clustered 95% lower bound is strictly above zero.
+///
+/// An unbounded delta — fewer than two fixtures, so between-fixture variance
+/// is unestimable — certifies nothing. "Cannot bound" fails the gate; it is
+/// never read as passing.
+pub fn clears_autonomous_gate(delta: &ClusteredDelta) -> bool {
+    delta.lower95.is_some_and(|lower| lower > 0.0)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MatrixComparison {
     pub schema_version: u32,
-    pub corpus: String,
+    /// The one protocol every arm was scored under. Arms that disagree here
+    /// are never compared, so a comparison always has exactly one.
+    pub protocol: ProtocolIdentity,
     pub repetitions: u32,
     pub baseline: String,
     pub arms: BTreeMap<String, StrictReport>,
     pub comparisons: Vec<ArmComparison>,
+    /// Present only when the run holds exactly one Alloy `default` arm and
+    /// exactly one Alloy `autonomous` arm. Any other shape leaves it absent:
+    /// the question was not asked, which is not a measured null effect.
+    #[serde(default)]
+    pub autonomous_vs_default: Option<AutonomousContrast>,
     pub notes: Vec<String>,
+}
+
+impl MatrixComparison {
+    /// Whether this run licenses a claim of autonomous uplift. Fails closed:
+    /// no direct default-versus-autonomous contrast means no claim.
+    pub fn autonomous_uplift_is_claimable(&self) -> bool {
+        self.autonomous_vs_default
+            .as_ref()
+            .is_some_and(|contrast| contrast.clears_gate)
+    }
 }
 
 /// A treatment effect with fixtures, not attempts, as the unit of analysis.
@@ -318,22 +433,20 @@ fn family_deltas(baseline: &[FixtureSummary], arm: &[FixtureSummary]) -> Vec<Fam
         .collect()
 }
 
-/// A naive-vs-alloy arm identity check that only differs on driver, profile,
-/// or build provenance — not the raw model endpoint. Used to separate
-/// "wrong endpoint" from "wrong arm/build" in error messages.
+/// The raw model endpoint the row reports. Separated from the treatment check
+/// so an error can say which of the two disagreed.
 fn endpoint_matches(row: &StrictObservation, endpoint: &Endpoint) -> bool {
     row.model == endpoint.model
         && row.temperature == endpoint.temperature
         && row.base_url == endpoint.base_url
-        && row.driver == endpoint.driver
-        && row.profile == endpoint.profile
-        && row.harness == endpoint.harness
 }
 
-fn core_endpoint_matches(row: &StrictObservation, endpoint: &Endpoint) -> bool {
-    row.model == endpoint.model
-        && row.temperature == endpoint.temperature
-        && row.base_url == endpoint.base_url
+/// The build, driver, and profile the row reports. Rows from two treatments
+/// never belong in one arm, however alike their endpoints look.
+fn treatment_matches(row: &StrictObservation, treatment: &TreatmentIdentity) -> bool {
+    row.build == treatment.build
+        && row.driver == treatment.driver
+        && row.profile == treatment.profile
 }
 
 /// Naive observations carry no profile; Alloy observations must declare one
@@ -672,6 +785,113 @@ fn fixture_ids(root: &Path) -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
+/// Deterministic digest over the corpus's oracle inputs: the sorted fixture
+/// ids, and for each fixture its manifest, its whole starting workspace
+/// (including the golden `.post` reference), and every hidden test.
+///
+/// This is what makes the corpus part of protocol identity rather than an
+/// assumption. Editing a hidden test, a golden reference, or a starting
+/// workspace moves the digest, so the edited corpus can no longer pass as the
+/// one earlier arms were scored against. Non-oracle fixture material —
+/// recordings, licences — is deliberately excluded: it cannot change what an
+/// attempt is asked to do or how it is judged.
+///
+/// Every record is length-prefixed and path-tagged, so no rearrangement of
+/// files can produce the same byte stream, and an absent input hashes as
+/// absent rather than as empty.
+pub fn corpus_digest(fixtures: &Path) -> Result<String, String> {
+    let mut hasher = DigestHasher::new();
+    hasher.update(CORPUS_DIGEST_DOMAIN);
+    for id in fixture_ids(fixtures)? {
+        hasher.update(b"fixture\0");
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+        let fixture = fixtures.join(&id);
+        let mut inputs = vec![PathBuf::from("manifest.toml")];
+        for directory in ["workspace", "oracle-tests"] {
+            inputs.extend(files_under(&fixture.join(directory), Path::new(directory))?);
+        }
+        for relative in inputs {
+            absorb_file(&mut hasher, &fixture, &relative)?;
+        }
+    }
+    Ok(hasher.finish().as_hex().to_owned())
+}
+
+/// Every file under `root`, as paths relative to the fixture and sorted, so
+/// the digest never depends on directory iteration order. A missing directory
+/// contributes nothing; its absence still shows up as absent oracle inputs.
+fn files_under(root: &Path, prefix: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("read {}: {error}", root.display())),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read {}: {error}", root.display()))?;
+        let relative = prefix.join(entry.file_name());
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("stat {}: {error}", entry.path().display()))?;
+        if kind.is_dir() {
+            files.extend(files_under(&entry.path(), &relative)?);
+        } else {
+            files.push(relative);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn absorb_file(hasher: &mut DigestHasher, fixture: &Path, relative: &Path) -> Result<(), String> {
+    let path = fixture.join(relative);
+    hasher.update(relative.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    match fs::read(&path) {
+        Ok(bytes) => {
+            hasher.update(bytes.len().to_string().as_bytes());
+            hasher.update(b"\0");
+            hasher.update(&bytes);
+        }
+        // Defensive only: every path reaching here either came from a
+        // directory listing taken moments ago or is the manifest that
+        // `fixture_ids` already required. This arm exists so a file vanishing
+        // in that window digests as absent instead of aborting the run; it is
+        // not reachable by any corpus layout, so no test covers it.
+        Err(error) if error.kind() == ErrorKind::NotFound => hasher.update(b"absent"),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    }
+    hasher.update(b"\n");
+    Ok(())
+}
+
+/// Refuse evidence written under an older contract instead of coercing it.
+///
+/// The observation rows themselves carry no schema version and stay readable,
+/// so the remedy for a legacy report is to re-score its raw observations under
+/// the current contract — not to reinterpret a report whose fields meant
+/// something else.
+pub fn check_report_version(version: u32, source: &str) -> Result<(), String> {
+    if version == REPORT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version > REPORT_SCHEMA_VERSION {
+        return Err(format!(
+            "{source} declares schema_version {version}, ahead of this evaluator's \
+             v{REPORT_SCHEMA_VERSION}; score it with the build that wrote it"
+        ));
+    }
+    Err(format!(
+        "{source} is legacy evidence at schema_version {version}; this evaluator scores \
+         v{REPORT_SCHEMA_VERSION}. Below v{REPORT_SCHEMA_VERSION} protocol identity (corpus, \
+         corpus digest, evaluator revision, schema) is conflated with treatment identity \
+         (binary bundle, driver, profile), and below v5 there is no semantic_pass evidence at \
+         all. Re-score the raw observations under v{REPORT_SCHEMA_VERSION} rather than \
+         comparing the legacy report"
+    ))
+}
+
 fn rate(rows: &[StrictObservation], predicate: impl Fn(&StrictObservation) -> bool) -> Rate {
     let attempts = rows.len() as u32;
     let passes = rows.iter().filter(|row| predicate(row)).count() as u32;
@@ -723,13 +943,23 @@ fn summarize_fixture(id: &str, rows: &[StrictObservation]) -> FixtureSummary {
 pub fn score(
     fixtures: &Path,
     mut rows: Vec<StrictObservation>,
-    endpoint: Endpoint,
+    arm: ArmIdentity,
     repetitions: u32,
 ) -> Result<StrictReport, String> {
     if repetitions == 0 {
         return Err("repetitions must be at least one".to_owned());
     }
-    validate_driver_profile(endpoint.driver, endpoint.profile.as_deref())?;
+    let ArmIdentity {
+        evaluator_revision,
+        endpoint,
+        treatment,
+    } = arm;
+    if evaluator_revision.trim().is_empty() {
+        return Err(
+            "evaluator revision must name the checkout that scored this evidence".to_owned(),
+        );
+    }
+    validate_driver_profile(treatment.driver, treatment.profile.as_deref())?;
     let ids = fixture_ids(fixtures)?;
     let expected: BTreeSet<_> = ids.iter().cloned().collect();
     let mut grouped: BTreeMap<String, Vec<StrictObservation>> =
@@ -738,11 +968,14 @@ pub fn score(
         if !expected.contains(&row.fixture_id) {
             return Err(format!("unknown fixture id {}", row.fixture_id));
         }
-        if row.corpus != CORPUS || !core_endpoint_matches(row, &endpoint) {
+        if row.corpus != CORPUS || !endpoint_matches(row, &endpoint) {
             return Err(format!("endpoint identity mismatch for {}", row.fixture_id));
         }
-        if !endpoint_matches(row, &endpoint) {
-            return Err(format!("harness identity mismatch for {}", row.fixture_id));
+        if !treatment_matches(row, &treatment) {
+            return Err(format!(
+                "treatment identity mismatch for {}",
+                row.fixture_id
+            ));
         }
         // The naive arm is exactly one completion with no retries. Missing
         // and extra calls both invalidate the attempted comparison.
@@ -840,17 +1073,24 @@ pub fn score(
             .cmp(&right.fixture_id)
             .then(left.repetition.cmp(&right.repetition))
     });
-    let fixtures = ids
+    let protocol = ProtocolIdentity {
+        corpus: CORPUS.to_owned(),
+        corpus_digest: corpus_digest(fixtures)?,
+        evaluator_revision,
+        schema_version: REPORT_SCHEMA_VERSION,
+    };
+    let summaries = ids
         .iter()
         .map(|id| summarize_fixture(id, grouped.get(id).expect("fixture id exists")))
         .collect::<Vec<_>>();
     let overall = summarize_fixture("overall", &rows);
     Ok(StrictReport {
         schema_version: REPORT_SCHEMA_VERSION,
-        corpus: CORPUS.to_owned(),
+        protocol,
+        treatment,
         endpoint,
         repetitions,
-        fixtures,
+        fixtures: summaries,
         overall,
         observations: rows,
     })
@@ -862,6 +1102,156 @@ fn delta(left: &Rate, right: &Rate) -> MetricDelta {
         arm_rate: right.rate,
         delta: left.rate.zip(right.rate).map(|(base, arm)| arm - base),
     }
+}
+
+/// Builds one baseline-versus-arm comparison, including the fixture-clustered
+/// interval and the per-family macro effects. Shared by the primary rows and
+/// by the direct default-versus-autonomous contrast so both carry identical
+/// rigour rather than the contrast being a weaker summary.
+fn arm_comparison(
+    baseline_name: &str,
+    baseline: &StrictReport,
+    arm_name: &str,
+    report: &StrictReport,
+) -> ArmComparison {
+    let oracle = delta(&baseline.overall.oracle, &report.overall.oracle);
+    // v5 assesses on semantics. `oracle` stays in the report as canonicality
+    // telemetry but no longer decides the verdict.
+    let semantic = delta(&baseline.overall.semantic, &report.overall.semantic);
+    let (result, why_not, basis) = match semantic.delta {
+        Some(value) if value > 0.0 => (
+            "improved".to_owned(),
+            None,
+            "semantic_rate_delta_positive".to_owned(),
+        ),
+        Some(value) if value < 0.0 => (
+            "why_not".to_owned(),
+            Some("semantic_rate_decreased".to_owned()),
+            "semantic_rate_delta_negative".to_owned(),
+        ),
+        _ => (
+            "why_not".to_owned(),
+            Some("no_semantic_rate_change".to_owned()),
+            "semantic_rate_delta_zero".to_owned(),
+        ),
+    };
+    let paired = |summaries: &[FixtureSummary]| -> Vec<(f64, u32)> {
+        summaries
+            .iter()
+            .map(|f| (f.semantic.rate.unwrap_or(0.0), f.semantic.attempts))
+            .collect()
+    };
+    let semantic_clustered =
+        clustered_delta(&paired(&baseline.fixtures), &paired(&report.fixtures));
+    let families = family_deltas(&baseline.fixtures, &report.fixtures);
+    let family_deltas_only: Vec<f64> = families.iter().filter_map(|f| f.delta).collect();
+    let macro_mean = |values: &[f64]| -> Option<f64> {
+        (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+    };
+    let semantic_family_macro = macro_mean(&family_deltas_only);
+    // Drop each family in turn; the worst result shows how much the headline
+    // leans on any single family.
+    let leave_one_family_out_min = (family_deltas_only.len() > 1)
+        .then(|| {
+            (0..family_deltas_only.len())
+                .filter_map(|skip| {
+                    let kept: Vec<f64> = family_deltas_only
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != skip)
+                        .map(|(_, v)| *v)
+                        .collect();
+                    macro_mean(&kept)
+                })
+                .fold(f64::INFINITY, f64::min)
+        })
+        .filter(|value| value.is_finite());
+    ArmComparison {
+        baseline: baseline_name.to_owned(),
+        arm: arm_name.to_owned(),
+        semantic,
+        semantic_clustered,
+        semantic_family_macro,
+        families,
+        leave_one_family_out_min,
+        safety_clean: delta(&baseline.overall.safety_clean, &report.overall.safety_clean),
+        semantic_false_green: delta(
+            &baseline.overall.semantic_false_green,
+            &report.overall.semantic_false_green,
+        ),
+        oracle,
+        process: delta(&baseline.overall.process, &report.overall.process),
+        compile_clean: delta(
+            &baseline.overall.compile_clean,
+            &report.overall.compile_clean,
+        ),
+        tests_pass: delta(&baseline.overall.tests_pass, &report.overall.tests_pass),
+        compile_clean_reference_mismatch: delta(
+            &baseline.overall.compile_clean_reference_mismatch,
+            &report.overall.compile_clean_reference_mismatch,
+        ),
+        compile_clean_tests_failed: delta(
+            &baseline.overall.compile_clean_tests_failed,
+            &report.overall.compile_clean_tests_failed,
+        ),
+        tests_pass_reference_mismatch: delta(
+            &baseline.overall.tests_pass_reference_mismatch,
+            &report.overall.tests_pass_reference_mismatch,
+        ),
+        reference_match: delta(
+            &baseline.overall.reference_match,
+            &report.overall.reference_match,
+        ),
+        assessment: Assessment {
+            result,
+            why_not,
+            basis,
+        },
+    }
+}
+
+/// The one arm running `profile` under the Alloy driver, by treatment identity
+/// rather than by arm name or position. `None` unless exactly one arm carries
+/// the profile, so an ambiguous matrix can never be silently resolved.
+fn profile_arm<'a>(
+    named_reports: &'a [(String, StrictReport)],
+    profile: &str,
+) -> Option<&'a (String, StrictReport)> {
+    let mut matched = named_reports.iter().filter(|(_, report)| {
+        report.treatment.driver == LiveHoldoutDriver::Alloy
+            && report.treatment.profile.as_deref() == Some(profile)
+    });
+    let found = matched.next()?;
+    matched.next().is_none().then_some(found)
+}
+
+/// Names the first component of the protocol that differs, or `None` when the
+/// two arms were scored under exactly the same protocol.
+fn protocol_drift(baseline: &ProtocolIdentity, other: &ProtocolIdentity) -> Option<String> {
+    if other.corpus != baseline.corpus {
+        return Some(format!(
+            "corpus {} is not {}",
+            other.corpus, baseline.corpus
+        ));
+    }
+    if other.corpus_digest != baseline.corpus_digest {
+        return Some(format!(
+            "corpus_digest {} is not {}; the corpus changed underneath the arms",
+            other.corpus_digest, baseline.corpus_digest
+        ));
+    }
+    if other.evaluator_revision != baseline.evaluator_revision {
+        return Some(format!(
+            "evaluator_revision {} is not {}",
+            other.evaluator_revision, baseline.evaluator_revision
+        ));
+    }
+    (other.schema_version != baseline.schema_version).then(|| {
+        format!(
+            "schema_version {} is not {}",
+            other.schema_version, baseline.schema_version
+        )
+    })
 }
 
 pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixComparison, String> {
@@ -876,12 +1266,19 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
         .collect();
     let mut arms = BTreeMap::new();
     for (name, report) in &named_reports {
+        check_report_version(report.schema_version, &format!("arm {name}"))?;
+        if report.protocol.schema_version != report.schema_version {
+            return Err(format!(
+                "arm {name} declares schema_version {} but its protocol identity says {}",
+                report.schema_version, report.protocol.schema_version
+            ));
+        }
         let ids: BTreeSet<_> = report
             .fixtures
             .iter()
             .map(|fixture| fixture.fixture_id.clone())
             .collect();
-        if ids != baseline_ids || report.corpus != baseline.corpus {
+        if ids != baseline_ids {
             return Err(format!("arm {name} is incompatible with {baseline_name}"));
         }
         if report.repetitions != baseline.repetitions {
@@ -890,12 +1287,15 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
                 baseline.repetitions
             ));
         }
-        if report.endpoint.harness != baseline.endpoint.harness {
-            // Arms may differ by model/temperature/driver/profile, but must
-            // share build provenance — otherwise the comparison is between
-            // two different codebases, not two arms of the same evaluation.
+        // The treatment — build, driver, profile — is exactly what a
+        // comparison is for, so it may differ freely. The protocol may not:
+        // a comparison across two protocols measures the protocol change as
+        // if it were a treatment effect.
+        if let Some(drift) = protocol_drift(&baseline.protocol, &report.protocol) {
             return Err(format!(
-                "arm {name} harness identity mismatch with {baseline_name}"
+                "arm {name} was scored under a different protocol than {baseline_name}: {drift}. \
+                 Re-score every arm's raw observations with one evaluator over one corpus before \
+                 comparing them"
             ));
         }
         if arms.insert(name.clone(), report.clone()).is_some() {
@@ -904,115 +1304,42 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
     }
     let comparisons = named_reports[1..]
         .iter()
-        .map(|(name, report)| {
-            let oracle = delta(&baseline.overall.oracle, &report.overall.oracle);
-            // v5 assesses on semantics. `oracle` stays in the report as
-            // canonicality telemetry but no longer decides the verdict.
-            let semantic = delta(&baseline.overall.semantic, &report.overall.semantic);
-            let (result, why_not, basis) = match semantic.delta {
-                Some(value) if value > 0.0 => (
-                    "improved".to_owned(),
-                    None,
-                    "semantic_rate_delta_positive".to_owned(),
-                ),
-                Some(value) if value < 0.0 => (
-                    "why_not".to_owned(),
-                    Some("semantic_rate_decreased".to_owned()),
-                    "semantic_rate_delta_negative".to_owned(),
-                ),
-                _ => (
-                    "why_not".to_owned(),
-                    Some("no_semantic_rate_change".to_owned()),
-                    "semantic_rate_delta_zero".to_owned(),
-                ),
-            };
-            let paired = |summaries: &[FixtureSummary]| -> Vec<(f64, u32)> {
-                summaries
-                    .iter()
-                    .map(|f| (f.semantic.rate.unwrap_or(0.0), f.semantic.attempts))
-                    .collect()
-            };
-            let semantic_clustered =
-                clustered_delta(&paired(&baseline.fixtures), &paired(&report.fixtures));
-            let families = family_deltas(&baseline.fixtures, &report.fixtures);
-            let family_deltas_only: Vec<f64> = families.iter().filter_map(|f| f.delta).collect();
-            let macro_mean = |values: &[f64]| -> Option<f64> {
-                (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
-            };
-            let semantic_family_macro = macro_mean(&family_deltas_only);
-            // Drop each family in turn; the worst result shows how much the
-            // headline leans on any single family.
-            let leave_one_family_out_min = (family_deltas_only.len() > 1)
-                .then(|| {
-                    (0..family_deltas_only.len())
-                        .filter_map(|skip| {
-                            let kept: Vec<f64> = family_deltas_only
-                                .iter()
-                                .enumerate()
-                                .filter(|(i, _)| *i != skip)
-                                .map(|(_, v)| *v)
-                                .collect();
-                            macro_mean(&kept)
-                        })
-                        .fold(f64::INFINITY, f64::min)
-                })
-                .filter(|value| value.is_finite());
-            ArmComparison {
-                baseline: baseline_name.clone(),
-                arm: name.clone(),
-                semantic,
-                semantic_clustered,
-                semantic_family_macro,
-                families,
-                leave_one_family_out_min,
-                safety_clean: delta(&baseline.overall.safety_clean, &report.overall.safety_clean),
-                semantic_false_green: delta(
-                    &baseline.overall.semantic_false_green,
-                    &report.overall.semantic_false_green,
-                ),
-                oracle,
-                process: delta(&baseline.overall.process, &report.overall.process),
-                compile_clean: delta(
-                    &baseline.overall.compile_clean,
-                    &report.overall.compile_clean,
-                ),
-                tests_pass: delta(&baseline.overall.tests_pass, &report.overall.tests_pass),
-                compile_clean_reference_mismatch: delta(
-                    &baseline.overall.compile_clean_reference_mismatch,
-                    &report.overall.compile_clean_reference_mismatch,
-                ),
-                compile_clean_tests_failed: delta(
-                    &baseline.overall.compile_clean_tests_failed,
-                    &report.overall.compile_clean_tests_failed,
-                ),
-                tests_pass_reference_mismatch: delta(
-                    &baseline.overall.tests_pass_reference_mismatch,
-                    &report.overall.tests_pass_reference_mismatch,
-                ),
-                reference_match: delta(
-                    &baseline.overall.reference_match,
-                    &report.overall.reference_match,
-                ),
-                assessment: Assessment {
-                    result,
-                    why_not,
-                    basis,
-                },
-            }
-        })
+        .map(|(name, report)| arm_comparison(baseline_name, baseline, name, report))
         .collect();
+    // The primary metric keeps its own baseline; this is an additional row so
+    // the two Alloy profiles are compared to each other directly.
+    let autonomous_vs_default = profile_arm(&named_reports, "default")
+        .zip(profile_arm(&named_reports, "autonomous"))
+        .map(
+            |((default_name, default_report), (autonomous_name, autonomous_report))| {
+                AutonomousContrast::new(arm_comparison(
+                    default_name,
+                    default_report,
+                    autonomous_name,
+                    autonomous_report,
+                ))
+            },
+        );
     Ok(MatrixComparison {
         schema_version: REPORT_SCHEMA_VERSION,
-        corpus: baseline.corpus.clone(),
+        protocol: baseline.protocol.clone(),
         repetitions: baseline.repetitions,
         baseline: baseline_name.clone(),
         arms,
         comparisons,
+        autonomous_vs_default,
         notes: vec![
             "Each arm retains its own denominator and Wilson interval.".to_owned(),
-            "Reports are compared only when fixture sets, corpus, and repetitions match."
+            "Arms are compared only when their protocol identity — corpus, corpus digest, \
+             evaluator revision, schema — is identical, and their fixture sets and repetitions \
+             match. Treatment identity (build, driver, profile) is expected to differ: that \
+             difference is what is being measured."
                 .to_owned(),
             "Deltas are descriptive; overlapping Wilson intervals are not a significance test."
+                .to_owned(),
+            "Autonomous uplift may be claimed only from autonomous_vs_default, and only when its \
+             clustered 95% lower bound is above zero. An absent contrast is an unasked question, \
+             not a null effect."
                 .to_owned(),
             "Strict-oracle results are live-BYOM telemetry, not an offline release gate."
                 .to_owned(),
@@ -1024,10 +1351,18 @@ pub fn compare(named_reports: Vec<(String, StrictReport)>) -> Result<MatrixCompa
 mod tests {
     use super::*;
 
-    fn harness_identity() -> HarnessIdentity {
-        HarnessIdentity {
+    fn treatment_build() -> TreatmentBuild {
+        TreatmentBuild {
             source_revision: "a".repeat(40),
             binary_bundle_sha256: "b".repeat(64),
+        }
+    }
+
+    fn treatment() -> TreatmentIdentity {
+        TreatmentIdentity {
+            build: treatment_build(),
+            driver: LiveHoldoutDriver::Alloy,
+            profile: Some("default".to_owned()),
         }
     }
 
@@ -1035,15 +1370,55 @@ mod tests {
         Endpoint {
             model: "stub-model".to_owned(),
             temperature: 0.6,
-            driver: LiveHoldoutDriver::Alloy,
-            profile: Some("default".to_owned()),
             base_url: "http://127.0.0.1:8089/v1/".to_owned(),
-            harness: harness_identity(),
         }
+    }
+
+    /// The evaluator revision is deliberately unlike any treatment revision:
+    /// a test that passed by confusing the two would be measuring nothing.
+    fn arm_identity() -> ArmIdentity {
+        ArmIdentity {
+            evaluator_revision: "c".repeat(40),
+            endpoint: endpoint(),
+            treatment: treatment(),
+        }
+    }
+
+    fn arm_with(treatment: TreatmentIdentity) -> ArmIdentity {
+        ArmIdentity {
+            treatment,
+            ..arm_identity()
+        }
+    }
+
+    /// One arm's report over `ids`, every attempt a semantic pass, scored
+    /// under the shared protocol but the given treatment.
+    fn rescored_arm(
+        fixtures: &Path,
+        ids: &[&str],
+        build: TreatmentBuild,
+        profile: &str,
+    ) -> StrictReport {
+        let treatment = TreatmentIdentity {
+            build,
+            driver: LiveHoldoutDriver::Alloy,
+            profile: Some(profile.to_owned()),
+        };
+        let rows = ids
+            .iter()
+            .map(|id| {
+                let mut row = observation(id, 1);
+                row.build = treatment.build.clone();
+                row.profile = treatment.profile.clone();
+                row
+            })
+            .collect();
+        score(fixtures, rows, arm_with(treatment), 1).unwrap()
     }
 
     fn observation(fixture_id: &str, repetition: u32) -> StrictObservation {
         let endpoint = endpoint();
+        let treatment = treatment();
         StrictObservation {
             fixture_id: fixture_id.to_owned(),
             repetition,
@@ -1063,10 +1438,10 @@ mod tests {
             evidence_relpath: format!("{fixture_id}/rep-{repetition}"),
             model: endpoint.model,
             temperature: endpoint.temperature,
-            driver: endpoint.driver,
-            profile: endpoint.profile,
+            driver: treatment.driver,
+            profile: treatment.profile,
             base_url: endpoint.base_url,
-            harness: endpoint.harness,
+            build: treatment.build,
             corpus: CORPUS.to_owned(),
             model_calls: 1,
             tokens_in: Some(100),
@@ -1128,20 +1503,20 @@ mod tests {
             row.oracle_pass = false;
             row.failure_class = "pass_reference_mismatch".to_owned();
         }
-        score(fixtures.path(), vec![row], endpoint(), 1).unwrap()
+        score(fixtures.path(), vec![row], arm_identity(), 1).unwrap()
     }
 
     fn report_for_driver(driver: LiveHoldoutDriver, profile: Option<String>) -> StrictReport {
         let fixtures = fixtures_with(&["shared"]);
-        let endpoint = Endpoint {
+        let treatment = TreatmentIdentity {
+            build: treatment_build(),
             driver,
             profile,
-            ..endpoint()
         };
         let mut row = observation("shared", 1);
-        row.driver = endpoint.driver;
-        row.profile = endpoint.profile.clone();
-        score(fixtures.path(), vec![row], endpoint, 1).unwrap()
+        row.driver = treatment.driver;
+        row.profile = treatment.profile.clone();
+        score(fixtures.path(), vec![row], arm_with(treatment), 1).unwrap()
     }
 
     #[test]
@@ -1166,8 +1541,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_five() {
-        assert_eq!(REPORT_SCHEMA_VERSION, 5);
+    fn schema_version_is_six() {
+        assert_eq!(REPORT_SCHEMA_VERSION, 6);
     }
 
     /// The E1 headline was an artefact: naive repaired E0308 correctly but
@@ -1205,7 +1580,7 @@ mod tests {
         let fixtures = fixtures_with(&["shared"]);
         let mut row = observation("shared", 1);
         row.semantic_pass = false; // contradicts its own evidence
-        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        let error = score(fixtures.path(), vec![row], arm_identity(), 1).unwrap_err();
         assert!(error.contains("semantic derivation"), "got {error}");
     }
 
@@ -1214,7 +1589,7 @@ mod tests {
         let fixtures = fixtures_with(&["shared"]);
         let mut row = observation("shared", 1);
         row.safety_clean = false;
-        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        let error = score(fixtures.path(), vec![row], arm_identity(), 1).unwrap_err();
         assert!(error.contains("semantic derivation"), "got {error}");
     }
 
@@ -1227,7 +1602,7 @@ mod tests {
         let mut unknown = observation("shared", 2);
         unknown.tokens_in = None;
         unknown.tokens_out = None;
-        let report = score(fixtures.path(), vec![known, unknown], endpoint(), 2).unwrap();
+        let report = score(fixtures.path(), vec![known, unknown], arm_identity(), 2).unwrap();
         let summary = &report.overall;
         assert_eq!(summary.semantic.passes, 2);
         assert_eq!(summary.semantic.attempts, 2);
@@ -1249,13 +1624,13 @@ mod tests {
         base_row.oracle_pass = false;
         base_row.semantic_pass = false;
         base_row.failure_class = "semantic_false_green".to_owned();
-        let baseline = score(fixtures.path(), vec![base_row], endpoint(), 1).unwrap();
+        let baseline = score(fixtures.path(), vec![base_row], arm_identity(), 1).unwrap();
 
         let mut arm_row = observation("shared", 1);
         arm_row.reference_match = false; // still not byte-canonical
         arm_row.oracle_pass = false;
         arm_row.failure_class = "pass_reference_mismatch".to_owned();
-        let arm = score(fixtures.path(), vec![arm_row], endpoint(), 1).unwrap();
+        let arm = score(fixtures.path(), vec![arm_row], arm_identity(), 1).unwrap();
 
         let matrix = compare(vec![
             ("naive".to_owned(), baseline),
@@ -1347,7 +1722,7 @@ mod tests {
             observation("b", 1),
             observation("b", 2),
         ];
-        let report = score(fixtures.path(), rows, endpoint(), 2).unwrap();
+        let report = score(fixtures.path(), rows, arm_identity(), 2).unwrap();
         assert_eq!(report.schema_version, REPORT_SCHEMA_VERSION);
         assert_eq!(report.overall.oracle.passes, 4);
         assert_eq!(report.overall.oracle.attempts, 4);
@@ -1364,7 +1739,7 @@ mod tests {
         let mut row = observation("a", 1);
         row.tokens_in = None;
         row.tokens_out = None;
-        let report = score(fixtures.path(), vec![row], endpoint(), 1).unwrap();
+        let report = score(fixtures.path(), vec![row], arm_identity(), 1).unwrap();
         assert_eq!(report.overall.model_calls_total, 1);
         assert_eq!(report.overall.tokens_in_total, 0);
         assert_eq!(report.observations[0].tokens_in, None);
@@ -1373,17 +1748,17 @@ mod tests {
     #[test]
     fn score_rejects_naive_rows_without_exactly_one_model_call() {
         let fixtures = fixtures_with(&["a"]);
-        let endpoint = Endpoint {
+        let arm = arm_with(TreatmentIdentity {
+            build: treatment_build(),
             driver: LiveHoldoutDriver::Naive,
             profile: None,
-            ..endpoint()
-        };
+        });
         for model_calls in [0, 2] {
             let mut row = observation("a", 1);
             row.driver = LiveHoldoutDriver::Naive;
             row.profile = None;
             row.model_calls = model_calls;
-            let error = score(fixtures.path(), vec![row], endpoint.clone(), 1).unwrap_err();
+            let error = score(fixtures.path(), vec![row], arm.clone(), 1).unwrap_err();
             assert!(
                 error.contains(&format!("naive driver recorded {model_calls} model calls")),
                 "{error}"
@@ -1484,28 +1859,42 @@ mod tests {
         let fixtures = fixtures_with(&["a"]);
         let mut row = observation("a", 1);
         row.temperature = 0.7;
-        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        let error = score(fixtures.path(), vec![row], arm_identity(), 1).unwrap_err();
         assert!(error.contains("endpoint identity mismatch"), "{error}");
     }
 
+    /// Rows from two different treatments never belong in one arm, whether
+    /// they differ by build, by driver, or by profile.
     #[test]
-    fn score_rejects_driver_or_harness_mixing() {
+    fn score_rejects_treatment_mixing() {
         let fixtures = fixtures_with(&["a"]);
-        let mut row = observation("a", 1);
-        row.harness.source_revision = "other".to_owned();
-        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
-        assert!(error.contains("harness identity mismatch"), "{error}");
+        for mutate in [
+            Box::new(|row: &mut StrictObservation| {
+                row.build.source_revision = "other".to_owned();
+            }) as Box<dyn Fn(&mut StrictObservation)>,
+            Box::new(|row: &mut StrictObservation| {
+                row.build.binary_bundle_sha256 = "0".repeat(64);
+            }),
+            Box::new(|row: &mut StrictObservation| {
+                row.profile = Some("autonomous".to_owned());
+            }),
+        ] {
+            let mut row = observation("a", 1);
+            mutate(&mut row);
+            let error = score(fixtures.path(), vec![row], arm_identity(), 1).unwrap_err();
+            assert!(error.contains("treatment identity mismatch"), "{error}");
+        }
     }
 
     #[test]
-    fn score_rejects_naive_endpoint_with_profile() {
+    fn score_rejects_naive_treatment_with_profile() {
         let fixtures = fixtures_with(&["a"]);
-        let endpoint = Endpoint {
+        let arm = arm_with(TreatmentIdentity {
+            build: treatment_build(),
             driver: LiveHoldoutDriver::Naive,
             profile: Some("default".to_owned()),
-            ..endpoint()
-        };
-        let error = score(fixtures.path(), vec![], endpoint, 1).unwrap_err();
+        });
+        let error = score(fixtures.path(), vec![], arm, 1).unwrap_err();
         assert!(
             error.contains("naive") && error.contains("profile"),
             "{error}"
@@ -1513,14 +1902,14 @@ mod tests {
     }
 
     #[test]
-    fn score_rejects_alloy_endpoint_without_recognized_profile() {
+    fn score_rejects_alloy_treatment_without_recognized_profile() {
         let fixtures = fixtures_with(&["a"]);
-        let endpoint = Endpoint {
+        let arm = arm_with(TreatmentIdentity {
+            build: treatment_build(),
             driver: LiveHoldoutDriver::Alloy,
             profile: None,
-            ..endpoint()
-        };
-        let error = score(fixtures.path(), vec![], endpoint, 1).unwrap_err();
+        });
+        let error = score(fixtures.path(), vec![], arm, 1).unwrap_err();
         assert!(
             error.contains("alloy") && error.contains("default") && error.contains("autonomous"),
             "{error}"
@@ -1535,7 +1924,7 @@ mod tests {
         row.cargo_check_exit = Some(101);
         row.oracle_pass = false;
         row.failure_class = "process_claimed_success_but_compile_failed".to_owned();
-        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        let error = score(fixtures.path(), vec![row], arm_identity(), 1).unwrap_err();
         assert!(
             error.contains("process/compile/test evidence inconsistency"),
             "{error}"
@@ -1547,7 +1936,7 @@ mod tests {
         let fixtures = fixtures_with(&["a"]);
         let mut test_row = observation("a", 1);
         test_row.cargo_test_exit = Some(101);
-        let error = score(fixtures.path(), vec![test_row], endpoint(), 1).unwrap_err();
+        let error = score(fixtures.path(), vec![test_row], arm_identity(), 1).unwrap_err();
         assert!(
             error.contains("process/compile/test evidence inconsistency"),
             "{error}"
@@ -1555,7 +1944,7 @@ mod tests {
 
         let mut path_row = observation("a", 1);
         path_row.evidence_relpath = "../escape".to_owned();
-        let error = score(fixtures.path(), vec![path_row], endpoint(), 1).unwrap_err();
+        let error = score(fixtures.path(), vec![path_row], arm_identity(), 1).unwrap_err();
         assert!(error.contains("evidence path inconsistency"), "{error}");
     }
 
@@ -1568,7 +1957,7 @@ mod tests {
         row.semantic_pass = false;
         row.failure_class = "semantic_false_green".to_owned();
 
-        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        let error = score(fixtures.path(), vec![row], arm_identity(), 1).unwrap_err();
         assert!(error.contains("oracle derivation inconsistency"), "{error}");
     }
 
@@ -1579,7 +1968,7 @@ mod tests {
         row.reference_match = false;
         row.oracle_pass = false;
         row.failure_class = "timeout".to_owned();
-        let error = score(fixtures.path(), vec![row], endpoint(), 1).unwrap_err();
+        let error = score(fixtures.path(), vec![row], arm_identity(), 1).unwrap_err();
         assert!(
             error.contains("failure-class consistency violation")
                 && error.contains("pass_reference_mismatch"),
@@ -1593,14 +1982,250 @@ mod tests {
         let duplicate = score(
             fixtures.path(),
             vec![observation("a", 1), observation("a", 1)],
-            endpoint(),
+            arm_identity(),
             2,
         )
         .unwrap_err();
         assert!(duplicate.contains("repetitions"), "{duplicate}");
 
-        let missing = score(fixtures.path(), vec![observation("a", 1)], endpoint(), 2).unwrap_err();
+        let missing = score(
+            fixtures.path(),
+            vec![observation("a", 1)],
+            arm_identity(),
+            2,
+        )
+        .unwrap_err();
         assert!(missing.contains("repetitions"), "{missing}");
+    }
+
+    /// Scores one arm over `ids` where only `passing` fixtures reach a
+    /// semantic pass, so arms can be made to differ by construction.
+    fn arm_report(
+        fixtures: &Path,
+        ids: &[&str],
+        treatment: TreatmentIdentity,
+        passing: &[&str],
+    ) -> StrictReport {
+        let rows = ids
+            .iter()
+            .map(|id| {
+                let mut row = observation(id, 1);
+                row.driver = treatment.driver;
+                row.profile = treatment.profile.clone();
+                if !passing.contains(id) {
+                    row.tests_pass = false;
+                    row.cargo_test_exit = Some(101);
+                    row.semantic_pass = false;
+                    row.reference_match = false;
+                    row.oracle_pass = false;
+                    row.failure_class = "semantic_false_green".to_owned();
+                }
+                row
+            })
+            .collect();
+        score(fixtures, rows, arm_with(treatment), 1).unwrap()
+    }
+
+    fn profile_report(
+        fixtures: &Path,
+        ids: &[&str],
+        profile: &str,
+        passing: &[&str],
+    ) -> StrictReport {
+        let treatment = TreatmentIdentity {
+            build: treatment_build(),
+            driver: LiveHoldoutDriver::Alloy,
+            profile: Some(profile.to_owned()),
+        };
+        arm_report(fixtures, ids, treatment, passing)
+    }
+
+    fn naive_report(fixtures: &Path, ids: &[&str], passing: &[&str]) -> StrictReport {
+        let treatment = TreatmentIdentity {
+            build: treatment_build(),
+            driver: LiveHoldoutDriver::Naive,
+            profile: None,
+        };
+        arm_report(fixtures, ids, treatment, passing)
+    }
+
+    /// The approved E2 rule forbids claiming autonomous uplift without a
+    /// direct default-versus-autonomous comparison. With naive as the
+    /// baseline that contrast is never one of the baseline-vs-arm rows, so it
+    /// must be emitted separately — and located by profile identity, not by
+    /// arm name or array position.
+    #[test]
+    fn compare_emits_a_direct_default_versus_autonomous_contrast() {
+        let ids = ["e0308_a", "e0502_b"];
+        let dir = fixtures_with(&ids);
+        let matrix = compare(vec![
+            (
+                "baseline-arm".to_owned(),
+                naive_report(dir.path(), &ids, &[]),
+            ),
+            (
+                "foo".to_owned(),
+                profile_report(dir.path(), &ids, "default", &["e0308_a"]),
+            ),
+            (
+                "bar".to_owned(),
+                profile_report(dir.path(), &ids, "autonomous", &ids),
+            ),
+        ])
+        .unwrap();
+
+        // The primary metric keeps its own baseline and arm rows.
+        assert_eq!(matrix.baseline, "baseline-arm");
+        assert_eq!(matrix.comparisons.len(), 2);
+        assert!(matrix
+            .comparisons
+            .iter()
+            .all(|item| item.baseline == "baseline-arm"));
+
+        let contrast = matrix
+            .autonomous_vs_default
+            .expect("one default arm and one autonomous arm are present");
+        // Named nothing like their profiles: identity comes from the endpoint.
+        assert_eq!(contrast.comparison.baseline, "foo");
+        assert_eq!(contrast.comparison.arm, "bar");
+        assert_eq!(contrast.comparison.semantic.delta, Some(0.5));
+        // Same rigour as the primary comparison.
+        assert_eq!(contrast.comparison.semantic_clustered.fixtures, 2);
+        assert!(contrast.comparison.semantic_clustered.lower95.is_some());
+        assert_eq!(contrast.comparison.families.len(), 2);
+        assert!(contrast.comparison.semantic_family_macro.is_some());
+    }
+
+    #[test]
+    fn compare_omits_the_contrast_without_exactly_one_default_and_autonomous_arm() {
+        let ids = ["e0308_a"];
+        let dir = fixtures_with(&ids);
+
+        let two_arm = compare(vec![
+            ("naive".to_owned(), naive_report(dir.path(), &ids, &[])),
+            (
+                "alloy-default".to_owned(),
+                profile_report(dir.path(), &ids, "default", &ids),
+            ),
+        ])
+        .unwrap();
+        assert!(
+            two_arm.autonomous_vs_default.is_none(),
+            "no autonomous arm ran, so the comparison must be absent, not zero"
+        );
+        assert!(!two_arm.autonomous_uplift_is_claimable());
+
+        let ambiguous = compare(vec![
+            (
+                "alloy-default".to_owned(),
+                profile_report(dir.path(), &ids, "default", &[]),
+            ),
+            (
+                "auto-a".to_owned(),
+                profile_report(dir.path(), &ids, "autonomous", &ids),
+            ),
+            (
+                "auto-b".to_owned(),
+                profile_report(dir.path(), &ids, "autonomous", &[]),
+            ),
+        ])
+        .unwrap();
+        assert!(
+            ambiguous.autonomous_vs_default.is_none(),
+            "two autonomous arms must not be resolved by position"
+        );
+    }
+
+    #[test]
+    fn autonomous_gate_needs_a_positive_clustered_lower_bound() {
+        let cleared = ClusteredDelta {
+            fixtures: 6,
+            mean_delta: Some(0.3),
+            lower95: Some(0.05),
+            upper95: Some(0.55),
+        };
+        assert!(clears_autonomous_gate(&cleared));
+        assert!(!clears_autonomous_gate(&ClusteredDelta {
+            lower95: Some(-0.01),
+            ..cleared.clone()
+        }));
+        assert!(!clears_autonomous_gate(&ClusteredDelta {
+            lower95: Some(0.0),
+            ..cleared.clone()
+        }));
+        // "Cannot bound" is never a pass.
+        assert!(!clears_autonomous_gate(&ClusteredDelta {
+            fixtures: 1,
+            mean_delta: Some(1.0),
+            lower95: None,
+            upper95: None,
+        }));
+    }
+
+    #[test]
+    fn contrast_answers_the_gate_in_both_directions() {
+        let ids = [
+            "e0308_a", "e0308_b", "e0502_c", "e0502_d", "e0716_e", "e0716_f",
+        ];
+        let dir = fixtures_with(&ids);
+
+        // Autonomous wins on five of six fixtures: consistent enough to bound.
+        let cleared = compare(vec![
+            (
+                "alloy-default".to_owned(),
+                profile_report(dir.path(), &ids, "default", &[]),
+            ),
+            (
+                "alloy-autonomous".to_owned(),
+                profile_report(dir.path(), &ids, "autonomous", &ids[..5]),
+            ),
+        ])
+        .unwrap();
+        let contrast = cleared
+            .autonomous_vs_default
+            .as_ref()
+            .expect("both profile arms ran");
+        assert!(
+            contrast.clears_gate,
+            "{:?}",
+            contrast.comparison.semantic_clustered
+        );
+        assert!(
+            contrast.gate_basis.contains("above_zero"),
+            "{}",
+            contrast.gate_basis
+        );
+        assert!(cleared.autonomous_uplift_is_claimable());
+
+        // A positive mean carried by one fixture must not clear the gate.
+        let blocked = compare(vec![
+            (
+                "alloy-default".to_owned(),
+                profile_report(dir.path(), &ids, "default", &[]),
+            ),
+            (
+                "alloy-autonomous".to_owned(),
+                profile_report(dir.path(), &ids, "autonomous", &ids[..1]),
+            ),
+        ])
+        .unwrap();
+        let contrast = blocked
+            .autonomous_vs_default
+            .as_ref()
+            .expect("both profile arms ran");
+        assert!(
+            contrast
+                .comparison
+                .semantic_clustered
+                .mean_delta
+                .is_some_and(|mean| mean > 0.0),
+            "the mean effect is positive"
+        );
+        assert!(
+            !contrast.clears_gate,
+            "one fixture cannot certify an arm-level effect"
+        );
+        assert!(!blocked.autonomous_uplift_is_claimable());
     }
 
     #[test]
@@ -1615,21 +2240,25 @@ mod tests {
         assert!(error.contains("duplicate arm identity"), "{error}");
     }
 
+    /// A build difference between arms is a treatment difference, which is
+    /// the measurement — not grounds for refusing to compare.
     #[test]
-    fn compare_requires_same_harness_identity() {
+    fn compare_allows_a_differing_treatment_build_between_drivers() {
         let baseline = report_for_driver(LiveHoldoutDriver::Naive, None);
         let mut candidate = report_for_driver(LiveHoldoutDriver::Alloy, Some("default".to_owned()));
-        candidate.endpoint.harness.source_revision = "other".to_owned();
-        let error = compare(vec![
+        candidate.treatment.build.source_revision = "e".repeat(40);
+
+        let matrix = compare(vec![
             ("naive".to_owned(), baseline),
             ("alloy-default".to_owned(), candidate),
         ])
-        .unwrap_err();
-        assert!(error.contains("harness identity mismatch"), "{error}");
+        .unwrap();
+
+        assert_eq!(matrix.comparisons.len(), 1);
     }
 
     #[test]
-    fn compare_allows_differing_driver_and_profile_with_same_harness() {
+    fn compare_allows_differing_driver_and_profile_under_one_protocol() {
         let baseline = report_for_driver(LiveHoldoutDriver::Naive, None);
         let candidate = report_for_driver(LiveHoldoutDriver::Alloy, Some("autonomous".to_owned()));
         let matrix = compare(vec![
@@ -1640,12 +2269,306 @@ mod tests {
         assert_eq!(matrix.comparisons.len(), 1);
     }
 
+    /// A corpus with the files the oracle actually reads, so a digest over it
+    /// means something.
+    fn corpus_with_oracles(ids: &[&str]) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        for id in ids {
+            let fixture = directory.path().join(id);
+            fs::create_dir_all(fixture.join("workspace/src")).unwrap();
+            fs::create_dir_all(fixture.join("oracle-tests")).unwrap();
+            fs::create_dir_all(fixture.join("recordings")).unwrap();
+            fs::write(
+                fixture.join("manifest.toml"),
+                "naive_target_path = \"src/lib.rs\"\n",
+            )
+            .unwrap();
+            fs::write(
+                fixture.join("workspace/src/lib.rs"),
+                "pub fn broken() -> i32 { missing }\n",
+            )
+            .unwrap();
+            fs::write(
+                fixture.join("workspace/src/lib.rs.post"),
+                "pub fn repaired() -> i32 { 42 }\n",
+            )
+            .unwrap();
+            fs::write(
+                fixture.join("oracle-tests/semantic.rs"),
+                format!("#[test]\nfn t() {{ assert_eq!({id}::repaired(), 42); }}\n"),
+            )
+            .unwrap();
+            fs::write(fixture.join("recordings/pre_repair.json"), "{}\n").unwrap();
+        }
+        directory
+    }
+
+    /// The corpus is protocol identity, so editing it silently must be
+    /// impossible: the digest has to move when any oracle input moves.
+    #[test]
+    fn corpus_digest_covers_ids_and_oracle_inputs() {
+        let directory = corpus_with_oracles(&["e0308_a", "e0502_b"]);
+        let root = directory.path();
+        let original = corpus_digest(root).unwrap();
+        assert_eq!(original.len(), 64, "{original}");
+        assert_eq!(
+            original,
+            corpus_digest(root).unwrap(),
+            "the digest must be deterministic"
+        );
+
+        for edited in [
+            "e0308_a/oracle-tests/semantic.rs",
+            "e0308_a/workspace/src/lib.rs.post",
+            "e0308_a/workspace/src/lib.rs",
+            "e0308_a/manifest.toml",
+        ] {
+            let path = root.join(edited);
+            let before = fs::read(&path).unwrap();
+            fs::write(
+                &path,
+                if edited.ends_with("manifest.toml") {
+                    "naive_target_path = \"src/other.rs\"\n".to_owned()
+                } else {
+                    String::from_utf8(before.clone()).unwrap() + "// edited\n"
+                },
+            )
+            .unwrap();
+            assert_ne!(
+                original,
+                corpus_digest(root).unwrap(),
+                "{edited} is an oracle input; editing it must change the digest"
+            );
+            fs::write(&path, &before).unwrap();
+        }
+        assert_eq!(original, corpus_digest(root).unwrap(), "restored corpus");
+
+        // Adding or removing a fixture is a different corpus too.
+        let added = corpus_with_oracles(&["e0308_a", "e0502_b", "e0716_c"]);
+        assert_ne!(original, corpus_digest(added.path()).unwrap());
+        fs::remove_dir_all(root.join("e0502_b")).unwrap();
+        assert_ne!(original, corpus_digest(root).unwrap());
+    }
+
+    /// A fixture whose oracle inputs are absent still digests, so the corpus
+    /// identity of a partial corpus is defined rather than a hard error.
+    #[test]
+    fn corpus_digest_handles_absent_oracle_inputs() {
+        let bare = fixtures_with(&["a"]);
+        assert_eq!(corpus_digest(bare.path()).unwrap().len(), 64);
+        assert!(corpus_digest(bare.path().join("missing").as_path()).is_err());
+    }
+
+    /// The whole point of the split: what scored an observation set (corpus,
+    /// evaluator, schema) is recorded apart from what produced it (binaries,
+    /// driver, profile).
+    #[test]
+    fn score_records_protocol_and_treatment_identity_separately() {
+        let directory = corpus_with_oracles(&["e0308_a"]);
+        let report = score(
+            directory.path(),
+            vec![observation("e0308_a", 1)],
+            arm_identity(),
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(report.protocol.corpus, CORPUS);
+        assert_eq!(
+            report.protocol.corpus_digest,
+            corpus_digest(directory.path()).unwrap()
+        );
+        assert_eq!(report.protocol.evaluator_revision, "c".repeat(40));
+        assert_eq!(report.protocol.schema_version, REPORT_SCHEMA_VERSION);
+        // Nothing about the product build may leak into protocol identity.
+        assert!(!report.protocol.evaluator_revision.contains(&"b".repeat(64)));
+
+        assert_eq!(report.treatment.build, treatment_build());
+        assert_eq!(report.treatment.driver, LiveHoldoutDriver::Alloy);
+        assert_eq!(report.treatment.profile.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn score_rejects_an_empty_evaluator_revision() {
+        let directory = fixtures_with(&["a"]);
+        let arm = ArmIdentity {
+            evaluator_revision: String::new(),
+            ..arm_identity()
+        };
+        let error = score(directory.path(), vec![], arm, 1).unwrap_err();
+        assert!(error.contains("evaluator revision"), "{error}");
+    }
+
+    /// Pre- and post-intervention runs differ by exactly the treatment. Once
+    /// both are scored by one evaluator over one corpus they must compare —
+    /// under the old conflated identity this was refused outright.
+    #[test]
+    fn compare_allows_a_changed_treatment_build() {
+        let directory = corpus_with_oracles(&["e0308_a", "e0502_b"]);
+        let ids = ["e0308_a", "e0502_b"];
+        let before = rescored_arm(directory.path(), &ids, treatment_build(), "default");
+        let after = rescored_arm(
+            directory.path(),
+            &ids,
+            TreatmentBuild {
+                source_revision: "e".repeat(40),
+                binary_bundle_sha256: "f".repeat(64),
+            },
+            "autonomous",
+        );
+
+        let matrix = compare(vec![
+            ("before".to_owned(), before),
+            ("after".to_owned(), after),
+        ])
+        .unwrap();
+
+        assert_eq!(matrix.comparisons.len(), 1);
+        assert_eq!(
+            matrix.arms["before"].treatment.build.binary_bundle_sha256,
+            "b".repeat(64)
+        );
+        assert_eq!(
+            matrix.arms["after"].treatment.build.binary_bundle_sha256,
+            "f".repeat(64)
+        );
+        assert_eq!(matrix.protocol, matrix.arms["before"].protocol);
+    }
+
+    /// A protocol change under the arms is not a treatment effect, so the
+    /// comparison must fail closed and name what moved.
+    #[test]
+    fn compare_refuses_arms_scored_under_different_protocols() {
+        let directory = corpus_with_oracles(&["e0308_a"]);
+        let ids = ["e0308_a"];
+        let baseline = rescored_arm(directory.path(), &ids, treatment_build(), "default");
+
+        for (label, mutate) in [
+            (
+                "corpus_digest",
+                Box::new(|report: &mut StrictReport| {
+                    report.protocol.corpus_digest = "0".repeat(64);
+                }) as Box<dyn Fn(&mut StrictReport)>,
+            ),
+            (
+                "evaluator_revision",
+                Box::new(|report: &mut StrictReport| {
+                    report.protocol.evaluator_revision = "d".repeat(40);
+                }),
+            ),
+            (
+                "corpus",
+                Box::new(|report: &mut StrictReport| {
+                    report.protocol.corpus = "some-other-corpus".to_owned();
+                }),
+            ),
+        ] {
+            let mut drifted = rescored_arm(directory.path(), &ids, treatment_build(), "autonomous");
+            mutate(&mut drifted);
+            let error = compare(vec![
+                ("baseline".to_owned(), baseline.clone()),
+                ("drifted".to_owned(), drifted),
+            ])
+            .unwrap_err();
+            assert!(
+                error.contains("protocol") && error.contains(label),
+                "{label}: {error}"
+            );
+        }
+    }
+
+    /// A report whose declared schema disagrees with its own protocol
+    /// identity is corrupt evidence, not a comparable arm.
+    #[test]
+    fn compare_rejects_a_report_that_disagrees_with_its_own_protocol_schema() {
+        let mut inconsistent = report_for(true);
+        inconsistent.protocol.schema_version = REPORT_SCHEMA_VERSION - 1;
+        let error = compare(vec![
+            ("inconsistent".to_owned(), inconsistent),
+            ("current".to_owned(), report_for(false)),
+        ])
+        .unwrap_err();
+        assert!(error.contains("protocol identity says"), "{error}");
+    }
+
+    /// Evidence written under an older contract is refused as legacy, never
+    /// coerced into the current one.
+    #[test]
+    fn legacy_schema_versions_are_refused_with_an_explicit_message() {
+        assert!(check_report_version(REPORT_SCHEMA_VERSION, "report.json").is_ok());
+        for legacy in [4, 5] {
+            let error = check_report_version(legacy, "run1/naive.report.json").unwrap_err();
+            assert!(error.contains("legacy"), "{error}");
+            assert!(error.contains(&legacy.to_string()), "{error}");
+            assert!(
+                error.contains(&REPORT_SCHEMA_VERSION.to_string()),
+                "{error}"
+            );
+            assert!(error.contains("run1/naive.report.json"), "{error}");
+        }
+
+        let mut stale = report_for(true);
+        stale.schema_version = 5;
+        let error = compare(vec![
+            ("stale".to_owned(), stale),
+            ("current".to_owned(), report_for(false)),
+        ])
+        .unwrap_err();
+        assert!(error.contains("legacy"), "{error}");
+    }
+
+    /// The v5 observation line `eval/live-holdout/run.sh` writes today must
+    /// keep loading, or the run in flight cannot be re-scored by this build.
+    #[test]
+    fn v5_observation_rows_load_under_the_current_evaluator() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("observations.jsonl");
+        let line = format!(
+            "{{\"fixture_id\":\"e0308_a\",\"repetition\":1,\"exit_code\":0,\
+             \"process_pass\":true,\"compile_clean\":true,\"tests_pass\":true,\
+             \"safety_clean\":true,\"semantic_pass\":true,\"reference_match\":true,\
+             \"oracle_pass\":true,\"failure_class\":\"pass\",\"cargo_check_exit\":0,\
+             \"cargo_test_exit\":0,\"repair_generations\":0,\"wall_ms\":10,\
+             \"evidence_relpath\":\"e0308_a/rep-1\",\"model\":\"stub-model\",\
+             \"temperature\":0.6,\"driver\":\"alloy\",\"profile\":\"default\",\
+             \"base_url\":\"http://127.0.0.1:8089/v1/\",\
+             \"harness\":{{\"source_revision\":\"{}\",\"binary_bundle_sha256\":\"{}\"}},\
+             \"corpus\":\"rfc0016-holdout-live\",\"model_calls\":1,\"tokens_in\":100,\
+             \"tokens_out\":50}}\n",
+            "a".repeat(40),
+            "b".repeat(64)
+        );
+        fs::write(&path, line).unwrap();
+
+        let rows = load_observations(&path).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].build, treatment_build());
+        // And they score: the same raw evidence, re-scored by this evaluator.
+        let corpus = corpus_with_oracles(&["e0308_a"]);
+        let report = score(corpus.path(), rows, arm_identity(), 1).unwrap();
+        assert_eq!(report.schema_version, REPORT_SCHEMA_VERSION);
+        assert_eq!(report.overall.semantic.passes, 1);
+    }
+
     #[test]
     fn compare_rejects_incompatible_inputs() {
         let fixtures_a = fixtures_with(&["a"]);
         let fixtures_b = fixtures_with(&["b"]);
-        let left = score(fixtures_a.path(), vec![observation("a", 1)], endpoint(), 1).unwrap();
-        let right = score(fixtures_b.path(), vec![observation("b", 1)], endpoint(), 1).unwrap();
+        let left = score(
+            fixtures_a.path(),
+            vec![observation("a", 1)],
+            arm_identity(),
+            1,
+        )
+        .unwrap();
+        let right = score(
+            fixtures_b.path(),
+            vec![observation("b", 1)],
+            arm_identity(),
+            1,
+        )
+        .unwrap();
         let error = compare(vec![
             ("baseline".to_owned(), left),
             ("arm".to_owned(), right),

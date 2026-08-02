@@ -74,14 +74,19 @@ pub use gate::{
 };
 pub use harness::{EvalHarness, EvalHarnessConfig, LoadedFixture, EVAL_MAX_CONCURRENCY};
 pub use live_holdout::{
-    compare as compare_live_holdout, load_observations as load_live_holdout_observations,
-    oracle as inspect_live_holdout, score as score_live_holdout,
-    target_path_text as live_holdout_target_path_text, telemetry as live_holdout_telemetry,
-    Endpoint as LiveHoldoutEndpoint, HarnessIdentity as LiveHoldoutHarnessIdentity,
+    check_report_version as check_live_holdout_report_version,
+    clears_autonomous_gate as live_holdout_clears_autonomous_gate, compare as compare_live_holdout,
+    corpus_digest as live_holdout_corpus_digest,
+    load_observations as load_live_holdout_observations, oracle as inspect_live_holdout,
+    score as score_live_holdout, target_path_text as live_holdout_target_path_text,
+    telemetry as live_holdout_telemetry, ArmIdentity as LiveHoldoutArmIdentity,
+    AutonomousContrast as LiveHoldoutAutonomousContrast,
+    ClusteredDelta as LiveHoldoutClusteredDelta, Endpoint as LiveHoldoutEndpoint,
     LiveHoldoutDriver, MatrixComparison as LiveHoldoutMatrixComparison,
-    OracleEvidence as LiveHoldoutOracleEvidence, RunTelemetry as LiveHoldoutRunTelemetry,
-    StrictObservation as LiveHoldoutObservation,
+    OracleEvidence as LiveHoldoutOracleEvidence, ProtocolIdentity as LiveHoldoutProtocolIdentity,
+    RunTelemetry as LiveHoldoutRunTelemetry, StrictObservation as LiveHoldoutObservation,
     StrictObservationFields as LiveHoldoutObservationFields, StrictReport as LiveHoldoutReport,
+    TreatmentBuild as LiveHoldoutTreatmentBuild, TreatmentIdentity as LiveHoldoutTreatmentIdentity,
     REPORT_SCHEMA_VERSION as LIVE_HOLDOUT_REPORT_VERSION,
 };
 #[cfg(feature = "live-naive")]
