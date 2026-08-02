@@ -207,6 +207,13 @@ for attempt in "${attempts[@]}"; do
   target_path="$(fixture_target_path "$FIXTURES/$id/manifest.toml")" ||
     die "fixture $id manifest has no naive_target_path"
   {
+    # Every cargo invocation below pins CARGO_TARGET_DIR inside this
+    # throwaway workspace. Without it they inherit the machine-wide
+    # ~/.cargo/config.toml target-dir, and because `cp -a` preserves mtimes,
+    # cargo replays a cached result from a previous attempt on the same
+    # fixture — reporting a clean build for source that does not compile.
+    # That bias is arm-asymmetric: an arm that rewrites the whole file gets
+    # fresh mtimes and escapes it, so the comparison itself is corrupted.
     ws="$(mktemp -d)" || die "could not create workspace for $id#$rep"
     cp -a "$workspace"/. "$ws/" ||
       die "fixture copy failed for $id#$rep"
@@ -232,7 +239,7 @@ for attempt in "${attempts[@]}"; do
     mkdir -p "$evidence" || die "could not create evidence directory for $id#$rep"
     # Pre-run diagnostics for every arm. The naive prompt is the only path
     # that shows this file to a model; it holds no golden or hidden-test data.
-    (cd "$ws" && timeout "$TIMEOUT" \
+    (cd "$ws" && CARGO_TARGET_DIR="$ws/target" timeout "$TIMEOUT" \
       cargo check --offline --message-format=short) \
       >"$evidence/initial-cargo.log" 2>&1 || true
     start_ms=$(date +%s%3N)
@@ -281,7 +288,8 @@ for attempt in "${attempts[@]}"; do
       124|126|127) ;;
       *)
         if [ -f "$ws/$target_path" ]; then
-          if (cd "$ws" && timeout "$TIMEOUT" cargo check --offline --quiet) \
+          if (cd "$ws" && CARGO_TARGET_DIR="$ws/target" timeout "$TIMEOUT" \
+            cargo check --offline --quiet) \
             >"$evidence/cargo-check.log" 2>&1; then
             compile_clean=true
             cargo_check_exit=0
@@ -300,7 +308,8 @@ for attempt in "${attempts[@]}"; do
           die "could not stage semantic tests for $id#$rep"
         cp -a "$FIXTURES/$id/oracle-tests"/. "$ws/tests/" ||
           die "semantic test copy failed for $id#$rep"
-        if (cd "$ws" && timeout "$TIMEOUT" cargo test --offline --quiet) \
+        if (cd "$ws" && CARGO_TARGET_DIR="$ws/target" timeout "$TIMEOUT" \
+          cargo test --offline --quiet) \
           >"$evidence/cargo-test.log" 2>&1; then
           tests_pass=true
           cargo_test_exit=0

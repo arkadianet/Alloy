@@ -540,7 +540,7 @@ pub fn oracle(
         failure_class,
         cargo_check_exit,
         cargo_test_exit,
-        repair_generations: log.matches("repair generation replanned").count() as u32,
+        repair_generations: repair_generations(&log),
     })
 }
 
@@ -595,9 +595,45 @@ fn unsafe_blocks(source: &str) -> usize {
         .count()
 }
 
+/// Tracing renders key/value pairs with ANSI escapes between the key and the
+/// `=`, so `reason="kind"` never appears literally in a captured log. Every
+/// match below runs against a stripped copy; matching the raw bytes silently
+/// classified real replan declines as generic process failures.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI ... final-byte, or a lone escape we simply drop.
+        if chars.next() == Some('[') {
+            for tail in chars.by_ref() {
+                if tail.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One replan is logged twice — once by the driver and once by the run
+/// controller — so counting the message across the whole log double-counts
+/// every generation. Only the driver's own module path is counted.
+fn repair_generations(log: &str) -> u32 {
+    strip_ansi(log)
+        .lines()
+        .filter(|line| {
+            line.contains("repair generation replanned") && line.contains("alloy_runtime::driver")
+        })
+        .count() as u32
+}
+
 fn classify(
     exit_code: i32,
-    log: &str,
+    raw_log: &str,
     postcheck_clean: bool,
     posttest_clean: bool,
     reference_match: bool,
@@ -619,6 +655,7 @@ fn classify(
     if exit_code == 0 && postcheck_clean && !posttest_clean {
         return "semantic_false_green".to_owned();
     }
+    let log = &strip_ansi(raw_log);
     if exit_code == TIMEOUT_EXIT_CODE {
         return "timeout".to_owned();
     }
@@ -1692,6 +1729,43 @@ mod tests {
         // Anything that is not a leading error code is its own family rather
         // than being silently lumped together.
         assert_eq!(fixture_family("weird-fixture"), "weird-fixture");
+    }
+
+    /// Tracing writes ANSI between a key and its `=`, so a captured log never
+    /// contains a literal `reason="kind"`. Matching raw bytes classified every
+    /// real replan decline as a generic process failure.
+    #[test]
+    fn classify_sees_through_tracing_ansi_escapes() {
+        let raw = "INFO \u{1b}[2malloy_runtime::driver\u{1b}[0m\u{1b}[2m:\u{1b}[0m \
+repair generation declined \u{1b}[3mreason\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"kind\"";
+        assert_eq!(
+            classify(5, raw, false, false, false),
+            "replan_declined_kind"
+        );
+        // Same text without escapes must classify identically.
+        assert_eq!(
+            classify(5, "reason=\"kind\"", false, false, false),
+            "replan_declined_kind"
+        );
+    }
+
+    /// One replan is logged by both the driver and the run controller, so
+    /// counting the message across the log reported twice the real number.
+    #[test]
+    fn repair_generations_counts_each_replan_once() {
+        let log = "\
+INFO alloy_runtime::driver: repair generation replanned generation=1
+INFO alloy_runtime::session::run_controller: repair generation replanned generation=1
+INFO alloy_runtime::driver: repair generation replanned generation=2
+INFO alloy_runtime::session::run_controller: repair generation replanned generation=2
+";
+        assert_eq!(repair_generations(log), 2, "one count per real generation");
+    }
+
+    #[test]
+    fn repair_generations_counts_ansi_wrapped_lines() {
+        let log = "INFO \u{1b}[2malloy_runtime::driver\u{1b}[0m: repair generation replanned\n";
+        assert_eq!(repair_generations(log), 1);
     }
 
     #[test]

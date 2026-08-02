@@ -685,6 +685,27 @@ fn compile_file_ops(path: &str, content: &str, ops: &[&LineOp]) -> Result<Vec<Hu
                     }
                 } else {
                     cursor = op.after_line;
+                    // `insert_lines` is the only op with no `expect`, so
+                    // nothing ties it to the file it was authored against.
+                    // Re-applying one across repair generations silently
+                    // duplicated whole items — the measured cause of most
+                    // E0428 "defined multiple times" failures. If the text is
+                    // already there, the edit is a duplicate, not progress.
+                    if !op.new.is_empty() {
+                        let at = op.after_line as usize;
+                        let already_present =
+                            lines.get(at..at + op.new.len()).is_some_and(|follows| {
+                                follows.iter().zip(&op.new).all(|(a, b)| *a == b.as_str())
+                            });
+                        if already_present {
+                            return Err(format!(
+                                "insert at {path} line {} would duplicate text that is \
+                                 already there — re-read the file; if it already has \
+                                 your change, do not re-send it",
+                                op.after_line
+                            ));
+                        }
+                    }
                     last_insert_boundary = Some(op.after_line);
                     let new_start = i64::from(op.after_line) + delta + 1;
                     delta += i64::try_from(op.new.len()).unwrap_or(i64::MAX);
@@ -1253,6 +1274,40 @@ mod tests {
     /// empty file (V8b bans `old_start == 0` outside Create, and there is no
     /// line to anchor context on), so the compile must fail with
     /// model-repairable feedback rather than emit a hunk the dry run rejects.
+    /// `insert_lines` carries no `expect`, so nothing ties it to the file it
+    /// was authored against. Re-sending one across repair generations
+    /// duplicated whole items — measured as the largest single cause of
+    /// failed Alloy attempts, surfacing as E0428 "defined multiple times".
+    #[test]
+    fn ops_compile_rejects_an_insert_whose_text_is_already_present() {
+        let files = one_file("a.rs", "pub fn keep() {}\npub struct Reader;\n");
+        let err = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 1,
+                "new": ["pub struct Reader;"],
+            }))],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(err.contains("a.rs"), "{err}");
+    }
+
+    /// The guard must compare the whole block, not just its first line, or a
+    /// multi-line item that merely starts alike would be refused.
+    #[test]
+    fn ops_compile_allows_an_insert_that_only_partly_matches() {
+        let files = one_file("a.rs", "pub fn one() {}\npub fn two() {}\n");
+        ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 1,
+                "new": ["pub fn two() {}", "pub fn three() {}"],
+            }))],
+            &files,
+        )
+        .expect("a genuinely new block must still apply");
+    }
+
     #[test]
     fn ops_compile_rejects_insert_into_empty_file() {
         let files = one_file("a.txt", "");
