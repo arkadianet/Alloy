@@ -327,6 +327,15 @@ pub(crate) fn parse_model_diff(diff: &str) -> Result<PatchSet, String> {
                     return Err("old and new paths differ (rename is not allowed)".into());
                 }
                 require_jail_relative(new)?;
+                // A pure-`+` Modify hunk IS unanchored — the apply path
+                // positions it by header number alone. Rejecting it was tried
+                // and reverted: `@@ -2,0 +3,1 @@` is exactly what `diff -U0`
+                // emits for a mid-file insertion, and it applied correctly
+                // before, so the guard refused valid work. The rationale was
+                // also wrong: it claimed to mirror an ops-path rule, but
+                // `insert_lines` with `after_line > 0` carries no `expect`
+                // either, so the same edit was legal via ops and illegal via
+                // diff. Anchor BOTH paths together, or neither.
                 FilePatch::Modify {
                     path: new.to_owned(),
                     hunks,
@@ -1180,6 +1189,44 @@ mod tests {
             panic!("expected Modify");
         };
         assert_eq!(hunks[0].lines.len(), 3);
+    }
+
+    /// `diff -U0` emits `@@ -2,0 +3,1 @@` with only `+` lines for a mid-file
+    /// insertion, and the apply path handles it correctly. A guard rejecting
+    /// that shape was tried and reverted: it refused valid work, and its
+    /// stated rationale — mirroring an ops-path anchoring rule — was wrong,
+    /// because `insert_lines` with `after_line > 0` carries no `expect`
+    /// either. Both paths are equally unanchored today; anchor them together.
+    #[test]
+    fn diff_u0_midfile_insertion_is_accepted() {
+        let patch = "--- a/a.rs\n+++ b/a.rs\n@@ -2,0 +3,1 @@\n+inserted\n";
+        parse_model_diff(patch).expect("diff -U0 mid-file insertion must apply");
+    }
+
+    /// An append at end-of-file stays legal in its verifiable form: anchored
+    /// on the final line as context.
+    #[test]
+    fn anchored_append_at_eof_still_parses() {
+        let set =
+            parse_model_diff("--- a/a.rs\n+++ b/a.rs\n@@ -3,1 +3,2 @@\n three\n+four\n").unwrap();
+        let FilePatch::Modify { hunks, .. } = &set.files[0] else {
+            panic!("expected Modify");
+        };
+        assert_eq!(hunks[0].old_lines, 1);
+        assert_eq!(hunks[0].lines, vec![" three", "+four"]);
+    }
+
+    /// A blank separator line (a lone ' ' sigil, empty content) is real
+    /// context: the apply path verifies it against the file, so it anchors.
+    #[test]
+    fn whitespace_only_context_still_anchors_a_hunk() {
+        let set = parse_model_diff("--- a/a.rs\n+++ b/a.rs\n@@ -2,1 +2,2 @@\n \n+fn extra() {}\n")
+            .unwrap();
+        let FilePatch::Modify { hunks, .. } = &set.files[0] else {
+            panic!("expected Modify");
+        };
+        assert_eq!(hunks[0].old_lines, 1);
+        assert_eq!(hunks[0].lines, vec![" ", "+fn extra() {}"]);
     }
 
     // --- line ops (AM-0013-1) --------------------------------------------

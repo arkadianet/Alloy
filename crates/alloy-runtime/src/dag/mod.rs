@@ -23,6 +23,8 @@ pub use proposal::{
     allocate_proposal_ids, compile_proposal, CompileArgs, ProposalRejection, ProposedDagManifest,
     ProposedNodeSpec, PROPOSAL_SCHEMA_VERSION,
 };
+#[cfg(test)]
+pub(crate) use templates::context_test_doubles;
 pub use templates::{
     allocate_ids, build_topology, BuildTopology, TemplateApprovalSpec, TemplateCatalog,
     TemplateEdgeSpec, TemplateId, TemplateIdMap, TemplateManifest, TemplateNodeSpec,

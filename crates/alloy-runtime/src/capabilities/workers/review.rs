@@ -267,6 +267,7 @@ impl ReviewWorker {
             diagnostics: Vec::new(),
             budget: Some(ctx.budget.clone()),
             focus_paths: changed.clone(),
+            prior_failure: None,
         };
 
         let (proposal, _pack) = llm_exchange(

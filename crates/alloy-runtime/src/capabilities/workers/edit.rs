@@ -12,16 +12,18 @@
 //! transaction is the unit of atomicity.
 
 use async_trait::async_trait;
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
 
 use crate::adapters::{CapabilityExecError, CapabilityOutcome};
 use crate::context::AssembleInputs;
 use crate::dag::{NodeInputPayload, NodeKind};
 use crate::edit::{FilePatch, PatchSet};
 use crate::graph::GraphQuery;
+use crate::obs::{truncate_utf8_bytes, DecisionKind, DecisionRecord};
 use crate::storage::{ArtifactKind, ArtifactPut};
 use crate::types::budget::ModelTier;
 use crate::types::diagnostic::{DiagnosticEvent, ErrorClass, RetryDisposition};
@@ -87,6 +89,115 @@ struct PatchOutcomeView {
     files_touched: Vec<String>,
     #[serde(default)]
     transaction_id: Option<TransactionId>,
+}
+
+/// OB3-adjacent bounds for the per-attempt `edit_attempt` telemetry record
+/// (audit 2026-08 FINDING 1): entries are one per model turn, so the default
+/// `max_model_turns = 3` never nears the cap; refusal detail is clamped
+/// before it reaches the decision log.
+const MAX_TELEMETRY_PROPOSALS: usize = 16;
+const MAX_TELEMETRY_REASON_BYTES: usize = 256;
+
+/// One model proposal's observable shape and fate, recorded per turn.
+#[derive(Debug, Clone, Serialize)]
+struct ProposalObs {
+    /// Response form: `"patch"`, `"ops"`, `"both"`, `"neither"`, or
+    /// `"undecodable"` (failed `PatchProposal` deserialization).
+    form: &'static str,
+    /// Ops carried by an ops-form reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    op_count: Option<usize>,
+    /// Raw `op` tag per op, in reply order (`"?"` for a missing tag).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    op_kinds: Vec<String>,
+    /// The check that refused this proposal, when refused: `schema`,
+    /// `form_exclusivity`, `diff_parse`, `op_parse`, `op_screen`,
+    /// `ops_compile`, `argument_bytes`, `dry_run`, or `apply`.
+    refused_by: Option<&'static str>,
+    /// Bounded refusal detail.
+    refusal: Option<String>,
+}
+
+/// Per-attempt edit-path telemetry (audit 2026-08 FINDING 1: no record
+/// existed of response form, op shape, refusing check, or terminal outcome,
+/// so no change to this path could be attributed). Interior mutability
+/// because the PS6 validate closure is `Fn`; the lock is uncontended and
+/// never held across an await.
+#[derive(Debug, Default)]
+struct EditTelemetry {
+    proposals: Mutex<Vec<ProposalObs>>,
+}
+
+impl EditTelemetry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<ProposalObs>> {
+        self.proposals
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Open one proposal entry for the turn that just validated.
+    fn propose(&self, form: &'static str, op_count: Option<usize>, op_kinds: Vec<String>) {
+        let mut proposals = self.lock();
+        if proposals.len() < MAX_TELEMETRY_PROPOSALS {
+            proposals.push(ProposalObs {
+                form,
+                op_count,
+                op_kinds,
+                refused_by: None,
+                refusal: None,
+            });
+        }
+    }
+
+    /// Attribute a refusal to the newest proposal.
+    fn refuse(&self, check: &'static str, reason: &str) {
+        if let Some(last) = self.lock().last_mut() {
+            last.refused_by = Some(check);
+            last.refusal = Some(truncate_utf8_bytes(reason, MAX_TELEMETRY_REASON_BYTES));
+        }
+    }
+
+    fn snapshot(&self) -> Vec<ProposalObs> {
+        self.lock().clone()
+    }
+}
+
+/// Append the per-attempt `edit_attempt` decision record (FINDING 1).
+/// Mirrors `finish_attempt`'s OB3 posture: a host-boundary fault records
+/// nothing (the attempt did not complete as a worker attempt), and a
+/// decision-log failure never fails the attempt.
+async fn record_edit_attempt(
+    ctx: &CapabilityContext<'_>,
+    attempt: &Attempt,
+    telemetry: &EditTelemetry,
+    result: &Result<WorkerSuccess, WorkerError>,
+) {
+    let (outcome, error_class) = match result {
+        Ok(_) => ("succeeded", None),
+        Err(WorkerError::Soft { class, .. }) => ("failed", Some(*class)),
+        Err(WorkerError::Host(_)) => return,
+    };
+    let metadata = json!({
+        "capability": "edit",
+        "attempt": ctx.attempt,
+        "model_turns": attempt.model_turns,
+        "tool_calls": attempt.tool_calls,
+        "proposals": telemetry.snapshot(),
+        "outcome": outcome,
+        "error_class": error_class.map(|c| format!("{c:?}")),
+    });
+    let record = DecisionRecord {
+        session: ctx.session,
+        run: Some(ctx.run),
+        node: Some(ctx.node),
+        kind: DecisionKind::Custom("edit_attempt".into()),
+        metadata,
+        content_hash: None,
+        prompt_body: None,
+    };
+    if let Err(e) = ctx.decisions.record(record).await {
+        tracing::warn!(error = %e, "edit_attempt decision record failed");
+    }
 }
 
 /// Patch-authoring worker.
@@ -447,10 +558,14 @@ impl Capability for EditWorker {
     ) -> Result<CapabilityOutcome, CapabilityExecError> {
         let span = worker_span(ctx);
         let mut attempt = Attempt::new(self.preferred_tier(), ctx.effective_tier);
+        let telemetry = EditTelemetry::default();
         let result = {
             use tracing::Instrument;
-            self.run(ctx, &mut attempt).instrument(span.clone()).await
+            self.run(ctx, &mut attempt, &telemetry)
+                .instrument(span.clone())
+                .await
         };
+        record_edit_attempt(ctx, &attempt, &telemetry, &result).await;
         finish_attempt(ctx, &self.describe(), &attempt, result, &span).await
     }
 }
@@ -468,6 +583,7 @@ impl EditWorker {
         &self,
         ctx: &CapabilityContext<'_>,
         attempt: &mut Attempt,
+        telemetry: &EditTelemetry,
     ) -> Result<WorkerSuccess, WorkerError> {
         if ctx.is_cancelled() {
             return Err(WorkerError::cancelled());
@@ -544,6 +660,18 @@ impl EditWorker {
             diagnostics,
             budget: Some(ctx.budget.clone()),
             focus_paths,
+            // NOT WIRED. The renderer and budget below this exist and are
+            // tested, but no producer feeds them: `CapabilityContext` carries
+            // `attempt` and no prior `FailureIr`, so every call site — here,
+            // repair, planning, review — passes None.
+            //
+            // Retry amnesia is therefore UNFIXED in production. The edit node
+            // retries up to three times and escalates tier after the first,
+            // and each attempt still starts blind. Wiring this means adding
+            // the failure to `CapabilityContext` and populating it at the
+            // retry dispatch site; until that lands, treat this field as
+            // scaffolding, not as a delivered capability.
+            prior_failure: None,
         };
 
         // §7.2 turn budget: the model turn(s), the EW6 dry-run, and the PS6
@@ -553,7 +681,9 @@ impl EditWorker {
         let mut dry_run_repaired = false;
         let mut ops_repaired = false;
         let (candidate, patch_artifact) = loop {
-            let (proposal, body) = self.author(ctx, attempt, &inputs, &feedback).await?;
+            let (proposal, body) = self
+                .author(ctx, attempt, &inputs, &feedback, telemetry)
+                .await?;
             let patch_set = match body {
                 ProposalBody::Patch(set) => set,
                 // AM-0013-1: compile ops against the current files; a stale
@@ -562,6 +692,7 @@ impl EditWorker {
                 ProposalBody::Ops(ops) => match self.compile_ops(ctx, attempt, &ops).await? {
                     Ok(set) => set,
                     Err(reason) => {
+                        telemetry.refuse("ops_compile", &reason);
                         if !ops_repaired && attempt.model_turns < self.config.max_model_turns {
                             ops_repaired = true;
                             feedback = vec![fence_tool(
@@ -579,7 +710,16 @@ impl EditWorker {
                     }
                 },
             };
-            let candidate = Self::candidate(proposal, &patch_set)?;
+            let candidate = match Self::candidate(proposal, &patch_set) {
+                Ok(candidate) => candidate,
+                Err(e) => {
+                    // The only soft refusal here is the EW5 size bound.
+                    if let WorkerError::Soft { notes, .. } = &e {
+                        telemetry.refuse("argument_bytes", notes);
+                    }
+                    return Err(e);
+                }
+            };
 
             // EW9: persist the canonical PatchSet before the apply call.
             let patch_artifact = self.persist_patch(ctx, &candidate).await?;
@@ -602,11 +742,20 @@ impl EditWorker {
             if !dry.is_error() {
                 break (candidate, patch_artifact);
             }
+            // Audit 2026-08 FINDING 2: the builtin's error CONTENT is only
+            // `{"code":…,"dry_run":true}` — the sanitized human-readable
+            // message rides `ToolResult::error()`. Feed the model both, or
+            // its one repair chance is a status code.
+            let dry_detail = match dry.error() {
+                Some(err) => format!("{err}\n{}", dry.content),
+                None => dry.content.to_string(),
+            };
+            telemetry.refuse("dry_run", &dry_detail);
             if !dry_run_repaired && attempt.model_turns < self.config.max_model_turns {
                 dry_run_repaired = true;
                 feedback = vec![fence_tool(
                     "apply_patch",
-                    &dry.content.to_string(),
+                    &dry_detail,
                     self.config.max_tool_result_bytes,
                 )];
                 continue;
@@ -628,6 +777,12 @@ impl EditWorker {
         )
         .await?;
         if applied.is_error() {
+            telemetry.refuse(
+                "apply",
+                &applied
+                    .error()
+                    .map_or_else(|| applied.content.to_string(), ToString::to_string),
+            );
             // EW10/EW11: no re-apply, no compensation; the disposition comes
             // from the tool error taxonomy.
             return Err(map_tool_result_error(&applied));
@@ -700,6 +855,7 @@ impl EditWorker {
         attempt: &mut Attempt,
         inputs: &AssembleInputs,
         feedback: &[String],
+        telemetry: &EditTelemetry,
     ) -> Result<(PatchProposal, ProposalBody), WorkerError> {
         let (authored, _pack) = llm_exchange(
             ctx,
@@ -710,24 +866,68 @@ impl EditWorker {
             inputs,
             feedback,
             |value| {
-                let proposal: PatchProposal =
-                    serde_json::from_value(value.clone()).map_err(|e| format!("schema: {e}"))?;
+                // Every validate call follows one completion, so one
+                // `ProposalObs` per model turn; PS5 refusals are attributed
+                // here, downstream ones (`ops_compile`, `dry_run`, …) by
+                // the run loop.
+                let refuse = |check: &'static str, reason: String| {
+                    telemetry.refuse(check, &reason);
+                    reason
+                };
+                let proposal: PatchProposal = match serde_json::from_value(value.clone()) {
+                    Ok(proposal) => proposal,
+                    Err(e) => {
+                        telemetry.propose("undecodable", None, Vec::new());
+                        return Err(refuse("schema", format!("schema: {e}")));
+                    }
+                };
+                let form = match (&proposal.patch, &proposal.ops) {
+                    (Some(_), Some(_)) => "both",
+                    (None, None) => "neither",
+                    (Some(_), None) => "patch",
+                    (None, Some(_)) => "ops",
+                };
+                let (op_count, op_kinds) =
+                    proposal.ops.as_ref().map_or((None, Vec::new()), |raw| {
+                        (
+                            Some(raw.len()),
+                            raw.iter()
+                                .take(MAX_TELEMETRY_PROPOSALS)
+                                .map(|op| {
+                                    op.get("op")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("?")
+                                        .to_owned()
+                                })
+                                .collect(),
+                        )
+                    });
+                telemetry.propose(form, op_count, op_kinds);
                 let body = match (&proposal.patch, &proposal.ops) {
                     (Some(_), Some(_)) => {
-                        return Err("reply with either patch or ops, never both".into());
+                        return Err(refuse(
+                            "form_exclusivity",
+                            "reply with either patch or ops, never both".into(),
+                        ));
                     }
                     (None, None) => {
-                        return Err("reply must carry a patch or an ops array".into());
+                        return Err(refuse(
+                            "form_exclusivity",
+                            "reply must carry a patch or an ops array".into(),
+                        ));
                     }
                     // EW4: local parse before any tool call — an unusable
                     // diff never becomes a permission-denied tool error.
-                    (Some(patch), None) => ProposalBody::Patch(parse_model_diff(patch)?),
+                    (Some(patch), None) => ProposalBody::Patch(
+                        parse_model_diff(patch).map_err(|e| refuse("diff_parse", e))?,
+                    ),
                     (None, Some(raw_ops)) => {
                         let ops = raw_ops
                             .iter()
                             .map(parse_line_op)
-                            .collect::<Result<Vec<_>, _>>()?;
-                        screen_line_ops(&ops)?;
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| refuse("op_parse", e))?;
+                        screen_line_ops(&ops).map_err(|e| refuse("op_screen", e))?;
                         ProposalBody::Ops(ops)
                     }
                 };
@@ -1386,7 +1586,8 @@ mod live_diagnostics_tests {
         let ctx = ctx(input, Arc::clone(&engine), artifacts, graph);
         let worker = EditWorker::new(WorkerConfig::default());
         let mut attempt = Attempt::new(ModelTier::Standard, ModelTier::Standard);
-        let result = worker.run(&ctx, &mut attempt).await;
+        let telemetry = EditTelemetry::default();
+        let result = worker.run(&ctx, &mut attempt, &telemetry).await;
         assert!(result.is_err(), "the recording engine halts the attempt");
         let seen = engine.seen.lock().expect("engine lock");
         seen.first().cloned().expect("assemble_with was reached")
@@ -1477,6 +1678,427 @@ mod live_diagnostics_tests {
             merged.len(),
             MAX_DIAGNOSTICS,
             "diagnostics presented to the model are capped like repair's RW2"
+        );
+    }
+}
+
+/// Full-exchange guards for the edit path's observability (audit 2026-08):
+/// a scripted router records every `PromptPack` it completes, so these tests
+/// see exactly what the model sees on a repair turn, and the recording
+/// decision log captures the per-attempt `edit_attempt` telemetry record.
+#[cfg(test)]
+mod exchange_tests {
+    use super::*;
+
+    use std::collections::VecDeque;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use tokio_util::sync::CancellationToken;
+
+    use crate::adapters::{NodeExecRef, ToolCaller, ToolCallerError};
+    use crate::context::NullContextEngine;
+    use crate::error::AdapterError;
+    use crate::graph::GraphViewHandle;
+    use crate::obs::{DecisionKind, RecordingDecisionLog, RetentionPolicy, SharedCostMeter};
+    use crate::router::{
+        ModelEndpoint, ModelResponse, ModelRouter, PromptPack, RoutedModel, RouterError,
+        RoutingRequest, Usage,
+    };
+    use crate::storage::{ArtifactBlob, ArtifactMeta, ArtifactStore, StoreError};
+    use crate::types::budget::{Goal, TokenBudget};
+    use crate::types::ids::{DagId, Digest, EndpointId, NodeId, ProviderId, RunId, SessionId};
+    use crate::types::permission::PermissionToken;
+    use crate::types::tools::{ToolCall, ToolError, ToolResult};
+
+    use super::super::super::perms::WorkerPermissions;
+    use crate::dag::NodeInputEnvelope;
+
+    const GOOD_DIFF: &str = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,1 @@\n-    let x: &str = 42;\n+    let x: i32 = 42;\n";
+
+    fn endpoint() -> ModelEndpoint {
+        ModelEndpoint {
+            id: EndpointId::new("test-endpoint").expect("static id"),
+            provider: ProviderId::new("test").expect("static id"),
+            display_name: "test".into(),
+            model: "test-model".into(),
+            tiers: vec![ModelTier::Standard],
+            supports_tools: false,
+            supports_structured_output: true,
+            supports_json_schema: false,
+            json_schema_strict: false,
+            max_context: 32_768,
+            input_usd_per_mtok: None,
+            output_usd_per_mtok: None,
+            temperature: None,
+        }
+    }
+
+    /// Pops one scripted structured body per completion and records the
+    /// exact `PromptPack` each turn sent.
+    struct ScriptedRouter {
+        responses: Mutex<VecDeque<serde_json::Value>>,
+        prompts: Mutex<Vec<PromptPack>>,
+    }
+
+    impl ScriptedRouter {
+        fn new(responses: Vec<serde_json::Value>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// One string per model turn: that turn's messages joined in order.
+        fn prompt_texts(&self) -> Vec<String> {
+            self.prompts
+                .lock()
+                .expect("prompts lock")
+                .iter()
+                .map(|p| {
+                    p.messages
+                        .iter()
+                        .map(|m| m.content.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n---\n")
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl ModelRouter for ScriptedRouter {
+        async fn route(&self, req: RoutingRequest) -> Result<RoutedModel, RouterError> {
+            Ok(RoutedModel::mint(
+                endpoint(),
+                ModelTier::Standard,
+                &req,
+                true,
+                None,
+                0,
+            ))
+        }
+
+        async fn complete(
+            &self,
+            _routed: &RoutedModel,
+            prompt: PromptPack,
+        ) -> Result<ModelResponse, RouterError> {
+            self.prompts.lock().expect("prompts lock").push(prompt);
+            let structured = self
+                .responses
+                .lock()
+                .expect("responses lock")
+                .pop_front()
+                .expect("model response script exhausted");
+            Ok(ModelResponse {
+                text: None,
+                structured: Some(structured),
+                tool_calls: vec![],
+                usage: Usage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                },
+                provider_request_id: None,
+                finish_reason: Some("stop".into()),
+            })
+        }
+    }
+
+    struct QueueTools {
+        results: Mutex<VecDeque<ToolResult>>,
+    }
+
+    #[async_trait]
+    impl ToolCaller for QueueTools {
+        async fn call(
+            &self,
+            _call: ToolCall,
+            _perms: PermissionToken,
+        ) -> Result<ToolResult, ToolCallerError> {
+            self.results
+                .lock()
+                .expect("tools lock")
+                .pop_front()
+                .ok_or_else(|| ToolCallerError::Internal("tool script exhausted".into()))
+        }
+    }
+
+    struct AllowPerms;
+
+    #[async_trait]
+    impl WorkerPermissions for AllowPerms {
+        async fn token_for(
+            &self,
+            ctx: &NodeExecRef,
+            _class: WorkerToolClass,
+        ) -> Result<PermissionToken, AdapterError> {
+            // Deserialized, not a struct literal: the PM2 grep pins token
+            // literals to perms.rs, and this double has no business looking
+            // like a production mint.
+            let token = serde_json::from_value(json!({
+                "profile": "default",
+                "grants": [],
+                "expires": null,
+                "run_id": ctx.run_id,
+            }))
+            .expect("static token shape");
+            Ok(token)
+        }
+    }
+
+    /// Goal-rooted attempts only load pred artifacts when preds exist, so
+    /// the store just accepts the EW9 patch put.
+    struct PutOnlyArtifacts;
+
+    #[async_trait]
+    impl ArtifactStore for PutOnlyArtifacts {
+        async fn put(&self, _req: ArtifactPut) -> Result<ArtifactId, StoreError> {
+            Ok(ArtifactId::new())
+        }
+
+        async fn get(&self, _id: ArtifactId) -> Result<ArtifactBlob, StoreError> {
+            Err(StoreError::NotFound("goal-rooted: no preds".into()))
+        }
+
+        async fn meta(&self, _id: ArtifactId) -> Result<ArtifactMeta, StoreError> {
+            Err(StoreError::NotFound("unused".into()))
+        }
+
+        async fn get_by_digest(&self, _d: &Digest) -> Result<Option<ArtifactId>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete(&self, _id: ArtifactId) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    fn patch_response(diff: &str) -> serde_json::Value {
+        json!({ "patch": diff, "summary": "fix the annotation", "confidence": 0.8 })
+    }
+
+    fn ops_response(expect: &str) -> serde_json::Value {
+        json!({
+            "ops": [{
+                "op": "replace_lines",
+                "path": "src/main.rs",
+                "start": 1,
+                "end": 1,
+                "expect": [expect],
+                "new": ["    let x: i32 = 42;"],
+            }],
+            "summary": "fix the annotation",
+            "confidence": 0.8,
+        })
+    }
+
+    fn dry_conflict(msg: &str) -> ToolResult {
+        ToolResult::err(
+            crate::types::tools::ToolName::new("apply_patch").expect("static name"),
+            json!({ "code": "conflict", "dry_run": true }),
+            ToolError::Permanent {
+                code: "conflict".into(),
+                message: msg.into(),
+            },
+            2,
+        )
+    }
+
+    fn apply_ok(dry_run: bool) -> ToolResult {
+        ToolResult::ok(
+            crate::types::tools::ToolName::new("apply_patch").expect("static name"),
+            json!({
+                "files_touched": ["src/main.rs"],
+                "transaction_id": TransactionId::new(),
+                "dry_run": dry_run,
+            }),
+            2,
+        )
+    }
+
+    fn fs_read_ok(path: &str, text: &str) -> ToolResult {
+        ToolResult::ok(
+            crate::types::tools::ToolName::new("fs_read").expect("static name"),
+            json!({ "path": path, "truncated": false, "text": text }),
+            1,
+        )
+    }
+
+    struct Fx {
+        router: Arc<ScriptedRouter>,
+        decisions: Arc<RecordingDecisionLog>,
+    }
+
+    /// Drive one full goal-rooted edit attempt through `Capability::execute`
+    /// with scripted model responses and tool results.
+    async fn run_edit(
+        responses: Vec<serde_json::Value>,
+        tool_results: Vec<ToolResult>,
+    ) -> (Fx, Result<CapabilityOutcome, CapabilityExecError>) {
+        let router = Arc::new(ScriptedRouter::new(responses));
+        let decisions = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+        let dag = DagId::new();
+        let node = NodeId::new();
+        let input = NodeInputEnvelope::new(
+            dag,
+            node,
+            NodeKind::Edit,
+            1,
+            NodeInputPayload::Goal(Goal {
+                text: "fix the type error in src/main.rs".into(),
+                constraints: vec![],
+                attachments: vec![],
+            }),
+        );
+        let ctx = CapabilityContext {
+            session: SessionId::new(),
+            run: RunId::new(),
+            dag,
+            node,
+            attempt: 1,
+            workspace_root: Path::new("."),
+            capability: CapabilityId::new("edit").expect("static id"),
+            kind: NodeKind::Edit,
+            effective_tier: ModelTier::Standard,
+            budget: TokenBudget {
+                max_input: 8192,
+                max_output: 1024,
+            },
+            deadline: Duration::from_secs(30),
+            cancel: CancellationToken::new(),
+            input: &input,
+            router: Arc::clone(&router) as Arc<dyn ModelRouter>,
+            context: Arc::new(NullContextEngine::with_goal(
+                "fix the type error in src/main.rs",
+            )),
+            tools: Arc::new(QueueTools {
+                results: Mutex::new(tool_results.into_iter().collect()),
+            }),
+            perms: Arc::new(AllowPerms),
+            graph: GraphViewHandle::null(),
+            artifacts: Arc::new(PutOnlyArtifacts),
+            decisions: Arc::clone(&decisions) as _,
+            cost_meter: SharedCostMeter::new(),
+            started: Instant::now(),
+        };
+        let worker = EditWorker::new(WorkerConfig::default());
+        let outcome = worker.execute(&ctx).await;
+        (Fx { router, decisions }, outcome)
+    }
+
+    fn edit_attempt_metadata(fx: &Fx) -> serde_json::Value {
+        fx.decisions
+            .recorded_decisions()
+            .iter()
+            .find(|r| r.kind == DecisionKind::Custom("edit_attempt".into()))
+            .expect("edit_attempt telemetry record")
+            .metadata
+            .clone()
+    }
+
+    /// FINDING 2 (audit 2026-08): the dry-run repair turn must fence the
+    /// sanitized human-readable tool error (`ToolResult::error()`), not just
+    /// the builtin's `{"code":...,"dry_run":true}` content JSON.
+    #[tokio::test]
+    async fn dry_run_repair_feedback_carries_the_tool_error_message() {
+        let msg = "hunk 1 does not apply: expected `let x: &str = 42;` at src/main.rs:1";
+        let (fx, outcome) = run_edit(
+            vec![patch_response(GOOD_DIFF), patch_response(GOOD_DIFF)],
+            vec![dry_conflict(msg), dry_conflict(msg)],
+        )
+        .await;
+        // EW6 terminal shape is unchanged: the second dry-run failure is a
+        // soft Tool failure.
+        assert!(
+            matches!(outcome, Ok(CapabilityOutcome::Failed { .. })),
+            "expected soft failure, got {outcome:?}"
+        );
+        let prompts = fx.router.prompt_texts();
+        assert_eq!(prompts.len(), 2, "one author turn + one repair turn");
+        assert!(
+            prompts[1].contains("hunk 1 does not apply"),
+            "the repair turn must see the tool error message, got:\n{}",
+            prompts[1]
+        );
+    }
+
+    /// FINDING 1 (audit 2026-08): one `edit_attempt` decision record per
+    /// attempt answers — response form per turn, op count and kinds, which
+    /// check refused, turns consumed, terminal outcome.
+    #[tokio::test]
+    async fn edit_attempt_record_captures_proposal_forms_and_ops_refusal() {
+        let (fx, outcome) = run_edit(
+            vec![
+                ops_response("    let x: &str = 43;"), // stale expect
+                patch_response(GOOD_DIFF),
+            ],
+            vec![
+                fs_read_ok("src/main.rs", "    let x: &str = 42;\n"),
+                apply_ok(true),
+                apply_ok(false),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(CapabilityOutcome::Succeeded { .. })),
+            "expected success, got {outcome:?}"
+        );
+        let m = edit_attempt_metadata(&fx);
+        assert_eq!(m["outcome"], json!("succeeded"));
+        assert_eq!(m["model_turns"], json!(2));
+        let proposals = m["proposals"].as_array().expect("proposals array");
+        assert_eq!(proposals.len(), 2, "{proposals:?}");
+        assert_eq!(proposals[0]["form"], json!("ops"));
+        assert_eq!(proposals[0]["op_count"], json!(1));
+        assert_eq!(proposals[0]["op_kinds"], json!(["replace_lines"]));
+        assert_eq!(proposals[0]["refused_by"], json!("ops_compile"));
+        assert!(
+            proposals[0]["refusal"]
+                .as_str()
+                .expect("refusal string")
+                .contains("stale op"),
+            "{proposals:?}"
+        );
+        assert_eq!(proposals[1]["form"], json!("patch"));
+        assert!(proposals[1]["refused_by"].is_null(), "{proposals:?}");
+    }
+
+    /// FINDING 1, refusal arm: dry-run refusals are attributed per proposal
+    /// and the terminal outcome carries the failure class.
+    #[tokio::test]
+    async fn edit_attempt_record_marks_dry_run_refusals_and_failed_outcome() {
+        let (fx, outcome) = run_edit(
+            vec![patch_response(GOOD_DIFF), patch_response(GOOD_DIFF)],
+            vec![
+                dry_conflict("hunk 1 does not apply"),
+                dry_conflict("hunk 1 does not apply"),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(outcome, Ok(CapabilityOutcome::Failed { .. })),
+            "expected soft failure, got {outcome:?}"
+        );
+        let m = edit_attempt_metadata(&fx);
+        assert_eq!(m["outcome"], json!("failed"));
+        assert_eq!(m["error_class"], json!("Tool"));
+        assert_eq!(m["model_turns"], json!(2));
+        let proposals = m["proposals"].as_array().expect("proposals array");
+        assert_eq!(proposals.len(), 2, "{proposals:?}");
+        assert!(
+            proposals
+                .iter()
+                .all(|p| p["refused_by"] == json!("dry_run")),
+            "{proposals:?}"
+        );
+        assert!(
+            proposals[1]["refusal"]
+                .as_str()
+                .expect("refusal string")
+                .contains("hunk 1 does not apply"),
+            "{proposals:?}"
         );
     }
 }

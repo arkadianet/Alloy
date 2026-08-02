@@ -24,7 +24,11 @@ use crate::mcp::patch::{
 use crate::redact::redact_abs_paths;
 
 /// Max length of any message forwarded from the backend.
-const MAX_BACKEND_MESSAGE_BYTES: usize = 512;
+///
+/// Sized so a rich context-mismatch — two bounded file-content excerpts, a
+/// long jail-relative path, and the instruction text — survives instead of
+/// degrading to the bare fallback; anything longer is dropped whole.
+const MAX_BACKEND_MESSAGE_BYTES: usize = 1024;
 
 /// Fallback used when a backend success message fails sanitization.
 const SAFE_SUCCESS_MESSAGE: &str = "apply_patch completed";
@@ -113,13 +117,28 @@ fn map_outcome(
         },
         Err(err) => {
             let (code, error) = map_backend_error(err);
-            ToolResult::err(
-                name,
-                json!({ "code": code, "dry_run": dry_run }),
-                error,
-                duration_ms,
-            )
+            // The worker retry loop feeds this `content` back to the model
+            // verbatim; the ToolError message alone never reaches it, so a
+            // repairable refusal must carry its instruction here. The unwired
+            // stub is operator misconfiguration no model can act on, and its
+            // content shape is part of the RFC-0006 stub contract.
+            let mut content = json!({ "code": code, "dry_run": dry_run });
+            if code != EDIT_ENGINE_UNWIRED_CODE {
+                content["message"] = Value::String(tool_error_message(&error).to_string());
+            }
+            ToolResult::err(name, content, error, duration_ms)
         }
+    }
+}
+
+/// The model-facing message of a mapped backend error.
+fn tool_error_message(error: &ToolError) -> &str {
+    match error {
+        ToolError::Transient { message, .. }
+        | ToolError::Permanent { message, .. }
+        | ToolError::InvalidArgs { message }
+        | ToolError::ExecutionFailed { message, .. } => message,
+        _ => "apply_patch failed",
     }
 }
 
@@ -147,13 +166,17 @@ fn map_backend_error(err: PatchApplyError) -> (&'static str, ToolError) {
                     .unwrap_or_else(|| "apply_patch invalid patch".to_string()),
             },
         ),
-        PatchApplyError::Conflict(msg) => (
-            "conflict",
-            ToolError::Permanent {
-                code: "conflict".into(),
-                message: sanitize_msg(&msg).unwrap_or_else(|| "apply_patch conflict".to_string()),
-            },
-        ),
+        PatchApplyError::Conflict(msg) => {
+            let msg = with_delete_guidance(msg);
+            (
+                "conflict",
+                ToolError::Permanent {
+                    code: "conflict".into(),
+                    message: sanitize_msg(&msg)
+                        .unwrap_or_else(|| "apply_patch conflict".to_string()),
+                },
+            )
+        }
         // Backend IO / internal detail is dropped wholesale: fixed messages.
         PatchApplyError::Io(_) => (
             "io",
@@ -220,20 +243,39 @@ fn has_drive_prefix(s: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+/// The backend's delete-validation refusals arrive as stable short details
+/// (shared vocabulary with the engine's local validator); as retry prompts
+/// they lack the instruction, so this boundary appends it before forwarding.
+fn with_delete_guidance(msg: String) -> String {
+    let guidance = if msg.ends_with("delete mismatch") {
+        "; a delete patch must repeat every line of the current file as '-' lines, exactly — \
+         re-read the file and copy it"
+    } else if msg.ends_with("delete leaves content") {
+        "; a delete patch must consume every line of the current file as '-' lines — to remove \
+         only part of the file, author a modify patch instead"
+    } else {
+        return msg;
+    };
+    format!("{msg}{guidance}")
+}
+
 /// Strip absolute-path spans (see [`crate::redact`]) and enforce the length /
 /// NUL limits.
+///
+/// Control characters are neutralized to spaces (prompt-structure risk), but
+/// plain spaces survive: quoted file-content excerpts carry meaningful
+/// indentation that whole-message whitespace collapsing would destroy.
 ///
 /// `None` means the caller must substitute a fixed message.
 fn sanitize_msg(msg: &str) -> Option<String> {
     if msg.len() > MAX_BACKEND_MESSAGE_BYTES || msg.contains('\0') {
         return None;
     }
-    Some(
-        redact_abs_paths(msg)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
+    let cleaned: String = redact_abs_paths(msg)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    Some(cleaned.trim().to_string())
 }
 
 #[cfg(test)]
@@ -398,6 +440,97 @@ mod tests {
                 message: "apply_patch conflict".into(),
             })
         );
+    }
+
+    /// The worker retry loop feeds `content` (not the ToolError) back to the
+    /// model, so a repairable refusal must carry its message there; the
+    /// unwired stub keeps its pinned message-free shape.
+    #[test]
+    fn error_content_carries_the_model_facing_message() {
+        let result = map_outcome(
+            Err(PatchApplyError::Conflict(
+                "a.rs: at line 2 the hunk expects context \"x\"".into(),
+            )),
+            true,
+            0,
+        );
+        assert_eq!(result.content["code"], "conflict");
+        assert_eq!(result.content["dry_run"], true);
+        let msg = result.content["message"].as_str().unwrap();
+        assert!(msg.contains("line 2"), "{msg}");
+
+        let result = map_outcome(
+            Err(PatchApplyError::InvalidPatch("bad hunk".into())),
+            false,
+            0,
+        );
+        assert_eq!(result.content["message"], "bad hunk");
+
+        let stub = map_outcome(
+            Err(PatchApplyError::Unsupported(
+                EDIT_ENGINE_UNWIRED_MESSAGE.into(),
+            )),
+            false,
+            0,
+        );
+        assert!(stub.content.get("message").is_none(), "{:?}", stub.content);
+    }
+
+    /// The backend's delete-validation refusals are stable short details; as
+    /// prompts they need the instruction appended at this boundary.
+    #[test]
+    fn delete_short_forms_gain_instruction_text() {
+        let result = map_outcome(
+            Err(PatchApplyError::Conflict("a.txt: delete mismatch".into())),
+            true,
+            0,
+        );
+        let msg = result.content["message"].as_str().unwrap();
+        assert!(msg.starts_with("a.txt: delete mismatch"), "{msg}");
+        assert!(msg.contains("'-' lines"), "{msg}");
+        assert!(msg.contains("re-read"), "{msg}");
+
+        let result = map_outcome(
+            Err(PatchApplyError::Conflict(
+                "a.txt: delete leaves content".into(),
+            )),
+            true,
+            0,
+        );
+        let msg = result.content["message"].as_str().unwrap();
+        assert!(msg.contains("every line"), "{msg}");
+        assert!(msg.contains("modify"), "{msg}");
+    }
+
+    /// Quoted file-content excerpts carry meaningful indentation; sanitizing
+    /// must not collapse it, while control characters still neutralize.
+    #[test]
+    fn sanitize_keeps_indentation_and_strips_control_chars() {
+        let result = map_outcome(
+            Ok(outcome(vec!["a.rs"], "expects \"    let x\" here")),
+            false,
+            0,
+        );
+        assert_eq!(result.content["message"], "expects \"    let x\" here");
+
+        let result = map_outcome(Err(PatchApplyError::Conflict("a\nb\tc".into())), false, 0);
+        assert_eq!(result.content["message"], "a b c");
+    }
+
+    /// A rich context-mismatch (two bounded excerpts plus a long path) must
+    /// survive the length cap instead of degrading to the bare fallback.
+    #[test]
+    fn rich_conflict_message_survives_the_length_cap() {
+        let msg = format!(
+            "crates/alloy-tools/src/edit/apply.rs: at line 42 the hunk expects context \"{}\" \
+             but the file actually contains \"{}\"; re-read the file",
+            "x".repeat(260),
+            "y".repeat(260),
+        );
+        assert!(msg.len() > 512, "test message must exceed the old cap");
+        let result = map_outcome(Err(PatchApplyError::Conflict(msg)), true, 0);
+        let forwarded = result.content["message"].as_str().unwrap();
+        assert!(forwarded.contains("re-read"), "{forwarded}");
     }
 
     #[test]
