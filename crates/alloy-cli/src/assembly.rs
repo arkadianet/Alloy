@@ -534,6 +534,8 @@ pub async fn assemble_full_with(
         edit_engine: edit_engine.clone(),
         worker_permissions: Some(Arc::clone(&worker_perms)),
         verify_compile: Some(Arc::clone(&verify_compile)),
+        // AM-0017-1: run-start compile evidence for the gen-1 replan seed.
+        graph: GraphViewHandle::new(Arc::clone(&graph) as Arc<dyn ProjectGraph>),
     });
     plane.set_executor(Arc::new(driver));
 

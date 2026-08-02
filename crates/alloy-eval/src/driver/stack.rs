@@ -466,7 +466,7 @@ async fn run_live_inner(
                     Some("**".into()),
                     Some("**".into()),
                 )),
-                graph: graph_handle,
+                graph: graph_handle.clone(),
                 artifacts: storage.artifacts(),
                 decisions: Arc::clone(&decisions) as _,
                 sessions: storage.sessions(),
@@ -530,6 +530,10 @@ async fn run_live_inner(
                 edit_engine: None,
                 worker_permissions: None,
                 verify_compile: None,
+                // AM-0017-1: same handle the workers read — the gen-1
+                // near-miss admission seeds from the stack's own
+                // seed_graph_diagnostics pass above.
+                graph: graph_handle,
             }));
             plane.set_executor(driver as _);
 

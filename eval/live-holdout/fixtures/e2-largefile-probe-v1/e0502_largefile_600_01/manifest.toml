@@ -1,0 +1,66 @@
+# Live-holdout fixture manifest (corpus e2-largefile-probe-v1).
+#
+# The live harness reads exactly one field from this file: `naive_target_path`
+# (crates/alloy-eval/src/live_holdout.rs, `HoldoutManifest`). Its deserializer
+# accepts unknown keys, so everything below is provenance metadata that the
+# harness ignores.
+#
+# Copy-fidelity probe: 24 audited golden repairs from e2-semantic-v1 composed
+# verbatim (indented one level, wrapped in named modules) into one ~600-line
+# crate, plus one small `pipeline` glue module authored for this probe. The
+# only planted bug is the audited two-line E0502 from e0502_preserve_both_01,
+# hosted in the `channel_updates` module. Every other module is untouched, and
+# the hidden oracle asserts both the repair and the integrity of the untouched
+# modules — collateral damage from whole-file regeneration must fail.
+
+naive_target_path = "src/lib.rs"
+
+id = "e0502_largefile_600_01"
+corpus = "e2-largefile-probe-v1"
+target_diagnostic = "E0502"
+summary = "600-line composed crate with one two-line E0502 (shared borrow held across a capped write) planted in channel_updates; oracles cover the repair and every untouched module."
+
+[license]
+class = "permitted"
+spdx = "Alloy-Original"
+source_note = "Composed from the audited Alloy-original e2-semantic-v1 golden repairs by arkadianet; pipeline glue module authored for this probe."
+
+[toolchain]
+channel = "1.97.1"
+rustc_version = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+cargo_version = "cargo 1.97.1 (c980f4866 2026-06-30)"
+
+[workspace]
+path = "workspace"
+package = "e0502_largefile_600_01"
+
+# Module -> source fixture (all verbatim .post content, indented one level).
+# `channel_updates` uses the audited BROKEN source of its fixture in
+# workspace/src/lib.rs and the audited .post in workspace/src/lib.rs.post;
+# every other module uses the .post content in both files.
+[provenance.modules]
+byte_reader = "e0106_impl_lifetime_param_01"
+name_order = "e0106_return_ref_two_params_01"
+reading_series = "e0106_struct_ref_field_01"
+config_parse = "e0277_collect_wrong_container_01"
+labeled_render = "e0277_display_bound_01"
+allow_filter = "e0277_partial_eq_bound_01"
+frame_totals = "e0308_int_width_return_01"
+keyed_lookup = "e0308_option_vs_result_01"
+slug = "e0308_str_vs_string_01"
+upload_store = "e0382_borrow_after_move_01"
+line_labels = "e0382_move_in_loop_01"
+command_describe = "e0382_partial_move_field_01"
+ledger_audit = "e0499_disjoint_field_split_03"
+series_extend = "e0499_scope_sequenced_borrow_02"
+balance_transfer = "e0499_two_mut_borrows_01"
+channel_updates = "e0502_preserve_both_01"
+rate_counters = "e0502_preserve_new_01"
+account_ledger = "e0502_preserve_old_01"
+log_flush = "e0502_string_flush_snapshot_01"
+sensor_history = "e0502_struct_previous_reading_01"
+task_queue = "e0502_vec_absorb_snapshot_01"
+label_suffix = "e0596_loop_needs_iter_mut_01"
+running_totals = "e0596_missing_mut_binding_01"
+event_log = "e0596_shared_self_method_01"
+pipeline = "authored-for-this-probe"

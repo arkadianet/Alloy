@@ -12,21 +12,26 @@
 //! `max_repair_generations` bound, the run's budget, and one **absolute**
 //! run deadline (GN7 / AM-0010-2). Day-1 the seed usually comes from a
 //! `VerifyCompile` Fail; a narrow GN2 exception also admits an exhausted
-//! `Edit`/`Analyze` Model failure when the current repair lineage still
-//! carries that seed (AM-0017-1). When wired, GN13 restores the newest
-//! edit checkpoint and re-verifies before replan so gen N+1 does not
-//! repair a morph. Everything else — including exhaustion — is an
-//! *outcome*, not an error (GN11).
+//! `Edit`/`Analyze` Model failure — from the current repair lineage when
+//! one exists (AM-0017-1), and in generation 1, where no in-run lineage
+//! can exist yet, from the run-start compile evidence the issue-#53 seed
+//! pass recorded in the graph channel (error-level diagnostics only, read
+//! through the same `Diagnostics` query the repair worker uses). When
+//! wired, GN13 restores the newest edit checkpoint and re-verifies before
+//! replan so gen N+1 does not repair a morph. Everything else — including
+//! exhaustion — is an *outcome*, not an error (GN11).
 //!
 //! Declines are reported, not just counted: every §9.2 decline record
 //! carries the repair-budget accounting (`bumps_used` /
 //! `max_repair_generations`), and the AM-0017-1 near-miss — an
-//! Edit/Analyze `Model` failure declined only because no in-run lineage
-//! seed exists yet, which is every first generation — additionally records
-//! `lineage: "absent"` and annotates the terminal `FailureIr` so the run
-//! does not exit shaped like a repair that fought and lost (live E2
-//! finding: 25/144 attempts burned the whole edit budget this way and
-//! exited silently). Declines additionally carry `failure_notes` — the
+//! Edit/Analyze `Model` failure declined because no in-run lineage seed
+//! exists yet *and* the graph channel holds no error-level run-start
+//! evidence — additionally records `lineage: "absent"` and annotates the
+//! terminal `FailureIr` so the run does not exit shaped like a repair that
+//! fought and lost (live E2 finding: 25/144 attempts burned the whole edit
+//! budget this way and exited silently, before the graph-channel fallback
+//! admitted the seedable subset). Declines additionally carry
+//! `failure_notes` — the
 //! terminal `FailureIr`'s bounded notes — because the decision row is the
 //! only durable channel the E2 evidence export keeps: on dev-gn13, 7/48
 //! attempts died exactly here with the edit validator's violation text
@@ -50,6 +55,7 @@ use crate::dag::NodeKind;
 use crate::edit::{transactions_of_run, EditContext, EditEngine};
 use crate::error::{RunError, RuntimeError};
 use crate::events::{NewSessionEvent, SessionEvent, SessionEventType};
+use crate::graph::{GraphQuery, GraphViewHandle};
 use crate::obs::{
     redact_secrets, truncate_utf8_bytes, BudgetCheck, CostMeterFactory, DecisionKind, DecisionLog,
     DecisionRecord,
@@ -60,8 +66,8 @@ use crate::scheduler::{DagOutcome, DagState};
 use crate::session::{ReplanReason, RunController, RunExecCtx, RunExecutor, RunGoalRecord};
 use crate::storage::{DagStore, EventStore, SessionRows, StoreError};
 use crate::types::budget::BudgetPolicy;
-use crate::types::diagnostic::{ErrorClass, FailureIr, RetryDisposition};
-use crate::types::ids::{DagId, Digest, EventSeq, SessionId};
+use crate::types::diagnostic::{DiagnosticLevel, ErrorClass, FailureIr, RetryDisposition};
+use crate::types::ids::{DagId, Digest, EventSeq, NodeId, SessionId};
 
 /// The driver's own policy struct (RFC-0017 §3.8). One field today; it
 /// exists so the bound has a home that is neither `SchedConfig` nor a bare
@@ -129,6 +135,13 @@ pub struct GenerationDriverDeps {
     pub worker_permissions: Option<Arc<dyn WorkerPermissions>>,
     /// GN13: re-verify after a successful restore so the seed matches disk.
     pub verify_compile: Option<Arc<dyn Verifier>>,
+    /// Read-only graph channel. Carries the run-start compile evidence the
+    /// issue-#53 seed pass recorded (`seed_graph_diagnostics`), which the
+    /// AM-0017-1 first-generation admission reads back as its replan seed
+    /// when no in-run lineage exists yet. [`GraphViewHandle::null`] when the
+    /// assembly has no graph — reads are then empty and the near-miss
+    /// declines exactly as before.
+    pub graph: GraphViewHandle,
 }
 
 /// Internal driver failure; folded into [`RuntimeError::Internal`] at the
@@ -178,13 +191,37 @@ pub struct GenerationDriver {
     metrics: AtomicDriverMetrics,
 }
 
+/// Where an admitted replan seed came from (§9.2 `seed_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedSource {
+    /// The outcome's own VerifyCompile Fail.
+    Outcome,
+    /// The in-run lineage seed (AM-0017-1's exhausted Edit/Analyze case).
+    Lineage,
+    /// Run-start compile evidence read back from the graph channel (the
+    /// issue-#53 seed pass) — the first-generation near-miss admission.
+    Graph,
+}
+
+impl SeedSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Outcome => "outcome",
+            Self::Lineage => "lineage",
+            Self::Graph => "graph",
+        }
+    }
+}
+
 /// A declined admission. `reason` is the first failed GN rule (§9.2's
 /// closed vocabulary). `missing_lineage` marks the AM-0017-1 near-miss —
 /// an Edit/Analyze `Model` failure that would have been admissible had this
-/// dispatch already admitted a verify Fail; true of every first generation,
-/// where no in-run lineage can exist yet. Live E2 measurement showed this
-/// decline ending runs indistinguishably from a repair that fought and
-/// lost, so the near-miss is reported, not merely declined.
+/// dispatch already admitted a verify Fail; true only in a first generation
+/// (no in-run lineage can exist yet) whose graph channel also holds no
+/// usable run-start compile evidence, since that evidence now seeds the
+/// replan directly. Live E2 measurement showed this decline ending runs
+/// indistinguishably from a repair that fought and lost, so the near-miss
+/// is reported, not merely declined.
 struct ReplanReject {
     reason: &'static str,
     missing_lineage: bool,
@@ -258,20 +295,20 @@ impl GenerationDriver {
 
     /// GN1–GN7 in order; the first failed rule names the rejection reason
     /// (§9.2's `reason` vocabulary). On admit, returns the `FailureIr` that
-    /// MUST seed the next generation (outcome verify Fail, or the in-run
-    /// lineage seed for AM-0017-1). A first-generation Edit/Analyze `Model`
-    /// failure declines deliberately (AC 23b): the lineage seed is in-run
-    /// only, and generation 1 precedes any admitted verify Fail — its
-    /// compile evidence travelled the graph channel (issue #53), never a
-    /// driver-held IR. That decline is flagged `missing_lineage` so the
-    /// caller can report it honestly.
+    /// MUST seed the next generation and where it came from: the outcome
+    /// verify Fail, the in-run lineage seed (AM-0017-1), or — for a
+    /// first-generation Edit/Analyze `Model` failure, which precedes any
+    /// admitted verify Fail — the run-start compile evidence the issue-#53
+    /// seed pass recorded in the graph channel. Only when that channel
+    /// holds no error-level evidence either does the near-miss decline
+    /// (flagged `missing_lineage`) so the caller can report it honestly.
     async fn admission_reason(
         &self,
         ctx: &RunExecCtx,
         outcome: &DagOutcome,
         bumps: u32,
         lineage_seed: Option<&FailureIr>,
-    ) -> Result<Result<FailureIr, ReplanReject>, DriveError> {
+    ) -> Result<Result<(FailureIr, SeedSource), ReplanReject>, DriveError> {
         // GN1 — a Failed outcome must carry its failure and failed node.
         // Without them there is nothing to seed, so the reject is reported
         // as `no_diagnostics`.
@@ -282,22 +319,28 @@ impl GenerationDriver {
         // GN2 — VerifyCompile Fail seeds from the outcome. AM-0017-1: an
         // exhausted Edit/Analyze Model failure may reuse the lineage seed
         // from the VerifyCompile Fail that admitted the current repair
-        // generation. No session-history scrape — only the in-run stash.
+        // generation — or, before any lineage exists (every generation 1),
+        // the graph channel's run-start compile evidence. No
+        // session-history scrape — only the in-run stash and the read-only
+        // graph handle.
         let kind = self
             .deps
             .dags
             .get(ctx.dag_id)
             .await?
             .and_then(|dag| dag.nodes.get(&failed_node).map(|n| n.kind));
-        let seed = match kind {
-            Some(NodeKind::VerifyCompile) => failure.clone(),
+        let (seed, source) = match kind {
+            Some(NodeKind::VerifyCompile) => (failure.clone(), SeedSource::Outcome),
             Some(NodeKind::Edit | NodeKind::Analyze) => {
                 if failure.error_class != ErrorClass::Model {
                     return Ok(Err(ReplanReject::rule("kind")));
                 }
                 match lineage_seed {
-                    Some(seed) => seed.clone(),
-                    None => return Ok(Err(ReplanReject::missing_lineage())),
+                    Some(seed) => (seed.clone(), SeedSource::Lineage),
+                    None => match self.graph_channel_seed(failed_node).await {
+                        Some(seed) => (seed, SeedSource::Graph),
+                        None => return Ok(Err(ReplanReject::missing_lineage())),
+                    },
                 }
             }
             _ => return Ok(Err(ReplanReject::rule("kind"))),
@@ -341,7 +384,58 @@ impl GenerationDriver {
             return Ok(Err(ReplanReject::rule("deadline")));
         }
 
-        Ok(Ok(seed))
+        Ok(Ok((seed, source)))
+    }
+
+    /// AM-0017-1 fallback seed for the first-generation near-miss: the
+    /// run-start compile evidence the issue-#53 seed pass recorded in the
+    /// project graph, re-read through the same `Diagnostics` query the
+    /// repair worker uses. Error-level diagnostics only — a clean or
+    /// warning-only run start left no compile failure to repair, so the
+    /// near-miss decline stands. Graph read failures degrade to `None`
+    /// (decline, logged), never a [`DriveError`]: the graph is a read-only
+    /// evidence channel and its absence must not crash admission.
+    async fn graph_channel_seed(&self, failed_node: NodeId) -> Option<FailureIr> {
+        let view = match self
+            .deps
+            .graph
+            .query(GraphQuery::Diagnostics {
+                crate_id: None,
+                since: None,
+            })
+            .await
+        {
+            Ok(view) => view,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "graph-channel seed read failed; AM-0017-1 decline stands"
+                );
+                return None;
+            }
+        };
+        let diagnostics: Vec<_> = view
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.level == DiagnosticLevel::Error)
+            .collect();
+        if diagnostics.is_empty() {
+            return None;
+        }
+        let seed = FailureIr {
+            node: failed_node,
+            error_class: ErrorClass::Compile,
+            retry: RetryDisposition::NonRetryable,
+            diagnostics,
+            notes: "seeded from run-start compile evidence (graph channel, AM-0017-1)".into(),
+        };
+        // GN4 would also catch this downstream, but declining here keeps
+        // the near-miss decline shape (`lineage: "absent"`) intact for
+        // evidence whose projection is empty — one countable bucket.
+        if seed_projection_is_empty(&seed) {
+            return None;
+        }
+        Some(seed)
     }
 
     /// Best-effort `Replan` decision record (GN12 / LP11): failures are
@@ -791,7 +885,7 @@ impl RunExecutor for GenerationDriver {
                 return Ok(outcome);
             }
 
-            let seed = match self
+            let (seed, seed_source) = match self
                 .admission_reason(&ctx, &outcome, bumps, lineage_seed.as_ref())
                 .await
             {
@@ -819,16 +913,19 @@ impl RunExecutor for GenerationDriver {
                         // The measured silent exit (E2 bucket A): the whole
                         // edit budget is already burned, no repair was ever
                         // admitted, and the raw outcome reads like an
-                        // ordinary model failure. Loud log, and an honest
-                        // terminal IR — GN11's intact-IR rule binds only
-                        // the exhausted/deadline declines, which never
-                        // reach this branch.
+                        // ordinary model failure. Reaching here means the
+                        // graph-channel fallback found no error-level
+                        // run-start evidence either. Loud log, and an
+                        // honest terminal IR — GN11's intact-IR rule binds
+                        // only the exhausted/deadline declines, which
+                        // never reach this branch.
                         warn!(
                             run_id = %ctx.run_id,
                             dag_id = %ctx.dag_id,
                             generation = outcome.generation,
                             "repair declined without lineage (AM-0017-1 near-miss): \
-                             Edit/Analyze Model failure before any admitted verify Fail; \
+                             Edit/Analyze Model failure before any admitted verify Fail \
+                             and no run-start compile evidence in the graph channel; \
                              no repair generation was admitted in this dispatch"
                         );
                         let mut outcome = outcome;
@@ -838,7 +935,8 @@ impl RunExecutor for GenerationDriver {
                             }
                             failure.notes.push_str(
                                 "auto-repair declined (kind): Edit/Analyze Model failure \
-                                 with no in-run lineage seed (AM-0017-1); no repair \
+                                 with no in-run lineage seed and no run-start compile \
+                                 evidence in the graph channel (AM-0017-1); no repair \
                                  generation was admitted in this dispatch",
                             );
                         }
@@ -853,12 +951,13 @@ impl RunExecutor for GenerationDriver {
                     );
                     return Ok(outcome);
                 }
-                Ok(Ok(seed)) => {
+                Ok(Ok(admitted)) => {
                     gen_span.record("admitted", true);
-                    seed
+                    admitted
                 }
                 Err(e) => return Err(fold(e)),
             };
+            let seed_source = seed_source.as_str();
 
             // GN13 — undo morphing edits and re-derive the seed against the
             // restored tree before the planner writes generation N+1.
@@ -892,15 +991,6 @@ impl RunExecutor for GenerationDriver {
                 "preserved"
             } else {
                 "degraded"
-            };
-            let seed_source = if outcome
-                .failure
-                .as_ref()
-                .is_some_and(|f| f.node == seed.node && f.error_class == ErrorClass::Compile)
-            {
-                "outcome"
-            } else {
-                "lineage"
             };
             self.metrics
                 .replans_admitted

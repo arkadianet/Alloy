@@ -777,6 +777,7 @@ planning = "standard"
             edit_engine: None,
             worker_permissions: None,
             verify_compile: None,
+            graph: GraphViewHandle::null(),
         }));
         fx.plane.set_executor(driver as _);
 
