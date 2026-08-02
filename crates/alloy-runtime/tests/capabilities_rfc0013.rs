@@ -21,17 +21,18 @@ use alloy_runtime::storage::{
 };
 use alloy_runtime::types::ids::{GraphNodeId, GraphSnapshotId, GraphVersion};
 use alloy_runtime::{
-    AdapterError, ArtifactId, ArtifactKind, BudgetPolicy, CapabilityExecContext,
-    CapabilityExecError, CapabilityExecutor, CapabilityId, CapabilityRegistry, ChatRole,
-    CompletionRequest, DagId, DecisionKind, DiagnosticEvent, DiagnosticId, DiagnosticLevel, Digest,
-    ErrorClass, Goal, GraphViewHandle, Health, ModelEndpoint, ModelProvider, ModelResponse,
-    ModelTier, NodeId, NodeInputEnvelope, NodeInputPayload, NodeKind, NullContextEngine,
-    PermissionToken, PredecessorOutput, ProcessRunRouterProvider, ProfileId, ProviderError,
-    ProviderId, RecordingDecisionLog, RegistryCapabilityExecutor, RepairPlanPayload,
-    RetentionPolicy, RetryDisposition, ReviewPayload, ReviewVerdict, RouterConfig, RunId, RunRow,
-    Session, SessionId, SharedCostMeter, SpanRef, TokenBudget, ToolCall, ToolError, ToolName,
-    ToolResult, Usage, WorkerConfig, WorkerDeps, WorkerPermissions, WorkerToolClass,
-    ENVELOPE_SCHEMA_VERSION,
+    AdapterError, ArtifactId, ArtifactKind, AssembleInputs, AssembleRequest, BudgetPolicy,
+    CapabilityExecContext, CapabilityExecError, CapabilityExecutor, CapabilityId,
+    CapabilityRegistry, ChatRole, CompactStrategy, CompletionRequest, ContextEngine, ContextError,
+    DagId, DecisionKind, DiagnosticEvent, DiagnosticId, DiagnosticLevel, Digest, DomainId,
+    ErrorClass, EvictPolicy, EvictReport, Goal, GraphViewHandle, Health, ModelEndpoint,
+    ModelProvider, ModelResponse, ModelTier, NodeId, NodeInputEnvelope, NodeInputPayload, NodeKind,
+    NullContextEngine, PermissionToken, PredecessorOutput, ProcessRunRouterProvider, ProfileId,
+    PromptPack, ProviderError, ProviderId, RecordingDecisionLog, RegistryCapabilityExecutor,
+    RepairPlanPayload, RetentionPolicy, RetryDisposition, ReviewPayload, ReviewVerdict,
+    RouterConfig, RunId, RunRow, Session, SessionId, SharedCostMeter, SpanRef, StaleReason,
+    SummaryId, TokenBudget, ToolCall, ToolError, ToolName, ToolResult, Usage, WorkerConfig,
+    WorkerDeps, WorkerPermissions, WorkerToolClass, ENVELOPE_SCHEMA_VERSION,
 };
 use alloy_runtime::{CapabilityOutcome, Glob, Grant};
 use async_trait::async_trait;
@@ -378,6 +379,50 @@ impl WorkerPermissions for StaticPerms {
     }
 }
 
+/// Records every `AssembleInputs` handed to prompt assembly, then delegates
+/// to the goal-carrying `NullContextEngine` so the worker proceeds normally.
+struct RecordingEngine {
+    inner: NullContextEngine,
+    seen: Mutex<Vec<AssembleInputs>>,
+}
+
+impl RecordingEngine {
+    fn new(goal: &str) -> Self {
+        Self {
+            inner: NullContextEngine::with_goal(goal),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn seen(&self) -> Vec<AssembleInputs> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ContextEngine for RecordingEngine {
+    async fn assemble(&self, req: AssembleRequest) -> Result<PromptPack, ContextError> {
+        self.inner.assemble(req).await
+    }
+    async fn assemble_with(
+        &self,
+        req: AssembleRequest,
+        inputs: AssembleInputs,
+    ) -> Result<PromptPack, ContextError> {
+        self.seen.lock().unwrap().push(inputs.clone());
+        self.inner.assemble_with(req, inputs).await
+    }
+    async fn compact(&self, d: DomainId, s: CompactStrategy) -> Result<(), ContextError> {
+        self.inner.compact(d, s).await
+    }
+    async fn evict(&self, p: EvictPolicy) -> Result<EvictReport, ContextError> {
+        self.inner.evict(p).await
+    }
+    async fn mark_stale(&self, id: SummaryId, r: StaleReason) -> Result<(), ContextError> {
+        self.inner.mark_stale(id, r).await
+    }
+}
+
 // --- fixture ------------------------------------------------------------
 
 fn router_toml(supports_structured: bool, supports_json_schema: bool) -> String {
@@ -450,6 +495,8 @@ struct FixtureSpec {
     graph: Option<Arc<FixesGraph>>,
     /// RFC-0017 AM-0013-1: register the planning worker's model branch.
     planning_model: bool,
+    /// Recording prompt-assembly seam; `None` ⇒ the plain `NullContextEngine`.
+    engine: Option<Arc<RecordingEngine>>,
 }
 
 impl Default for FixtureSpec {
@@ -463,6 +510,7 @@ impl Default for FixtureSpec {
             config: WorkerConfig::default(),
             graph: None,
             planning_model: false,
+            engine: None,
         }
     }
 }
@@ -489,9 +537,12 @@ fn fixture(spec: FixtureSpec) -> Fixture {
     ));
     let deps = WorkerDeps {
         routers,
-        context: Arc::new(NullContextEngine::with_goal(
-            "fix the type error in src/main.rs",
-        )),
+        context: match &spec.engine {
+            Some(e) => Arc::clone(e) as Arc<dyn ContextEngine>,
+            None => Arc::new(NullContextEngine::with_goal(
+                "fix the type error in src/main.rs",
+            )),
+        },
         tools: Arc::clone(&tools) as Arc<dyn ToolCaller>,
         perms: Arc::clone(&perms) as _,
         graph: match &spec.graph {
@@ -552,6 +603,7 @@ fn exec_ctx(
         },
         attempt: 1,
         cost_meter: fx.meter.clone(),
+        prior_failure: None,
     }
 }
 
@@ -742,6 +794,137 @@ fn success(outcome: CapabilityOutcome) -> serde_json::Value {
 }
 
 // --- tests --------------------------------------------------------------
+
+// ---- Retry memory: `CapabilityExecContext.prior_failure` must reach the
+// engine's `AssembleInputs` through the real executor and each real worker.
+// The engine's rendering/budgeting of the field is proven separately
+// (`default_engine.rs::prior_failure_tests`); these tests pin the handoff.
+
+fn prior_attempt_failure(node: NodeId) -> alloy_runtime::FailureIr {
+    alloy_runtime::FailureIr {
+        node,
+        error_class: ErrorClass::Model,
+        retry: RetryDisposition::Retryable,
+        diagnostics: vec![],
+        notes: "attempt 1: patch hunk did not apply at src/main.rs:1".into(),
+    }
+}
+
+fn assert_prior_forwarded(engine: &RecordingEngine, node: NodeId) {
+    let seen = engine.seen();
+    let inputs = seen.first().expect("the worker reached prompt assembly");
+    let prior = inputs
+        .prior_failure
+        .as_ref()
+        .expect("ctx.prior_failure must be forwarded to AssembleInputs.prior_failure");
+    assert_eq!(prior.node, node);
+    assert_eq!(prior.error_class, ErrorClass::Model);
+    assert_eq!(
+        prior.notes,
+        "attempt 1: patch hunk did not apply at src/main.rs:1"
+    );
+}
+
+#[tokio::test]
+async fn repair_worker_forwards_the_prior_failure_to_prompt_assembly() {
+    let engine = Arc::new(RecordingEngine::new("fix the type error in src/main.rs"));
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(repair_response(&["src/main.rs"], false))],
+        engine: Some(Arc::clone(&engine)),
+        ..FixtureSpec::default()
+    });
+    let payload = failure_pred(&fx, &[diagnostic("src/main.rs", "E0308")]).await;
+    let mut ctx = exec_ctx(&fx, "repair", NodeKind::Analyze, payload);
+    ctx.prior_failure = Some(prior_attempt_failure(ctx.meta.node_id));
+    success(fx.executor.execute(&ctx).await.unwrap());
+    assert_prior_forwarded(&engine, ctx.meta.node_id);
+}
+
+#[tokio::test]
+async fn edit_worker_forwards_the_prior_failure_to_prompt_assembly() {
+    let engine = Arc::new(RecordingEngine::new("fix the type error in src/main.rs"));
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(patch_response(GOOD_DIFF))],
+        tool_results: vec![apply_ok(true, false), apply_ok(false, true)],
+        engine: Some(Arc::clone(&engine)),
+        ..FixtureSpec::default()
+    });
+    let plan = json!({
+        "schema_version": 1,
+        "capability": "repair",
+        "summary": "fix annotation",
+        "target_files": ["src/main.rs"],
+        "steps": [],
+        "diagnostics_addressed": [],
+        "needs_replan": false,
+        "truncated": false,
+        "confidence": 0.9,
+        "citations": [],
+        "artifacts": [],
+        "metrics": {
+            "model_tier_used": "standard",
+            "provider_id": "provider",
+            "input_tokens": null,
+            "output_tokens": null,
+            "tool_calls": 0,
+            "cache_hits": 0,
+            "duration_ms": 1,
+            "confidence": null,
+            "error_class": null,
+        },
+    });
+    let payload = json_pred(&fx, NodeKind::Analyze, &plan).await;
+    let mut ctx = exec_ctx(&fx, "edit", NodeKind::Edit, payload);
+    ctx.prior_failure = Some(prior_attempt_failure(ctx.meta.node_id));
+    success(fx.executor.execute(&ctx).await.unwrap());
+    assert_prior_forwarded(&engine, ctx.meta.node_id);
+}
+
+#[tokio::test]
+async fn planning_model_worker_forwards_the_prior_failure_to_prompt_assembly() {
+    let engine = Arc::new(RecordingEngine::new("fix the type error in src/main.rs"));
+    let reply = json!({
+        "schema_version": 1,
+        "nodes": [
+            { "name": "analyze", "kind": "analyze", "approval_reason": null },
+            { "name": "edit", "kind": "edit", "approval_reason": null },
+            { "name": "verify", "kind": "verify_compile", "approval_reason": null },
+            { "name": "gate", "kind": "gate_human", "approval_reason": "Approve fix" }
+        ],
+        "rationale": "repair chain",
+        "confidence": 0.8
+    });
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(reply)],
+        planning_model: true,
+        engine: Some(Arc::clone(&engine)),
+        ..FixtureSpec::default()
+    });
+    let mut ctx = exec_ctx(&fx, "planning", NodeKind::Plan, goal());
+    ctx.prior_failure = Some(prior_attempt_failure(ctx.meta.node_id));
+    success(fx.executor.execute(&ctx).await.unwrap());
+    assert_prior_forwarded(&engine, ctx.meta.node_id);
+}
+
+#[tokio::test]
+async fn review_worker_forwards_the_prior_failure_to_prompt_assembly() {
+    let engine = Arc::new(RecordingEngine::new("fix the type error in src/main.rs"));
+    let fx = fixture(FixtureSpec {
+        responses: vec![structured(json!({
+            "verdict": "approve",
+            "findings": [],
+            "summary": "fine",
+            "confidence": 0.7,
+        }))],
+        engine: Some(Arc::clone(&engine)),
+        ..FixtureSpec::default()
+    });
+    let payload = goal_with_diff(&fx, GOOD_DIFF).await;
+    let mut ctx = exec_ctx(&fx, "review", NodeKind::Review, payload);
+    ctx.prior_failure = Some(prior_attempt_failure(ctx.meta.node_id));
+    success(fx.executor.execute(&ctx).await.unwrap());
+    assert_prior_forwarded(&engine, ctx.meta.node_id);
+}
 
 #[tokio::test]
 async fn repair_worker_produces_plan_from_predecessor_failure_ir() {

@@ -477,6 +477,7 @@ async fn record_edit_attempt(
 /// #     },
 /// #     attempt: 1,
 /// #     cost_meter: SharedCostMeter::new(),
+/// #     prior_failure: None,
 ///     // ...
 /// };
 ///
@@ -660,18 +661,13 @@ impl EditWorker {
             diagnostics,
             budget: Some(ctx.budget.clone()),
             focus_paths,
-            // NOT WIRED. The renderer and budget below this exist and are
-            // tested, but no producer feeds them: `CapabilityContext` carries
-            // `attempt` and no prior `FailureIr`, so every call site — here,
-            // repair, planning, review — passes None.
-            //
-            // Retry amnesia is therefore UNFIXED in production. The edit node
-            // retries up to three times and escalates tier after the first,
-            // and each attempt still starts blind. Wiring this means adding
-            // the failure to `CapabilityContext` and populating it at the
-            // retry dispatch site; until that lands, treat this field as
-            // scaffolding, not as a delivered capability.
-            prior_failure: None,
+            // Retry memory: the scheduler captures a failed attempt's
+            // terminal `FailureIr` at its retry seam and threads it through
+            // `CapabilityExecContext` → `CapabilityContext`; the engine
+            // renders it as one bounded `conversation:prior_failure`
+            // section. Absent on first attempts and on crash-resumed
+            // attempts whose outcome was not captured.
+            prior_failure: ctx.prior_failure.cloned(),
         };
 
         // §7.2 turn budget: the model turn(s), the EW6 dry-run, and the PS6
@@ -1564,6 +1560,7 @@ mod live_diagnostics_tests {
             deadline: Duration::from_secs(30),
             cancel: CancellationToken::new(),
             input,
+            prior_failure: None,
             router: Arc::new(StubRouter),
             context: engine,
             tools: Arc::new(StubTools),
@@ -1969,6 +1966,7 @@ mod exchange_tests {
             deadline: Duration::from_secs(30),
             cancel: CancellationToken::new(),
             input: &input,
+            prior_failure: None,
             router: Arc::clone(&router) as Arc<dyn ModelRouter>,
             context: Arc::new(NullContextEngine::with_goal(
                 "fix the type error in src/main.rs",

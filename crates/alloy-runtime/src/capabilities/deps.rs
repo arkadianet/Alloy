@@ -20,6 +20,7 @@ use crate::router::{
 };
 use crate::storage::{ArtifactStore, SessionRows};
 use crate::types::budget::{BudgetPolicy, ModelTier, TokenBudget};
+use crate::types::diagnostic::FailureIr;
 use crate::types::ids::{CapabilityId, DagId, NodeId, RunId, SessionId};
 use crate::ToolCaller;
 
@@ -28,8 +29,8 @@ use super::perms::WorkerPermissions;
 /// Everything a worker needs that is *not* per-attempt. Cloneable (all `Arc`).
 ///
 /// Constructor-injected by the composition root (RFC-0015, §3.8) — never
-/// carried on the merged `CapabilityExecContext`, which stays byte-identical
-/// to RFC-0010.
+/// carried on the merged `CapabilityExecContext` (whose only post-RFC-0010
+/// addition is the per-attempt `prior_failure` retry memory).
 #[derive(Clone)]
 pub struct WorkerDeps {
     /// Run-scoped router provider (§3.7).
@@ -134,6 +135,12 @@ pub struct CapabilityContext<'a> {
     // --- input ---
     /// Decoded input envelope.
     pub input: &'a NodeInputEnvelope,
+    /// Terminal failure of this node's previous scheduler attempt, when one
+    /// was captured (retry memory). Absent on first attempts and on resumed
+    /// attempts whose prior outcome was not captured. Workers forward it to
+    /// `AssembleInputs.prior_failure`; the context engine bounds the
+    /// rendering (`PRIOR_FAILURE_MAX_BYTES`).
+    pub prior_failure: Option<&'a FailureIr>,
 
     // --- seams ---
     /// Router bound to `run` and to `cost_meter` (MR1, BG1).

@@ -99,6 +99,13 @@ pub(super) struct RunCtx<'a> {
     /// the event log and we owe the wait" — without it the in-loop retry path
     /// would sleep twice per retry.
     backoff_served: std::sync::Mutex<std::collections::HashSet<NodeId>>,
+    /// Retry memory: the last terminal failure this `run` invocation captured
+    /// for each node, recorded by `apply_soft_failure` and read by the next
+    /// `dispatch_node` of the same node. Process-local ON PURPOSE — after a
+    /// crash resume the prior outcome was not captured, and the honest value
+    /// is absence (never a recovered guess and never `adopt_running`'s
+    /// synthetic "adopted after restart" failure, which bypasses this map).
+    prior_failures: std::sync::Mutex<std::collections::HashMap<NodeId, FailureIr>>,
 }
 
 impl RunCtx<'_> {
@@ -158,6 +165,25 @@ impl RunCtx<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&node)
+    }
+
+    /// Record `node`'s captured terminal failure for its next dispatch.
+    fn record_prior_failure(&self, node: NodeId, failure: FailureIr) {
+        self.prior_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(node, failure);
+    }
+
+    /// The failure this `run` invocation captured for `node`'s previous
+    /// attempt, if any. `None` on first attempts and on crash-resumed
+    /// attempts (uncaptured ⇒ absent — never an empty-but-present value).
+    fn prior_failure_of(&self, node: NodeId) -> Option<FailureIr> {
+        self.prior_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&node)
+            .cloned()
     }
 
     /// §5.7.9 `GATE_REREGISTER_MAX`: consume one re-registration attempt for
@@ -407,6 +433,7 @@ impl LinearScheduler {
             expired_gates: std::sync::Mutex::new(std::collections::HashSet::new()),
             gate_reregister_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
             backoff_served: std::sync::Mutex::new(std::collections::HashSet::new()),
+            prior_failures: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         // BG1/BG5: record once, now that `rc` exists to record through.
         self.record_budget_ignored(&rc, &effective).await;
@@ -1071,6 +1098,10 @@ impl LinearScheduler {
             budget: dag.nodes[&node_id].budget.clone(),
             deadline: node_deadline,
             input,
+            // Retry memory: absent on attempt 1 (nothing recorded yet) and
+            // on crash-resumed attempts (the map is process-local — an
+            // uncaptured outcome must read "unknown").
+            prior_failure: rc.prior_failure_of(node_id),
         };
         let meta = NodeExecRef {
             session_id: rc.session.id,
@@ -1138,6 +1169,7 @@ impl LinearScheduler {
             budget,
             deadline,
             input,
+            prior_failure,
         } = plan;
         match kind {
             NodeKind::Plan | NodeKind::Analyze | NodeKind::Edit | NodeKind::Review => {
@@ -1155,6 +1187,7 @@ impl LinearScheduler {
                     input,
                     attempt: meta.attempt,
                     cost_meter: self.deps.cost_meters.meter_for(meta.run_id),
+                    prior_failure,
                 };
                 match self.deps.capabilities.execute(&ctx).await {
                     Ok(CapabilityOutcome::Succeeded { payload }) => {
@@ -1325,6 +1358,12 @@ impl LinearScheduler {
         attempt: u32,
         failure: FailureIr,
     ) -> Result<StepOutcome, SchedError> {
+        // Retry memory: this is the seam where a dispatched attempt's real
+        // terminal failure is in hand, so the next dispatch of this node can
+        // see it (`DispatchPlan.prior_failure`). Recording here — not in
+        // `admit_retry` — keeps `adopt_running`'s synthetic post-crash
+        // failure out of the map: an uncaptured outcome stays absent.
+        rc.record_prior_failure(node_id, failure.clone());
         match self.admit_retry(dag, rc, node_id, attempt, failure).await? {
             StepOutcome::Terminal(outcome) => Ok(StepOutcome::Terminal(outcome)),
             other => Ok(other),
@@ -2081,6 +2120,11 @@ struct DispatchPlan {
     /// scheduler's.
     deadline: Duration,
     input: crate::dag::NodeInputEnvelope,
+    /// Retry memory: the terminal failure this process captured for this
+    /// node's previous attempt, if any. `None` on first attempts and on
+    /// crash-resumed attempts (the failure was not captured here) — absence
+    /// must read "unknown", never "the last attempt was fine".
+    prior_failure: Option<FailureIr>,
 }
 
 /// Success payload or structured failure from one dispatch (capability or
@@ -7460,6 +7504,169 @@ mod tests {
             started.elapsed() < Duration::from_millis(20_000),
             "in-loop retry double-waited its backoff: {:?}",
             started.elapsed()
+        );
+        fx.close().await;
+    }
+
+    // ---- Retry memory: the re-dispatch carries the prior captured failure ----
+
+    /// Records `ctx.prior_failure` on every dispatch, then returns the queued
+    /// outcomes in order.
+    struct PriorFailureCapturingCapability {
+        seen: StdMutex<Vec<Option<FailureIr>>>,
+        outcomes: StdMutex<VecDeque<Result<CapabilityOutcome, CapabilityExecError>>>,
+    }
+    impl PriorFailureCapturingCapability {
+        fn new(outcomes: Vec<Result<CapabilityOutcome, CapabilityExecError>>) -> Arc<Self> {
+            Arc::new(Self {
+                seen: StdMutex::new(Vec::new()),
+                outcomes: StdMutex::new(VecDeque::from(outcomes)),
+            })
+        }
+        fn seen(&self) -> Vec<Option<FailureIr>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl CapabilityExecutor for PriorFailureCapturingCapability {
+        async fn execute(
+            &self,
+            ctx: &CapabilityExecContext,
+        ) -> Result<CapabilityOutcome, CapabilityExecError> {
+            self.seen.lock().unwrap().push(ctx.prior_failure.clone());
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(CapabilityExecError::Internal("exhausted".into())))
+        }
+    }
+
+    /// Retry memory end to end through a real `LinearScheduler::run`: the
+    /// attempt that follows an admitted retry sees the failed attempt's
+    /// captured `FailureIr` on `CapabilityExecContext.prior_failure`, and the
+    /// first attempt sees none (its dispatch is byte-identical to today).
+    #[tokio::test]
+    async fn retry_dispatch_carries_the_prior_attempts_captured_failure() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Edit).await;
+        let mut node = llm_node(a, NodeKind::Edit, input, adapter_retry());
+        node.retry = RetryPolicy {
+            max_attempts: 2,
+            backoff: Backoff::Fixed { delay_ms: 0 },
+            retry_on: vec![ErrorClass::Model],
+            escalate_after: None,
+            escalate_to_tier: None,
+        };
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Pending,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let caps = PriorFailureCapturingCapability::new(vec![
+            Ok(CapabilityOutcome::Failed {
+                failure: retryable_model_failure(a, "stale hunk anchor at src/main.rs:3"),
+            }),
+            Ok(CapabilityOutcome::Succeeded {
+                payload: serde_json::json!({"ok": true}),
+            }),
+        ]);
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-prior"),
+            Arc::clone(&caps) as Arc<dyn CapabilityExecutor>,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(600),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        let seen = caps.seen();
+        assert_eq!(seen.len(), 2, "one failed attempt plus its retry");
+        assert!(
+            seen[0].is_none(),
+            "attempt 1 must dispatch with no prior failure"
+        );
+        let prior = seen[1]
+            .as_ref()
+            .expect("attempt 2 must carry attempt 1's captured terminal failure");
+        assert_eq!(prior.node, a);
+        assert_eq!(prior.error_class, ErrorClass::Model);
+        assert_eq!(prior.retry, RetryDisposition::Retryable);
+        assert_eq!(prior.notes, "stale hunk anchor at src/main.rs:3");
+        fx.close().await;
+    }
+
+    /// Honesty on crash resume (R13): `adopt_running` retries an adopted
+    /// node with a *synthetic* "adopted after restart" failure — the real
+    /// outcome of the interrupted attempt was never captured. The
+    /// re-dispatch must present ABSENCE, not that fabrication (and not an
+    /// empty-but-present value that reads as "the last attempt went fine").
+    #[tokio::test]
+    async fn adopted_resume_dispatch_carries_no_fabricated_prior_failure() {
+        let fx = Fixture::new().await;
+        let session = fx.seed_session().await;
+        let dag_id = DagId::new();
+        let a = NodeId::new();
+        let input = fx.put_goal_envelope(dag_id, a, NodeKind::Analyze).await;
+        let mut node = llm_node(
+            a,
+            NodeKind::Analyze,
+            input,
+            RetryPolicy {
+                max_attempts: 3,
+                backoff: Backoff::Fixed { delay_ms: 0 },
+                // Includes Internal so the synthetic adoption failure is
+                // admitted and the node genuinely re-dispatches.
+                retry_on: vec![ErrorClass::Model, ErrorClass::Internal],
+                escalate_after: None,
+                escalate_to_tier: None,
+            },
+        );
+        node.state = NodeState::Running; // crash landed mid-attempt
+        let dag = TaskDag {
+            id: dag_id,
+            session_id: session,
+            generation: 1,
+            nodes: BTreeMap::from([(a, node)]),
+            edges: vec![],
+            state: DagState::Running,
+        };
+        fx.storage.dags().put(&dag).await.unwrap();
+        fx.seed_run(session, dag_id, "running").await;
+
+        let caps = PriorFailureCapturingCapability::new(vec![Ok(CapabilityOutcome::Succeeded {
+            payload: serde_json::json!({"ok": true}),
+        })]);
+        let sched = fx.build_scheduler(
+            fx._dir.path().join("s-prior-adopt"),
+            Arc::clone(&caps) as Arc<dyn CapabilityExecutor>,
+            Arc::new(crate::adapters::UnavailableVerifyCompile),
+            Arc::new(crate::adapters::UnavailableVerifyTest),
+            Arc::new(crate::adapters::UnavailableGateHuman),
+            BudgetPolicy::default(),
+            Duration::from_secs(600),
+        );
+        let outcome = sched.run(dag_id).await.unwrap();
+        assert_eq!(outcome.state, DagState::Succeeded);
+
+        let seen = caps.seen();
+        assert_eq!(seen.len(), 1, "the adopted node re-dispatches once");
+        assert!(
+            seen[0].is_none(),
+            "an uncaptured prior outcome must be ABSENT, not the synthetic \
+             'adopted after restart' failure"
         );
         fx.close().await;
     }

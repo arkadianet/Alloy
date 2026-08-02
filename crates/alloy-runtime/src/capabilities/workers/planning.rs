@@ -208,7 +208,7 @@ impl PlanningWorker {
             diagnostics: vec![],
             budget: Some(ctx.budget.clone()),
             focus_paths: vec![],
-            prior_failure: None,
+            prior_failure: ctx.prior_failure.cloned(),
         };
         let system = if self.config.enable_review {
             PLANNING_SYSTEM

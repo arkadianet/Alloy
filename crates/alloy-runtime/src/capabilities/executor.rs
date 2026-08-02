@@ -102,6 +102,7 @@ impl CapabilityExecutor for RegistryCapabilityExecutor {
             deadline: ctx.timeout,
             cancel: ctx.cancellation.clone(),
             input: &ctx.input,
+            prior_failure: ctx.prior_failure.as_ref(),
             router,
             context: Arc::clone(&deps.context),
             tools: Arc::clone(&deps.tools),
@@ -216,6 +217,7 @@ mod tests {
             },
             attempt: 1,
             cost_meter: SharedCostMeter::new(),
+            prior_failure: None,
         }
     }
 

@@ -268,6 +268,38 @@ pub(crate) fn parse_model_diff(diff: &str) -> Result<PatchSet, String> {
                     }
                     Some(b'-') => seen_old += 1,
                     Some(b'+') => seen_new += 1,
+                    None => {
+                        // A blank context line loses its leading space in
+                        // transit constantly — models copy a blank line out
+                        // of a file and emit it bare. Since the body is read
+                        // by structure and not by the header's counts, the
+                        // discriminator is what FOLLOWS: skip the run of
+                        // blanks, and if hunk-shaped content resumes after
+                        // it, they were context. Otherwise the hunk ended and
+                        // the blanks are separator or trailing junk.
+                        let mut ahead = lines.clone();
+                        let mut blanks = 0usize;
+                        while ahead.peek().is_some_and(|n| n.is_empty()) {
+                            ahead.next();
+                            blanks += 1;
+                        }
+                        let resumes = ahead.peek().is_some_and(|n| {
+                            matches!(n.as_bytes().first(), Some(b' ' | b'-' | b'+'))
+                                || n.starts_with("@@")
+                        });
+                        if !resumes {
+                            break;
+                        }
+                        // Re-emit them with the sigil the rest of the
+                        // pipeline requires; a bare "" is not a body line.
+                        for _ in 0..blanks {
+                            seen_old += 1;
+                            seen_new += 1;
+                            body.push(" ".to_owned());
+                            lines.next();
+                        }
+                        continue;
+                    }
                     _ => break, // not a body line; outer structure resumes
                 }
                 body.push(l.to_owned());
@@ -1197,6 +1229,37 @@ mod tests {
     /// stated rationale — mirroring an ops-path anchoring rule — was wrong,
     /// because `insert_lines` with `after_line > 0` carries no `expect`
     /// either. Both paths are equally unanchored today; anchor them together.
+    /// Models copy a blank line out of a file and emit it bare, losing the
+    /// leading space. An earlier fix for this landed in alloy-tools, one
+    /// layer PAST the parser the model's text actually reaches first — so it
+    /// could never fire in production. This is the parser that runs.
+    #[test]
+    fn blank_context_line_inside_a_hunk_is_body_not_a_terminator() {
+        let patch =
+            "--- a/a.rs\n+++ b/a.rs\n@@ -1,4 +1,4 @@\n fn a() {}\n\n-fn b() {}\n+fn b(x: u8) {}\n";
+        let set = parse_model_diff(patch).expect("blank context line must stay in the hunk");
+        let rendered = format!("{set:?}");
+        assert!(rendered.contains("fn b(x: u8)"), "{rendered}");
+    }
+
+    #[test]
+    fn consecutive_blank_context_lines_stay_in_the_hunk() {
+        let patch = "--- a/a.rs\n+++ b/a.rs\n@@ -1,5 +1,5 @@\n fn a() {}\n\n\n-fn b() {}\n+fn b(x: u8) {}\n";
+        parse_model_diff(patch).expect("a run of blank context lines must stay in the hunk");
+    }
+
+    /// The counts cannot be the discriminator here — this parser reads the
+    /// body by structure precisely because local models mis-count — so the
+    /// blank-line rule must not swallow genuine trailing junk.
+    #[test]
+    fn blank_line_before_trailing_junk_still_ends_the_hunk() {
+        let patch = "--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-fn b() {}\n+fn b(x: u8) {}\n\nHope this helps!\n";
+        assert!(
+            parse_model_diff(patch).is_err(),
+            "prose after a hunk must still be refused"
+        );
+    }
+
     #[test]
     fn diff_u0_midfile_insertion_is_accepted() {
         let patch = "--- a/a.rs\n+++ b/a.rs\n@@ -2,0 +3,1 @@\n+inserted\n";

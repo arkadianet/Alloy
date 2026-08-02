@@ -177,6 +177,17 @@ pub(crate) fn parse_unified_diff(text: &str) -> Result<PatchSet, EditError> {
                 if l.starts_with("@@ ") || l.starts_with("diff --git ") {
                     break;
                 }
+                // A bare blank line inside a count-incomplete hunk is an empty
+                // context line whose ' ' sigil the emitter dropped (models do
+                // this when copying blank lines; git apply and GNU patch read
+                // it the same way). Counts discriminate: a blank no context
+                // slot can absorb stays malformed, and a blank after a
+                // count-complete hunk was consumed by the break above.
+                let l = if l.is_empty() && old_count < old_lines && new_count < new_lines {
+                    " "
+                } else {
+                    l
+                };
                 let Some(&prefix) = l.as_bytes().first() else {
                     return Err(EditError::InvalidPatch("hunk line content".into()));
                 };
@@ -650,7 +661,12 @@ pub(crate) fn validate_hunk_line_counts(hunk: &Hunk) -> Result<(), EditError> {
             return Err(EditError::InvalidPatch("hunk line content".into()));
         }
         let Some(prefix) = line.chars().next() else {
-            return Err(EditError::InvalidPatch("hunk line content".into()));
+            // Zero-length line: an empty context line whose ' ' sigil the
+            // emitter dropped. The declared counts still discriminate, and
+            // apply anchors it against the file like any other context line.
+            old_count = old_count.saturating_add(1);
+            new_count = new_count.saturating_add(1);
+            continue;
         };
         match prefix {
             ' ' => {
@@ -1197,6 +1213,91 @@ dissimilarity index 100%
             panic!("expected create");
         };
         assert_eq!(hunks[0].lines, vec!["+value"]);
+    }
+
+    /// A bare blank line inside a hunk body is what models (and
+    /// whitespace-stripping mailers) emit for an empty context line; git
+    /// apply and GNU patch both read it as ' ' context when the declared
+    /// counts admit one, and so do we.
+    #[test]
+    fn interior_blank_line_is_empty_context_when_counts_admit_it() {
+        let diff = "\
+--- a/a.rs
++++ b/a.rs
+@@ -1,4 +1,4 @@
+ fn a() {}
+
+-fn b() {}
++fn b(x: u8) {}
+ fn c() {}
+";
+        let patch = parse_unified_diff(diff).unwrap();
+        let FilePatch::Modify { hunks, .. } = &patch.files[0] else {
+            panic!("expected modify");
+        };
+        assert_eq!(hunks[0].lines[1], " ", "blank body line is empty context");
+        let bytes = crate::edit::apply::apply_hunks_to_text(
+            "a.rs",
+            "fn a() {}\n\nfn b() {}\nfn c() {}\n",
+            hunks,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"fn a() {}\n\nfn b(x: u8) {}\nfn c() {}\n");
+    }
+
+    /// Counts are the discriminator: a blank line where no context slot can
+    /// absorb it (pure insertion) is still malformed.
+    #[test]
+    fn blank_line_outside_count_window_still_rejected() {
+        let insertion = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1,0 +2,2 @@
++two
+
++three
+";
+        assert!(matches!(
+            parse_unified_diff(insertion),
+            Err(EditError::InvalidPatch(ref m)) if m == "hunk line content"
+        ));
+    }
+
+    /// A count-complete hunk ends the body loop, so junk after it — with or
+    /// without a blank separator — is still refused.
+    #[test]
+    fn trailing_junk_after_complete_hunk_still_rejected() {
+        for tail in ["Thanks!\n", "\nThanks!\n"] {
+            let diff = format!("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n{tail}");
+            assert!(matches!(
+                parse_unified_diff(&diff),
+                Err(EditError::InvalidPatch(ref m)) if m == "hunk header"
+            ));
+        }
+    }
+
+    /// Blank lines between count-complete hunks stay separators, not context.
+    #[test]
+    fn blank_separator_between_hunks_still_parses() {
+        let diff = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-one
++ONE
+
+@@ -3 +3 @@
+-three
++THREE
+";
+        let patch = parse_unified_diff(diff).unwrap();
+        let FilePatch::Modify { hunks, .. } = &patch.files[0] else {
+            panic!("expected modify");
+        };
+        assert_eq!(hunks.len(), 2);
+        let bytes =
+            crate::edit::apply::apply_hunks_to_text("a.txt", "one\ntwo\nthree\n", hunks).unwrap();
+        assert_eq!(bytes, b"ONE\ntwo\nTHREE\n");
     }
 
     #[test]

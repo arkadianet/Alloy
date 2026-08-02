@@ -200,10 +200,15 @@ pub(crate) fn apply_hunks_to_text(
         new_lines.extend_from_slice(&old_lines[old_idx..start]);
         old_idx = start;
         for raw in &hunk.lines {
-            let Some((&prefix, content)) = raw.as_bytes().split_first() else {
-                return Err(bad_line(raw));
+            // A zero-length line is an empty context line with its ' ' sigil
+            // dropped by the emitter; it is content-checked like any context.
+            let (prefix, content) = match raw.as_bytes().split_first() {
+                Some((&prefix, content)) => (
+                    prefix,
+                    std::str::from_utf8(content).map_err(|_| bad_line(raw))?,
+                ),
+                None => (b' ', ""),
             };
-            let content = std::str::from_utf8(content).map_err(|_| bad_line(raw))?;
             match prefix {
                 b' ' => {
                     let Some(actual) = old_lines.get(old_idx) else {
@@ -862,7 +867,9 @@ mod tests {
 
     #[test]
     fn invalid_hunk_prefixes_are_panic_free() {
-        for line in ["", "écontent"] {
+        // ("" is no longer a bad prefix — it reads as empty context, so with
+        // declared counts 0/0 it is a count mismatch, not bad content.)
+        for (line, message) in [("", "hunk line count"), ("écontent", "hunk line content")] {
             let malformed = Hunk {
                 old_start: 1,
                 old_lines: 0,
@@ -876,7 +883,7 @@ mod tests {
             // first; the apply loop's own prefix check is defense in depth.
             assert!(matches!(
                 apply_hunks_to_text("a.txt", "one\n", &[malformed]),
-                Err(EditError::InvalidPatch(ref message)) if message == "hunk line content"
+                Err(EditError::InvalidPatch(ref got)) if got == message
             ));
         }
     }
@@ -887,6 +894,29 @@ mod tests {
         mid_file.eof_newline = false;
         let bytes = apply_hunks_to_text("a.txt", "one\ntwo\n", &[mid_file]).unwrap();
         assert_eq!(bytes, b"ONE\ntwo\n");
+    }
+
+    /// A zero-length hunk line on the structured wire is an empty context
+    /// line whose ' ' sigil the emitter dropped; it stays anchored — the
+    /// file's line at that position must itself be blank.
+    #[test]
+    fn zero_length_line_applies_as_empty_context() {
+        let h = Hunk {
+            old_start: 1,
+            old_lines: 3,
+            new_start: 1,
+            new_lines: 3,
+            lines: vec![" a".into(), String::new(), "-b".into(), "+B".into()],
+            eof_newline: true,
+            old_eof_no_newline: false,
+        };
+        let bytes = apply_hunks_to_text("a.txt", "a\n\nb\n", std::slice::from_ref(&h)).unwrap();
+        assert_eq!(bytes, b"a\n\nB\n");
+        // Still content-checked: a non-blank file line is a mismatch.
+        assert!(matches!(
+            apply_hunks_to_text("a.txt", "a\nX\nb\n", &[h]),
+            Err(EditError::ContextMismatch { .. })
+        ));
     }
 
     #[test]
