@@ -620,6 +620,183 @@ fn verify_expect(path: &str, start: u32, expect: &[String], lines: &[&str]) -> R
     Ok(())
 }
 
+/// Kind and name of a named item a Rust source line declares, if any.
+///
+/// Only kinds whose names Rust requires to be unique within a namespace are
+/// reported (the E0428/E0592 class). `impl` is deliberately absent (repeated
+/// impl blocks are legal) and so is `use` (a genuinely new import must never
+/// be refused; an exact re-import is caught by the verbatim check instead).
+fn declared_item(line: &str) -> Option<(&'static str, &str)> {
+    let code = line.trim_start();
+    if code.starts_with("//") {
+        return None; // comments, including doc lines, declare nothing
+    }
+    let mut tokens = code.split_whitespace().peekable();
+    let kind = loop {
+        match tokens.next()? {
+            // Qualifiers that may precede the item keyword.
+            "pub" | "default" | "unsafe" | "async" | "extern" => {}
+            t if t.starts_with("pub(") || t.starts_with('"') => {}
+            // `const fn f` is a qualified fn; `const N: T` declares N.
+            "const" if tokens.peek() == Some(&"fn") => {}
+            "const" => break "const",
+            "fn" => break "fn",
+            "struct" => break "struct",
+            "enum" => break "enum",
+            "trait" => break "trait",
+            "mod" => break "mod",
+            "union" => break "union",
+            "type" => break "type",
+            "static" => break "static",
+            "macro_rules!" => break "macro_rules!",
+            _ => return None,
+        }
+    };
+    let mut name_tok = tokens.next()?;
+    if name_tok == "mut" {
+        name_tok = tokens.next()?; // `static mut NAME`
+    }
+    let name = name_tok
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .next()
+        .filter(|n| !n.is_empty())?;
+    Some((kind, name))
+}
+
+/// `insert_lines` is the only op with no `expect`, so nothing ties it to the
+/// content it was authored against — and measured live (144 attempts), the
+/// model's dominant misuse is expressing REPLACEMENT with it: inserting a
+/// lightly modified copy of an item that is still in the file, leaving both
+/// copies (44/144 attempts destroyed the file this way — 32 structurally
+/// invalid, 12 E0428). A byte-identical check at the insertion point caught
+/// none of them. Two precise refusals, no similarity thresholds:
+///
+/// 1. The block already sits verbatim at the boundary (either side): the
+///    edit is already applied, and re-sending it only duplicates it. Blocks
+///    with no alphanumeric content (`}`, blank lines) are exempt — they
+///    carry no identity, and inserting a brace beside an identical brace
+///    line is a legitimate delimiter repair.
+/// 2. (`.rs` only) An inserted line declares an item (kind + name) the file
+///    already declares. Rust allows one item per kind + name per namespace
+///    (E0428/E0592), so the copy necessarily conflicts with the original
+///    that the insert cannot remove — the op the model wanted is
+///    replace_lines, and the error says so. Declarations nested in a scope
+///    the insert itself opens are exempt unless that scope re-opens one
+///    whose header line already exists in the file (a copied `impl Foo {`):
+///    a genuinely new scope (`impl Display for Foo {`, a new mod)
+///    namespaces its contents away from existing items.
+///
+/// Both checks over-approximate (the file side ignores scoping; brace depth
+/// is counted naively), so a rare legitimate insert — say a same-named
+/// method for an unrelated type elsewhere in the file — can be refused.
+/// That costs one retry: the error routes the model to replace_lines, which
+/// expresses the same edit anchored by `expect`. A missed duplicate costs
+/// the whole attempt (measured 0% pass once a file is structurally broken).
+fn reject_duplicating_insert(path: &str, op: &InsertLinesOp, lines: &[&str]) -> Result<(), String> {
+    let at = op.after_line as usize;
+    let k = op.new.len();
+    let block_eq = |w: &[&str]| w.iter().zip(&op.new).all(|(a, b)| *a == b.as_str());
+    let has_identity = op
+        .new
+        .iter()
+        .any(|l| l.bytes().any(|b| b.is_ascii_alphanumeric()));
+    if has_identity {
+        let after = lines
+            .get(at..at + k)
+            .filter(|w| block_eq(w))
+            .map(|_| at + 1);
+        let before = (at >= k)
+            .then(|| lines.get(at - k..at))
+            .flatten()
+            .filter(|w| block_eq(w))
+            .map(|_| at - k + 1);
+        if let Some(first) = after.or(before) {
+            let last = first + k - 1;
+            return Err(format!(
+                "insert at {path} line {} duplicates lines {first}..={last}, which \
+                 already contain exactly this text; if your change is already applied, \
+                 do not re-send it — to modify those lines instead, use replace_lines \
+                 over {first}..={last} with their current content in expect",
+                op.after_line,
+            ));
+        }
+    }
+    if path.ends_with(".rs") {
+        // Only declarations sharing the insertion point's namespace can
+        // collide with it; see `scope_at`. Scopes the insert itself opens
+        // extend that namespace — a copied `impl Recorder {` re-opens the
+        // file's existing one, so its contents do collide.
+        let insert_scope = scope_at(lines, op.after_line as usize);
+        let mut opened_shared: Vec<bool> = Vec::new();
+        let mut opened_headers: Vec<String> = Vec::new();
+        for new_line in &op.new {
+            if opened_shared.iter().all(|&shared| shared) {
+                let mut scope = insert_scope.clone();
+                scope.extend(opened_headers.iter().cloned());
+                if let Some((kind, name)) = declared_item(new_line) {
+                    if let Some((line_no, ..)) = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| scope_at(lines, *i) == scope)
+                        .filter_map(|(i, l)| {
+                            declared_item(l).map(|(kind, name)| (i + 1, kind, name))
+                        })
+                        .find(|(_, fk, fname)| *fk == kind && *fname == name)
+                    {
+                        return Err(format!(
+                            "insert at {path} line {} declares `{kind} {name}`, but \
+                             {path}:{line_no} already declares `{kind} {name}`; the \
+                             insert leaves both in the file — a duplicate definition. \
+                             insert_lines only adds lines; to CHANGE the existing item, \
+                             use replace_lines over the lines it occupies, with their \
+                             current content in expect",
+                            op.after_line,
+                        ));
+                    }
+                }
+            }
+            let opens = new_line.bytes().filter(|&b| b == b'{').count();
+            let closes = new_line.bytes().filter(|&b| b == b'}').count();
+            for _ in opens..closes {
+                opened_shared.pop();
+                opened_headers.pop();
+            }
+            if opens > closes {
+                let header = new_line.trim();
+                let reopened = lines.iter().any(|l| l.trim() == header);
+                for _ in closes..opens {
+                    opened_shared.push(reopened);
+                    opened_headers.push(header.to_owned());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The stack of block headers enclosing `lines[..upto]`, used as a scope key.
+///
+/// Rust allows one item per kind and name **per namespace**, not per file, so a
+/// duplicate-declaration check that ignores scope rejects legal code: two types
+/// may each have `fn new`, and a `mod tests` may reuse a name from its parent.
+/// `new`, `default`, `len` and `from` are among the commonest method names in
+/// Rust, so an unscoped check would refuse a large share of valid repairs — and
+/// a refused edit scores exactly as badly as a corrupted one.
+fn scope_at(lines: &[&str], upto: usize) -> Vec<String> {
+    let mut stack: Vec<String> = Vec::new();
+    for line in lines.iter().take(upto) {
+        let opens = line.bytes().filter(|&b| b == b'{').count();
+        let closes = line.bytes().filter(|&b| b == b'}').count();
+        for _ in closes..opens {
+            stack.push(line.trim().to_owned());
+        }
+        for _ in opens..closes {
+            stack.pop();
+        }
+    }
+    stack
+}
+
 fn compile_file_ops(path: &str, content: &str, ops: &[&LineOp]) -> Result<Vec<Hunk>, String> {
     let (lines, eof_newline) = split_current_lines(content);
     let total = u32::try_from(lines.len()).map_err(|_| format!("{path} is too large"))?;
@@ -646,6 +823,7 @@ fn compile_file_ops(path: &str, content: &str, ops: &[&LineOp]) -> Result<Vec<Hu
                         op.after_line.saturating_add(1)
                     ));
                 }
+                reject_duplicating_insert(path, op, &lines)?;
                 if op.after_line == 0 {
                     // The backend reserves `old_start == 0` for Create (its
                     // V8b rule), so a pure zero-length-range prepend hunk is
@@ -685,27 +863,6 @@ fn compile_file_ops(path: &str, content: &str, ops: &[&LineOp]) -> Result<Vec<Hu
                     }
                 } else {
                     cursor = op.after_line;
-                    // `insert_lines` is the only op with no `expect`, so
-                    // nothing ties it to the file it was authored against.
-                    // Re-applying one across repair generations silently
-                    // duplicated whole items — the measured cause of most
-                    // E0428 "defined multiple times" failures. If the text is
-                    // already there, the edit is a duplicate, not progress.
-                    if !op.new.is_empty() {
-                        let at = op.after_line as usize;
-                        let already_present =
-                            lines.get(at..at + op.new.len()).is_some_and(|follows| {
-                                follows.iter().zip(&op.new).all(|(a, b)| *a == b.as_str())
-                            });
-                        if already_present {
-                            return Err(format!(
-                                "insert at {path} line {} would duplicate text that is \
-                                 already there — re-read the file; if it already has \
-                                 your change, do not re-send it",
-                                op.after_line
-                            ));
-                        }
-                    }
                     last_insert_boundary = Some(op.after_line);
                     let new_start = i64::from(op.after_line) + delta + 1;
                     delta += i64::try_from(op.new.len()).unwrap_or(i64::MAX);
@@ -1293,19 +1450,259 @@ mod tests {
         assert!(err.contains("a.rs"), "{err}");
     }
 
-    /// The guard must compare the whole block, not just its first line, or a
-    /// multi-line item that merely starts alike would be refused.
+    /// The verbatim check compares the whole block at the boundary, not just
+    /// its first line: a block that merely starts with an existing line
+    /// still applies.
     #[test]
     fn ops_compile_allows_an_insert_that_only_partly_matches() {
-        let files = one_file("a.rs", "pub fn one() {}\npub fn two() {}\n");
+        let files = one_file("a.rs", "one();\ntwo();\nfour();\n");
         ops_to_patchset(
             &[op(serde_json::json!({
                 "op": "insert_lines", "path": "a.rs", "after_line": 1,
-                "new": ["pub fn two() {}", "pub fn three() {}"],
+                "new": ["two();", "three();"],
             }))],
             &files,
         )
-        .expect("a genuinely new block must still apply");
+        .expect("a block that only starts like existing text must still apply");
+    }
+
+    /// Reason (a) the previous guard never fired: `after_line == 0` bypassed
+    /// it entirely. A top-of-file re-insert must be refused like any other,
+    /// with retry text that routes the model to replace_lines.
+    #[test]
+    fn ops_compile_rejects_top_of_file_exact_reinsert() {
+        let files = one_file("a.rs", "use std::fmt;\nfn main() {}\n");
+        let err = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 0,
+                "new": ["use std::fmt;"],
+            }))],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(err.contains("replace_lines"), "{err}");
+    }
+
+    /// A re-sent insert whose text now sits immediately BEFORE the boundary
+    /// (the model re-anchored below its own applied lines) is a re-send too;
+    /// the previous guard only looked at the lines after the boundary.
+    #[test]
+    fn ops_compile_rejects_exact_reinsert_preceding_the_boundary() {
+        let files = one_file("a.txt", "alpha beta\ngamma\n");
+        let err = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.txt", "after_line": 1,
+                "new": ["alpha beta"],
+            }))],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    const RECORDER_RS: &str = "pub struct Recorder;\nimpl Recorder {\n    pub fn record(&self, entry: &str) {\n        let _ = entry;\n    }\n}\n";
+
+    /// The measured dominant failure (44/144 live attempts, 0% pass): the
+    /// model expresses REPLACEMENT with insert_lines, adding a lightly
+    /// modified copy of an item header that is still in the file. The
+    /// original survives beside the "fix" — E0428 or an orphaned header. A
+    /// byte-identical check cannot see it; the kind + name declaration
+    /// collision can, and its error must name the existing line and point
+    /// at replace_lines.
+    #[test]
+    fn ops_compile_rejects_modified_copy_of_an_existing_fn_header() {
+        let files = one_file("a.rs", RECORDER_RS);
+        let err = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 2,
+                "new": ["    pub fn record(&mut self, entry: &str) {"],
+            }))],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("fn record"), "{err}");
+        assert!(err.contains("a.rs:3"), "{err}");
+        assert!(err.contains("replace_lines"), "{err}");
+    }
+
+    /// Same defect, whole-item shape: a modified copy of a full method or of
+    /// a struct definition inserted beside the original.
+    #[test]
+    fn ops_compile_rejects_modified_copy_of_a_whole_item_block() {
+        let files = one_file("a.rs", RECORDER_RS);
+        let err = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 5,
+                "new": [
+                    "    pub fn record(&mut self, entry: &str) {",
+                    "        self.log(entry);",
+                    "    }",
+                ],
+            }))],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("fn record"), "{err}");
+        let err = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 1,
+                "new": ["pub struct Recorder(u32);"],
+            }))],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("struct Recorder"), "{err}");
+    }
+
+    /// A copied `impl Recorder {` block re-opens a scope whose header is
+    /// already in the file, so the method inside collides with the original
+    /// (E0592) even though it is nested in braces the insert brings along.
+    #[test]
+    fn ops_compile_rejects_method_copy_inside_a_reopened_impl_block() {
+        let files = one_file("a.rs", RECORDER_RS);
+        let err = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 6,
+                "new": [
+                    "impl Recorder {",
+                    "    pub fn record(&mut self, entry: &str) {",
+                    "        let _ = entry;",
+                    "    }",
+                    "}",
+                ],
+            }))],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("fn record"), "{err}");
+    }
+
+    /// The must-allow set: a genuinely new function, a new use statement, a
+    /// doc line, a blank line, and a new match arm all still insert.
+    #[test]
+    fn ops_compile_allows_genuinely_new_inserts() {
+        let files = one_file("a.rs", RECORDER_RS);
+        for new in [
+            serde_json::json!(["pub fn totally_new(x: u32) -> u32 {", "    x + 1", "}"]),
+            serde_json::json!(["use std::fmt::Write;"]),
+            serde_json::json!(["/// Records one entry."]),
+            serde_json::json!([""]),
+        ] {
+            let insert = op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 6, "new": new,
+            }));
+            ops_to_patchset(&[insert], &files).unwrap_or_else(|e| panic!("{new}: {e}"));
+        }
+        let files = one_file(
+            "b.rs",
+            "fn f(x: Option<u32>) -> u32 {\n    match x {\n        Some(v) => v,\n        None => 0,\n    }\n}\n",
+        );
+        ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "b.rs", "after_line": 3,
+                "new": ["        Some(0) => 7,"],
+            }))],
+            &files,
+        )
+        .expect("a new match arm must insert");
+    }
+
+    /// `fn fmt` already exists in the Debug impl, but the insert nests its
+    /// own copy in a genuinely NEW scope (`impl Display`), whose contents
+    /// cannot collide with items outside it — a same-name method for a new
+    /// trait impl is the canonical legitimate insert and must not be
+    /// refused.
+    #[test]
+    fn ops_compile_allows_same_name_method_inside_a_new_trait_impl() {
+        let files = one_file(
+            "a.rs",
+            "use std::fmt;\npub struct Foo;\nimpl fmt::Debug for Foo {\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n        write!(f, \"Foo\")\n    }\n}\n",
+        );
+        ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 7,
+                "new": [
+                    "impl fmt::Display for Foo {",
+                    "    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {",
+                    "        write!(f, \"Foo\")",
+                    "    }",
+                    "}",
+                ],
+            }))],
+            &files,
+        )
+        .expect("a new trait impl with a same-name method must insert");
+    }
+
+    /// Delimiter repairs insert brace-only lines that may sit next to
+    /// byte-identical brace lines; blocks with no alphanumeric content carry
+    /// no identity and are never treated as duplicates.
+    #[test]
+    fn ops_compile_allows_brace_only_insert_next_to_identical_brace() {
+        let files = one_file("a.rs", "fn a() {\n    if x() {\n        g();\n}\n");
+        ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 4, "new": ["}"],
+            }))],
+            &files,
+        )
+        .expect("a lone closing brace must insert even beside an identical line");
+    }
+
+    /// The declaration guard reasons with Rust's item-name rules, so it
+    /// stays out of non-Rust files, where repeated headers are legitimate.
+    #[test]
+    fn ops_compile_declaration_guard_applies_only_to_rust_files() {
+        let files = one_file("notes.md", "# api\nfn record(&self, entry: &str) {\n");
+        ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "notes.md", "after_line": 2,
+                "new": ["fn record(&mut self, entry: &str) {"],
+            }))],
+            &files,
+        )
+        .expect("near-duplicate headers outside .rs are not the guard's business");
+    }
+
+    /// Rust scopes items by namespace, not by file. An unscoped
+    /// duplicate-declaration check refuses two types each having `fn new` —
+    /// and `new`, `default`, `len` and `from` are among the commonest method
+    /// names in Rust, so it would refuse a large share of valid repairs. A
+    /// refused edit scores exactly as badly as a corrupted one, so a false
+    /// rejection is not the safe direction to err in.
+    #[test]
+    fn ops_compile_allows_the_same_method_name_on_a_second_type() {
+        let files = one_file(
+            "a.rs",
+            "pub struct Cache;\nimpl Cache {\n    pub fn new() -> Self { Cache }\n}\npub struct Store;\nimpl Store {\n}\n",
+        );
+        ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 6,
+                "new": ["    pub fn new() -> Self { Store }"],
+            }))],
+            &files,
+        )
+        .expect("inherent fn new on a distinct type must still apply");
+    }
+
+    /// A nested module is its own namespace: `mod tests` may define `fn parse`
+    /// even though the parent module already has one.
+    #[test]
+    fn ops_compile_allows_a_name_reused_inside_a_nested_module() {
+        let files = one_file(
+            "a.rs",
+            "pub fn parse() {}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n}\n",
+        );
+        ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "insert_lines", "path": "a.rs", "after_line": 5,
+                "new": ["    #[test]", "    fn parse() { super::parse(); }"],
+            }))],
+            &files,
+        )
+        .expect("a nested module has its own namespace");
     }
 
     #[test]

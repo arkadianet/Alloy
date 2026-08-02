@@ -21,9 +21,10 @@ use crate::adapters::{CapabilityExecError, CapabilityOutcome};
 use crate::context::AssembleInputs;
 use crate::dag::{NodeInputPayload, NodeKind};
 use crate::edit::{FilePatch, PatchSet};
+use crate::graph::GraphQuery;
 use crate::storage::{ArtifactKind, ArtifactPut};
 use crate::types::budget::ModelTier;
-use crate::types::diagnostic::{ErrorClass, RetryDisposition};
+use crate::types::diagnostic::{DiagnosticEvent, ErrorClass, RetryDisposition};
 use crate::types::ids::{ArtifactId, CapabilityId, TransactionId};
 use crate::types::tools::{ToolName, ToolSelector};
 
@@ -38,14 +39,18 @@ use super::super::perms::WorkerToolClass;
 use super::super::prompt::{edit_response_schema, fence_tool, EDIT_SYSTEM};
 use super::super::traits::{Capability, CapabilityDescriptor, CapabilityVersion, SideEffectClass};
 use super::{
-    call_tool, finish_attempt, llm_exchange, load_pred_payloads, map_tool_result_error,
-    worker_span, Attempt, WorkerError, WorkerSuccess,
+    call_tool, diagnostics_from_payloads, finish_attempt, llm_exchange, load_pred_payloads,
+    map_tool_result_error, worker_span, Attempt, WorkerError, WorkerSuccess,
 };
 
 /// EW5: mirrors RFC-0006's `MAX_ARGUMENT_BYTES` (64 KiB). The constant
 /// lives in `alloy-tools`, which this crate MUST NOT depend on (C2), so the
 /// bound is restated here and cross-checked by the RFC-0006 host anyway.
 const MAX_PATCH_ARGUMENT_BYTES: usize = 64 * 1024;
+
+/// RW2 parity: diagnostics presented to the model are capped at this many,
+/// matching the repair worker's bound.
+const MAX_DIAGNOSTICS: usize = 32;
 
 /// Tools this worker may call (TL5).
 const ALLOWED_TOOLS: [&str; 2] = ["fs_read", "apply_patch"];
@@ -199,10 +204,34 @@ impl EditWorker {
             .as_ref()
             .map(|p| p.target_files.clone())
             .unwrap_or_default();
+
+        // Edit against the errors that exist NOW, acquired exactly as the
+        // repair worker acquires them (RW2/RW4): any predecessor payload
+        // carrying a `diagnostics` array is the live set. An empty vector
+        // here made the context engine fall back to the run-start
+        // `graph_diagnostics` table, so generation N edited against
+        // generation-0 errors it had already "fixed".
+        let live = diagnostics_from_payloads(&payloads);
+        // Best-effort graph read (RW4 posture): keeps the recorded table in
+        // the working set now that the engine's empty-vector fallback no
+        // longer fires; a graph error degrades to "no graph input".
+        let recorded = match ctx
+            .graph
+            .query(GraphQuery::Diagnostics {
+                crate_id: None,
+                since: None,
+            })
+            .await
+        {
+            Ok(view) => view.diagnostics,
+            Err(_) => Vec::new(),
+        };
+        let diagnostics = merge_live_diagnostics(live, recorded);
+
         let inputs = AssembleInputs {
             run: Some(ctx.run),
             input: Some(ctx.input.clone()),
-            diagnostics: Vec::new(),
+            diagnostics,
             budget: Some(ctx.budget.clone()),
             focus_paths,
         };
@@ -537,6 +566,34 @@ impl EditWorker {
     }
 }
 
+/// RW2 treatment of the working-set diagnostics, mirrored from the repair
+/// worker: predecessor-carried (`live`) and graph-recorded (`recorded`)
+/// events merged, sorted by `(primary span path, start line, code)`,
+/// deduplicated by fingerprint (stable sort keeps the live copy first), and
+/// capped at [`MAX_DIAGNOSTICS`].
+fn merge_live_diagnostics(
+    mut diagnostics: Vec<DiagnosticEvent>,
+    recorded: Vec<DiagnosticEvent>,
+) -> Vec<DiagnosticEvent> {
+    diagnostics.extend(recorded);
+    diagnostics.sort_by_key(diagnostic_sort_key);
+    let mut seen = std::collections::BTreeSet::new();
+    diagnostics.retain(|d| seen.insert(d.fingerprint.as_hex().to_owned()));
+    diagnostics.truncate(MAX_DIAGNOSTICS);
+    diagnostics
+}
+
+/// RW2 ordering key, mirrored from the repair worker: `(primary span path,
+/// start line, code)`; diagnostics without spans sort first on the empty
+/// path, exactly as there.
+fn diagnostic_sort_key(d: &DiagnosticEvent) -> (String, u32, Option<String>) {
+    let (path, line) = d
+        .spans
+        .first()
+        .map_or((String::new(), 0), |s| (s.path.clone(), s.start_line));
+    (path, line, d.code.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +759,392 @@ mod tests {
             schema["additionalProperties"],
             json!(false),
             "schema must stay closed while the parser is deny_unknown_fields"
+        );
+    }
+}
+
+/// Defect-2 regression guard: the working set the edit worker assembles must
+/// carry the live diagnostics its predecessors and the graph know about,
+/// exactly as the repair worker's does (RW2/RW4 acquisition). An empty
+/// `diagnostics` vector silently downgrades the context engine to its
+/// run-start `graph_diagnostics` fallback, so in generation N the model
+/// edits against generation-0 errors.
+#[cfg(test)]
+mod live_diagnostics_tests {
+    use super::*;
+
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use tokio_util::sync::CancellationToken;
+
+    use crate::adapters::{NodeExecRef, ToolCaller, ToolCallerError};
+    use crate::context::{
+        AssembleRequest, CompactStrategy, ContextEngine, ContextError, DomainId, EvictPolicy,
+        EvictReport, StaleReason,
+    };
+    use crate::dag::{NodeInputEnvelope, PredecessorOutput};
+    use crate::error::AdapterError;
+    use crate::graph::GraphViewHandle;
+    use crate::obs::{RecordingDecisionLog, RetentionPolicy, SharedCostMeter};
+    use crate::router::{
+        ModelResponse, ModelRouter, PromptPack, RoutedModel, RouterError, RoutingRequest,
+    };
+    use crate::storage::{ArtifactBlob, ArtifactMeta, ArtifactStore, StoreError};
+    use crate::types::budget::TokenBudget;
+    use crate::types::diagnostic::{DiagnosticLevel, SpanRef};
+    use crate::types::ids::{
+        DagId, DiagnosticId, Digest, NodeId, ProviderId, RunId, SessionId, SummaryId, Timestamp,
+    };
+    use crate::types::metrics::WorkerMetrics;
+    use crate::types::permission::PermissionToken;
+    use crate::types::tools::{ToolCall, ToolResult};
+
+    use super::super::super::payload::{RepairPlanPayload, PAYLOAD_SCHEMA_VERSION};
+    use super::super::super::perms::WorkerPermissions;
+    use super::super::Attempt;
+
+    /// Records every `AssembleInputs` the worker hands the engine, then
+    /// halts the attempt: these tests assert on the working-set inputs, not
+    /// on a full model turn.
+    #[derive(Default)]
+    struct RecordingEngine {
+        seen: Mutex<Vec<AssembleInputs>>,
+    }
+
+    #[async_trait]
+    impl ContextEngine for RecordingEngine {
+        async fn assemble(&self, _req: AssembleRequest) -> Result<PromptPack, ContextError> {
+            Err(ContextError::EmptyPrompt)
+        }
+
+        async fn assemble_with(
+            &self,
+            _req: AssembleRequest,
+            inputs: AssembleInputs,
+        ) -> Result<PromptPack, ContextError> {
+            self.seen.lock().expect("engine lock").push(inputs);
+            Err(ContextError::EmptyPrompt)
+        }
+
+        async fn compact(&self, _d: DomainId, _s: CompactStrategy) -> Result<(), ContextError> {
+            Ok(())
+        }
+
+        async fn evict(&self, _p: EvictPolicy) -> Result<EvictReport, ContextError> {
+            Ok(EvictReport::default())
+        }
+
+        async fn mark_stale(&self, id: SummaryId, _r: StaleReason) -> Result<(), ContextError> {
+            Err(ContextError::SummaryNotFound(id))
+        }
+    }
+
+    /// Never reached: the recording engine stops the attempt first.
+    struct StubRouter;
+
+    #[async_trait]
+    impl ModelRouter for StubRouter {
+        async fn route(&self, _req: RoutingRequest) -> Result<RoutedModel, RouterError> {
+            Err(RouterError::Internal("unused in these tests".into()))
+        }
+
+        async fn complete(
+            &self,
+            _routed: &RoutedModel,
+            _prompt: PromptPack,
+        ) -> Result<ModelResponse, RouterError> {
+            Err(RouterError::Internal("unused in these tests".into()))
+        }
+    }
+
+    /// Never reached: the recording engine stops the attempt first.
+    struct StubTools;
+
+    #[async_trait]
+    impl ToolCaller for StubTools {
+        async fn call(
+            &self,
+            _call: ToolCall,
+            _perms: PermissionToken,
+        ) -> Result<ToolResult, ToolCallerError> {
+            Err(ToolCallerError::UnknownTool("unused in these tests".into()))
+        }
+    }
+
+    /// Never reached: the recording engine stops the attempt first.
+    struct StubPerms;
+
+    #[async_trait]
+    impl WorkerPermissions for StubPerms {
+        async fn token_for(
+            &self,
+            _ctx: &NodeExecRef,
+            _class: WorkerToolClass,
+        ) -> Result<PermissionToken, AdapterError> {
+            Err(AdapterError::PermissionDenied(
+                "unused in these tests".into(),
+            ))
+        }
+    }
+
+    /// In-memory artifact store serving predecessor payload blobs.
+    #[derive(Default)]
+    struct MemArtifacts {
+        blobs: Mutex<HashMap<ArtifactId, Vec<u8>>>,
+    }
+
+    impl MemArtifacts {
+        async fn put_json(&self, value: &serde_json::Value) -> ArtifactId {
+            self.put(ArtifactPut {
+                bytes: serde_json::to_vec(value).expect("payload serializes"),
+                kind: ArtifactKind::Blob,
+                content_type: Some("application/json".into()),
+                session_id: None,
+                run_id: None,
+                labels: serde_json::Map::new(),
+            })
+            .await
+            .expect("put")
+        }
+    }
+
+    #[async_trait]
+    impl ArtifactStore for MemArtifacts {
+        async fn put(&self, req: ArtifactPut) -> Result<ArtifactId, StoreError> {
+            let id = ArtifactId::new();
+            self.blobs.lock().expect("store lock").insert(id, req.bytes);
+            Ok(id)
+        }
+
+        async fn get(&self, id: ArtifactId) -> Result<ArtifactBlob, StoreError> {
+            let bytes = self
+                .blobs
+                .lock()
+                .expect("store lock")
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| StoreError::NotFound("artifact".into()))?;
+            let meta = ArtifactMeta {
+                kind: ArtifactKind::Blob,
+                content_type: Some("application/json".into()),
+                byte_len: bytes.len() as u64,
+                digest: Digest::sha256(&bytes),
+                created_at: Timestamp::now(),
+                session_id: None,
+                run_id: None,
+                labels: serde_json::Map::new(),
+            };
+            Ok(ArtifactBlob { id, meta, bytes })
+        }
+
+        async fn meta(&self, id: ArtifactId) -> Result<ArtifactMeta, StoreError> {
+            Ok(self.get(id).await?.meta)
+        }
+
+        async fn get_by_digest(&self, _digest: &Digest) -> Result<Option<ArtifactId>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete(&self, _id: ArtifactId) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    fn diag(path: &str, code: &str) -> DiagnosticEvent {
+        DiagnosticEvent {
+            id: DiagnosticId::new(),
+            code: Some(code.into()),
+            level: DiagnosticLevel::Error,
+            message: format!("cannot borrow ({code})"),
+            spans: vec![SpanRef {
+                path: path.into(),
+                start_line: 3,
+                start_col: 5,
+                end_line: 3,
+                end_col: 9,
+            }],
+            children: vec![],
+            package: None,
+            fingerprint: Digest::sha256(format!("{path}:{code}").as_bytes()),
+            raw_json: None,
+        }
+    }
+
+    /// Analyze-pred body: a decodable `RepairPlanPayload`. Deliberately
+    /// carries no `diagnostics` array — the shipped plan payload has none.
+    fn plan_value(target: &str) -> serde_json::Value {
+        serde_json::to_value(RepairPlanPayload {
+            schema_version: PAYLOAD_SCHEMA_VERSION,
+            capability: "repair".into(),
+            summary: "fix the borrow".into(),
+            target_files: vec![target.into()],
+            steps: vec![],
+            diagnostics_addressed: vec![],
+            needs_replan: false,
+            truncated: false,
+            confidence: 0.9,
+            citations: vec![],
+            artifacts: vec![],
+            metrics: WorkerMetrics {
+                model_tier_used: ModelTier::Standard,
+                provider_id: ProviderId::new("test").expect("static id"),
+                input_tokens: None,
+                output_tokens: None,
+                tool_calls: 0,
+                cache_hits: 0,
+                duration_ms: 0,
+                confidence: None,
+                error_class: None,
+            },
+        })
+        .expect("plan serializes")
+    }
+
+    fn pred(kind: NodeKind, output_ref: ArtifactId) -> PredecessorOutput {
+        PredecessorOutput {
+            node_id: NodeId::new(),
+            kind,
+            output_ref,
+        }
+    }
+
+    fn envelope(preds: Vec<PredecessorOutput>) -> NodeInputEnvelope {
+        NodeInputEnvelope::new(
+            DagId::new(),
+            NodeId::new(),
+            NodeKind::Edit,
+            1,
+            NodeInputPayload::FromPredecessors { preds },
+        )
+    }
+
+    fn ctx<'a>(
+        input: &'a NodeInputEnvelope,
+        engine: Arc<RecordingEngine>,
+        artifacts: Arc<MemArtifacts>,
+        graph: GraphViewHandle,
+    ) -> CapabilityContext<'a> {
+        CapabilityContext {
+            session: SessionId::new(),
+            run: RunId::new(),
+            dag: input.dag_id,
+            node: input.node_id,
+            attempt: 1,
+            workspace_root: Path::new("."),
+            capability: CapabilityId::new("edit").expect("static id"),
+            kind: NodeKind::Edit,
+            effective_tier: ModelTier::Standard,
+            budget: TokenBudget {
+                max_input: 4096,
+                max_output: 1024,
+            },
+            deadline: Duration::from_secs(30),
+            cancel: CancellationToken::new(),
+            input,
+            router: Arc::new(StubRouter),
+            context: engine,
+            tools: Arc::new(StubTools),
+            perms: Arc::new(StubPerms),
+            graph,
+            artifacts,
+            decisions: Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults())),
+            cost_meter: SharedCostMeter::new(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Run one attempt to the assembly seam and return the captured inputs.
+    async fn assembled_inputs(
+        input: &NodeInputEnvelope,
+        artifacts: Arc<MemArtifacts>,
+        graph: GraphViewHandle,
+    ) -> AssembleInputs {
+        let engine = Arc::new(RecordingEngine::default());
+        let ctx = ctx(input, Arc::clone(&engine), artifacts, graph);
+        let worker = EditWorker::new(WorkerConfig::default());
+        let mut attempt = Attempt::new(ModelTier::Standard, ModelTier::Standard);
+        let result = worker.run(&ctx, &mut attempt).await;
+        assert!(result.is_err(), "the recording engine halts the attempt");
+        let seen = engine.seen.lock().expect("engine lock");
+        seen.first().cloned().expect("assemble_with was reached")
+    }
+
+    /// A `VerifyCompile` predecessor's `{ ok, diagnostics }` body must reach
+    /// the working set — while focus paths stay the plan's target files.
+    /// Proven red against the shipped `diagnostics: Vec::new()`.
+    #[tokio::test]
+    async fn edit_worker_passes_live_pred_diagnostics_to_the_working_set() {
+        let artifacts = Arc::new(MemArtifacts::default());
+        let plan_ref = artifacts.put_json(&plan_value("src/lib.rs")).await;
+        let live = diag("src/lib.rs", "E0502");
+        let failure_ref = artifacts
+            .put_json(&json!({
+                "ok": false,
+                "diagnostics": [live],
+                "notes": "generation 2 soft failure",
+            }))
+            .await;
+        let input = envelope(vec![
+            pred(NodeKind::Analyze, plan_ref),
+            pred(NodeKind::VerifyCompile, failure_ref),
+        ]);
+
+        let inputs = assembled_inputs(&input, artifacts, GraphViewHandle::null()).await;
+
+        assert!(
+            inputs
+                .diagnostics
+                .iter()
+                .any(|d| d.fingerprint == live.fingerprint),
+            "live predecessor diagnostics must reach the edit working set"
+        );
+        // Working-set selection semantics beyond diagnostics are unchanged.
+        assert_eq!(inputs.focus_paths, vec!["src/lib.rs".to_owned()]);
+    }
+
+    /// Graph-recorded diagnostics still flow (they no longer arrive via the
+    /// engine's empty-vector fallback), deduplicated by fingerprint against
+    /// the live copy — repair's RW2 treatment. Pure-function form: SEC1/SEC3
+    /// greps ban graph doubles inside `src/capabilities/**`, so the
+    /// end-to-end variant of this assertion lived only in the red phase.
+    #[test]
+    fn merge_live_diagnostics_dedupes_by_fingerprint() {
+        let live = diag("src/lib.rs", "E0502");
+        let stale_copy = diag("src/lib.rs", "E0502"); // same fingerprint
+        let other = diag("src/main.rs", "E0308");
+
+        let merged = merge_live_diagnostics(vec![live.clone()], vec![stale_copy, other.clone()]);
+
+        let fingerprints: Vec<_> = merged.iter().map(|d| &d.fingerprint).collect();
+        assert!(
+            fingerprints.contains(&&live.fingerprint) && fingerprints.contains(&&other.fingerprint),
+            "both live and graph-recorded diagnostics must survive the merge"
+        );
+        assert_eq!(
+            merged.len(),
+            2,
+            "the shared fingerprint must be deduplicated"
+        );
+        // Live copy first: `src/lib.rs` sorts before `src/main.rs`, and the
+        // stable sort keeps the live instance ahead of its stale twin.
+        assert_eq!(merged[0].id, live.id);
+    }
+
+    /// The RW2 cap holds for the edit working set too.
+    #[test]
+    fn merge_live_diagnostics_caps_at_the_rw2_bound() {
+        let many: Vec<DiagnosticEvent> = (0..40)
+            .map(|i| diag(&format!("src/f{i:02}.rs"), "E0308"))
+            .collect();
+
+        let merged = merge_live_diagnostics(Vec::new(), many);
+
+        assert_eq!(
+            merged.len(),
+            MAX_DIAGNOSTICS,
+            "diagnostics presented to the model are capped like repair's RW2"
         );
     }
 }

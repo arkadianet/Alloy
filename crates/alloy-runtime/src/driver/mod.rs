@@ -18,6 +18,16 @@
 //! repair a morph. Everything else — including exhaustion — is an
 //! *outcome*, not an error (GN11).
 //!
+//! Declines are reported, not just counted: every §9.2 decline record
+//! carries the repair-budget accounting (`bumps_used` /
+//! `max_repair_generations`), and the AM-0017-1 near-miss — an
+//! Edit/Analyze `Model` failure declined only because no in-run lineage
+//! seed exists yet, which is every first generation — additionally records
+//! `lineage: "absent"` and annotates the terminal `FailureIr` so the run
+//! does not exit shaped like a repair that fought and lost (live E2
+//! finding: 25/144 attempts burned the whole edit budget this way and
+//! exited silently).
+//!
 //! Author: arkadianet
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -160,10 +170,48 @@ pub struct GenerationDriver {
     metrics: AtomicDriverMetrics,
 }
 
+/// A declined admission. `reason` is the first failed GN rule (§9.2's
+/// closed vocabulary). `missing_lineage` marks the AM-0017-1 near-miss —
+/// an Edit/Analyze `Model` failure that would have been admissible had this
+/// dispatch already admitted a verify Fail; true of every first generation,
+/// where no in-run lineage can exist yet. Live E2 measurement showed this
+/// decline ending runs indistinguishably from a repair that fought and
+/// lost, so the near-miss is reported, not merely declined.
+struct ReplanReject {
+    reason: &'static str,
+    missing_lineage: bool,
+}
+
+impl ReplanReject {
+    /// An ordinary GN1–GN7 decline.
+    const fn rule(reason: &'static str) -> Self {
+        Self {
+            reason,
+            missing_lineage: false,
+        }
+    }
+
+    /// The AM-0017-1 near-miss (reason stays `"kind"` per AC 23b).
+    const fn missing_lineage() -> Self {
+        Self {
+            reason: "kind",
+            missing_lineage: true,
+        }
+    }
+}
+
 /// Fields for a best-effort `Replan` decision record (§9.2).
 struct ReplanDecisionMeta<'a> {
     admitted: bool,
     reason: Option<&'a str>,
+    /// AM-0017-1 near-miss marker (declines only): records `lineage:
+    /// "absent"` so the refused-first-generation case is countable without
+    /// joining on generation numbers.
+    missing_lineage: bool,
+    /// `(bumps_used, max_repair_generations)` on declines — every decline
+    /// is terminal for the dispatch, so the record states how much of the
+    /// repair budget the run died holding.
+    bumps: Option<(u32, u32)>,
     provenance: Option<&'a str>,
     seed: Option<&'a FailureIr>,
     seed_source: Option<&'a str>,
@@ -203,19 +251,24 @@ impl GenerationDriver {
     /// GN1–GN7 in order; the first failed rule names the rejection reason
     /// (§9.2's `reason` vocabulary). On admit, returns the `FailureIr` that
     /// MUST seed the next generation (outcome verify Fail, or the in-run
-    /// lineage seed for AM-0017-1).
+    /// lineage seed for AM-0017-1). A first-generation Edit/Analyze `Model`
+    /// failure declines deliberately (AC 23b): the lineage seed is in-run
+    /// only, and generation 1 precedes any admitted verify Fail — its
+    /// compile evidence travelled the graph channel (issue #53), never a
+    /// driver-held IR. That decline is flagged `missing_lineage` so the
+    /// caller can report it honestly.
     async fn admission_reason(
         &self,
         ctx: &RunExecCtx,
         outcome: &DagOutcome,
         bumps: u32,
         lineage_seed: Option<&FailureIr>,
-    ) -> Result<Result<FailureIr, &'static str>, DriveError> {
+    ) -> Result<Result<FailureIr, ReplanReject>, DriveError> {
         // GN1 — a Failed outcome must carry its failure and failed node.
         // Without them there is nothing to seed, so the reject is reported
         // as `no_diagnostics`.
         let (Some(failure), Some(failed_node)) = (&outcome.failure, outcome.failed_node) else {
-            return Ok(Err("no_diagnostics"));
+            return Ok(Err(ReplanReject::rule("no_diagnostics")));
         };
 
         // GN2 — VerifyCompile Fail seeds from the outcome. AM-0017-1: an
@@ -232,29 +285,29 @@ impl GenerationDriver {
             Some(NodeKind::VerifyCompile) => failure.clone(),
             Some(NodeKind::Edit | NodeKind::Analyze) => {
                 if failure.error_class != ErrorClass::Model {
-                    return Ok(Err("kind"));
+                    return Ok(Err(ReplanReject::rule("kind")));
                 }
                 match lineage_seed {
                     Some(seed) => seed.clone(),
-                    None => return Ok(Err("kind")),
+                    None => return Ok(Err(ReplanReject::missing_lineage())),
                 }
             }
-            _ => return Ok(Err("kind")),
+            _ => return Ok(Err(ReplanReject::rule("kind"))),
         };
 
         // GN3 — seed must be a genuine verify Fail verdict.
         if seed.error_class != ErrorClass::Compile {
-            return Ok(Err("class"));
+            return Ok(Err(ReplanReject::rule("class")));
         }
 
         // GN4 — no diagnostics after the SD9 projection, no seed, no bump.
         if seed_projection_is_empty(&seed) {
-            return Ok(Err("no_diagnostics"));
+            return Ok(Err(ReplanReject::rule("no_diagnostics")));
         }
 
         // GN5 — the bound.
         if bumps >= self.deps.policy.max_repair_generations {
-            return Ok(Err("exhausted"));
+            return Ok(Err(ReplanReject::rule("exhausted")));
         }
 
         // GN6 — run not cancelled…
@@ -263,12 +316,12 @@ impl GenerationDriver {
             || state.is_terminal()
             || self.deps.cancellation.is_cancelled()
         {
-            return Ok(Err("cancelled"));
+            return Ok(Err(ReplanReject::rule("cancelled")));
         }
         // …and budget not exhausted.
         let meter = self.deps.cost_meters.meter_for(ctx.run_id);
         if meter.check_budget(&self.deps.budget_policy) != BudgetCheck::Ok {
-            return Ok(Err("budget"));
+            return Ok(Err(ReplanReject::rule("budget")));
         }
 
         // GN7 — the absolute deadline must have budget left.
@@ -277,7 +330,7 @@ impl GenerationDriver {
             .saturating_duration_since(Instant::now())
             .is_zero()
         {
-            return Ok(Err("deadline"));
+            return Ok(Err(ReplanReject::rule("deadline")));
         }
 
         Ok(Ok(seed))
@@ -307,6 +360,16 @@ impl GenerationDriver {
             }
             if let Some(reason) = decision.reason {
                 map.insert("reason".into(), json!(reason));
+            }
+            if decision.missing_lineage {
+                // AM-0017-1 near-miss: right kind, right class, no in-run
+                // lineage seed (every generation 1). Additive to §9.2 —
+                // `reason` keeps AC 23b's "kind".
+                map.insert("lineage".into(), json!("absent"));
+            }
+            if let Some((used, max)) = decision.bumps {
+                map.insert("bumps_used".into(), json!(used));
+                map.insert("max_repair_generations".into(), json!(max));
             }
             if let Some(provenance) = decision.provenance {
                 map.insert("provenance".into(), json!(provenance));
@@ -612,9 +675,9 @@ impl RunExecutor for GenerationDriver {
                 .admission_reason(&ctx, &outcome, bumps, lineage_seed.as_ref())
                 .await
             {
-                Ok(Err(reason)) => {
+                Ok(Err(reject)) => {
                     gen_span.record("admitted", false);
-                    gen_span.record("reject_reason", reason);
+                    gen_span.record("reject_reason", reject.reason);
                     self.metrics
                         .replans_rejected
                         .fetch_add(1, Ordering::Relaxed);
@@ -623,18 +686,49 @@ impl RunExecutor for GenerationDriver {
                         &outcome,
                         ReplanDecisionMeta {
                             admitted: false,
-                            reason: Some(reason),
+                            reason: Some(reject.reason),
+                            missing_lineage: reject.missing_lineage,
+                            bumps: Some((bumps, self.deps.policy.max_repair_generations)),
                             provenance: None,
                             seed: None,
                             seed_source: None,
                         },
                     )
                     .await;
+                    if reject.missing_lineage {
+                        // The measured silent exit (E2 bucket A): the whole
+                        // edit budget is already burned, no repair was ever
+                        // admitted, and the raw outcome reads like an
+                        // ordinary model failure. Loud log, and an honest
+                        // terminal IR — GN11's intact-IR rule binds only
+                        // the exhausted/deadline declines, which never
+                        // reach this branch.
+                        warn!(
+                            run_id = %ctx.run_id,
+                            dag_id = %ctx.dag_id,
+                            generation = outcome.generation,
+                            "repair declined without lineage (AM-0017-1 near-miss): \
+                             Edit/Analyze Model failure before any admitted verify Fail; \
+                             no repair generation was admitted in this dispatch"
+                        );
+                        let mut outcome = outcome;
+                        if let Some(failure) = outcome.failure.as_mut() {
+                            if !failure.notes.is_empty() {
+                                failure.notes.push_str("; ");
+                            }
+                            failure.notes.push_str(
+                                "auto-repair declined (kind): Edit/Analyze Model failure \
+                                 with no in-run lineage seed (AM-0017-1); no repair \
+                                 generation was admitted in this dispatch",
+                            );
+                        }
+                        return Ok(outcome);
+                    }
                     info!(
                         run_id = %ctx.run_id,
                         dag_id = %ctx.dag_id,
                         generation = outcome.generation,
-                        reason,
+                        reason = reject.reason,
                         "repair generation declined"
                     );
                     return Ok(outcome);
@@ -683,6 +777,8 @@ impl RunExecutor for GenerationDriver {
                 ReplanDecisionMeta {
                     admitted: true,
                     reason: None,
+                    missing_lineage: false,
+                    bumps: None,
                     provenance: Some(provenance_str),
                     seed: Some(&seed),
                     seed_source: Some(seed_source),

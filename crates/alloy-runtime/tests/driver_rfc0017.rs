@@ -790,6 +790,154 @@ async fn ac23b_lineage_edit_model_may_bump() {
     h.close().await;
 }
 
+/// Live defect (E2 bucket A): a generation-1 `Edit(Model)` failure is the
+/// AM-0017-1 near-miss — admissible kind, admissible class, no in-run
+/// lineage seed — and its decline is deliberate (AC 23/23b). What must not
+/// happen is the measured silent exit: the run burned its whole edit
+/// budget, no repair generation was ever admitted, and nothing durable
+/// distinguished that from a repair that fought and lost. The §9.2 decline
+/// record must name the absent lineage and the unspent repair budget, and
+/// the terminal outcome's `FailureIr` must say no repair generation ran.
+#[tokio::test]
+async fn gen1_edit_model_decline_reports_absent_lineage_and_unspent_budget() {
+    let h = Harness::new(HarnessOptions::default()).await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [Step::Fail {
+            node: NodeSel::Edit,
+            class: ErrorClass::Model,
+            diags: 1,
+        }],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+
+    h.plane.runs().start(run).await.unwrap();
+
+    assert_eq!(sched.calls(), 1, "the decline admits nothing (AC 23)");
+    assert_eq!(h.run_state(run).await, "failed");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["admitted"], json!(false));
+    // AC 23b's reason vocabulary is retained; the near-miss is additive.
+    assert_eq!(decisions[0]["reason"], json!("kind"));
+    assert_eq!(decisions[0]["lineage"], json!("absent"));
+    assert_eq!(decisions[0]["bumps_used"], json!(0));
+    assert_eq!(decisions[0]["max_repair_generations"], json!(2));
+
+    // The durable terminal outcome names the declined repair instead of
+    // exiting shaped like an ordinary model failure — scheduler notes kept.
+    let notes = run_finished_failure_notes(&h, run).await;
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].contains("no repair generation was admitted"),
+        "terminal FailureIr must carry the decline note, got: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("cargo check failed"),
+        "scheduler-authored notes must be preserved, got: {}",
+        notes[0]
+    );
+    h.close().await;
+}
+
+/// The near-miss annotation stays narrow. An exhausted lineage decline
+/// (GN5) keeps its `FailureIr` intact (GN11) and reports no `lineage`
+/// field; a generation-1 `Edit(Tool)` decline (wrong class, not a
+/// near-miss) reports neither — while every decline still carries the
+/// budget accounting.
+#[tokio::test]
+async fn non_near_miss_declines_keep_failure_ir_intact() {
+    // Bound 1: the verify Fail admits the only bump, then the lineage
+    // Edit(Model) failure declines "exhausted" with lineage present.
+    let h = Harness::new(HarnessOptions {
+        max_repair_generations: 1,
+        ..Default::default()
+    })
+    .await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            Step::Fail {
+                node: NodeSel::VerifyCompile,
+                class: ErrorClass::Compile,
+                diags: 1,
+            },
+            Step::Fail {
+                node: NodeSel::Edit,
+                class: ErrorClass::Model,
+                diags: 1,
+            },
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+    h.plane.runs().start(run).await.unwrap();
+
+    assert_eq!(h.run_state(run).await, "failed");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[1]["admitted"], json!(false));
+    assert_eq!(decisions[1]["reason"], json!("exhausted"));
+    assert!(
+        decisions[1].get("lineage").is_none_or(|v| v.is_null()),
+        "an exhausted decline with lineage present is not the near-miss"
+    );
+    assert_eq!(decisions[1]["bumps_used"], json!(1));
+    assert_eq!(decisions[1]["max_repair_generations"], json!(1));
+    let notes = run_finished_failure_notes(&h, run).await;
+    assert_eq!(
+        notes,
+        vec!["cargo check failed".to_owned()],
+        "GN11: an exhausted decline returns the FailureIr intact"
+    );
+    h.close().await;
+
+    // Generation-1 Edit(Tool): declines "kind" but is not the near-miss —
+    // no annotation, no lineage field.
+    let h = Harness::new(HarnessOptions::default()).await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [Step::Fail {
+            node: NodeSel::Edit,
+            class: ErrorClass::Tool,
+            diags: 1,
+        }],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+    h.plane.runs().start(run).await.unwrap();
+
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["reason"], json!("kind"));
+    assert!(
+        decisions[0].get("lineage").is_none_or(|v| v.is_null()),
+        "a wrong-class decline is not the near-miss"
+    );
+    let notes = run_finished_failure_notes(&h, run).await;
+    assert_eq!(notes, vec!["cargo check failed".to_owned()]);
+    h.close().await;
+}
+
+/// Terminal `RunFinished` failure notes for `run`, in emission order.
+async fn run_finished_failure_notes(h: &Harness, run: RunId) -> Vec<String> {
+    h.runtime_events()
+        .await
+        .into_iter()
+        .filter_map(|ev| match ev {
+            RuntimeEvent::RunFinished { run_id, outcome } if run_id == run => {
+                outcome.failure.map(|f| f.notes)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// AC 24 / GN5 / GN11: with the default bound of 2, the third verify Fail
 /// returns the final Failed outcome with its `FailureIr` intact and records
 /// `Replan{admitted:false, reason:"exhausted"}`.
