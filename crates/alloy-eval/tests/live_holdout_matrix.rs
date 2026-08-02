@@ -279,6 +279,27 @@ fn arm_row(
 /// documents are left deliberately uncommitted — a real operator's roadmap
 /// edits must never block a run.
 fn write_checkout(root: &Path) -> PathBuf {
+    write_checkout_with(root, &[], &[])
+}
+
+/// A fixture with a manifest but no workspace: run.sh dies on it, which is how
+/// a test forces an arm to fail *during execution* rather than at a preflight
+/// guard.
+fn write_unrunnable_fixture(root: &Path, id: &str) {
+    let fixture = root.join(id);
+    fs::create_dir_all(&fixture).unwrap();
+    fs::write(
+        fixture.join("manifest.toml"),
+        format!("naive_target_path = \"src/lib.rs\"\nid = \"{id}\"\n"),
+    )
+    .unwrap();
+}
+
+/// Extra fixtures must be planted before the first commit. The fixture root is
+/// one of the guarded harness paths, so a fixture added later is either
+/// uncommitted (tripping the cleanliness guard) or committed (moving HEAD off
+/// the bundle revision) — both abort before scheduling.
+fn write_checkout_with(root: &Path, extra_fixtures: &[&str], unrunnable: &[&str]) -> PathBuf {
     let repo = root.join("repo");
     let scripts = repo.join("eval/live-holdout");
     fs::create_dir_all(&scripts).unwrap();
@@ -288,6 +309,12 @@ fn write_checkout(root: &Path) -> PathBuf {
     }
     copy_tree(&repo_root().join("profiles"), &repo.join("profiles"));
     write_fixture(&repo.join(FIXTURES_RELPATH), "pass_fixture");
+    for id in extra_fixtures {
+        write_fixture(&repo.join(FIXTURES_RELPATH), id);
+    }
+    for id in unrunnable {
+        write_unrunnable_fixture(&repo.join(FIXTURES_RELPATH), id);
+    }
     fs::create_dir_all(repo.join("docs/roadmap")).unwrap();
     fs::write(repo.join("docs/roadmap/README.md"), "roadmap\n").unwrap();
     git(&repo, &["init", "-q"]);
@@ -308,9 +335,17 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_fixtures(&[], &[])
+    }
+
+    fn with_extra_fixtures(extra: &[&str]) -> Self {
+        Self::with_fixtures(extra, &[])
+    }
+
+    fn with_fixtures(extra: &[&str], unrunnable: &[&str]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_owned();
-        let repo = write_checkout(&root);
+        let repo = write_checkout_with(&root, extra, unrunnable);
         let revision = head_revision(&repo);
         // The bundle lives outside the checkout, as prepare.sh requires.
         let bundle = write_bundle(&root, &revision);
@@ -745,26 +780,65 @@ fn matrix_interleaves_arms_by_block_with_a_reproducible_schedule() {
     }
 }
 
+/// The first pass must sweep the whole corpus. Fixture-major ordering would
+/// spend every repetition on the first fixture before touching the second, so
+/// a broken fixture late in the corpus would only surface near the end of a
+/// multi-hour run, and an interrupted run would hold a lopsided sample.
+#[test]
+fn schedule_is_repetition_major_so_the_first_pass_covers_every_fixture() {
+    let harness = Harness::with_extra_fixtures(&["zz_second_fixture"]);
+    let arms = arms_file(
+        harness.root(),
+        "arms.tsv",
+        &[
+            &arm_row("baseline", "alloy", "stub-model-a", "0.6", "default", "2"),
+            &arm_row("hotter", "alloy", "stub-model-b", "0.6", "default", "2"),
+        ],
+    );
+    let out = harness.root().join("out");
+    let output = harness.run("matrix.sh", &arms, &out);
+    assert!(output.status.success(), "{}", describe(&output));
+
+    let schedule = fs::read_to_string(out.join("schedule.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = schedule
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split('\t').collect())
+        .collect();
+    // 2 fixtures x 2 repetitions x 2 arms.
+    assert_eq!(rows.len(), 8, "schedule:\n{schedule}");
+
+    // Both fixtures must appear before any fixture reaches repetition 2.
+    let first_pass: Vec<&str> = rows
+        .iter()
+        .filter(|row| row[2] == "1")
+        .map(|row| row[1])
+        .collect();
+    let distinct: std::collections::BTreeSet<&&str> = first_pass.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        2,
+        "repetition 1 must cover every fixture:\n{schedule}"
+    );
+
+    // No repetition-2 block may be scheduled before every repetition-1 block.
+    let last_rep1 = rows.iter().rposition(|row| row[2] == "1").unwrap();
+    let first_rep2 = rows.iter().position(|row| row[2] == "2").unwrap();
+    assert!(
+        last_rep1 < first_rep2,
+        "repetition 2 started before repetition 1 finished:\n{schedule}"
+    );
+}
+
 /// A harness failure in one arm voids the comparison, so the matrix must stop
 /// before spending budget on arms that can no longer be compared. Previously
 /// it recorded the failure and carried on to the next arm.
 #[test]
 fn matrix_aborts_the_whole_run_when_one_arm_fails() {
-    let harness = Harness::new();
     // Sorts before "pass_fixture", so it is reached in the very first block.
-    let broken = harness
-        .root()
-        .join("repo")
-        .join(FIXTURES_RELPATH)
-        .join("aa_unrunnable_fixture");
-    fs::create_dir_all(&broken).unwrap();
-    fs::write(
-        broken.join("manifest.toml"),
-        "naive_target_path = \"src/lib.rs\"\nid = \"aa_unrunnable_fixture\"\n",
-    )
-    .unwrap();
-    git_commit(&harness.root().join("repo"), "add an unrunnable fixture");
-
+    // It is planted before the first commit so the abort is attributable to
+    // the arm rather than to a preflight guard.
+    let harness = Harness::with_fixtures(&[], &["aa_unrunnable_fixture"]);
     let arms = arms_file(
         harness.root(),
         "arms.tsv",
@@ -781,14 +855,30 @@ fn matrix_aborts_the_whole_run_when_one_arm_fails() {
         "matrix must fail when an arm fails: {}",
         describe(&output)
     );
-    // The second arm of the failing block must never have been started.
-    let started: Vec<&str> = ["baseline", "hotter"]
-        .into_iter()
-        .filter(|arm| out.join(format!("{arm}.jsonl")).exists())
-        .collect();
+    // The abort must come from the ARM, not from a preflight guard that never
+    // reaches scheduling — otherwise this test passes for the wrong reason.
     assert!(
-        started.len() < 2,
-        "the matrix ran every arm despite a failure: {started:?}\n{}",
+        out.join("schedule.tsv").exists(),
+        "matrix aborted before scheduling, so this proves nothing about arm \
+         failure handling: {}",
+        describe(&output)
+    );
+    // The schedule holds 4 attempts (2 blocks x 2 arms). Exactly one may be
+    // dispatched: the matrix must stop at the first failure, not carry on
+    // through the remaining arms and blocks.
+    let scheduled = fs::read_to_string(out.join("schedule.tsv"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .count();
+    assert_eq!(scheduled, 4, "{}", describe(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dispatched = stdout.lines().filter(|l| l.starts_with("BLOCK ")).count();
+    assert_eq!(
+        dispatched,
+        1,
+        "matrix dispatched {dispatched} attempts after a failure; it must stop \
+         at the first\n{}",
         describe(&output)
     );
     assert!(

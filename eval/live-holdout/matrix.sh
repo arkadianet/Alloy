@@ -212,9 +212,14 @@ arm_count="${#arm_ids[@]}"
 schedule_file="$out_dir/schedule.tsv"
 : >"$schedule_file" || die "cannot write $schedule_file"
 
+# Repetition-major, not fixture-major. Sweeping every fixture at rep 1 before
+# any fixture reaches rep 2 means the first pass exercises the whole corpus —
+# a broken fixture or family surfaces in the first fraction of the run rather
+# than near the end — and a run stopped early still holds a balanced sample
+# rather than every repetition of the first few fixtures.
 block=0
-for fixture_id in "${fixture_ids[@]}"; do
-  for rep in $(seq 1 "$expected_reps"); do
+for rep in $(seq 1 "$expected_reps"); do
+  for fixture_id in "${fixture_ids[@]}"; do
     offset=$(((block + SEED) % arm_count))
     for slot in $(seq 0 $((arm_count - 1))); do
       index=$(((offset + slot) % arm_count))
