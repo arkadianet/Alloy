@@ -10,14 +10,17 @@ use std::time::Duration;
 
 use alloy_runtime::{
     compiler_fingerprint_digest, install_sqlite_event_sink, policy_hash_digest,
-    tool_versions_digest, AlloyRuntime, AlloyStorage, ArtifactStore, BudgetPolicy,
+    tool_versions_digest, AdapterError, AlloyRuntime, AlloyStorage, ArtifactStore, BudgetPolicy,
     CostMeterFactory, CreateSession, DagId, DagOutcome, DagState, DagStore, DecisionLog,
-    DecisionRecord, DiagnosticEvent, DiagnosticId, DiagnosticLevel, Digest, ErrorClass, EventStore,
-    FailureIr, GenerationDriver, GenerationDriverDeps, GenerationPolicy, Goal, LanguageId,
-    ModelCallRecord, NodeId, NodeKind, ObsError, PlanContext, PlanFingerprints,
-    PlanProducedPayload, PlanService, ProcessCostMeterFactory, ProfileId, RunId, RuntimeConfig,
-    RuntimeEvent, RuntimeHandle, SchedError, Scheduler, SessionEventType, SessionId, SessionPlane,
-    SessionRows, StorageOpenOptions, TemplatePlanService, ToolCallRecord, ToolchainRecord,
+    DecisionRecord, DiagnosticEvent, DiagnosticId, DiagnosticLevel, Digest, EditContext,
+    EditEngine, EditError, EditRequest, EditTransaction, EditValidation, ErrorClass, EventSink,
+    EventStore, FailureIr, GenerationDriver, GenerationDriverDeps, GenerationPolicy, Goal,
+    LanguageId, ModelCallRecord, NewSessionEvent, NodeExecContext, NodeExecRef, NodeId, NodeKind,
+    ObsError, PermissionToken, PlanContext, PlanFingerprints, PlanProducedPayload, PlanService,
+    ProcessCostMeterFactory, ProfileId, RunId, RuntimeConfig, RuntimeEvent, RuntimeHandle,
+    SchedError, Scheduler, SessionEventType, SessionId, SessionPlane, SessionRows,
+    StorageOpenOptions, TemplatePlanService, ToolCallRecord, ToolchainRecord, TransactionId,
+    Verdict, VerdictOutcome, Verifier, WorkerPermissions, WorkerToolClass,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -248,6 +251,71 @@ fn fingerprints() -> (Digest, Digest, Digest) {
     )
 }
 
+// ---- GN13 fakes: enough machinery for `restore_workspace_and_reseed` to
+// take its success path (rollback the journaled edit, re-verify against the
+// "restored" tree) so the driver observes a replaced seed.
+
+/// Edit engine whose `rollback` always succeeds; apply/validate are never
+/// reached by the driver.
+struct RollbackOkEditEngine;
+
+#[async_trait]
+impl EditEngine for RollbackOkEditEngine {
+    async fn validate(
+        &self,
+        _req: EditRequest,
+        _ctx: &EditContext,
+    ) -> Result<EditValidation, EditError> {
+        unreachable!("driver never validates")
+    }
+
+    async fn apply(
+        &self,
+        _req: EditRequest,
+        _ctx: &EditContext,
+    ) -> Result<EditTransaction, EditError> {
+        unreachable!("driver never applies")
+    }
+
+    async fn rollback(&self, _tx: TransactionId, _ctx: &EditContext) -> Result<(), EditError> {
+        Ok(())
+    }
+}
+
+/// Permission source that mints an empty-grant token for any request.
+struct GrantAllPerms;
+
+#[async_trait]
+impl WorkerPermissions for GrantAllPerms {
+    async fn token_for(
+        &self,
+        ctx: &NodeExecRef,
+        _class: WorkerToolClass,
+    ) -> Result<PermissionToken, AdapterError> {
+        Ok(PermissionToken {
+            profile: ProfileId::new("default").unwrap(),
+            grants: vec![],
+            expires: None,
+            run_id: ctx.run_id,
+        })
+    }
+}
+
+/// Post-rollback verifier: fails compile with the RESTORED tree's original
+/// diagnostic, i.e. a different failure than the admitted (post-edit) seed.
+struct RestoredTreeVerifier;
+
+#[async_trait]
+impl Verifier for RestoredTreeVerifier {
+    async fn verify(&self, _ctx: &NodeExecContext) -> Result<Verdict, AdapterError> {
+        Ok(Verdict {
+            outcome: VerdictOutcome::Fail,
+            diagnostics: vec![diag("original error: missing lifetime specifier")],
+            raw_artifact: None,
+        })
+    }
+}
+
 /// A decision log that always fails (AC 45 / GN12).
 struct FailingDecisionLog;
 
@@ -288,6 +356,10 @@ struct HarnessOptions {
     run_timeout: Duration,
     budget_policy: BudgetPolicy,
     failing_decisions: bool,
+    /// Wire the GN13 fakes (rollback-ok edit engine, grant-all perms,
+    /// restored-tree verifier) so `restore_workspace_and_reseed` replaces
+    /// the admitted seed instead of no-opping.
+    gn13_fakes: bool,
 }
 
 impl Default for HarnessOptions {
@@ -297,6 +369,7 @@ impl Default for HarnessOptions {
             run_timeout: Duration::from_secs(30),
             budget_policy: BudgetPolicy::default(),
             failing_decisions: false,
+            gn13_fakes: false,
         }
     }
 }
@@ -364,9 +437,13 @@ impl Harness {
             policy: GenerationPolicy {
                 max_repair_generations: options.max_repair_generations,
             },
-            edit_engine: None,
-            worker_permissions: None,
-            verify_compile: None,
+            edit_engine: options
+                .gn13_fakes
+                .then(|| Arc::new(RollbackOkEditEngine) as _),
+            worker_permissions: options.gn13_fakes.then(|| Arc::new(GrantAllPerms) as _),
+            verify_compile: options
+                .gn13_fakes
+                .then(|| Arc::new(RestoredTreeVerifier) as _),
         }));
         plane.set_executor(Arc::clone(&driver) as _);
         Self {
@@ -1340,5 +1417,125 @@ async fn ac45_failing_decision_log_never_fails_a_generation() {
     let m = h.driver.metrics();
     assert_eq!(m.replans_admitted, 1);
     assert_eq!(m.generations_run, 2);
+    h.close().await;
+}
+
+/// E2 dev-loop fix: when GN13 replaces the admitted (post-edit) seed with
+/// the restored tree's verdict, the informative failure — what the
+/// rolled-back edit actually broke — must not be erased. The driver must
+/// record it as an `error` event with class `rollback` on the run, whose
+/// message names the discarded diagnostics and states the workspace was
+/// restored, so the context engine can promote it into generation N+1's
+/// `conversation:prior_failure` section. Measured motivation: 16/16
+/// two-plus-edit dev-loop runs never saw a post-edit diagnostic and 7/16
+/// re-emitted a byte-identical patch every generation.
+#[tokio::test]
+async fn gn13_reseed_records_the_discarded_post_edit_failure_as_a_rollback_note() {
+    let h = Harness::new(HarnessOptions {
+        gn13_fakes: true,
+        ..HarnessOptions::default()
+    })
+    .await;
+    let (session, run, _dag) = h.planned_run().await;
+
+    // Journal one applied edit so GN13 has a checkpoint to restore.
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run),
+            type_: SessionEventType::EditApplied,
+            payload: json!({
+                "transaction_id": TransactionId::new().to_string(),
+                "files_touched": ["src/lib.rs"],
+            }),
+        })
+        .await
+        .unwrap();
+
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            // Generation 1 fails verify on the POST-EDIT tree ("mismatched
+            // types 0"). GN13 then rolls back and re-verifies; the fake
+            // verifier reports the restored tree's ORIGINAL diagnostic.
+            Step::Fail {
+                node: NodeSel::VerifyCompile,
+                class: ErrorClass::Compile,
+                diags: 1,
+            },
+            Step::Succeed,
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+
+    h.plane.runs().start(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, "succeeded");
+
+    let notes: Vec<alloy_runtime::SessionEvent> = h
+        .session_events(session)
+        .await
+        .into_iter()
+        .filter(|e| {
+            e.type_ == SessionEventType::Error && e.payload.get("class") == Some(&json!("rollback"))
+        })
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "exactly one rollback note for the one reseeded generation"
+    );
+    let note = &notes[0];
+    assert_eq!(note.run_id, Some(run), "the note must be run-attributed");
+    let message = note.payload["message"].as_str().expect("message present");
+    assert!(
+        message.contains("mismatched types 0"),
+        "the DISCARDED post-edit diagnostic must be quoted: {message}"
+    );
+    assert!(
+        message.contains("rolled back"),
+        "the note must state the workspace was rolled back: {message}"
+    );
+    assert!(
+        !message.contains("original error: missing lifetime"),
+        "the restored tree's diagnostic rides the replan seed, not the note: {message}"
+    );
+    h.close().await;
+}
+
+/// Control for the note above: without GN13 wiring the seed is never
+/// replaced, so no rollback note may appear — the note must never become
+/// ambient noise on ordinary replans.
+#[tokio::test]
+async fn no_rollback_note_when_gn13_leaves_the_seed_alone() {
+    let h = Harness::new(HarnessOptions::default()).await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            Step::Fail {
+                node: NodeSel::VerifyCompile,
+                class: ErrorClass::Compile,
+                diags: 1,
+            },
+            Step::Succeed,
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+
+    h.plane.runs().start(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, "succeeded");
+
+    let rollbacks = h
+        .session_events(session)
+        .await
+        .into_iter()
+        .filter(|e| {
+            e.type_ == SessionEventType::Error && e.payload.get("class") == Some(&json!("rollback"))
+        })
+        .count();
+    assert_eq!(rollbacks, 0, "an untouched seed must record no note");
     h.close().await;
 }

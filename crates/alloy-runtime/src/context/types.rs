@@ -354,6 +354,10 @@ pub struct AssembleInputs {
     /// never "no problems". Rendered by the engine as one bounded
     /// `conversation:prior_failure` section carrying the class and notes
     /// only; the carried `diagnostics` are NOT rendered (live diagnostics
-    /// arrive via [`AssembleInputs::diagnostics`]).
+    /// arrive via [`AssembleInputs::diagnostics`]). The engine composes the
+    /// same section from the run's newest GN13 rollback note in the event
+    /// log (an `error` event with class `rollback`) even when this field is
+    /// `None`, so a fresh generation-N+1 node still learns what the
+    /// rolled-back edit broke.
     pub prior_failure: Option<FailureIr>,
 }

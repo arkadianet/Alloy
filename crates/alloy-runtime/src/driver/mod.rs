@@ -49,9 +49,10 @@ use crate::capabilities::{WorkerPermissions, WorkerToolClass};
 use crate::dag::NodeKind;
 use crate::edit::{transactions_of_run, EditContext, EditEngine};
 use crate::error::{RunError, RuntimeError};
-use crate::events::{SessionEvent, SessionEventType};
+use crate::events::{NewSessionEvent, SessionEvent, SessionEventType};
 use crate::obs::{
-    truncate_utf8_bytes, BudgetCheck, CostMeterFactory, DecisionKind, DecisionLog, DecisionRecord,
+    redact_secrets, truncate_utf8_bytes, BudgetCheck, CostMeterFactory, DecisionKind, DecisionLog,
+    DecisionRecord,
 };
 use crate::planner::seed::seed_projection_is_empty;
 use crate::planner::{PlanContext, PlanError, PlanProducedPayload, PlanService, PlanSource};
@@ -487,6 +488,35 @@ impl GenerationDriver {
         }
     }
 
+    /// Record the seed GN13 just discarded as an `error` event with class
+    /// `rollback` on the run — the durable channel the context engine's
+    /// conversation domain reads. Best-effort (GN12 posture): a sink
+    /// failure is logged and never fails the generation.
+    async fn note_discarded_seed_rollback(&self, ctx: &RunExecCtx, discarded: &FailureIr) {
+        let payload = json!({
+            "class": "rollback",
+            "message": rollback_note_message(discarded),
+        });
+        if let Err(error) = self
+            .deps
+            .events
+            .append_session(NewSessionEvent {
+                session_id: ctx.session_id,
+                run_id: Some(ctx.run_id),
+                type_: SessionEventType::Error,
+                payload,
+            })
+            .await
+        {
+            warn!(
+                run_id = %ctx.run_id,
+                dag_id = %ctx.dag_id,
+                error = %error,
+                "GN13 rollback note dropped (best-effort)"
+            );
+        }
+    }
+
     /// Rebuild the replan [`PlanContext`] (GN10): goal from the run row's
     /// durable goal envelope, fingerprints from the composition root,
     /// provenance from the last `PlanProduced` event for this DAG.
@@ -523,6 +553,55 @@ impl GenerationDriver {
 /// worker-side FM15 bound is 2 KiB; a decision row is not a log sink, and
 /// every observed edit-validator violation fits well inside this.
 const MAX_DECLINE_NOTE_BYTES: usize = 512;
+
+/// Byte bound on a GN13 rollback note's message. The context engine cuts
+/// the rendered `prior_failure` section at its own 2 KiB cap; staying under
+/// it here means a compliant note is never truncated mid-diagnostic.
+const MAX_ROLLBACK_NOTE_BYTES: usize = 1_536;
+
+/// How many of the discarded seed's diagnostics a rollback note quotes.
+const MAX_ROLLBACK_NOTE_DIAGS: usize = 3;
+
+/// The rollback note for a seed GN13 discarded: what the applied edit
+/// broke, that the workspace was restored, and what the next generation
+/// must therefore do. Pure and bounded ([`MAX_ROLLBACK_NOTE_BYTES`],
+/// secret-redacted) so the message surface is testable without the driver
+/// assembly. Read by a weak model next to the ORIGINAL file and the
+/// ORIGINAL diagnostics, so it must say explicitly that the shown state is
+/// the pre-edit one.
+fn rollback_note_message(discarded: &FailureIr) -> String {
+    let mut quoted = String::new();
+    for d in discarded.diagnostics.iter().take(MAX_ROLLBACK_NOTE_DIAGS) {
+        if !quoted.is_empty() {
+            quoted.push_str("; ");
+        }
+        if let Some(code) = &d.code {
+            quoted.push_str(&format!("error[{code}] "));
+        }
+        if let Some(span) = d.spans.first() {
+            quoted.push_str(&format!("{}:{} — ", span.path, span.start_line));
+        }
+        quoted.push_str(&truncate_utf8_bytes(&d.message, 256));
+    }
+    let more = discarded
+        .diagnostics
+        .len()
+        .saturating_sub(MAX_ROLLBACK_NOTE_DIAGS);
+    if more > 0 {
+        quoted.push_str(&format!("; and {more} more"));
+    }
+    if quoted.is_empty() {
+        quoted.push_str("(no diagnostics captured)");
+    }
+    let message = format!(
+        "an earlier repair edit was applied, but verification then failed with: {quoted}. \
+         That edit was rolled back — the files and diagnostics shown are the ORIGINAL \
+         pre-edit state, and no patch from history or artifacts is in the file. Fix the \
+         shown diagnostics with a complete change that does not reintroduce the failure \
+         quoted above."
+    );
+    truncate_utf8_bytes(&redact_secrets(&message), MAX_ROLLBACK_NOTE_BYTES)
+}
 
 /// §9.2 `Replan` decision metadata, pure so the record surface is testable
 /// without the full driver assembly.
@@ -783,10 +862,24 @@ impl RunExecutor for GenerationDriver {
 
             // GN13 — undo morphing edits and re-derive the seed against the
             // restored tree before the planner writes generation N+1.
+            let admitted_seed = seed.clone();
             let seed = match self.restore_workspace_and_reseed(&ctx, seed).await {
                 Ok(seed) => seed,
                 Err(e) => return Err(fold(e)),
             };
+            // A replaced seed means GN13 rolled the newest edit back and
+            // re-verified: the admitted (post-edit) failure — the one fact
+            // generation N+1 needs and generation N's file state no longer
+            // shows — is about to be discarded. Record it as a run-scoped
+            // rollback note; the context engine promotes the newest note
+            // into the next generation's `conversation:prior_failure`
+            // section. Without this, dev-loop showed generation N+1 to be
+            // a byte-for-byte replay of generation N (16/16 two-plus-edit
+            // runs saw zero post-edit diagnostics; 0% passed).
+            if seed != admitted_seed {
+                self.note_discarded_seed_rollback(&ctx, &admitted_seed)
+                    .await;
+            }
 
             // Admitted. Recover provenance first (read-only) so the
             // decision record can carry it (§9.2).
