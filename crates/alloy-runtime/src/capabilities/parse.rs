@@ -529,13 +529,14 @@ pub(crate) fn screen_line_ops(ops: &[LineOp]) -> Result<(), String> {
             if end < start {
                 return Err(format!("end {end} is before start {start}"));
             }
-            let span = usize::try_from(end - start + 1).unwrap_or(usize::MAX);
-            if expect.len() != span {
-                return Err(format!(
-                    "expect lists {} line(s) but start..=end covers {span}; \
-                     expect must repeat every current line in the range",
-                    expect.len()
-                ));
+            // Deliberately NOT checking that expect.len() == end - start + 1.
+            // That mismatch refused the whole edit before any file was read
+            // and was the largest single cause of attempts that never applied
+            // an edit — which score zero, exactly as badly as a corrupted
+            // file. The range is derived from `expect` at compile time and
+            // the content is still verified line by line against the file.
+            if expect.is_empty() {
+                return Err("expect must list the current content of the range".into());
             }
             Ok(())
         };
@@ -925,11 +926,24 @@ fn compile_file_ops(path: &str, content: &str, ops: &[&LineOp]) -> Result<Vec<Hu
                 }
             }
             LineOp::Replace(_) | LineOp::Delete(_) => {
-                let (start, end, expect, new): (u32, u32, &[String], &[String]) = match op {
+                let (start, declared_end, expect, new): (u32, u32, &[String], &[String]) = match op
+                {
                     LineOp::Replace(op) => (op.start, op.end, &op.expect, &op.new),
                     LineOp::Delete(op) => (op.start, op.end, &op.expect, &[]),
                     LineOp::Insert(_) => unreachable!("matched above"),
                 };
+                // `expect` is the authority for the range, not `end`. Local
+                // models quote the right lines and miscount the boundary
+                // constantly, and `end` carries no safety weight — the check
+                // that catches a stale or mis-anchored op is `verify_expect`,
+                // which walks `expect` from `start` and never reads `end`.
+                // Deriving it also keeps the emitted hunk internally
+                // consistent: trusting a too-large `end` produced a hunk
+                // claiming more old lines than it listed.
+                let end = start
+                    .saturating_add(u32::try_from(expect.len()).unwrap_or(u32::MAX))
+                    .saturating_sub(1);
+                let _ = declared_end;
                 if end > total {
                     return Err(format!(
                         "op targets lines {start}..={end} but {path} has {total} line(s); \
@@ -1260,6 +1274,52 @@ mod tests {
         );
     }
 
+    /// The model routinely miscounts `end` while quoting `expect` correctly.
+    /// That arithmetic carried no safety weight — `verify_expect` anchors on
+    /// `start` plus expect CONTENT and never reads `end` — yet the mismatch
+    /// refused the whole edit before any file was read. It was the single
+    /// largest cause of attempts that never applied an edit at all, and those
+    /// score zero. `expect` is the authority; the range is derived from it.
+    #[test]
+    fn miscounted_end_is_derived_from_expect_not_refused() {
+        let files = one_file("a.rs", "one\ntwo\nthree\n");
+        // Correct content, wrong arithmetic: end says 3 lines, expect lists 2.
+        let set = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "replace_lines", "path": "a.rs", "start": 1, "end": 3,
+                "expect": ["one", "two"], "new": ["ONE", "TWO"],
+            }))],
+            &files,
+        )
+        .expect("a miscounted end must not refuse a correctly quoted edit");
+        // The emitted hunk must claim exactly as many old lines as `expect`
+        // listed. Trusting the model's `end` produced a hunk asserting three
+        // old lines while listing two deletions — an internally inconsistent
+        // patch the backend would reject or misapply.
+        let rendered = format!("{set:?}");
+        assert!(rendered.contains("ONE"), "{rendered}");
+        assert!(
+            rendered.contains("old_lines: 2"),
+            "hunk must be sized from expect, not from the declared end: {rendered}"
+        );
+    }
+
+    /// The content check must still fire — deriving the range must not mean
+    /// trusting the model about what the file holds.
+    #[test]
+    fn wrong_expect_content_is_still_refused_after_deriving_the_range() {
+        let files = one_file("a.rs", "one\ntwo\nthree\n");
+        let err = ops_to_patchset(
+            &[op(serde_json::json!({
+                "op": "replace_lines", "path": "a.rs", "start": 1, "end": 9,
+                "expect": ["NOT THE FILE"], "new": ["x"],
+            }))],
+            &files,
+        )
+        .unwrap_err();
+        assert!(err.contains("stale op"), "{err}");
+    }
+
     #[test]
     fn diff_u0_midfile_insertion_is_accepted() {
         let patch = "--- a/a.rs\n+++ b/a.rs\n@@ -2,0 +3,1 @@\n+inserted\n";
@@ -1360,12 +1420,21 @@ mod tests {
         }))])
         .is_err());
         assert!(screen_line_ops(&[op(serde_json::json!({
-            "op": "delete_lines", "path": "a.rs", "start": 3, "end": 2, "expect": [],
+            "op": "delete_lines", "path": "a.rs", "start": 3, "end": 2, "expect": ["x"],
         }))])
         .is_err());
+        // A miscounted `end` is NOT a screen failure any more: the range is
+        // derived from `expect` at compile time, and the content is verified
+        // against the file there. Refusing it here cost more than it caught.
         assert!(screen_line_ops(&[op(serde_json::json!({
             "op": "replace_lines", "path": "a.rs", "start": 1, "end": 2,
             "expect": ["only one"], "new": ["n"],
+        }))])
+        .is_ok());
+        // An absent expect still is: nothing would anchor the op.
+        assert!(screen_line_ops(&[op(serde_json::json!({
+            "op": "replace_lines", "path": "a.rs", "start": 1, "end": 1,
+            "expect": [], "new": ["n"],
         }))])
         .is_err());
         // Empty new on replace/insert.
