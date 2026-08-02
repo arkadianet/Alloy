@@ -880,9 +880,20 @@ fn matrix_aborts_the_whole_run_when_one_arm_fails() {
     let dispatched = stdout.lines().filter(|l| l.starts_with("BLOCK ")).count();
     assert_eq!(
         dispatched,
+        2,
+        "expected only the failing block's two arms to be dispatched, got \
+         {dispatched} of 4 scheduled\n{}",
+        describe(&output)
+    );
+    let blocks: std::collections::BTreeSet<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("BLOCK "))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .collect();
+    assert_eq!(
+        blocks.len(),
         1,
-        "matrix dispatched {dispatched} attempts after a failure; it must stop \
-         at the first\n{}",
+        "matrix continued past the failing block: {blocks:?}\n{}",
         describe(&output)
     );
     assert!(

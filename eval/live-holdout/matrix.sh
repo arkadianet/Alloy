@@ -238,29 +238,62 @@ echo "SCHEDULE seed=$SEED blocks=$block arms=$arm_count -> $schedule_file"
 # longer be compared against a valid baseline. Model repair failures are
 # different: run.sh scores those as observations and still exits 0.
 
-attempt_schedule="$out_dir/.attempt.schedule"
+# Every arm in a block runs CONCURRENTLY. Sequential arms let endpoint state
+# drift between the first arm and the last within the same block; running them
+# together means all arms see one server state, which is a stronger control
+# than ordering alone. Each arm owns its own schedule file and its own
+# observations file, so nothing is shared across the concurrent processes.
+run_block_arm() {
+  local index="$1" fixture_id="$2" rep="$3" arm_id="$4"
+  local sched="$out_dir/.attempt.$arm_id.schedule"
+  printf '%s %s\n' "$fixture_id" "$rep" >"$sched" || return 1
+  DRIVER="${arm_drivers[$index]}" MODEL="${arm_models[$index]}" \
+    TEMP="${arm_temps[$index]}" PROFILE="${arm_profiles[$index]}" \
+    BASEURL="${arm_urls[$index]}" REPS="${arm_reps[$index]}" \
+    FIXTURES="$fixtures" \
+    SCHEDULE="$sched" APPEND=1 SCORE=0 \
+    ALLOY="$debug/alloy" NAIVE="$debug/alloy-eval-live-naive" \
+    SCORER="$debug/alloy-eval-live-repair" \
+    EVAL_HOLDOUT="$debug/alloy-eval-live-holdout" \
+    SOURCE_REVISION="$source_revision" BUNDLE_SHA256="$bundle_sha256" \
+    "$repo/eval/live-holdout/run.sh" "$out_dir/$arm_id.jsonl" </dev/null
+}
+
+current_block=""
+block_pids=()
+block_arms=()
+
+await_block() {
+  local rc=0 i
+  for i in "${!block_pids[@]}"; do
+    if ! wait "${block_pids[$i]}"; then
+      echo "matrix.sh: arm ${block_arms[$i]} failed in block $current_block" >&2
+      rc=1
+    fi
+  done
+  block_pids=()
+  block_arms=()
+  [ "$rc" -eq 0 ] ||
+    die "an arm failed; aborting the matrix before any further block runs"
+}
+
 while IFS=$'\t' read -r block_id fixture_id rep arm_id; do
+  if [ -n "$current_block" ] && [ "$block_id" != "$current_block" ]; then
+    await_block
+  fi
+  current_block="$block_id"
   index=-1
   for candidate in "${!arm_ids[@]}"; do
     [ "${arm_ids[$candidate]}" = "$arm_id" ] && index="$candidate" && break
   done
   [ "$index" -ge 0 ] || die "schedule names unknown arm '$arm_id'"
-  printf '%s %s\n' "$fixture_id" "$rep" >"$attempt_schedule"
   echo "BLOCK $block_id $fixture_id#$rep -> $arm_id"
-  if ! DRIVER="${arm_drivers[$index]}" MODEL="${arm_models[$index]}" \
-    TEMP="${arm_temps[$index]}" PROFILE="${arm_profiles[$index]}" \
-    BASEURL="${arm_urls[$index]}" REPS="${arm_reps[$index]}" \
-    FIXTURES="$fixtures" \
-    SCHEDULE="$attempt_schedule" APPEND=1 SCORE=0 \
-    ALLOY="$debug/alloy" NAIVE="$debug/alloy-eval-live-naive" \
-    SCORER="$debug/alloy-eval-live-repair" \
-    EVAL_HOLDOUT="$debug/alloy-eval-live-holdout" \
-    SOURCE_REVISION="$source_revision" BUNDLE_SHA256="$bundle_sha256" \
-    "$repo/eval/live-holdout/run.sh" "$out_dir/$arm_id.jsonl" </dev/null; then
-    die "arm $arm_id failed on $fixture_id#$rep (block $block_id); aborting the matrix"
-  fi
+  run_block_arm "$index" "$fixture_id" "$rep" "$arm_id" &
+  block_pids+=("$!")
+  block_arms+=("$arm_id")
 done <"$schedule_file"
-rm -f "$attempt_schedule"
+[ "${#block_pids[@]}" -eq 0 ] || await_block
+rm -f "$out_dir"/.attempt.*.schedule
 
 # --- Score each arm once the whole schedule has run. ------------------------
 
