@@ -188,34 +188,137 @@ mkdir -p "$out_dir" || die "cannot create $out_dir"
 
 echo "BUNDLE $bundle source_revision=$source_revision binary_bundle_sha256=$bundle_sha256"
 
-arm_args=()
-status=0
-for index in "${!arm_ids[@]}"; do
-  arm_id="${arm_ids[$index]}"
-  observations="$out_dir/$arm_id.jsonl"
-  report="$out_dir/$arm_id.report.json"
-  echo "RUN $arm_id: driver=${arm_drivers[$index]} model=${arm_models[$index]}" \
-    "profile=${arm_profiles[$index]} temp=${arm_temps[$index]} reps=${arm_reps[$index]}"
-  if ! DRIVER="${arm_drivers[$index]}" MODEL="${arm_models[$index]}" \
+# --- Deterministic interleaved block schedule. ------------------------------
+#
+# Running whole arms back-to-back confounds the treatment with time: endpoint
+# warm-up, thermal throttling and server drift all land unevenly across arms.
+# Instead the unit of work is a BLOCK — one (fixture, repetition) pair — and
+# every arm runs that block before the schedule moves on. Arm order rotates by
+# block so no arm is systematically first; the rotation is a pure function of
+# SEED and the block index, so the whole schedule is reproducible.
+
+SEED="${SEED:-1}"
+case "$SEED" in
+  '' | *[!0-9]*) die "SEED must be a non-negative integer, got '$SEED'" ;;
+esac
+
+mapfile -t fixture_ids < <(
+  find "$fixtures" -mindepth 2 -maxdepth 2 -name manifest.toml -printf '%h\n' |
+    xargs -r -n1 basename | sort
+)
+[ "${#fixture_ids[@]}" -gt 0 ] || die "no fixture manifests under $fixtures"
+
+arm_count="${#arm_ids[@]}"
+schedule_file="$out_dir/schedule.tsv"
+: >"$schedule_file" || die "cannot write $schedule_file"
+
+# Repetition-major, not fixture-major. Sweeping every fixture at rep 1 before
+# any fixture reaches rep 2 means the first pass exercises the whole corpus —
+# a broken fixture or family surfaces in the first fraction of the run rather
+# than near the end — and a run stopped early still holds a balanced sample
+# rather than every repetition of the first few fixtures.
+block=0
+for rep in $(seq 1 "$expected_reps"); do
+  for fixture_id in "${fixture_ids[@]}"; do
+    offset=$(((block + SEED) % arm_count))
+    for slot in $(seq 0 $((arm_count - 1))); do
+      index=$(((offset + slot) % arm_count))
+      printf '%d\t%s\t%d\t%s\n' \
+        "$block" "$fixture_id" "$rep" "${arm_ids[$index]}" >>"$schedule_file"
+    done
+    block=$((block + 1))
+  done
+done
+echo "SCHEDULE seed=$SEED blocks=$block arms=$arm_count -> $schedule_file"
+
+# --- Execute the schedule. --------------------------------------------------
+#
+# A harness or preflight failure in ANY arm voids the whole comparison, so the
+# matrix stops immediately rather than spending budget on arms that can no
+# longer be compared against a valid baseline. Model repair failures are
+# different: run.sh scores those as observations and still exits 0.
+
+# Every arm in a block runs CONCURRENTLY. Sequential arms let endpoint state
+# drift between the first arm and the last within the same block; running them
+# together means all arms see one server state, which is a stronger control
+# than ordering alone. Each arm owns its own schedule file and its own
+# observations file, so nothing is shared across the concurrent processes.
+run_block_arm() {
+  local index="$1" fixture_id="$2" rep="$3" arm_id="$4"
+  local sched="$out_dir/.attempt.$arm_id.schedule"
+  printf '%s %s\n' "$fixture_id" "$rep" >"$sched" || return 1
+  DRIVER="${arm_drivers[$index]}" MODEL="${arm_models[$index]}" \
     TEMP="${arm_temps[$index]}" PROFILE="${arm_profiles[$index]}" \
     BASEURL="${arm_urls[$index]}" REPS="${arm_reps[$index]}" \
     FIXTURES="$fixtures" \
+    SCHEDULE="$sched" APPEND=1 SCORE=0 \
     ALLOY="$debug/alloy" NAIVE="$debug/alloy-eval-live-naive" \
     SCORER="$debug/alloy-eval-live-repair" \
     EVAL_HOLDOUT="$debug/alloy-eval-live-holdout" \
     SOURCE_REVISION="$source_revision" BUNDLE_SHA256="$bundle_sha256" \
-    "$repo/eval/live-holdout/run.sh" "$observations" </dev/null; then
-    status=1
+    "$repo/eval/live-holdout/run.sh" "$out_dir/$arm_id.jsonl" </dev/null
+}
+
+current_block=""
+block_pids=()
+block_arms=()
+
+await_block() {
+  local rc=0 i
+  for i in "${!block_pids[@]}"; do
+    if ! wait "${block_pids[$i]}"; then
+      echo "matrix.sh: arm ${block_arms[$i]} failed in block $current_block" >&2
+      rc=1
+    fi
+  done
+  block_pids=()
+  block_arms=()
+  [ "$rc" -eq 0 ] ||
+    die "an arm failed; aborting the matrix before any further block runs"
+}
+
+while IFS=$'\t' read -r block_id fixture_id rep arm_id; do
+  if [ -n "$current_block" ] && [ "$block_id" != "$current_block" ]; then
+    await_block
   fi
-  [ -f "$report" ] || {
-    echo "matrix.sh: missing report for $arm_id: $report" >&2
-    status=1
-    continue
-  }
+  current_block="$block_id"
+  index=-1
+  for candidate in "${!arm_ids[@]}"; do
+    [ "${arm_ids[$candidate]}" = "$arm_id" ] && index="$candidate" && break
+  done
+  [ "$index" -ge 0 ] || die "schedule names unknown arm '$arm_id'"
+  echo "BLOCK $block_id $fixture_id#$rep -> $arm_id"
+  run_block_arm "$index" "$fixture_id" "$rep" "$arm_id" &
+  block_pids+=("$!")
+  block_arms+=("$arm_id")
+done <"$schedule_file"
+[ "${#block_pids[@]}" -eq 0 ] || await_block
+rm -f "$out_dir"/.attempt.*.schedule
+
+# --- Score each arm once the whole schedule has run. ------------------------
+
+arm_args=()
+for index in "${!arm_ids[@]}"; do
+  arm_id="${arm_ids[$index]}"
+  observations="$out_dir/$arm_id.jsonl"
+  report="$out_dir/$arm_id.report.json"
+  profile_arg=()
+  [ -n "${arm_profiles[$index]}" ] && profile_arg=(--profile "${arm_profiles[$index]}")
+  "$debug/alloy-eval-live-holdout" score \
+    --fixtures "$fixtures" \
+    --observations "$observations" \
+    --model "${arm_models[$index]}" \
+    --temperature "${arm_temps[$index]}" \
+    --driver "${arm_drivers[$index]}" \
+    "${profile_arg[@]}" \
+    --base-url "${arm_urls[$index]}" \
+    --source-revision "$source_revision" \
+    --binary-bundle-sha256 "$bundle_sha256" \
+    --reps "${arm_reps[$index]}" \
+    --out "$report" ||
+    die "scoring arm $arm_id failed; aborting the matrix"
   arm_args+=(--arm "$arm_id=$report")
 done
-
-[ "$status" -eq 0 ] || exit "$status"
 
 "$debug/alloy-eval-live-holdout" compare "${arm_args[@]}" \
   --out "$out_dir/matrix.report.json"

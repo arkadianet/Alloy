@@ -28,7 +28,7 @@ cargo build -p alloy-eval --bin alloy-eval-live-holdout
 
 # llama.cpp on :8089 (see router.toml.local-example), or Ollama on :11434
 ALLOY_API_KEY=local \
-MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf' \
+MODEL='Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf' \
   BASEURL='http://127.0.0.1:8089/v1/' \
   TEMP=0.6 PROFILE=default REPS=1 \
   ./eval/live-holdout/run.sh /tmp/live-holdout.jsonl
@@ -103,15 +103,28 @@ longer sufficient for the strict oracle, and each row also records
 `failure_class`, cargo's post-check/test exit codes, repair-generation count,
 model-call/token telemetry, and the selected `profile`.
 
-Endpoint identity — the fields that must match for two reports to be one
-arm — is `model`, `temperature`, `base_url`, `driver`, `profile`, and
-`harness`. `driver` (`naive` or `alloy`) and `profile` (`none` for naive,
-`default`/`autonomous` for alloy) are both part of that identity, so a naive
-run and an agent run, or two agent runs on different profiles, are never
-silently pooled into one report. `harness` is `{source_revision,
-binary_bundle_sha256}` — build provenance, described next — so a rebuild
-into a shared Cargo target directory can never be mistaken for the binaries
-that actually produced a report.
+Identity is split three ways, because the three parts answer different
+questions and have different comparison rules.
+
+**Endpoint** — `model`, `temperature`, `base_url`. The model server every arm
+talks to. Arms that disagree here are not measuring the same thing.
+
+**Treatment** — `driver` (`naive` or `alloy`), `profile` (`none` for naive,
+`default`/`autonomous` for alloy), and the build that produced the repairs
+(`source_revision`, `binary_bundle_sha256`). This is what a comparison is
+*about*, so arms are expected to differ here; observations from different
+treatments are never silently pooled into one report.
+
+**Protocol** — the corpus, its digest, the evaluator revision that scored the
+run, and the report schema version. This is what a comparison is *controlled
+by*, so it must be identical across arms; `compare` refuses arms scored under
+different protocols rather than reporting a difference that mixes a treatment
+effect with an evaluator or corpus change. The corpus digest covers fixture
+ids and oracle inputs, so an edited corpus cannot pass unnoticed.
+
+Keeping treatment separate from protocol is what makes evidence re-scorable:
+observations captured by one build can be scored again by a corrected
+evaluator without pretending the evaluator never changed.
 
 A malformed or incomplete observation — a missing naive result, a naive result
 that is not exactly one model call, a failed or page-limited Alloy event
@@ -196,8 +209,8 @@ The arms file is seven tab-separated columns:
 
 ```text
 arm_id	driver	model	temperature	profile	base_url	reps
-baseline	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	30
-autonomous-profile	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	30
+baseline	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf	0.6	default	http://127.0.0.1:8089/v1/	30
+autonomous-profile	alloy	Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf	0.6	autonomous	http://127.0.0.1:8089/v1/	30
 ```
 
 The first arm is the descriptive baseline. `matrix.report.json` retains each
@@ -206,6 +219,18 @@ per-fixture deltas. A positive strict-oracle delta is evidence of improvement
 on this measured corpus; zero
 or negative deltas are retained as the documented "why not" result, not hidden
 by an aggregate score.
+
+Because the first arm is the baseline for every row in `comparisons`, the two
+Alloy profiles are never compared to each other there. `matrix.report.json`
+therefore carries a separate `autonomous_vs_default` object: the same
+fixture-clustered paired delta, 95% interval, and per-family macro deltas, with
+the default arm as its baseline. It states `clears_gate` outright — true only
+when the clustered 95% lower bound is above zero — so autonomous uplift is
+never claimed from a bound that does not support it. The arms are located by
+`driver`+`profile`, not by id or position, and the object is **absent** unless
+exactly one `default` arm and one `autonomous` arm ran: an unasked question is
+not a measured null effect. Fewer than two fixtures leaves the bound unbounded,
+which fails the gate rather than passing it.
 
 ## E1: the three-arm operator contract
 

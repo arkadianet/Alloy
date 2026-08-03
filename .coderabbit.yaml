@@ -1,0 +1,20 @@
+# CodeRabbit review scope.
+#
+# The live-holdout fixture corpora are generated measurement data, not
+# application logic: each fixture is a handful of small, near-identical files
+# (a broken source, its reference repair, hidden oracle tests, a manifest).
+# A single corpus version is well over a hundred files, which pushes a PR past
+# CodeRabbit's review limit and buries the code changes that actually need
+# review.
+#
+# These fixtures are already verified mechanically rather than by reading:
+# every one must fail `cargo check` with its declared error code, pass both
+# `cargo check` and its hidden tests once the reference repair is applied, and
+# introduce no `unsafe`. That is enforced in CI, not by review.
+#
+# Everything else — including the harness that consumes these fixtures — stays
+# in review scope.
+reviews:
+  path_filters:
+    - "!eval/live-holdout/fixtures/**"
+    - "!crates/alloy-eval/fixtures/**"

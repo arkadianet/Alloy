@@ -21,7 +21,7 @@ artifacts="${out%.jsonl}.artifacts"
 
 FIXTURES="${FIXTURES:-$repo/crates/alloy-eval/fixtures/holdout}"
 DRIVER="${DRIVER:-alloy}"
-MODEL="${MODEL:-Qwen3-Coder-30B-A3B-Instruct-UD-Q6_K_XL.gguf}"
+MODEL="${MODEL:-Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf}"
 TEMP="${TEMP:-0.6}"
 REPS="${REPS:-1}"
 PROFILE="${PROFILE:-}"
@@ -29,6 +29,11 @@ BASEURL="${BASEURL:-http://127.0.0.1:8089/v1/}"
 TIMEOUT="${TIMEOUT:-600}"
 GOAL="${GOAL:-fix the compile error in this crate}"
 SCORE="${SCORE:-1}"
+# Optional file of "<fixture_id> <repetition>" lines. When set, exactly those
+# attempts run, in that order, so the matrix can interleave arms by block
+# instead of running each arm start-to-finish.
+SCHEDULE="${SCHEDULE:-}"
+APPEND="${APPEND:-0}"
 EVAL_HOLDOUT="${EVAL_HOLDOUT:-}"
 
 die() { echo "live-holdout/run.sh: $1" >&2; exit 2; }
@@ -155,19 +160,60 @@ done
 mkdir -p "$(dirname -- "$out")"
 exec 9>"$out.lock" || die "could not open lock $out.lock"
 flock -n 9 || die "another live-holdout sweep holds $out.lock"
-: > "$out" || die "could not initialize observations file: $out"
+# APPEND lets an interleaved matrix accumulate one arm's attempts across many
+# invocations; a fresh sweep still starts from an empty file.
+if [ "$APPEND" = "1" ]; then
+  [ -e "$out" ] || : > "$out" || die "could not initialize observations file: $out"
+else
+  : > "$out" || die "could not initialize observations file: $out"
+fi
 mkdir -p "$artifacts" || die "could not create evidence root: $artifacts"
 total=0
 process_passed=0
 oracle_passed=0
+# v5 primary outcome: compile + hidden tests + safety, without byte canonicality.
+semantic_passed=0
 unexecutable=0
 
-for id in "${ids[@]}"; do
+# One attempt per line: "<fixture_id> <repetition>". Without a SCHEDULE this
+# is every fixture across every repetition, which is the standalone sweep.
+attempts=()
+if [ -n "$SCHEDULE" ]; then
+  [ -f "$SCHEDULE" ] || die "SCHEDULE file not found: $SCHEDULE"
+  while read -r sched_id sched_rep; do
+    case "$sched_id" in '' | '#'*) continue ;; esac
+    case " ${ids[*]} " in
+      *" $sched_id "*) ;;
+      *) die "SCHEDULE names unknown fixture '$sched_id'" ;;
+    esac
+    case "$sched_rep" in
+      '' | *[!0-9]*) die "SCHEDULE repetition must be a positive integer, got '$sched_rep'" ;;
+    esac
+    attempts+=("$sched_id $sched_rep")
+  done <"$SCHEDULE"
+  [ "${#attempts[@]}" -gt 0 ] || die "SCHEDULE $SCHEDULE contained no attempts"
+else
+  for id in "${ids[@]}"; do
+    for rep in $(seq 1 "$REPS"); do
+      attempts+=("$id $rep")
+    done
+  done
+fi
+
+for attempt in "${attempts[@]}"; do
+  read -r id rep <<<"$attempt"
   workspace="$FIXTURES/$id/workspace"
   [ -d "$workspace" ] || die "fixture $id missing workspace/ at $workspace"
   target_path="$(fixture_target_path "$FIXTURES/$id/manifest.toml")" ||
     die "fixture $id manifest has no naive_target_path"
-  for rep in $(seq 1 "$REPS"); do
+  {
+    # Every cargo invocation below pins CARGO_TARGET_DIR inside this
+    # throwaway workspace. Without it they inherit the machine-wide
+    # ~/.cargo/config.toml target-dir, and because `cp -a` preserves mtimes,
+    # cargo replays a cached result from a previous attempt on the same
+    # fixture — reporting a clean build for source that does not compile.
+    # That bias is arm-asymmetric: an arm that rewrites the whole file gets
+    # fresh mtimes and escapes it, so the comparison itself is corrupted.
     ws="$(mktemp -d)" || die "could not create workspace for $id#$rep"
     cp -a "$workspace"/. "$ws/" ||
       die "fixture copy failed for $id#$rep"
@@ -193,7 +239,7 @@ for id in "${ids[@]}"; do
     mkdir -p "$evidence" || die "could not create evidence directory for $id#$rep"
     # Pre-run diagnostics for every arm. The naive prompt is the only path
     # that shows this file to a model; it holds no golden or hidden-test data.
-    (cd "$ws" && timeout "$TIMEOUT" \
+    (cd "$ws" && CARGO_TARGET_DIR="$ws/target" timeout "$TIMEOUT" \
       cargo check --offline --message-format=short) \
       >"$evidence/initial-cargo.log" 2>&1 || true
     start_ms=$(date +%s%3N)
@@ -242,7 +288,8 @@ for id in "${ids[@]}"; do
       124|126|127) ;;
       *)
         if [ -f "$ws/$target_path" ]; then
-          if (cd "$ws" && timeout "$TIMEOUT" cargo check --offline --quiet) \
+          if (cd "$ws" && CARGO_TARGET_DIR="$ws/target" timeout "$TIMEOUT" \
+            cargo check --offline --quiet) \
             >"$evidence/cargo-check.log" 2>&1; then
             compile_clean=true
             cargo_check_exit=0
@@ -257,11 +304,23 @@ for id in "${ids[@]}"; do
     case "$code" in
       124|126|127) ;;
       *)
+        # Scrub before injecting. `cp -a` MERGES, so any tests/ the driver
+        # left behind would survive alongside the hidden oracle and be run by
+        # a bare `cargo test` — letting a model's own tests decide the score
+        # in either direction. No driver writes tests today, which is why this
+        # has never fired; it is a hole, not a symptom.
+        rm -rf "$ws/tests" ||
+          die "could not clear staged tests for $id#$rep"
         mkdir -p "$ws/tests" ||
           die "could not stage semantic tests for $id#$rep"
         cp -a "$FIXTURES/$id/oracle-tests"/. "$ws/tests/" ||
           die "semantic test copy failed for $id#$rep"
-        if (cd "$ws" && timeout "$TIMEOUT" cargo test --offline --quiet) \
+        # Score the oracle target by name rather than everything cargo finds.
+        # No fixture ships inline `#[cfg(test)]` (verified across the corpus),
+        # so this is behaviour-preserving today and stays honest if one ever
+        # does.
+        if (cd "$ws" && CARGO_TARGET_DIR="$ws/target" timeout "$TIMEOUT" \
+          cargo test --offline --quiet --test semantic) \
           >"$evidence/cargo-test.log" 2>&1; then
           tests_pass=true
           cargo_test_exit=0
@@ -280,7 +339,8 @@ for id in "${ids[@]}"; do
       --tests-pass "$tests_pass" \
       --cargo-test-exit "$cargo_test_exit")" ||
       die "oracle failed for $id#$rep"
-    read -r process_pass compile_clean tests_pass reference_match oracle_pass failure_class \
+    read -r process_pass compile_clean tests_pass safety_clean semantic_pass \
+      reference_match oracle_pass failure_class \
       cargo_check_exit cargo_test_exit generations <<<"$oracle_out" ||
       die "oracle parse failed for $id#$rep"
     case "$DRIVER" in
@@ -308,32 +368,34 @@ for id in "${ids[@]}"; do
       die "telemetry extraction failed for $id#$rep"
     read -r model_calls tokens_in tokens_out <<<"$telemetry_out" ||
       die "telemetry parse failed for $id#$rep"
-    printf '{"fixture_id":"%s","repetition":%d,"driver":"%s","run_exit":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"reference_match":%s,"strict_oracle":%s,"failure_class":"%s","model_calls":%s,"tokens_in":%s,"tokens_out":%s}\n' \
+    printf '{"fixture_id":"%s","repetition":%d,"driver":"%s","run_exit":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"safety_clean":%s,"semantic_pass":%s,"reference_match":%s,"strict_oracle":%s,"failure_class":"%s","model_calls":%s,"tokens_in":%s,"tokens_out":%s}\n' \
       "$id" "$rep" "$DRIVER" "$code" "$process_pass" "$compile_clean" "$tests_pass" \
-      "$reference_match" "$oracle_pass" "$failure_class" \
+      "$safety_clean" "$semantic_pass" "$reference_match" "$oracle_pass" "$failure_class" \
       "$model_calls" "$tokens_in" "$tokens_out" >"$evidence/metadata.json"
     total=$((total + 1))
     [ "$process_pass" = "true" ] && process_passed=$((process_passed + 1))
     [ "$oracle_pass" = "true" ] && oracle_passed=$((oracle_passed + 1))
+    [ "$semantic_pass" = "true" ] && semantic_passed=$((semantic_passed + 1))
     case "$code" in
       126|127) unexecutable=$((unexecutable + 1));;
     esac
-    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"reference_match":%s,"oracle_pass":%s,"failure_class":"%s","cargo_check_exit":%s,"cargo_test_exit":%s,"repair_generations":%d,"wall_ms":%d,"evidence_relpath":"%s","model":"%s","temperature":%s,"driver":"%s","profile":%s,"base_url":"%s","harness":{"source_revision":"%s","binary_bundle_sha256":"%s"},"corpus":"rfc0016-holdout-live","model_calls":%s,"tokens_in":%s,"tokens_out":%s}\n' \
+    printf '{"fixture_id":"%s","repetition":%d,"exit_code":%d,"process_pass":%s,"compile_clean":%s,"tests_pass":%s,"safety_clean":%s,"semantic_pass":%s,"reference_match":%s,"oracle_pass":%s,"failure_class":"%s","cargo_check_exit":%s,"cargo_test_exit":%s,"repair_generations":%d,"wall_ms":%d,"evidence_relpath":"%s","model":"%s","temperature":%s,"driver":"%s","profile":%s,"base_url":"%s","harness":{"source_revision":"%s","binary_bundle_sha256":"%s"},"corpus":"rfc0016-holdout-live","model_calls":%s,"tokens_in":%s,"tokens_out":%s}\n' \
       "$id" "$rep" "$code" "${process_pass,,}" "${compile_clean,,}" \
-      "${tests_pass,,}" "${reference_match,,}" "${oracle_pass,,}" "$failure_class" \
+      "${tests_pass,,}" "${safety_clean,,}" "${semantic_pass,,}" \
+      "${reference_match,,}" "${oracle_pass,,}" "$failure_class" \
       "$cargo_check_exit" "$cargo_test_exit" "$generations" "$wall_ms" \
       "$evidence_relpath" "$MODEL" "$TEMP" "$DRIVER" "$profile_json" "$BASEURL" \
       "$SOURCE_REVISION" "$BUNDLE_SHA256" \
       "$model_calls" "$tokens_in" "$tokens_out" >>"$out"
-    echo "[$oracle_passed/$total oracle; $process_passed process] $id#$rep \
-oracle=$oracle_pass tests=$tests_pass class=$failure_class generations=$generations ${wall_ms}ms"
+    echo "[$semantic_passed/$total semantic; $oracle_passed oracle; $process_passed process] $id#$rep \
+semantic=$semantic_pass oracle=$oracle_pass tests=$tests_pass class=$failure_class generations=$generations ${wall_ms}ms"
     echo "  evidence: $evidence" >&2
     rm -rf "$ws"
-  done
+  }
 done
 
-echo "DONE driver=$DRIVER oracle=$oracle_passed/$total process=$process_passed/$total -> $out \
-(live-BYOM holdout; not an offline gate)"
+echo "DONE driver=$DRIVER semantic=$semantic_passed/$total oracle=$oracle_passed/$total \
+process=$process_passed/$total -> $out (live-BYOM holdout; not an offline gate)"
 echo "EVIDENCE $artifacts"
 
 if [ "$total" -eq 0 ]; then

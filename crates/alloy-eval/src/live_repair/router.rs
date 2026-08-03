@@ -49,6 +49,13 @@ model = "{model}"
 tiers = ["standard", "economy", "premium"]
 supports_tools = true
 supports_structured_output = true
+# E2 (c): explicit, never defaulted. Without this flag the router silently
+# degrades a schema-carrying request to `json_object`, which puts this arm on
+# a different wire contract than the one-shot naive arm and makes the two
+# incomparable. `json_schema_strict` stays off: strict mode rejects schemas
+# outside OpenAI's supported subset, and local servers grammar-constrain
+# regardless.
+supports_json_schema = true
 max_context = 32768
 input_usd_per_mtok = 0.0
 output_usd_per_mtok = 0.0
@@ -124,6 +131,36 @@ mod tests {
         let tiers = model_endpoint["tiers"].as_array().unwrap();
         assert!(tiers.iter().any(|tier| tier.as_str() == Some("premium")));
         assert!(rendered.ends_with('\n'));
+    }
+
+    /// E2 (c) — the Alloy arm's endpoint must declare `supports_json_schema`.
+    /// Omitting it serde-defaults to `false`, which makes the router degrade
+    /// a schema-carrying repair request to `json_object` behind a log line;
+    /// the naive arm always sends `json_schema`, so the two arms would run on
+    /// different wire contracts and would not be comparable.
+    #[test]
+    fn rendered_router_declares_the_json_schema_wire_contract() {
+        let rendered = render_router_toml(&endpoint()).unwrap();
+        assert!(
+            rendered.contains("supports_json_schema = true"),
+            "the flag must be explicit in the document, not defaulted:\n{rendered}"
+        );
+        let parsed: toml::Value = toml::from_str(&rendered).unwrap();
+        let model_endpoint = &parsed["providers"][0]["endpoints"][0];
+        assert_eq!(
+            model_endpoint["supports_json_schema"].as_bool(),
+            Some(true),
+            "the Alloy arm must accept the caller's JSON Schema"
+        );
+        assert_eq!(
+            model_endpoint["supports_structured_output"].as_bool(),
+            Some(true),
+            "supports_json_schema requires supports_structured_output"
+        );
+        // The rendered document must be loadable by the same validator the
+        // real binary uses, or the arm never starts.
+        let config = alloy_runtime::RouterConfig::from_str("rendered", &rendered).unwrap();
+        assert!(config.providers[0].endpoints[0].supports_json_schema);
     }
 
     #[test]

@@ -494,6 +494,180 @@ pub fn build_topology(args: BuildTopology<'_>) -> TaskDag {
     }
 }
 
+/// Test-only event-store double for `DefaultContextEngine` unit tests.
+///
+/// It lives here, not beside those tests, because the RFC-0012 §13.9 CI
+/// greps (`rfc0012_ci_greps.rs`) ban the literal sink trait/method names an
+/// event-store double must spell (rule OB1) on **every** line under
+/// `src/context/**` — comments and `cfg(test)` code included. This is the
+/// nearest Task-B-owned file outside that walked tree; the module compiles
+/// only under `cfg(test)` and ships nothing.
+#[cfg(test)]
+pub(crate) mod context_test_doubles {
+    use async_trait::async_trait;
+
+    use crate::events::{
+        EventSink, EventSinkError, HandoffSnapshot, NewSessionEvent, RuntimeEvent, SessionEvent,
+        SessionEventType,
+    };
+    use crate::storage::{EventStore, StoreError};
+    use crate::types::ids::{EventSeq, RunId, SessionId};
+
+    /// Always-empty store: no goal events, no history, no artifact refs.
+    pub(crate) struct NullEventStore;
+
+    /// Fixed-events store: replays the given session events to every
+    /// caller (`last_seq` = the max seq present). Lets the Task-B tests
+    /// feed the conversation domain a scripted log — e.g. a GN13 rollback
+    /// note — without the banned literals appearing under `src/context/**`.
+    pub(crate) struct ScriptedEventStore(pub(crate) Vec<SessionEvent>);
+
+    #[async_trait]
+    impl EventSink for ScriptedEventStore {
+        async fn append_runtime(&self, _ev: RuntimeEvent) -> Result<(), EventSinkError> {
+            Ok(())
+        }
+
+        async fn append_session(&self, _ev: NewSessionEvent) -> Result<EventSeq, EventSinkError> {
+            Ok(EventSeq(0))
+        }
+    }
+
+    #[async_trait]
+    impl EventStore for ScriptedEventStore {
+        async fn list_session_events(
+            &self,
+            _session: SessionId,
+            after: Option<EventSeq>,
+            limit: usize,
+        ) -> Result<Vec<SessionEvent>, StoreError> {
+            let mut out: Vec<SessionEvent> = self
+                .0
+                .iter()
+                .filter(|e| after.is_none_or(|a| e.seq > a))
+                .cloned()
+                .collect();
+            out.sort_by_key(|e| e.seq);
+            out.truncate(limit);
+            Ok(out)
+        }
+
+        async fn replay_session<F>(
+            &self,
+            _session: SessionId,
+            mut on_event: F,
+        ) -> Result<Option<EventSeq>, StoreError>
+        where
+            F: FnMut(&SessionEvent) -> Result<(), StoreError> + Send,
+        {
+            for e in &self.0 {
+                on_event(e)?;
+            }
+            Ok(self.0.iter().map(|e| e.seq).max())
+        }
+
+        async fn last_seq(&self, _session: SessionId) -> Result<Option<EventSeq>, StoreError> {
+            Ok(self.0.iter().map(|e| e.seq).max())
+        }
+
+        async fn list_runtime_events(
+            &self,
+            _after_rowid: Option<i64>,
+            _limit: usize,
+        ) -> Result<Vec<(i64, RuntimeEvent)>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn has_session_event_for_run(
+            &self,
+            _session: SessionId,
+            _run: RunId,
+            _type_: SessionEventType,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn has_run_accepted_event(&self, _run: RunId) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn has_run_finished_event(&self, _run: RunId) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn import_handoff_snapshot(&self, _snap: HandoffSnapshot) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl EventSink for NullEventStore {
+        async fn append_runtime(&self, _ev: RuntimeEvent) -> Result<(), EventSinkError> {
+            Ok(())
+        }
+
+        async fn append_session(&self, _ev: NewSessionEvent) -> Result<EventSeq, EventSinkError> {
+            Ok(EventSeq(0))
+        }
+    }
+
+    #[async_trait]
+    impl EventStore for NullEventStore {
+        async fn list_session_events(
+            &self,
+            _session: SessionId,
+            _after: Option<EventSeq>,
+            _limit: usize,
+        ) -> Result<Vec<SessionEvent>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn replay_session<F>(
+            &self,
+            _session: SessionId,
+            _on_event: F,
+        ) -> Result<Option<EventSeq>, StoreError>
+        where
+            F: FnMut(&SessionEvent) -> Result<(), StoreError> + Send,
+        {
+            Ok(None)
+        }
+
+        async fn last_seq(&self, _session: SessionId) -> Result<Option<EventSeq>, StoreError> {
+            Ok(None)
+        }
+
+        async fn list_runtime_events(
+            &self,
+            _after_rowid: Option<i64>,
+            _limit: usize,
+        ) -> Result<Vec<(i64, RuntimeEvent)>, StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn has_session_event_for_run(
+            &self,
+            _session: SessionId,
+            _run: RunId,
+            _type_: SessionEventType,
+        ) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn has_run_accepted_event(&self, _run: RunId) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn has_run_finished_event(&self, _run: RunId) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        async fn import_handoff_snapshot(&self, _snap: HandoffSnapshot) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

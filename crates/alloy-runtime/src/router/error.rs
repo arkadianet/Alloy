@@ -49,6 +49,41 @@ pub enum RouterError {
     Internal(String),
 }
 
+/// Stage of a provider attempt whose deadline expired.
+///
+/// A bare "timeout" cannot be acted on: a CONNECT expiry means the endpoint
+/// was unreachable, while a REQUEST or READ expiry means the model was
+/// reached and was simply slower than the configured ceiling. Reports must be
+/// able to say which one happened (E2 §a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TimeoutStage {
+    /// TCP connect or TLS handshake did not complete within `connect_timeout`.
+    Connect,
+    /// The request deadline expired before response headers arrived.
+    Request,
+    /// The request deadline expired while the response body was being read.
+    Read,
+}
+
+impl TimeoutStage {
+    /// Stable lowercase token for logs, metrics, and report JSON.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Request => "request",
+            Self::Read => "read",
+        }
+    }
+}
+
+impl std::fmt::Display for TimeoutStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Failure produced by a model provider.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -62,9 +97,20 @@ pub enum ProviderError {
     /// Prompt exceeded the provider context window.
     #[error("context length exceeded")]
     ContextLength,
-    /// Connect or request timeout elapsed.
+    /// A deadline elapsed but the expiring stage is not knowable.
+    ///
+    /// Only providers that cannot observe transport stages (scripted and
+    /// offline providers) produce this. Every HTTP attempt reports
+    /// [`ProviderError::TimeoutAt`] instead, so a real run never has to
+    /// guess.
     #[error("timeout")]
     Timeout,
+    /// A deadline elapsed, attributed to the stage that expired.
+    #[error("timeout during {stage}")]
+    TimeoutAt {
+        /// Stage whose deadline expired.
+        stage: TimeoutStage,
+    },
     /// A successful HTTP response had unusable JSON or shape.
     #[error("malformed response: {0}")]
     MalformedResponse(String),
@@ -87,6 +133,35 @@ pub enum ProviderError {
     Internal(String),
 }
 
+impl ProviderError {
+    /// Whether this failure is a deadline expiry, attributed or not.
+    #[must_use]
+    pub const fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout | Self::TimeoutAt { .. })
+    }
+
+    /// Stage whose deadline expired, when the provider could attribute one.
+    ///
+    /// `None` for non-timeouts **and** for an unattributed
+    /// [`ProviderError::Timeout`]: a report must never invent a stage.
+    #[must_use]
+    pub const fn timeout_stage(&self) -> Option<TimeoutStage> {
+        match self {
+            Self::TimeoutAt { stage } => Some(*stage),
+            _ => None,
+        }
+    }
+
+    /// Numeric HTTP status when the provider returned an unmapped one.
+    #[must_use]
+    pub const fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::HttpStatus { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}
+
 /// Scheduler-facing classification that preserves retry disposition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifiedRouterFailure {
@@ -103,7 +178,9 @@ pub fn classify_provider_error(err: &ProviderError) -> ClassifiedRouterFailure {
         ProviderError::RateLimit | ProviderError::Transport(_) => {
             (ErrorClass::Model, RetryDisposition::Retryable)
         }
-        ProviderError::Timeout => (ErrorClass::Timeout, RetryDisposition::Retryable),
+        ProviderError::Timeout | ProviderError::TimeoutAt { .. } => {
+            (ErrorClass::Timeout, RetryDisposition::Retryable)
+        }
         ProviderError::HttpStatus { status, .. } if *status >= 500 => {
             (ErrorClass::Model, RetryDisposition::Retryable)
         }
@@ -162,10 +239,33 @@ pub(crate) fn normalize_provider_error(err: ProviderError) -> ProviderError {
     }
 }
 
+/// Pick the stage to report for a timeout.
+///
+/// A connect-phase failure is authoritative regardless of where the caller
+/// was in the exchange; otherwise the caller's position (`Request` before
+/// headers, `Read` while draining the body) is the honest answer.
+pub(crate) const fn resolve_timeout_stage(
+    is_connect: bool,
+    default_stage: TimeoutStage,
+) -> TimeoutStage {
+    if is_connect {
+        TimeoutStage::Connect
+    } else {
+        default_stage
+    }
+}
+
+/// Map a transport failure, attributing a timeout to `default_stage` unless
+/// reqwest reports it as a connect-phase failure.
 #[cfg(feature = "http-provider")]
-pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
+pub(crate) fn map_reqwest_error_at(
+    err: reqwest::Error,
+    default_stage: TimeoutStage,
+) -> ProviderError {
     if err.is_timeout() {
-        return ProviderError::Timeout;
+        return ProviderError::TimeoutAt {
+            stage: resolve_timeout_stage(err.is_connect(), default_stage),
+        };
     }
 
     let message = err.to_string();
@@ -174,6 +274,12 @@ pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
     }
 
     ProviderError::Transport(redact_and_truncate(&message, 512))
+}
+
+/// Map a transport failure raised before the response body is being drained.
+#[cfg(feature = "http-provider")]
+pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ProviderError {
+    map_reqwest_error_at(err, TimeoutStage::Request)
 }
 
 /// Walk `Error::source` **and** nested `io::Error::get_ref` payloads.
@@ -244,6 +350,77 @@ mod tests {
             classify_router_error(&RouterError::Cancelled).class,
             ErrorClass::Cancelled
         );
+    }
+
+    /// E2 (a) — a timeout must say *which* stage expired. A retained error
+    /// that only says "timeout" cannot be attributed to CONNECT vs
+    /// REQUEST/READ in a report.
+    #[test]
+    fn timeout_carries_and_classifies_its_stage() {
+        for (stage, text) in [
+            (TimeoutStage::Connect, "connect"),
+            (TimeoutStage::Request, "request"),
+            (TimeoutStage::Read, "read"),
+        ] {
+            let error = ProviderError::TimeoutAt { stage };
+            assert_eq!(error.timeout_stage(), Some(stage));
+            assert!(error.is_timeout());
+            assert_eq!(stage.as_str(), text);
+            assert!(error.to_string().contains(text), "{error}");
+            assert_eq!(
+                classify_provider_error(&error),
+                ClassifiedRouterFailure {
+                    class: ErrorClass::Timeout,
+                    retry: RetryDisposition::Retryable,
+                }
+            );
+            // Normalization must not erase the stage.
+            assert_eq!(
+                normalize_provider_error(ProviderError::TimeoutAt { stage }).timeout_stage(),
+                Some(stage)
+            );
+        }
+
+        // The stage-less variant stays a timeout but reports no stage, so a
+        // report can never invent one.
+        let unattributed = ProviderError::Timeout;
+        assert!(unattributed.is_timeout());
+        assert_eq!(unattributed.timeout_stage(), None);
+        assert_eq!(
+            classify_provider_error(&unattributed).class,
+            ErrorClass::Timeout
+        );
+
+        // Non-timeouts never claim a stage, and HTTP status is readable.
+        let status = ProviderError::HttpStatus {
+            status: 503,
+            message: String::new(),
+        };
+        assert!(!status.is_timeout());
+        assert_eq!(status.timeout_stage(), None);
+        assert_eq!(status.http_status(), Some(503));
+        assert_eq!(ProviderError::Auth.http_status(), None);
+    }
+
+    /// A connect-phase reqwest timeout is attributed to CONNECT even when the
+    /// caller's default stage is REQUEST or READ; anything else keeps the
+    /// caller's stage.
+    #[test]
+    fn connect_phase_timeouts_override_the_caller_stage() {
+        for default_stage in [TimeoutStage::Request, TimeoutStage::Read] {
+            assert_eq!(
+                resolve_timeout_stage(true, default_stage),
+                TimeoutStage::Connect
+            );
+            assert_eq!(resolve_timeout_stage(false, default_stage), default_stage);
+        }
+    }
+
+    #[test]
+    fn timeout_stage_names_are_stable_report_tokens() {
+        assert_eq!(TimeoutStage::Connect.to_string(), "connect");
+        assert_eq!(TimeoutStage::Request.to_string(), "request");
+        assert_eq!(TimeoutStage::Read.to_string(), "read");
     }
 
     #[test]

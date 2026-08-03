@@ -200,6 +200,7 @@ impl RepairWorker {
             diagnostics: diagnostics.clone(),
             budget: Some(ctx.budget.clone()),
             focus_paths: diag_paths.clone(),
+            prior_failure: ctx.prior_failure.cloned(),
         };
 
         // RW4 (A-0011-5): what the graph remembers about these codes. Best

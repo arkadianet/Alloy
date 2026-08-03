@@ -96,6 +96,49 @@ where
     Ok(out)
 }
 
+/// Max chars of one embedded line excerpt. Refusals here are retry prompts
+/// (the harness feeds them back to the model), so they must show what the
+/// file actually contains — clipped, because file content is
+/// untrusted-adjacent and the MCP boundary drops over-long messages whole.
+const EXCERPT_CHARS: usize = 80;
+
+/// Quoted, escaped, bounded excerpt of `line` starting at char `from`.
+fn excerpt_from(line: &str, from: usize) -> String {
+    let body: String = line.chars().skip(from).take(EXCERPT_CHARS).collect();
+    let clipped_tail = line.chars().count() > from + EXCERPT_CHARS;
+    let mut out = String::from("\"");
+    if from > 0 {
+        out.push('…');
+    }
+    out.extend(body.escape_debug());
+    if clipped_tail {
+        out.push('…');
+    }
+    out.push('"');
+    out
+}
+
+/// Bounded excerpt of one line, from its start.
+fn excerpt(line: &str) -> String {
+    excerpt_from(line, 0)
+}
+
+/// Excerpts of the hunk's claimed line and the file's actual line, windowed
+/// so the first differing character is visible even on long lines.
+fn diff_excerpts(claimed: &str, actual: &str) -> (String, String) {
+    let common = claimed
+        .chars()
+        .zip(actual.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let from = if common < EXCERPT_CHARS {
+        0
+    } else {
+        common.saturating_sub(20)
+    };
+    (excerpt_from(claimed, from), excerpt_from(actual, from))
+}
+
 /// Apply hunks to UTF-8 file text and return new bytes.
 pub(crate) fn apply_hunks_to_text(
     rel: &str,
@@ -109,42 +152,89 @@ pub(crate) fn apply_hunks_to_text(
     let mut new_lines = Vec::new();
     let mut old_idx = 0_usize;
     let mut final_eof_newline = old_eof_newline;
+    let bad_line = |raw: &str| {
+        EditError::InvalidPatch(format!(
+            "hunk line {} does not start with ' ', '-' or '+'; every hunk body line needs one \
+             of those prefixes (' ' unchanged, '-' removed, '+' added)",
+            excerpt(raw)
+        ))
+    };
     for hunk in hunks {
         let start = if hunk.old_lines == 0 {
-            usize::try_from(hunk.old_start)
-                .map_err(|_| EditError::InvalidPatch("hunk header".into()))?
+            usize::try_from(hunk.old_start).map_err(|_| {
+                EditError::InvalidPatch("hunk header: old_start out of range".into())
+            })?
         } else if hunk.old_start == 0 {
-            return Err(EditError::InvalidPatch("hunk header".into()));
+            return Err(EditError::InvalidPatch(
+                "hunk header: old line numbers are 1-based, so old_start 0 is invalid; a hunk \
+                 touching the top of the file starts at line 1"
+                    .into(),
+            ));
         } else {
-            usize::try_from(hunk.old_start - 1)
-                .map_err(|_| EditError::InvalidPatch("hunk header".into()))?
+            usize::try_from(hunk.old_start - 1).map_err(|_| {
+                EditError::InvalidPatch("hunk header: old_start out of range".into())
+            })?
         };
-        if start < old_idx || start > old_lines.len() {
+        if start < old_idx {
             return Err(EditError::ContextMismatch {
                 path: rel.to_string(),
-                detail: "hunk range".into(),
+                detail: format!(
+                    "hunk positioned at old line {} overlaps the previous hunk, which already \
+                     covered the file through line {old_idx}; list hunks in ascending order and \
+                     touch each line at most once",
+                    start + 1
+                ),
+            });
+        }
+        if start > old_lines.len() {
+            return Err(EditError::ContextMismatch {
+                path: rel.to_string(),
+                detail: format!(
+                    "hunk positioned at old line {} but the file has only {} line(s); the file \
+                     differs from what the hunk assumed — re-read it and re-anchor the hunk",
+                    start + 1,
+                    old_lines.len()
+                ),
             });
         }
         new_lines.extend_from_slice(&old_lines[old_idx..start]);
         old_idx = start;
         for raw in &hunk.lines {
-            let Some((&prefix, content)) = raw.as_bytes().split_first() else {
-                return Err(EditError::InvalidPatch("hunk line content".into()));
+            // A zero-length line is an empty context line with its ' ' sigil
+            // dropped by the emitter; it is content-checked like any context.
+            let (prefix, content) = match raw.as_bytes().split_first() {
+                Some((&prefix, content)) => (
+                    prefix,
+                    std::str::from_utf8(content).map_err(|_| bad_line(raw))?,
+                ),
+                None => (b' ', ""),
             };
-            let content = std::str::from_utf8(content)
-                .map_err(|_| EditError::InvalidPatch("hunk line content".into()))?;
             match prefix {
                 b' ' => {
                     let Some(actual) = old_lines.get(old_idx) else {
                         return Err(EditError::ContextMismatch {
                             path: rel.to_string(),
-                            detail: "context past eof".into(),
+                            detail: format!(
+                                "the hunk expects context {} at line {}, but the file has only \
+                                 {} line(s); it is shorter than the hunk assumed — re-read it \
+                                 and re-anchor the hunk",
+                                excerpt(content),
+                                old_idx + 1,
+                                old_lines.len()
+                            ),
                         });
                     };
                     if actual != content {
+                        let (claimed, actual) = diff_excerpts(content, actual);
                         return Err(EditError::ContextMismatch {
                             path: rel.to_string(),
-                            detail: "context mismatch".into(),
+                            detail: format!(
+                                "at line {} the hunk expects context {claimed} but the file \
+                                 actually contains {actual}; ' ' and '-' lines must match the \
+                                 file exactly — re-read it and rebuild the hunk from its current \
+                                 content",
+                                old_idx + 1
+                            ),
                         });
                     }
                     new_lines.push(content.to_string());
@@ -154,31 +244,49 @@ pub(crate) fn apply_hunks_to_text(
                     let Some(actual) = old_lines.get(old_idx) else {
                         return Err(EditError::ContextMismatch {
                             path: rel.to_string(),
-                            detail: "delete past eof".into(),
+                            detail: format!(
+                                "the hunk deletes {} at line {}, but the file has only {} \
+                                 line(s); it is shorter than the hunk assumed — re-read it and \
+                                 re-anchor the hunk",
+                                excerpt(content),
+                                old_idx + 1,
+                                old_lines.len()
+                            ),
                         });
                     };
                     if actual != content {
+                        let (claimed, actual) = diff_excerpts(content, actual);
                         return Err(EditError::ContextMismatch {
                             path: rel.to_string(),
-                            detail: "delete mismatch".into(),
+                            detail: format!(
+                                "at line {} the hunk deletes {claimed} but the file actually \
+                                 contains {actual}; ' ' and '-' lines must match the file \
+                                 exactly — re-read it and rebuild the hunk from its current \
+                                 content",
+                                old_idx + 1
+                            ),
                         });
                     }
                     old_idx += 1;
                 }
                 b'+' => new_lines.push(content.to_string()),
-                _ => return Err(EditError::InvalidPatch("hunk line content".into())),
+                _ => return Err(bad_line(raw)),
             }
         }
         if hunk.old_eof_no_newline {
             if old_idx != old_lines.len() {
                 return Err(EditError::InvalidPatch(
-                    "old no-newline marker before eof".into(),
+                    "the '\\ No newline at end of file' marker on the old side applies mid-file; \
+                     it is only valid after the final line of the file"
+                        .into(),
                 ));
             }
             if old_eof_newline {
                 return Err(EditError::ContextMismatch {
                     path: rel.to_string(),
-                    detail: "old file has trailing newline".into(),
+                    detail: "the hunk claims the file has no trailing newline ('\\ No newline at \
+                             end of file'), but it does end with one; drop the marker"
+                        .into(),
                 });
             }
         }
@@ -200,7 +308,17 @@ pub(crate) fn verify_hunks_delete_whole_file(
     old_text: &str,
     hunks: &[Hunk],
 ) -> Result<(), EditError> {
-    if apply_hunks_to_text(rel, old_text, hunks)?.is_empty() {
+    // Delete validation keeps the stable short details ("delete mismatch" /
+    // "delete leaves content") — shared vocabulary with the local validator —
+    // and the MCP boundary appends the instruction when forwarding them.
+    let applied = apply_hunks_to_text(rel, old_text, hunks).map_err(|err| match err {
+        EditError::ContextMismatch { path, .. } => EditError::ContextMismatch {
+            path,
+            detail: "delete mismatch".into(),
+        },
+        other => other,
+    })?;
+    if applied.is_empty() {
         Ok(())
     } else {
         Err(EditError::ContextMismatch {
@@ -221,7 +339,10 @@ fn apply_delete(
     let path = policy.jail().join(rel);
     let meta = fs::symlink_metadata(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            EditError::Conflict("delete missing file".into())
+            EditError::Conflict(format!(
+                "cannot delete {rel}: no such file in the workspace; check the path against the \
+                 repository listing (paths are jail-relative)"
+            ))
         } else {
             EditError::Io(e.to_string())
         }
@@ -254,7 +375,10 @@ where
     let path = policy.jail().join(rel);
     let meta = fs::symlink_metadata(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            EditError::Conflict("modify missing file".into())
+            EditError::Conflict(format!(
+                "cannot modify {rel}: no such file in the workspace; check the path, or author a \
+                 create patch if the file should be new"
+            ))
         } else {
             EditError::Io(e.to_string())
         }
@@ -287,15 +411,21 @@ fn apply_create<F>(
 where
     F: FnMut(ApplyProgress),
 {
+    let create_exists = || {
+        EditError::Conflict(format!(
+            "cannot create {rel}: the file already exists; author a modify patch for it, \
+             anchored with ' ' context or '-' lines copied from its current content"
+        ))
+    };
     authorize_patch_create(policy, writes, rel)?;
     if policy.jail().join(rel).exists() {
-        return Err(EditError::Conflict("create exists".into()));
+        return Err(create_exists());
     }
     create_parents(rel, policy, out, progress)?;
     authorize_policy_write(policy, rel)?;
     let path = policy.jail().join(rel);
     if path.exists() {
-        return Err(EditError::Conflict("create exists".into()));
+        return Err(create_exists());
     }
     let new_bytes = apply_hunks_to_text(rel, "", hunks)?;
     let temp = temp_path_for(&path, tx)?;
@@ -546,6 +676,187 @@ mod tests {
         assert!(matches!(err, EditError::ContextMismatch { .. }));
     }
 
+    fn detail_of(err: EditError) -> String {
+        match err {
+            EditError::ContextMismatch { detail, .. } => detail,
+            other => panic!("expected ContextMismatch, got {other:?}"),
+        }
+    }
+
+    /// Refusals here are retry prompts: a weak model can only act on a
+    /// context mismatch that names the line, what the hunk claimed, and what
+    /// the file actually contains.
+    #[test]
+    fn context_mismatch_names_line_expected_and_actual() {
+        let err =
+            apply_hunks_to_text("a.txt", "one\ntwo\n", &[hunk(vec![" one", " TWO"])]).unwrap_err();
+        let detail = detail_of(err);
+        assert!(detail.contains("line 2"), "{detail}");
+        assert!(detail.contains("\"TWO\""), "{detail}");
+        assert!(detail.contains("\"two\""), "{detail}");
+        assert!(detail.contains("re-read"), "{detail}");
+    }
+
+    #[test]
+    fn delete_line_mismatch_names_line_expected_and_actual() {
+        let err =
+            apply_hunks_to_text("a.txt", "one\ntwo\n", &[hunk(vec![" one", "-TWO"])]).unwrap_err();
+        let detail = detail_of(err);
+        assert!(detail.contains("line 2"), "{detail}");
+        assert!(detail.contains("deletes"), "{detail}");
+        assert!(detail.contains("\"TWO\""), "{detail}");
+        assert!(detail.contains("\"two\""), "{detail}");
+    }
+
+    #[test]
+    fn past_eof_details_name_the_file_length() {
+        let err = apply_hunks_to_text(
+            "a.txt",
+            "one\ntwo\n",
+            &[hunk(vec![" one", " two", " three"])],
+        )
+        .unwrap_err();
+        let detail = detail_of(err);
+        assert!(detail.contains("line 3"), "{detail}");
+        assert!(detail.contains("2 line(s)"), "{detail}");
+        assert!(detail.contains("\"three\""), "{detail}");
+
+        let err = apply_hunks_to_text(
+            "a.txt",
+            "one\ntwo\n",
+            &[hunk(vec![" one", " two", "-three"])],
+        )
+        .unwrap_err();
+        let detail = detail_of(err);
+        assert!(detail.contains("2 line(s)"), "{detail}");
+        assert!(detail.contains("\"three\""), "{detail}");
+    }
+
+    #[test]
+    fn hunk_range_details_distinguish_overlap_from_short_file() {
+        // Second hunk starts before the lines the first already consumed.
+        let mut second = hunk(vec![" one"]);
+        second.old_start = 1;
+        let err = apply_hunks_to_text(
+            "a.txt",
+            "one\ntwo\n",
+            &[hunk(vec![" one", "-two", "+2"]), second],
+        )
+        .unwrap_err();
+        let detail = detail_of(err);
+        assert!(detail.contains("overlap"), "{detail}");
+        assert!(detail.contains("ascending"), "{detail}");
+
+        // Hunk positioned beyond the end of the file.
+        let mut past = hunk(vec![" x"]);
+        past.old_start = 9;
+        let err = apply_hunks_to_text("a.txt", "one\n", &[past]).unwrap_err();
+        let detail = detail_of(err);
+        assert!(detail.contains("1 line(s)"), "{detail}");
+        assert!(detail.contains("re-read"), "{detail}");
+    }
+
+    /// On long lines the excerpts window to the first differing character,
+    /// so the model sees the disagreement instead of two identical prefixes.
+    #[test]
+    fn long_line_mismatch_excerpts_window_to_the_difference() {
+        let claimed = format!(" {}EXPECTED_TAIL", "a".repeat(100));
+        let actual_line = format!("{}ACTUAL_TAIL", "a".repeat(100));
+        let err = apply_hunks_to_text(
+            "a.txt",
+            &format!("{actual_line}\n"),
+            &[hunk(vec![claimed.as_str()])],
+        )
+        .unwrap_err();
+        let detail = detail_of(err);
+        assert!(detail.contains("EXPECTED_TAIL"), "{detail}");
+        assert!(detail.contains("ACTUAL_TAIL"), "{detail}");
+        assert!(detail.contains('…'), "{detail}");
+    }
+
+    /// Conflicts are retry prompts too: name the path and the usable next
+    /// step instead of a bare state label.
+    #[test]
+    fn conflicts_name_the_path_and_the_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let apply = |patch: &PatchSet| {
+            apply_file_patches(
+                patch,
+                &policy(dir.path()),
+                &token(),
+                TransactionId::new(),
+                |_| {},
+            )
+            .map(|_| ())
+            .map_err(|e| e.error)
+        };
+        let modify = PatchSet {
+            files: vec![FilePatch::Modify {
+                path: "a.txt".into(),
+                hunks: vec![hunk(vec![" x"])],
+            }],
+        };
+        let Err(EditError::Conflict(msg)) = apply(&modify) else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("cannot modify a.txt"), "{msg}");
+        assert!(msg.contains("create"), "{msg}");
+
+        let delete = PatchSet {
+            files: vec![FilePatch::Delete {
+                path: "a.txt".into(),
+                validation_hunks: vec![],
+            }],
+        };
+        let Err(EditError::Conflict(msg)) = apply(&delete) else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("cannot delete a.txt"), "{msg}");
+
+        std::fs::write(dir.path().join("a.txt"), "hi\n").unwrap();
+        let create = PatchSet {
+            files: vec![FilePatch::Create {
+                path: "a.txt".into(),
+                hunks: vec![hunk(vec!["+hi"])],
+            }],
+        };
+        let Err(EditError::Conflict(msg)) = apply(&create) else {
+            panic!("expected Conflict");
+        };
+        assert!(msg.contains("cannot create a.txt"), "{msg}");
+        assert!(msg.contains("already exists"), "{msg}");
+        assert!(msg.contains("modify"), "{msg}");
+    }
+
+    /// Delete validation reports the stable short detail (`delete mismatch`)
+    /// shared with the local validator's vocabulary; the MCP boundary owns
+    /// appending the instruction text. This pins the exact string.
+    #[test]
+    fn delete_validation_reports_the_stable_short_detail() {
+        let bad = Hunk {
+            old_start: 1,
+            old_lines: 1,
+            new_start: 0,
+            new_lines: 0,
+            lines: vec!["-ONE".into()],
+            eof_newline: true,
+            old_eof_no_newline: false,
+        };
+        let err = verify_hunks_delete_whole_file("a.txt", "one\n", &[bad]).unwrap_err();
+        assert_eq!(detail_of(err), "delete mismatch");
+    }
+
+    #[test]
+    fn zero_old_start_with_old_lines_is_a_1_based_reminder() {
+        let mut h = hunk(vec![" one"]);
+        h.old_start = 0;
+        let err = apply_hunks_to_text("a.txt", "one\n", &[h]).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::InvalidPatch(ref message) if message.contains("1-based")
+        ));
+    }
+
     #[test]
     fn preserve_no_trailing_newline() {
         let mut h = hunk(vec!["-one", "+two"]);
@@ -556,7 +867,9 @@ mod tests {
 
     #[test]
     fn invalid_hunk_prefixes_are_panic_free() {
-        for line in ["", "écontent"] {
+        // ("" is no longer a bad prefix — it reads as empty context, so with
+        // declared counts 0/0 it is a count mismatch, not bad content.)
+        for (line, message) in [("", "hunk line count"), ("écontent", "hunk line content")] {
             let malformed = Hunk {
                 old_start: 1,
                 old_lines: 0,
@@ -566,9 +879,11 @@ mod tests {
                 eof_newline: true,
                 old_eof_no_newline: false,
             };
+            // `validate_hunk_line_counts` (patch_parse) screens prefixes
+            // first; the apply loop's own prefix check is defense in depth.
             assert!(matches!(
                 apply_hunks_to_text("a.txt", "one\n", &[malformed]),
-                Err(EditError::InvalidPatch(ref message)) if message == "hunk line content"
+                Err(EditError::InvalidPatch(ref got)) if got == message
             ));
         }
     }
@@ -579,6 +894,29 @@ mod tests {
         mid_file.eof_newline = false;
         let bytes = apply_hunks_to_text("a.txt", "one\ntwo\n", &[mid_file]).unwrap();
         assert_eq!(bytes, b"ONE\ntwo\n");
+    }
+
+    /// A zero-length hunk line on the structured wire is an empty context
+    /// line whose ' ' sigil the emitter dropped; it stays anchored — the
+    /// file's line at that position must itself be blank.
+    #[test]
+    fn zero_length_line_applies_as_empty_context() {
+        let h = Hunk {
+            old_start: 1,
+            old_lines: 3,
+            new_start: 1,
+            new_lines: 3,
+            lines: vec![" a".into(), String::new(), "-b".into(), "+B".into()],
+            eof_newline: true,
+            old_eof_no_newline: false,
+        };
+        let bytes = apply_hunks_to_text("a.txt", "a\n\nb\n", std::slice::from_ref(&h)).unwrap();
+        assert_eq!(bytes, b"a\n\nB\n");
+        // Still content-checked: a non-blank file line is a mismatch.
+        assert!(matches!(
+            apply_hunks_to_text("a.txt", "a\nX\nb\n", &[h]),
+            Err(EditError::ContextMismatch { .. })
+        ));
     }
 
     #[test]
@@ -709,11 +1047,12 @@ mod tests {
             old_eof_no_newline: true,
         };
         verify_hunks_delete_whole_file("a.txt", "one", std::slice::from_ref(&hunk)).unwrap();
-        // The old-side no-newline marker is still an assertion about the file.
+        // The old-side no-newline marker is still an assertion about the
+        // file; on the delete path it reports as the stable short detail.
         assert!(matches!(
             verify_hunks_delete_whole_file("a.txt", "one\n", &[hunk]),
             Err(EditError::ContextMismatch { ref detail, .. })
-                if detail == "old file has trailing newline"
+                if detail == "delete mismatch"
         ));
     }
 

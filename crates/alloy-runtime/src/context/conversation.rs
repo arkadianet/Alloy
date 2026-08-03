@@ -5,10 +5,15 @@
 //! degrade, they never abort assembly.
 
 use crate::storage::EventStore;
-use crate::types::ids::{ArtifactId, Digest, EventSeq, SessionId};
+use crate::types::ids::{ArtifactId, Digest, EventSeq, RunId, SessionId};
 
 use super::render::{bound_bytes, sanitize_line};
 use super::types::{Degradation, DegradationReason, DomainId};
+
+/// Producer-side byte bound on a captured rollback note (defence in depth:
+/// the driver already bounds what it appends, and the engine re-bounds the
+/// rendered section at `PRIOR_FAILURE_MAX_BYTES`).
+const ROLLBACK_NOTE_MAX_BYTES: usize = 4_096;
 
 /// A reference from an admitted conversation event into the artifact store
 /// (feeds the Artifacts candidate set, §4.4).
@@ -29,6 +34,22 @@ pub(super) struct EventLine {
     pub line: String,
 }
 
+/// A GN13 rollback note: an `error` event with class `rollback`, written by
+/// the generation driver when the informative post-edit verify failure was
+/// about to be erased by the workspace restore. Captured for promotion into
+/// the `conversation:prior_failure` section instead of rendering as a
+/// history line — a repair generation's one chance to learn what the
+/// rolled-back edit actually broke.
+#[derive(Debug, Clone)]
+pub(super) struct RollbackNote {
+    /// Event sequence (newest wins).
+    pub seq: EventSeq,
+    /// Run the rollback belongs to; promotion is run-scoped.
+    pub run: Option<RunId>,
+    /// Bounded raw message; sanitised at render time.
+    pub message: String,
+}
+
 /// Raw Conversation inputs before clamping.
 #[derive(Debug, Default)]
 pub(super) struct ConversationRaw {
@@ -38,6 +59,8 @@ pub(super) struct ConversationRaw {
     pub events: Vec<EventLine>,
     /// Artifact references discovered in admitted events (§4.4).
     pub artifact_refs: Vec<EventArtifactRef>,
+    /// GN13 rollback notes in the window, ascending `EventSeq`.
+    pub rollback_notes: Vec<RollbackNote>,
     /// Admitted-type events skipped for a missing/mistyped pointer
     /// (Appendix F) — counted as omitted, never guessed.
     pub skipped_malformed: usize,
@@ -172,6 +195,16 @@ pub(super) async fn fetch(
                     continue;
                 };
                 let message = pointer_str(payload, "/message").unwrap_or_default();
+                // GN13 rollback notes are captured for the prior_failure
+                // section, never double-spent as a history line.
+                if class == "rollback" && !message.trim().is_empty() {
+                    raw.rollback_notes.push(RollbackNote {
+                        seq: event.seq,
+                        run: event.run_id,
+                        message: bound_bytes(message, ROLLBACK_NOTE_MAX_BYTES),
+                    });
+                    continue;
+                }
                 let line = format!("error {}: {}", sanitize_line(class), sanitize_line(message));
                 raw.events.push(EventLine {
                     seq: event.seq,

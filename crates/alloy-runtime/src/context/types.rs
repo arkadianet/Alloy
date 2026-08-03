@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::{GraphEdge, GraphFidelity, GraphNode};
 use crate::types::budget::TokenBudget;
-use crate::types::diagnostic::DiagnosticEvent;
+use crate::types::diagnostic::{DiagnosticEvent, FailureIr};
 use crate::types::ids::{
     ArtifactId, CapabilityId, CrateId, DiagnosticId, Digest, GraphVersion, NodeId, RunId, SessionId,
 };
@@ -346,4 +346,18 @@ pub struct AssembleInputs {
     pub budget: Option<TokenBudget>,
     /// Files the caller knows are in play (edit targets, diagnostic paths).
     pub focus_paths: Vec<String>,
+    /// Terminal failure of this node's previous scheduler attempt
+    /// (RFC-0010 `FailureIr`; its `notes` are already redacted and bounded
+    /// by RFC-0013 FM15 at production). MUST be `None` on first attempts
+    /// and whenever the prior outcome was not captured — a process
+    /// restart, a killed attempt — so absence always reads "unknown",
+    /// never "no problems". Rendered by the engine as one bounded
+    /// `conversation:prior_failure` section carrying the class and notes
+    /// only; the carried `diagnostics` are NOT rendered (live diagnostics
+    /// arrive via [`AssembleInputs::diagnostics`]). The engine composes the
+    /// same section from the run's newest GN13 rollback note in the event
+    /// log (an `error` event with class `rollback`) even when this field is
+    /// `None`, so a fresh generation-N+1 node still learns what the
+    /// rolled-back edit broke.
+    pub prior_failure: Option<FailureIr>,
 }

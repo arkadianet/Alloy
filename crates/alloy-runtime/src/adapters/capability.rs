@@ -52,6 +52,11 @@ pub struct CapabilityExecContext {
     /// Run-scoped cost meter. Workers MUST record model usage here and MUST
     /// NOT construct their own meter.
     pub cost_meter: SharedCostMeter,
+    /// Terminal failure of this node's previous attempt, when the scheduler
+    /// captured one in this process (retry memory). MUST be `None` on first
+    /// attempts and on crash-resumed attempts whose prior outcome was not
+    /// captured — absence reads "unknown", never "the last attempt was fine".
+    pub prior_failure: Option<FailureIr>,
 }
 
 /// Success or structured soft failure. A worker never both succeeds and fails.
@@ -155,6 +160,7 @@ mod tests {
             },
             attempt: 1,
             cost_meter: SharedCostMeter::new(),
+            prior_failure: None,
         }
     }
 

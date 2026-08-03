@@ -27,7 +27,7 @@ pub use config::{
 };
 pub use error::{
     classify_provider_error, classify_router_error, ClassifiedRouterFailure, ProviderError,
-    RouterError,
+    RouterError, TimeoutStage,
 };
 pub use metrics::RouterMetricsSnapshot;
 #[cfg(feature = "http-provider")]

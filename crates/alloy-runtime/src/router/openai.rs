@@ -13,7 +13,7 @@ use zeroize::Zeroize;
 use crate::types::ids::ProviderId;
 
 use super::config::validate_base_url;
-use super::error::{map_reqwest_error, ProviderError};
+use super::error::{map_reqwest_error_at, ProviderError, TimeoutStage};
 use super::http_client::ValidatedHttpClient;
 use super::secret::SecretString;
 use super::traits::ModelProvider;
@@ -114,7 +114,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
         }
         .instrument(span.clone())
         .await
-        .map_err(map_reqwest_error)?;
+        // Nothing has been received yet: a deadline here expired while
+        // connecting or waiting for response headers.
+        .map_err(|error| map_reqwest_error_at(error, TimeoutStage::Request))?;
         let status = response.status();
         span.record("status", status.as_u16());
 
@@ -131,7 +133,10 @@ impl ModelProvider for OpenAiCompatibleProvider {
                     message: "response body too large".into(),
                 });
             }
-            Err(BodyReadError::Request(error)) => return Err(map_reqwest_error(error)),
+            // Headers already arrived: a deadline here expired mid-body.
+            Err(BodyReadError::Request(error)) => {
+                return Err(map_reqwest_error_at(error, TimeoutStage::Read))
+            }
         };
 
         if !status.is_success() {
@@ -747,5 +752,160 @@ mod tests {
             map_success(nested, &ResponseFormat::Text, ""),
             Err(ProviderError::MalformedResponse(_))
         ));
+    }
+
+    /// E2 (b) — absent usage must stay unknown end-to-end. A provider that
+    /// omits `usage` (OpenRouter does, for some upstreams) must never be
+    /// rendered as "0 tokens", which reads as a measured zero.
+    #[test]
+    fn absent_usage_stays_unknown_and_is_never_zero() {
+        for body in [
+            &br#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#[..],
+            &br#"{"choices":[{"message":{"content":"ok"}}],"usage":null}"#[..],
+            &br#"{"choices":[{"message":{"content":"ok"}}],"usage":{}}"#[..],
+            &br#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":null,"completion_tokens":null}}"#[..],
+            // Wrong-typed counters are unknown, not zero.
+            &br#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":"12","completion_tokens":-3}}"#[..],
+        ] {
+            let usage = map_success(body, &ResponseFormat::Text, "").unwrap().usage;
+            assert_eq!(usage.input_tokens, None, "body: {}", String::from_utf8_lossy(body));
+            assert_eq!(usage.output_tokens, None, "body: {}", String::from_utf8_lossy(body));
+        }
+
+        // A provider that genuinely reports zero is reported as zero, and one
+        // known counter never fabricates the other.
+        let explicit_zero =
+            br#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":0,"completion_tokens":0}}"#;
+        let usage = map_success(explicit_zero, &ResponseFormat::Text, "")
+            .unwrap()
+            .usage;
+        assert_eq!(usage.input_tokens, Some(0));
+        assert_eq!(usage.output_tokens, Some(0));
+
+        let half = br#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":7}}"#;
+        let usage = map_success(half, &ResponseFormat::Text, "").unwrap().usage;
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, None);
+    }
+
+    /// E2 (a) — a whole-request deadline that expires before headers arrive
+    /// is reported as a REQUEST-stage timeout, not an unattributed one.
+    #[tokio::test]
+    async fn request_deadline_reports_the_request_stage() {
+        let server = StallingServer::spawn(StallMode::NoResponse);
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleSpec {
+            id: ProviderId::new("provider").unwrap(),
+            base_url: server.base_url(),
+            api_key: SecretString::new("k"),
+            connect_timeout: Duration::from_millis(200),
+            request_timeout: Duration::from_millis(250),
+        })
+        .unwrap();
+        let error = provider
+            .complete(&stall_endpoint(), stall_request())
+            .await
+            .expect_err("stalled server must time out");
+        assert!(error.is_timeout(), "{error}");
+        assert_eq!(error.timeout_stage(), Some(TimeoutStage::Request));
+    }
+
+    /// E2 (a) — a deadline that expires while the body is being drained is a
+    /// READ-stage timeout: the endpoint was reachable and answered.
+    #[tokio::test]
+    async fn body_deadline_reports_the_read_stage() {
+        let server = StallingServer::spawn(StallMode::HeadersThenStall);
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleSpec {
+            id: ProviderId::new("provider").unwrap(),
+            base_url: server.base_url(),
+            api_key: SecretString::new("k"),
+            connect_timeout: Duration::from_millis(200),
+            request_timeout: Duration::from_millis(400),
+        })
+        .unwrap();
+        let error = provider
+            .complete(&stall_endpoint(), stall_request())
+            .await
+            .expect_err("stalled body must time out");
+        assert!(error.is_timeout(), "{error}");
+        assert_eq!(error.timeout_stage(), Some(TimeoutStage::Read));
+    }
+
+    fn stall_endpoint() -> ModelEndpoint {
+        use crate::types::budget::ModelTier;
+        use crate::types::ids::EndpointId;
+        ModelEndpoint {
+            id: EndpointId::new("endpoint").unwrap(),
+            provider: ProviderId::new("provider").unwrap(),
+            display_name: "Endpoint".into(),
+            model: "m".into(),
+            tiers: vec![ModelTier::Standard],
+            supports_tools: false,
+            supports_structured_output: false,
+            supports_json_schema: false,
+            json_schema_strict: false,
+            max_context: 1,
+            input_usd_per_mtok: None,
+            output_usd_per_mtok: None,
+            temperature: None,
+        }
+    }
+
+    fn stall_request() -> CompletionRequest {
+        use crate::router::ToolChoice;
+        CompletionRequest {
+            messages: vec![],
+            tools: vec![],
+            tool_choice: ToolChoice::None,
+            response_format: ResponseFormat::Text,
+            temperature: None,
+            max_output_tokens: None,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum StallMode {
+        /// Accept the connection and never write a byte.
+        NoResponse,
+        /// Send a complete status line + headers promising a body, then stall.
+        HeadersThenStall,
+    }
+
+    /// Loopback-only TCP server that stalls on purpose. Held connections are
+    /// dropped when the listener thread ends with the test process.
+    struct StallingServer {
+        port: u16,
+    }
+
+    impl StallingServer {
+        fn spawn(mode: StallMode) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    std::thread::spawn(move || {
+                        // Drain the request head so the client finishes sending.
+                        let mut scratch = [0u8; 4096];
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let _ = stream.read(&mut scratch);
+                        if matches!(mode, StallMode::HeadersThenStall) {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                  content-length: 4096\r\n\r\n{\"cho",
+                            );
+                            let _ = stream.flush();
+                        }
+                        // Hold the socket open past any test deadline.
+                        std::thread::sleep(Duration::from_secs(30));
+                    });
+                }
+            });
+            Self { port }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://127.0.0.1:{}/v1/", self.port)
+        }
     }
 }

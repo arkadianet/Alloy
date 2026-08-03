@@ -22,6 +22,9 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+/// Exact-contract BYOM preflight (E2): both arms' wire contracts, live.
+#[cfg(feature = "live-naive")]
+mod byom_preflight;
 /// Cost claim envelope and USD derivation.
 mod cost_claim;
 mod driver;
@@ -55,6 +58,13 @@ mod scripted;
 /// Eval-local trajectory retention.
 mod trajectory;
 
+#[cfg(feature = "live-naive")]
+pub use byom_preflight::{
+    alloy_contract as byom_alloy_contract, evaluate as evaluate_byom_preflight,
+    naive_contract as byom_naive_contract, run as run_byom_preflight, schema_digest, spec_digest,
+    ArmContract, ContractArm, ContractProbe, PreflightFailure, PreflightReport, PreflightSpec,
+    ProviderFailure, WireMode, PREFLIGHT_SCHEMA_VERSION,
+};
 pub use cost_claim::{CostClaimEnvelope, CostClaimGrade, COST_DISCLAIMER};
 pub use error::{EvalError, ReportError};
 pub use fingerprint::RequestFingerprint;
@@ -64,21 +74,26 @@ pub use gate::{
 };
 pub use harness::{EvalHarness, EvalHarnessConfig, LoadedFixture, EVAL_MAX_CONCURRENCY};
 pub use live_holdout::{
-    compare as compare_live_holdout, load_observations as load_live_holdout_observations,
-    oracle as inspect_live_holdout, score as score_live_holdout,
-    target_path_text as live_holdout_target_path_text, telemetry as live_holdout_telemetry,
-    Endpoint as LiveHoldoutEndpoint, HarnessIdentity as LiveHoldoutHarnessIdentity,
+    check_report_version as check_live_holdout_report_version,
+    clears_autonomous_gate as live_holdout_clears_autonomous_gate, compare as compare_live_holdout,
+    corpus_digest as live_holdout_corpus_digest,
+    load_observations as load_live_holdout_observations, oracle as inspect_live_holdout,
+    score as score_live_holdout, target_path_text as live_holdout_target_path_text,
+    telemetry as live_holdout_telemetry, ArmIdentity as LiveHoldoutArmIdentity,
+    AutonomousContrast as LiveHoldoutAutonomousContrast,
+    ClusteredDelta as LiveHoldoutClusteredDelta, Endpoint as LiveHoldoutEndpoint,
     LiveHoldoutDriver, MatrixComparison as LiveHoldoutMatrixComparison,
-    OracleEvidence as LiveHoldoutOracleEvidence, RunTelemetry as LiveHoldoutRunTelemetry,
-    StrictObservation as LiveHoldoutObservation,
+    OracleEvidence as LiveHoldoutOracleEvidence, ProtocolIdentity as LiveHoldoutProtocolIdentity,
+    RunTelemetry as LiveHoldoutRunTelemetry, StrictObservation as LiveHoldoutObservation,
     StrictObservationFields as LiveHoldoutObservationFields, StrictReport as LiveHoldoutReport,
+    TreatmentBuild as LiveHoldoutTreatmentBuild, TreatmentIdentity as LiveHoldoutTreatmentIdentity,
     REPORT_SCHEMA_VERSION as LIVE_HOLDOUT_REPORT_VERSION,
 };
 #[cfg(feature = "live-naive")]
 pub use live_naive::{
     build_naive_request, parse_replacement, resolve_target, write_replacement,
-    write_resolved_replacement, NaiveReplacement, NaiveRunTelemetry, MAX_REPLACEMENT_BYTES,
-    NAIVE_SCHEMA_NAME,
+    write_resolved_replacement, NaiveReplacement, NaiveRunTelemetry, DEFAULT_CONNECT_TIMEOUT_MS,
+    DEFAULT_REQUEST_TIMEOUT_MS, MAX_REPLACEMENT_BYTES, NAIVE_SCHEMA_NAME,
 };
 pub use live_repair::{
     parse_observations_jsonl, render_router_toml, wilson_interval, LiveRepairCorpus,

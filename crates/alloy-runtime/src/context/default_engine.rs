@@ -19,7 +19,7 @@ use tracing::Instrument;
 use crate::graph::{GraphNode, GraphQuery, GraphViewHandle};
 use crate::router::{ChatMessage, ChatRole, Citation, PromptPack};
 use crate::storage::{ArtifactStore, EventStore};
-use crate::types::diagnostic::DiagnosticEvent;
+use crate::types::diagnostic::{DiagnosticEvent, ErrorClass, FailureIr};
 use crate::types::ids::{ArtifactId, Digest, GraphVersion, SessionId, SummaryId};
 
 use super::artifacts::{
@@ -48,6 +48,15 @@ use super::{CONTEXT_FORMAT_VERSION, SYSTEM_FRAME_RESERVE_EST};
 
 /// D3: the pinned goal is never truncated below its first 2 000 bytes.
 const GOAL_MIN_BYTES: usize = 2_000;
+
+/// Byte cap on the rendered `prior_failure` note body. Deliberately equals
+/// RFC-0013 FM15's `FailureIr.notes` producer bound (2 KiB), so a
+/// compliant note is never cut here, while a non-compliant caller still
+/// cannot spend more than ~512 estimated tokens (B2, 4 bytes/token) —
+/// ≈1.6% of the default 32k budget — on attempt history. The section is
+/// charged to the Conversation domain's weighted allowance (B4), so at
+/// worst it displaces history lines, never WorkingSet or Artifacts items.
+const PRIOR_FAILURE_MAX_BYTES: usize = 2_048;
 
 // ---------------------------------------------------------------------
 // Metrics (§3.9, OB2)
@@ -517,6 +526,13 @@ struct ConvState {
     /// admitted newest-first (D13).
     admitted: usize,
     omitted: usize,
+    /// Rendered `prior_failure` body, when the caller supplied one and it
+    /// fit the allowance; `None` otherwise — never an empty-present body.
+    prior_failure_body: Option<String>,
+    /// `true` when the supplied note was cut at `PRIOR_FAILURE_MAX_BYTES`.
+    prior_failure_truncated: bool,
+    /// `true` when a supplied note was dropped by the allowance/backstop.
+    prior_failure_omitted: bool,
     used_est: usize,
 }
 
@@ -668,9 +684,14 @@ impl DefaultContextEngine {
 
         // 8. Build domains clamped to their allowances (B6), then
         // redistribute unused allowance exactly once in LIVE order (B5).
+        // The run's newest GN13 rollback note joins the dispatch-supplied
+        // prior failure in the one bounded prior_failure section.
+        let rollback_note = latest_rollback_note(&conv, inputs.run);
         let mut conv_state = self.clamp_conversation(
             &conv,
             goal_text.as_deref(),
+            inputs.prior_failure.as_ref(),
+            rollback_note,
             allowance_of(&base, DomainId::Conversation),
         );
         let mut ws_state = self.clamp_working_set(&ws, allowance_of(&base, DomainId::WorkingSet));
@@ -690,6 +711,8 @@ impl DefaultContextEngine {
                     let expanded = self.clamp_conversation(
                         &conv,
                         goal_text.as_deref(),
+                        inputs.prior_failure.as_ref(),
+                        rollback_note,
                         allowance_of(&base, domain) + leftover,
                     );
                     leftover -= expanded
@@ -1224,6 +1247,25 @@ impl DefaultContextEngine {
         self.section_est(&self.goal_section(body))
     }
 
+    /// The prior-attempt failure note (Task B, retry amnesia): one bounded
+    /// section carrying the previous scheduler attempt's terminal
+    /// `FailureIr` class and notes. Rendered between the goal and the
+    /// history so a retry reads "why the last attempt failed" before old
+    /// event lines.
+    fn prior_failure_section(&self, body: String) -> Section {
+        Section {
+            domain_label: DomainId::Conversation.label(),
+            kind: "prior_failure",
+            key: String::new(),
+            body,
+            fidelity: None,
+            citations: vec![SectionCitation {
+                source: "alloy://conversation/prior_failure".into(),
+                bytes: None,
+            }],
+        }
+    }
+
     fn history_section(&self, lines: &[&EventLine], omitted: usize) -> Section {
         let first = lines.first().map_or(0, |l| l.seq.0);
         let last = lines.last().map_or(0, |l| l.seq.0);
@@ -1531,6 +1573,8 @@ impl DefaultContextEngine {
         &self,
         conv: &ConversationRaw,
         goal: Option<&str>,
+        prior_failure: Option<&FailureIr>,
+        rollback_note: Option<&str>,
         allowance: usize,
     ) -> ConvState {
         let mut state = ConvState::default();
@@ -1561,6 +1605,23 @@ impl DefaultContextEngine {
                 state.goal_kept_bytes = kept.len();
                 state.goal_truncated = kept.len() < goal.len();
                 state.used_est += est;
+            }
+        }
+        // Prior-failure note (Task B, extended by the E2 dev-loop fix with
+        // the run's GN13 rollback note): all-or-nothing at its bounded
+        // size, charged after the goal and before history so a retry
+        // prefers "why the last attempt failed" over old event lines —
+        // and, being Conversation-charged, it can never displace another
+        // domain's items. Absent input stays absent: no empty-present
+        // section.
+        if let Some((body, truncated)) = prior_failure_body(prior_failure, rollback_note) {
+            let est = self.section_est(&self.prior_failure_section(body.clone()));
+            if est <= allowance.saturating_sub(state.used_est) {
+                state.prior_failure_body = Some(body);
+                state.prior_failure_truncated = truncated;
+                state.used_est += est;
+            } else {
+                state.prior_failure_omitted = true;
             }
         }
         // History: newest-first admission (D13), oldest-first rendering.
@@ -1787,10 +1848,16 @@ impl DefaultContextEngine {
             let dropped = match domain {
                 DomainId::Conversation => {
                     // Inclusion is newest-first; its reverse drops the
-                    // oldest admitted line.
+                    // oldest admitted line, then the prior-failure note —
+                    // leaving the goal cut as the caller's last resort.
                     if conv.admitted > 0 {
                         conv.admitted -= 1;
                         conv.omitted += 1;
+                        true
+                    } else if conv.prior_failure_body.is_some() {
+                        conv.prior_failure_body = None;
+                        conv.prior_failure_truncated = false;
+                        conv.prior_failure_omitted = true;
                         true
                     } else {
                         false
@@ -1884,6 +1951,98 @@ impl DefaultContextEngine {
             return true;
         }
         false
+    }
+}
+
+/// The newest GN13 rollback note belonging to the assembling run.
+/// Run-scoped on purpose: notes are workspace facts of one run's repair
+/// lineage, and a stale note from an earlier run in the same session must
+/// not haunt later prompts. An out-of-run assemble (`run == None`) adopts
+/// nothing.
+fn latest_rollback_note(
+    conv: &ConversationRaw,
+    run: Option<crate::types::ids::RunId>,
+) -> Option<&str> {
+    let run = run?;
+    conv.rollback_notes
+        .iter()
+        .filter(|n| n.run == Some(run))
+        .max_by_key(|n| n.seq)
+        .map(|n| n.message.as_str())
+}
+
+/// Bounded, fence-safe `prior_failure` body, composed from up to two
+/// memories: the dispatch-supplied `FailureIr` of this node's previous
+/// scheduler attempt (an Alloy-authored class line, then the producer's
+/// already-redacted RFC-0013 FM15 notes) and/or the run's newest GN13
+/// rollback note (the post-edit verify failure the workspace restore
+/// erased — without it, generation N+1 is generation N re-run blind).
+/// Both are re-sanitised here (SEC2/SEC8 defence in depth) and the tail
+/// after the class line is cut at [`PRIOR_FAILURE_MAX_BYTES`] with a B7
+/// marker. Returns `Some((body, truncated))`, or `None` when neither
+/// memory yields text — never an empty-present section that could read as
+/// a "no problems" report.
+fn prior_failure_body(
+    failure: Option<&FailureIr>,
+    rollback_note: Option<&str>,
+) -> Option<(String, bool)> {
+    let mut head = String::new();
+    let mut tail = String::new();
+    if let Some(failure) = failure {
+        head = format!(
+            "previous attempt failed: {}",
+            error_class_label(failure.error_class)
+        );
+        let notes = sanitize_untrusted(&failure.notes);
+        let notes = notes.trim();
+        if !notes.is_empty() {
+            tail.push_str(notes);
+        }
+    }
+    if let Some(note) = rollback_note {
+        let note = sanitize_untrusted(note);
+        let note = note.trim();
+        if !note.is_empty() {
+            if !tail.is_empty() {
+                tail.push('\n');
+            }
+            tail.push_str(note);
+        }
+    }
+    if head.is_empty() && tail.is_empty() {
+        return None;
+    }
+    let kept = bound_bytes(&tail, PRIOR_FAILURE_MAX_BYTES);
+    let truncated = kept.len() < tail.len();
+    let mut body = head;
+    if !kept.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&kept);
+        if truncated {
+            let kept_lines = kept.split('\n').count();
+            let total_lines = tail.split('\n').count();
+            body.push('\n');
+            body.push_str(&truncated_marker(kept_lines, total_lines));
+        }
+    }
+    Some((body, truncated))
+}
+
+/// Stable snake_case label for an [`ErrorClass`] (matches its serde
+/// rename), rendered in the `prior_failure` class line.
+const fn error_class_label(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Compile => "compile",
+        ErrorClass::Test => "test",
+        ErrorClass::Tool => "tool",
+        ErrorClass::Model => "model",
+        ErrorClass::Budget => "budget",
+        ErrorClass::Approval => "approval",
+        ErrorClass::Internal => "internal",
+        ErrorClass::Timeout => "timeout",
+        ErrorClass::Cancelled => "cancelled",
     }
 }
 
@@ -2005,7 +2164,8 @@ impl DefaultContextEngine {
             }
         };
 
-        // Conversation sections (A2: goal, then history).
+        // Conversation sections (A2 extension: goal, then the prior-failure
+        // note, then history).
         let mut conv_sections: Vec<Section> = Vec::new();
         if let Some(goal) = &conv_state.goal_full {
             let body = if conv_state.goal_truncated {
@@ -2014,6 +2174,9 @@ impl DefaultContextEngine {
                 goal.clone()
             };
             conv_sections.push(self.goal_section(body));
+        }
+        if let Some(body) = &conv_state.prior_failure_body {
+            conv_sections.push(self.prior_failure_section(body.clone()));
         }
         let mut history_lines: Vec<&EventLine> = Vec::new();
         if conv_state.admitted > 0 {
@@ -2159,10 +2322,15 @@ impl DefaultContextEngine {
             .is_some_and(|p| p.truncated && !graph_sections.is_empty());
         let stats = [
             DomainStats {
-                items: usize::from(conv_state.goal_full.is_some()) + conv_state.admitted,
+                items: usize::from(conv_state.goal_full.is_some())
+                    + usize::from(conv_state.prior_failure_body.is_some())
+                    + conv_state.admitted,
                 tokens_est: conv_tokens,
-                truncated: usize::from(conv_state.goal_truncated),
-                omitted: conv_state.omitted + conv.skipped_malformed,
+                truncated: usize::from(conv_state.goal_truncated)
+                    + usize::from(conv_state.prior_failure_truncated),
+                omitted: conv_state.omitted
+                    + conv.skipped_malformed
+                    + usize::from(conv_state.prior_failure_omitted),
             },
             DomainStats {
                 items: ws_state.files.len() + kept_nodes + kept_edges + kept_impact + kept_diags,
@@ -2423,5 +2591,421 @@ impl ContextEngine for DefaultContextEngine {
             // K6: never silently succeed on a miss.
             None => Err(ContextError::SummaryNotFound(summary_id)),
         }
+    }
+}
+
+#[cfg(test)]
+mod prior_failure_tests {
+    //! Task B (retry amnesia): the optional `AssembleInputs.prior_failure`
+    //! must reach the assembled pack as one bounded
+    //! `conversation:prior_failure` section — and must be provably inert
+    //! when absent.
+
+    use super::*;
+
+    // The event-store double lives in `dag::templates` because the RFC-0012
+    // §13.9 OB1 grep bans the sink trait/method literals it must spell on
+    // every line under `src/context/**` (see its module doc).
+    use crate::dag::context_test_doubles::NullEventStore;
+    use crate::dag::{NodeInputEnvelope, NodeInputPayload, NodeKind};
+    use crate::storage::{ArtifactBlob, ArtifactMeta, ArtifactPut, StoreError};
+    use crate::types::budget::Goal;
+    use crate::types::diagnostic::{DiagnosticLevel, RetryDisposition};
+    use crate::types::ids::{CapabilityId, DagId, DiagnosticId, NodeId};
+
+    /// Never consulted: these tests pin no artifacts and reference none.
+    struct NoArtifacts;
+
+    #[async_trait]
+    impl ArtifactStore for NoArtifacts {
+        async fn put(&self, _req: ArtifactPut) -> Result<ArtifactId, StoreError> {
+            Ok(ArtifactId::new())
+        }
+
+        async fn get(&self, _id: ArtifactId) -> Result<ArtifactBlob, StoreError> {
+            Err(StoreError::NotFound("unused".into()))
+        }
+
+        async fn meta(&self, _id: ArtifactId) -> Result<ArtifactMeta, StoreError> {
+            Err(StoreError::NotFound("unused".into()))
+        }
+
+        async fn get_by_digest(&self, _digest: &Digest) -> Result<Option<ArtifactId>, StoreError> {
+            Ok(None)
+        }
+
+        async fn delete(&self, _id: ArtifactId) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    /// Engine over empty stores and a null graph. The workspace root is a
+    /// real directory these tests never touch: nothing here reads or
+    /// writes files (A14 discipline holds for the tests too).
+    fn engine() -> DefaultContextEngine {
+        DefaultContextEngine::new(
+            ContextProfile::v2_defaults(),
+            GraphViewHandle::null(),
+            Arc::new(NullEventStore),
+            Arc::new(NoArtifacts),
+            std::env::temp_dir(),
+        )
+    }
+
+    fn request(budget: usize) -> AssembleRequest {
+        AssembleRequest {
+            session: SessionId::new(),
+            node: NodeId::new(),
+            capability: CapabilityId::new("edit").expect("static id"),
+            token_budget: budget,
+            must_include: vec![],
+        }
+    }
+
+    fn goal_inputs() -> AssembleInputs {
+        let dag = DagId::new();
+        let node = NodeId::new();
+        let input = Some(NodeInputEnvelope::new(
+            dag,
+            node,
+            NodeKind::Edit,
+            1,
+            NodeInputPayload::Goal(Goal {
+                text: "fix the borrow error".into(),
+                constraints: vec![],
+                attachments: vec![],
+            }),
+        ));
+        AssembleInputs {
+            input,
+            ..AssembleInputs::default()
+        }
+    }
+
+    fn failure(notes: &str) -> FailureIr {
+        FailureIr {
+            node: NodeId::new(),
+            error_class: ErrorClass::Model,
+            retry: RetryDisposition::Retryable,
+            diagnostics: vec![],
+            notes: notes.into(),
+        }
+    }
+
+    /// Spanless diagnostic: renders in the WorkingSet without any file IO.
+    fn diag() -> DiagnosticEvent {
+        DiagnosticEvent {
+            id: DiagnosticId::new(),
+            code: Some("E0502".into()),
+            level: DiagnosticLevel::Error,
+            message: "cannot borrow `x` as mutable".into(),
+            spans: vec![],
+            children: vec![],
+            package: None,
+            fingerprint: Digest::sha256(b"prior-failure-test-diag"),
+            raw_json: None,
+        }
+    }
+
+    fn pack_text(pack: &crate::router::PromptPack) -> String {
+        pack.messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// The retry's whole point: a captured prior failure must reach the
+    /// pack, as a fenced conversation section with a citation.
+    #[tokio::test]
+    async fn prior_failure_is_rendered_into_the_conversation_domain() {
+        let engine = engine();
+        let mut inputs = goal_inputs();
+        inputs.prior_failure = Some(failure(
+            "apply_patch dry run failed: hunk 1 does not match src/lib.rs:3",
+        ));
+
+        let pack = engine
+            .assemble_with(request(32_000), inputs)
+            .await
+            .expect("assembles");
+        let text = pack_text(&pack);
+
+        assert!(
+            text.contains("conversation:prior_failure"),
+            "prior failure must render as its own fenced section: {text}"
+        );
+        assert!(
+            text.contains("previous attempt failed: model"),
+            "the Alloy-authored class line must be present"
+        );
+        assert!(
+            text.contains("hunk 1 does not match src/lib.rs:3"),
+            "the producer's note must reach the model"
+        );
+        assert!(
+            pack.citations
+                .iter()
+                .any(|c| c.source == "alloy://conversation/prior_failure"),
+            "the section must contribute a citation (A7)"
+        );
+    }
+
+    /// Honesty: `None` renders nothing — no fence, no class line, no
+    /// empty-present section that could read as "no problems".
+    #[tokio::test]
+    async fn absent_prior_failure_renders_no_prior_failure_section() {
+        let engine = engine();
+
+        let pack = engine
+            .assemble_with(request(32_000), goal_inputs())
+            .await
+            .expect("assembles");
+        let text = pack_text(&pack);
+
+        assert!(
+            !text.contains("prior_failure"),
+            "absent input must leave zero trace in the pack: {text}"
+        );
+        assert!(!text.contains("previous attempt failed"));
+        assert!(pack
+            .citations
+            .iter()
+            .all(|c| c.source != "alloy://conversation/prior_failure"));
+    }
+
+    /// Bounding: a non-compliant oversized note is cut at
+    /// [`PRIOR_FAILURE_MAX_BYTES`] with a B7 marker, and the WorkingSet
+    /// keeps its diagnostic — the note competes with conversation history,
+    /// never with another domain's items.
+    #[tokio::test]
+    async fn oversized_prior_failure_is_cut_and_never_displaces_the_working_set() {
+        let engine = engine();
+        let mut inputs = goal_inputs();
+        inputs.diagnostics = vec![diag()];
+        inputs.prior_failure = Some(failure(&"x".repeat(100 * 1024)));
+
+        let pack = engine
+            .assemble_with(request(32_000), inputs)
+            .await
+            .expect("assembles");
+        let text = pack_text(&pack);
+
+        let start = text
+            .find("conversation:prior_failure")
+            .expect("section present");
+        let body_span = text[start..]
+            .find("<<<alloy:end conversation:prior_failure>>>")
+            .expect("closing fence");
+        assert!(
+            body_span < PRIOR_FAILURE_MAX_BYTES + 256,
+            "body must be cut at the cap; got {body_span} bytes"
+        );
+        assert!(
+            text[start..start + body_span].contains("[alloy: truncated —"),
+            "a cut note must carry the B7 marker"
+        );
+        assert!(
+            text.contains("working_set:diagnostics"),
+            "the diagnostic must still render: {text}"
+        );
+    }
+
+    // ---- Cross-generation rollback notes (E2 dev-loop fix). GN13 rolls
+    // the newest edit back between repair generations and reseeds from the
+    // restored tree, erasing the post-edit verify failure from every
+    // generation-N+1 prompt (measured: 16/16 two-plus-edit runs, zero
+    // post-edit diagnostics cited, 0% pass). The driver now records that
+    // discarded failure as an `error` event with class `rollback`; the
+    // engine must promote the newest note for the assembling run into the
+    // bounded `conversation:prior_failure` section — and never leak notes
+    // across runs.
+
+    use crate::dag::context_test_doubles::ScriptedEventStore;
+    use crate::events::{SessionEvent, SessionEventType};
+    use crate::types::ids::{EventSeq, RunId, Timestamp};
+
+    fn engine_with_events(events: Vec<SessionEvent>) -> DefaultContextEngine {
+        DefaultContextEngine::new(
+            ContextProfile::v2_defaults(),
+            GraphViewHandle::null(),
+            Arc::new(ScriptedEventStore(events)),
+            Arc::new(NoArtifacts),
+            std::env::temp_dir(),
+        )
+    }
+
+    fn rollback_event(
+        seq: u64,
+        session: SessionId,
+        run: Option<RunId>,
+        message: &str,
+    ) -> SessionEvent {
+        SessionEvent {
+            seq: EventSeq(seq),
+            ts: Timestamp::now(),
+            session_id: session,
+            run_id: run,
+            type_: SessionEventType::Error,
+            payload: serde_json::json!({ "class": "rollback", "message": message }),
+        }
+    }
+
+    /// The whole point of the fix: a first attempt of a fresh
+    /// generation-N+1 node (no dispatch `prior_failure`) must still learn
+    /// what the rolled-back edit broke — as the bounded
+    /// `conversation:prior_failure` section, not as a 400-byte history
+    /// line lost among scheduler telemetry.
+    #[tokio::test]
+    async fn rollback_note_is_promoted_to_the_prior_failure_section_for_its_run() {
+        let session = SessionId::new();
+        let run = RunId::new();
+        let note = "an earlier repair edit was applied and verification then failed with: \
+                    error[E0726] src/lib.rs:10 — implicit elided lifetime not allowed here. \
+                    That edit was rolled back";
+        let engine = engine_with_events(vec![rollback_event(3, session, Some(run), note)]);
+        let mut inputs = goal_inputs();
+        inputs.run = Some(run);
+
+        let mut req = request(32_000);
+        req.session = session;
+        let pack = engine.assemble_with(req, inputs).await.expect("assembles");
+        let text = pack_text(&pack);
+
+        assert!(
+            text.contains("conversation:prior_failure"),
+            "the rollback note must render as the prior_failure section: {text}"
+        );
+        assert!(
+            text.contains("error[E0726]"),
+            "the discarded post-edit failure must reach the model: {text}"
+        );
+        let history_start = text.find("conversation:history");
+        if let Some(start) = history_start {
+            assert!(
+                !text[start..].contains("E0726"),
+                "the note must not be double-spent as a history line: {text}"
+            );
+        }
+        assert!(
+            pack.citations
+                .iter()
+                .any(|c| c.source == "alloy://conversation/prior_failure"),
+            "the promoted note must contribute the prior_failure citation"
+        );
+    }
+
+    /// Run scoping: a rollback note from a different run — or an assemble
+    /// outside any run — must not be promoted. Stale notes from finished
+    /// runs in the same session would otherwise haunt every later prompt.
+    #[tokio::test]
+    async fn rollback_notes_from_other_runs_are_not_promoted() {
+        let session = SessionId::new();
+        let other = RunId::new();
+        let engine = engine_with_events(vec![rollback_event(
+            3,
+            session,
+            Some(other),
+            "error[E0726] from a previous run",
+        )]);
+
+        // Assembling for a different run.
+        let mut inputs = goal_inputs();
+        inputs.run = Some(RunId::new());
+        let mut req = request(32_000);
+        req.session = session;
+        let pack = engine.assemble_with(req, inputs).await.expect("assembles");
+        assert!(
+            !pack_text(&pack).contains("prior_failure"),
+            "a foreign run's rollback note must not be promoted"
+        );
+
+        // Assembling outside any run.
+        let engine = engine_with_events(vec![rollback_event(
+            3,
+            session,
+            Some(other),
+            "error[E0726] from a previous run",
+        )]);
+        let mut req = request(32_000);
+        req.session = session;
+        let pack = engine
+            .assemble_with(req, goal_inputs())
+            .await
+            .expect("assembles");
+        assert!(
+            !pack_text(&pack).contains("prior_failure"),
+            "an out-of-run assemble must not adopt any rollback note"
+        );
+    }
+
+    /// A generation-N+1 within-node retry carries BOTH memories: the
+    /// dispatch `prior_failure` (this node's own failed attempt) and the
+    /// cross-generation rollback note. One section, both facts, newest
+    /// rollback note wins when several exist.
+    #[tokio::test]
+    async fn dispatch_prior_failure_and_rollback_note_compose_in_one_section() {
+        let session = SessionId::new();
+        let run = RunId::new();
+        let engine = engine_with_events(vec![
+            rollback_event(2, session, Some(run), "stale note: error[E9999]"),
+            rollback_event(
+                5,
+                session,
+                Some(run),
+                "newest note: error[E0726] at src/lib.rs:10",
+            ),
+        ]);
+        let mut inputs = goal_inputs();
+        inputs.run = Some(run);
+        inputs.prior_failure = Some(failure("output truncated"));
+
+        let mut req = request(32_000);
+        req.session = session;
+        let pack = engine.assemble_with(req, inputs).await.expect("assembles");
+        let text = pack_text(&pack);
+
+        assert!(
+            text.contains("previous attempt failed: model") && text.contains("output truncated"),
+            "the dispatch prior_failure half must survive composition: {text}"
+        );
+        assert!(
+            text.contains("error[E0726]"),
+            "the rollback half must survive composition: {text}"
+        );
+        assert!(
+            !text.contains("E9999"),
+            "only the newest rollback note is promoted: {text}"
+        );
+        assert_eq!(
+            text.matches("<<<alloy:conversation:prior_failure").count(),
+            1,
+            "both memories share the one bounded section: {text}"
+        );
+    }
+
+    /// B10 extension: within Conversation the backstop drops history lines
+    /// first, then the prior-failure note, and only then may the caller
+    /// cut the goal to its D3 floor.
+    #[test]
+    fn backstop_drops_the_prior_failure_note_after_history_and_before_the_goal() {
+        let engine = engine();
+        let mut conv = ConvState {
+            goal_full: Some("g".into()),
+            goal_kept_bytes: 1,
+            admitted: 0,
+            prior_failure_body: Some("previous attempt failed: model".into()),
+            ..ConvState::default()
+        };
+        let ws_raw = WsRaw::default();
+        let mut ws = WsState::default();
+        let mut art = ArtState::default();
+
+        let dropped = engine.backstop_drop_one(&mut conv, &ws_raw, &mut ws, &mut art, &[]);
+
+        assert!(dropped, "the note must be droppable before the goal cut");
+        assert!(conv.prior_failure_body.is_none());
+        assert!(conv.prior_failure_omitted, "the drop must be counted");
+        assert!(conv.goal_full.is_some(), "the goal is untouched");
     }
 }

@@ -135,6 +135,9 @@ pub struct TomlModelRouter {
     report_tx: watch::Sender<Option<RouterShutdownReport>>,
     metrics: Arc<RouterMetrics>,
     append_supervisor: Arc<DurableAppendSupervisor>,
+    /// Completions that asked for a JSON Schema and were served under the
+    /// weaker `json_object` contract because the endpoint never opted in.
+    schema_contract_degradations: AtomicU64,
 }
 
 impl TomlModelRouter {
@@ -253,6 +256,7 @@ impl TomlModelRouter {
             report_tx,
             metrics,
             append_supervisor,
+            schema_contract_degradations: AtomicU64::new(0),
         })
     }
 
@@ -260,6 +264,20 @@ impl TomlModelRouter {
     #[must_use]
     pub fn metrics(&self) -> RouterMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Completions whose requested JSON Schema was dropped because the routed
+    /// endpoint did not declare `supports_json_schema`.
+    ///
+    /// A non-zero count means the run did **not** execute the wire contract
+    /// its caller asked for. Comparative evaluation must treat that as a
+    /// changed independent variable, not a detail: E1's two arms ran on
+    /// different `response_format` contracts for exactly this reason. Callers
+    /// that need contract equality should assert this is zero rather than
+    /// rely on a log line surviving to the report.
+    #[must_use]
+    pub fn schema_contract_degradations(&self) -> u64 {
+        self.schema_contract_degradations.load(Ordering::Relaxed)
     }
 
     /// Begin draining and return the final report shared by every shutdown caller.
@@ -528,12 +546,17 @@ impl TomlModelRouter {
                             }
                         }
                         // Honest degrade: a requested schema the endpoint
-                        // cannot take falls back to plain JSON-object.
+                        // cannot take falls back to plain JSON-object. This
+                        // silently changes the wire contract, so it is
+                        // counted and warned — never only a debug line.
                         Some(spec) => {
-                            tracing::debug!(
+                            self.schema_contract_degradations
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
                                 endpoint_id = %routed.endpoint().id,
                                 schema = %spec.name,
-                                "endpoint lacks supports_json_schema; degrading to json_object"
+                                "endpoint lacks supports_json_schema; wire contract degraded \
+                                 from json_schema to json_object"
                             );
                             ResponseFormat::JsonObject
                         }
@@ -1060,6 +1083,96 @@ output_usd_per_mtok = 1.0
             router.route(request(run)).await,
             Err(RouterError::ShuttingDown)
         ));
+    }
+
+    /// E2 (c) — a schema-carrying request served by an endpoint that never
+    /// declared `supports_json_schema` silently changes the wire contract.
+    /// The degrade stays legal, but it must be *counted*, so a harness can
+    /// assert "zero degradations" instead of grepping a debug log.
+    #[tokio::test]
+    async fn schema_contract_degradations_are_counted_not_just_logged() {
+        use crate::router::JsonSchemaSpec;
+
+        let id = ProviderId::new("provider").unwrap();
+        let provider = Arc::new(RecordingModelProvider::new(id));
+        for _ in 0..2 {
+            provider.push(Ok(ModelResponse {
+                text: Some("{}".into()),
+                structured: None,
+                tool_calls: vec![],
+                usage: Usage {
+                    input_tokens: None,
+                    output_tokens: None,
+                },
+                provider_request_id: None,
+                finish_reason: Some("stop".into()),
+            }));
+        }
+        let log = Arc::new(RecordingDecisionLog::new(RetentionPolicy::defaults()));
+        let run = RunId::new();
+        // The endpoint does not opt in: `supports_json_schema` is absent from
+        // the config, exactly as in the E1 Alloy arm's rendered router.toml.
+        let mut structured_only = config();
+        structured_only.providers[0].endpoints[0].supports_structured_output = true;
+        assert!(!structured_only.providers[0].endpoints[0].supports_json_schema);
+        let router = TomlModelRouter::from_parts(TomlModelRouterParts::new(
+            structured_only,
+            provider.clone(),
+            BudgetPolicy::default(),
+            Some(log),
+            Some(SharedCostMeter::new()),
+            Some(run),
+        ))
+        .unwrap();
+        assert_eq!(router.schema_contract_degradations(), 0);
+
+        let mut schema_request = request(run);
+        schema_request.requires_structured_output = true;
+        schema_request.response_schema = Some(JsonSchemaSpec {
+            name: "repair_plan".into(),
+            schema: serde_json::json!({"type": "object"}),
+        });
+        let routed = router.route(schema_request.clone()).await.unwrap();
+        router
+            .complete(
+                &routed,
+                PromptPack {
+                    messages: vec![],
+                    citations: vec![],
+                    domains: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provider.recorded()[0].1.response_format,
+            ResponseFormat::JsonObject,
+            "the degrade itself is unchanged"
+        );
+        assert_eq!(
+            router.schema_contract_degradations(),
+            1,
+            "the silent contract change must be countable"
+        );
+
+        // A structured request without a schema is not a degrade: nothing was
+        // asked for and nothing was dropped.
+        let mut plain = request(run);
+        plain.requires_structured_output = true;
+        let routed = router.route(plain).await.unwrap();
+        router
+            .complete(
+                &routed,
+                PromptPack {
+                    messages: vec![],
+                    citations: vec![],
+                    domains: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(router.schema_contract_degradations(), 1);
     }
 
     #[test]

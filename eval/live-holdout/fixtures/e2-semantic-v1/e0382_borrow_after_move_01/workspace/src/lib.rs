@@ -1,0 +1,21 @@
+/// One file staged for upload.
+pub struct Upload {
+    /// Display name of the file.
+    pub name: String,
+    /// Raw payload bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl Upload {
+    /// Consumes the upload and hands back its payload unchanged.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// Stores `upload` and returns a receipt of the form `<name>: <n> bytes`,
+/// where `<n>` is the length of the stored payload.
+pub fn store(upload: Upload) -> String {
+    let bytes = upload.into_bytes();
+    format!("{}: {} bytes", upload.name, bytes.len())
+}

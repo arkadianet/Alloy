@@ -167,6 +167,8 @@ impl PlanProposer for CapabilityPlanProposer {
             input,
             attempt: 1,
             cost_meter: meter,
+            // Always attempt 1 (PP1): there is no prior attempt to remember.
+            prior_failure: None,
         };
 
         let outcome = self.executor.execute(&exec_ctx).await;

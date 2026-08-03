@@ -53,6 +53,14 @@ name = "alloy-eval-live-naive"
 path = "src/bin/alloy-eval-live-naive.rs"
 required-features = ["live-naive"]
 
+# Exact-contract BYOM preflight: exercises both arms' wire contracts against
+# the live endpoint before any fixture runs. Shares the naive arm's HTTP
+# provider feature, so default offline builds stay network-free.
+[[bin]]
+name = "alloy-eval-byom-preflight"
+path = "src/bin/alloy-eval-byom-preflight.rs"
+required-features = ["live-naive"]
+
 [[test]]
 name = "live_naive_runner"
 required-features = ["live-naive"]

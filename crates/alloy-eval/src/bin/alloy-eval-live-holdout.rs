@@ -10,11 +10,18 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// Just enough of a report to decide whether this build can score it.
+#[derive(serde::Deserialize)]
+struct SchemaVersionPeek {
+    schema_version: u32,
+}
+
 use alloy_eval::{
-    compare_live_holdout, inspect_live_holdout, live_holdout_target_path_text,
-    live_holdout_telemetry, load_live_holdout_observations, score_live_holdout, LiveHoldoutDriver,
-    LiveHoldoutEndpoint, LiveHoldoutHarnessIdentity, LiveHoldoutOracleEvidence, LiveHoldoutReport,
-    LIVE_HOLDOUT_REPORT_VERSION,
+    check_live_holdout_report_version, compare_live_holdout, inspect_live_holdout,
+    live_holdout_corpus_digest, live_holdout_target_path_text, live_holdout_telemetry,
+    load_live_holdout_observations, score_live_holdout, LiveHoldoutArmIdentity, LiveHoldoutDriver,
+    LiveHoldoutEndpoint, LiveHoldoutOracleEvidence, LiveHoldoutReport, LiveHoldoutTreatmentBuild,
+    LiveHoldoutTreatmentIdentity,
 };
 
 const USAGE: &str = "\
@@ -22,6 +29,7 @@ alloy-eval-live-holdout — strict live-BYOM telemetry (not an offline gate)
 
 USAGE:
   alloy-eval-live-holdout target-path --manifest <path>
+  alloy-eval-live-holdout corpus-digest --fixtures <dir>
   alloy-eval-live-holdout oracle --fixture-dir <dir> --workspace <dir>
       --run-log <path> --exit-code <n> --compile-clean <bool>
       --cargo-check-exit <n|null> --tests-pass <bool>
@@ -32,8 +40,19 @@ USAGE:
       --model <model> --temperature <n> --driver <naive|alloy>
       --profile <none|default|autonomous> --base-url <url>
       --source-revision <40-hex-sha> --binary-bundle-sha256 <64-hex-sha>
-      --reps <n> --out <path>
-  alloy-eval-live-holdout compare --arm <id=report> --arm <id=report> --out <path>";
+      [--evaluator-revision <40-hex-sha>] --reps <n> --out <path>
+  alloy-eval-live-holdout compare --arm <id=report> --arm <id=report> --out <path>
+
+IDENTITY:
+  --source-revision and --binary-bundle-sha256 identify the TREATMENT: the
+  product build whose repairs are being scored. Together with --driver and
+  --profile they may differ between arms; that difference is the measurement.
+
+  --evaluator-revision identifies the PROTOCOL: the checkout whose evaluator
+  and corpus performed the scoring. It must be identical across arms, or they
+  are incomparable. It defaults to --source-revision, which is correct only
+  while one bundle produces every arm; pass it explicitly when re-scoring
+  observations produced by an older build.";
 
 fn main() -> ExitCode {
     match run() {
@@ -58,6 +77,13 @@ fn run() -> Result<String, String> {
             Ok(format!(
                 "{}\n",
                 live_holdout_target_path_text(&PathBuf::from(manifest))?
+            ))
+        }
+        "corpus-digest" => {
+            let fixtures = required(&options, "fixtures")?;
+            Ok(format!(
+                "{}\n",
+                live_holdout_corpus_digest(&PathBuf::from(fixtures))?
             ))
         }
         "oracle" => oracle(&options),
@@ -134,14 +160,17 @@ fn oracle(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
             cargo_test_exit: parse_optional_exit(options, "cargo-test-exit")?,
         },
     )?;
-    // Nine-field TSV consumed by eval/live-holdout/run.sh, in order:
-    // process_pass, compile_clean, tests_pass, reference_match, oracle_pass,
-    // failure_class, cargo_check_exit, cargo_test_exit, repair_generations.
+    // Eleven-field TSV consumed by eval/live-holdout/run.sh, in order:
+    // process_pass, compile_clean, tests_pass, safety_clean, semantic_pass,
+    // reference_match, oracle_pass, failure_class, cargo_check_exit,
+    // cargo_test_exit, repair_generations.
     Ok(format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         fields.process_pass,
         fields.compile_clean,
         fields.tests_pass,
+        fields.safety_clean,
+        fields.semantic_pass,
         fields.reference_match,
         fields.oracle_pass,
         fields.failure_class,
@@ -223,14 +252,33 @@ fn endpoint(options: &BTreeMap<String, Vec<String>>) -> Result<LiveHoldoutEndpoi
     Ok(LiveHoldoutEndpoint {
         model: required(options, "model")?.clone(),
         temperature,
-        driver: parse_driver(options)?,
-        profile: parse_profile(options)?,
         base_url: required(options, "base-url")?.clone(),
-        harness: LiveHoldoutHarnessIdentity {
+    })
+}
+
+fn treatment(
+    options: &BTreeMap<String, Vec<String>>,
+) -> Result<LiveHoldoutTreatmentIdentity, String> {
+    Ok(LiveHoldoutTreatmentIdentity {
+        build: LiveHoldoutTreatmentBuild {
             source_revision: parse_hex_sha(options, "source-revision", 40)?,
             binary_bundle_sha256: parse_hex_sha(options, "binary-bundle-sha256", 64)?,
         },
+        driver: parse_driver(options)?,
+        profile: parse_profile(options)?,
     })
+}
+
+/// The checkout that scored this evidence. It defaults to the treatment's
+/// source revision — right while one bundle produces every arm — and is
+/// passed explicitly when one evaluator re-scores observations from several
+/// builds, which is the only way those runs become comparable.
+fn evaluator_revision(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
+    if options.contains_key("evaluator-revision") {
+        parse_hex_sha(options, "evaluator-revision", 40)
+    } else {
+        parse_hex_sha(options, "source-revision", 40)
+    }
 }
 
 fn score(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
@@ -242,7 +290,11 @@ fn score(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
     let report = score_live_holdout(
         &PathBuf::from(required(options, "fixtures")?),
         observations,
-        endpoint(options)?,
+        LiveHoldoutArmIdentity {
+            evaluator_revision: evaluator_revision(options)?,
+            endpoint: endpoint(options)?,
+            treatment: treatment(options)?,
+        },
         repetitions,
     )?;
     let output = required(options, "out")?;
@@ -264,14 +316,15 @@ fn compare(options: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
             .ok_or_else(|| format!("--arm must be id=report, got {path}"))?;
         let raw = std::fs::read_to_string(report_path)
             .map_err(|error| format!("read {report_path}: {error}"))?;
+        // Read the version before the body: an older report lacks fields this
+        // build requires, and a bare serde error would read as a corrupt file
+        // rather than as legacy evidence.
+        let version = serde_json::from_str::<SchemaVersionPeek>(&raw)
+            .map_err(|error| format!("parse {report_path}: {error}"))?
+            .schema_version;
+        check_live_holdout_report_version(version, report_path)?;
         let report: LiveHoldoutReport =
             serde_json::from_str(&raw).map_err(|error| format!("parse {report_path}: {error}"))?;
-        if report.schema_version != LIVE_HOLDOUT_REPORT_VERSION {
-            return Err(format!(
-                "unsupported schema_version {} in {report_path}; expected {LIVE_HOLDOUT_REPORT_VERSION}",
-                report.schema_version,
-            ));
-        }
         reports.push((name.to_owned(), report));
     }
     let comparison = compare_live_holdout(reports)?;
@@ -301,11 +354,16 @@ fn render_report(report: &LiveHoldoutReport) -> String {
         .wilson95
         .map(|value| value.render())
         .unwrap_or_else(|| "unmeasured".to_owned());
+    // Protocol and treatment are printed apart, so an operator reading the
+    // terminal can see which one a later run changed.
     format!(
-        "driver={} profile={} harness={} overall oracle={}/{} rate={} wilson95={} process={}/{} compile={}/{} tests={}/{} compile_clean_reference_mismatch={}/{} compile_clean_tests_failed={}/{} tests_pass_reference_mismatch={}/{} reference={}/{} model_calls={} tokens_in={} tokens_out={}\n",
-        driver_label(report.endpoint.driver),
-        profile_label(report.endpoint.profile.as_deref()),
-        report.endpoint.harness.source_revision,
+        "driver={} profile={} treatment_build={} protocol_evaluator={} protocol_corpus={}@{} overall oracle={}/{} rate={} wilson95={} process={}/{} compile={}/{} tests={}/{} compile_clean_reference_mismatch={}/{} compile_clean_tests_failed={}/{} tests_pass_reference_mismatch={}/{} reference={}/{} model_calls={} tokens_in={} tokens_out={}\n",
+        driver_label(report.treatment.driver),
+        profile_label(report.treatment.profile.as_deref()),
+        report.treatment.build.binary_bundle_sha256,
+        report.protocol.evaluator_revision,
+        report.protocol.corpus,
+        report.protocol.corpus_digest,
         overall.oracle.passes,
         overall.oracle.attempts,
         overall
@@ -335,9 +393,16 @@ fn render_report(report: &LiveHoldoutReport) -> String {
 }
 
 fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> String {
+    // The protocol is stated once because every arm shares it; the treatment
+    // is stated per arm because that is what differs.
     let mut output = format!(
-        "baseline={} repetitions={}\narm\tdriver\tprofile\toracle\ttests\tcompile_clean_reference_mismatch\tcompile_clean_tests_failed\ttests_pass_reference_mismatch\toracle_wilson95\tmodel_calls\n",
-        comparison.baseline, comparison.repetitions
+        "baseline={} repetitions={} protocol_corpus={}@{} protocol_evaluator={} schema_version={}\narm\tdriver\tprofile\ttreatment_build\toracle\ttests\tcompile_clean_reference_mismatch\tcompile_clean_tests_failed\ttests_pass_reference_mismatch\toracle_wilson95\tmodel_calls\n",
+        comparison.baseline,
+        comparison.repetitions,
+        comparison.protocol.corpus,
+        comparison.protocol.corpus_digest,
+        comparison.protocol.evaluator_revision,
+        comparison.protocol.schema_version,
     );
     for (name, report) in &comparison.arms {
         let interval = report
@@ -347,9 +412,10 @@ fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> St
             .map(|value| value.render())
             .unwrap_or_else(|| "unmeasured".to_owned());
         output.push_str(&format!(
-            "{name}\t{}\t{}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{interval}\t{}\n",
-            driver_label(report.endpoint.driver),
-            profile_label(report.endpoint.profile.as_deref()),
+            "{name}\t{}\t{}\t{}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{}/{}\t{interval}\t{}\n",
+            driver_label(report.treatment.driver),
+            profile_label(report.treatment.profile.as_deref()),
+            report.treatment.build.binary_bundle_sha256,
             report.overall.oracle.passes,
             report.overall.oracle.attempts,
             report.overall.tests_pass.passes,
@@ -374,7 +440,37 @@ fn render_comparison(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> St
                 .unwrap_or(&item.assessment.basis)
         ));
     }
+    output.push_str(&render_autonomous_gate(comparison));
     output
+}
+
+/// States the default-versus-autonomous verdict outright. Absence is printed
+/// as absence: no such pair of arms ran, so no autonomous claim is available.
+fn render_autonomous_gate(comparison: &alloy_eval::LiveHoldoutMatrixComparison) -> String {
+    let Some(contrast) = &comparison.autonomous_vs_default else {
+        return "autonomous_gate\tabsent\tno_single_default_and_autonomous_arm_pair\n".to_owned();
+    };
+    let clustered = &contrast.comparison.semantic_clustered;
+    let bound = |value: Option<f64>| {
+        value
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "unbounded".to_owned())
+    };
+    format!(
+        "autonomous_gate\t{}\tvs\t{}\t{}\t{}\tfixtures={}\tmean={}\tlower95={}\tupper95={}\n",
+        contrast.comparison.arm,
+        contrast.comparison.baseline,
+        if contrast.clears_gate {
+            "clears"
+        } else {
+            "blocked"
+        },
+        contrast.gate_basis,
+        clustered.fixtures,
+        bound(clustered.mean_delta),
+        bound(clustered.lower95),
+        bound(clustered.upper95),
+    )
 }
 
 #[cfg(test)]
@@ -391,5 +487,28 @@ mod tests {
 
             assert!(error.contains("lower-case"), "{error}");
         }
+    }
+
+    /// Protocol identity falls back to the treatment revision, so a runner
+    /// that knows nothing of the split still scores; passing it explicitly is
+    /// what lets one evaluator re-score several builds into one protocol.
+    #[test]
+    fn evaluator_revision_defaults_to_the_treatment_revision() {
+        let treatment_revision = "a".repeat(40);
+        let evaluator = "c".repeat(40);
+        let mut options = BTreeMap::new();
+        options.insert(
+            "source-revision".to_owned(),
+            vec![treatment_revision.clone()],
+        );
+
+        assert_eq!(evaluator_revision(&options).unwrap(), treatment_revision);
+
+        options.insert("evaluator-revision".to_owned(), vec![evaluator.clone()]);
+        assert_eq!(evaluator_revision(&options).unwrap(), evaluator);
+
+        // A malformed override is refused rather than silently ignored.
+        options.insert("evaluator-revision".to_owned(), vec!["nope".to_owned()]);
+        assert!(evaluator_revision(&options).is_err());
     }
 }

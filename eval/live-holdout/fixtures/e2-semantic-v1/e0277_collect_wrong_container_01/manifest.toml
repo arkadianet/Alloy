@@ -1,0 +1,33 @@
+# Live-holdout fixture manifest (corpus e2-semantic-v1).
+#
+# The live harness reads exactly one field from this file: `naive_target_path`
+# (crates/alloy-eval/src/live_holdout.rs, `HoldoutManifest`). Its deserializer
+# accepts unknown keys, so everything below is provenance metadata that the
+# harness ignores.
+#
+# The strict offline schema in crates/alloy-eval/src/manifest.rs does NOT
+# apply here: `load_fixture` only ever resolves `<root>/train/<id>` and
+# `<root>/holdout/<id>`, and this corpus is a sibling of those directories.
+# Consequently [[turns]], request_fingerprint, cargo_recordings and
+# recordings/*.json are deliberately absent.
+
+naive_target_path = "src/lib.rs"
+
+id = "e0277_collect_wrong_container_01"
+corpus = "e2-semantic-v1"
+target_diagnostic = "E0277"
+summary = "Key-only iterator collected into a BTreeMap that needs key/value pairs."
+
+[license]
+class = "permitted"
+spdx = "Alloy-Original"
+source_note = "Alloy-original E2 semantic-holdout fixture by arkadianet."
+
+[toolchain]
+channel = "1.97.1"
+rustc_version = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+cargo_version = "cargo 1.97.1 (c980f4866 2026-06-30)"
+
+[workspace]
+path = "workspace"
+package = "e0277_collect_wrong_container_01"

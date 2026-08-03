@@ -1,0 +1,40 @@
+/// A set of counters plus an audit log of the adjustments applied to them.
+pub struct Ledger {
+    counters: Vec<i64>,
+    audit: Vec<i64>,
+}
+
+impl Ledger {
+    /// Builds a ledger over `counters` with an empty audit log.
+    pub fn new(counters: Vec<i64>) -> Self {
+        Self {
+            counters,
+            audit: Vec::new(),
+        }
+    }
+
+    /// Adds `delta` to the counter at `index` and records `delta` in the audit
+    /// log.
+    ///
+    /// Callers must pass an index that is in range.
+    pub fn adjust(&mut self, index: usize, delta: i64) {
+        let counter = &mut self.counters[index];
+        self.push_audit(delta);
+        *counter += delta;
+    }
+
+    /// Appends `delta` to the audit log without touching any counter.
+    pub fn push_audit(&mut self, delta: i64) {
+        self.audit.push(delta);
+    }
+
+    /// The current counter values.
+    pub fn counters(&self) -> &[i64] {
+        &self.counters
+    }
+
+    /// The adjustments recorded so far, oldest first.
+    pub fn audit(&self) -> &[i64] {
+        &self.audit
+    }
+}

@@ -10,14 +10,19 @@ use std::time::Duration;
 
 use alloy_runtime::{
     compiler_fingerprint_digest, install_sqlite_event_sink, policy_hash_digest,
-    tool_versions_digest, AlloyRuntime, AlloyStorage, ArtifactStore, BudgetPolicy,
+    tool_versions_digest, AdapterError, AlloyRuntime, AlloyStorage, ArtifactStore, BudgetPolicy,
     CostMeterFactory, CreateSession, DagId, DagOutcome, DagState, DagStore, DecisionLog,
-    DecisionRecord, DiagnosticEvent, DiagnosticId, DiagnosticLevel, Digest, ErrorClass, EventStore,
-    FailureIr, GenerationDriver, GenerationDriverDeps, GenerationPolicy, Goal, LanguageId,
-    ModelCallRecord, NodeId, NodeKind, ObsError, PlanContext, PlanFingerprints,
-    PlanProducedPayload, PlanService, ProcessCostMeterFactory, ProfileId, RunId, RuntimeConfig,
-    RuntimeEvent, RuntimeHandle, SchedError, Scheduler, SessionEventType, SessionId, SessionPlane,
-    SessionRows, StorageOpenOptions, TemplatePlanService, ToolCallRecord, ToolchainRecord,
+    DecisionRecord, DiagnosticEvent, DiagnosticId, DiagnosticLevel, Digest, EditContext,
+    EditEngine, EditError, EditRequest, EditTransaction, EditValidation, ErrorClass, EventSink,
+    EventStore, FailureIr, FileChange, FixEvent, GenerationDriver, GenerationDriverDeps,
+    GenerationPolicy, Goal, GraphError, GraphQuery, GraphSnapshotId, GraphVersion, GraphView,
+    GraphViewHandle, LanguageId, ModelCallRecord, NewSessionEvent, NodeExecContext, NodeExecRef,
+    NodeId, NodeKind, ObsError, PermissionToken, PlanContext, PlanFingerprints,
+    PlanProducedPayload, PlanService, ProcessCostMeterFactory, ProfileId, ProjectGraph, RunId,
+    RuntimeConfig, RuntimeEvent, RuntimeHandle, SchedError, Scheduler, SessionEventType, SessionId,
+    SessionPlane, SessionRows, StorageOpenOptions, TemplatePlanService, ToolCallRecord,
+    ToolchainRecord, TransactionId, Verdict, VerdictOutcome, Verifier, WorkerPermissions,
+    WorkerToolClass,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -248,6 +253,105 @@ fn fingerprints() -> (Digest, Digest, Digest) {
     )
 }
 
+// ---- GN13 fakes: enough machinery for `restore_workspace_and_reseed` to
+// take its success path (rollback the journaled edit, re-verify against the
+// "restored" tree) so the driver observes a replaced seed.
+
+/// Edit engine whose `rollback` always succeeds; apply/validate are never
+/// reached by the driver.
+struct RollbackOkEditEngine;
+
+#[async_trait]
+impl EditEngine for RollbackOkEditEngine {
+    async fn validate(
+        &self,
+        _req: EditRequest,
+        _ctx: &EditContext,
+    ) -> Result<EditValidation, EditError> {
+        unreachable!("driver never validates")
+    }
+
+    async fn apply(
+        &self,
+        _req: EditRequest,
+        _ctx: &EditContext,
+    ) -> Result<EditTransaction, EditError> {
+        unreachable!("driver never applies")
+    }
+
+    async fn rollback(&self, _tx: TransactionId, _ctx: &EditContext) -> Result<(), EditError> {
+        Ok(())
+    }
+}
+
+/// Permission source that mints an empty-grant token for any request.
+struct GrantAllPerms;
+
+#[async_trait]
+impl WorkerPermissions for GrantAllPerms {
+    async fn token_for(
+        &self,
+        ctx: &NodeExecRef,
+        _class: WorkerToolClass,
+    ) -> Result<PermissionToken, AdapterError> {
+        Ok(PermissionToken {
+            profile: ProfileId::new("default").unwrap(),
+            grants: vec![],
+            expires: None,
+            run_id: ctx.run_id,
+        })
+    }
+}
+
+/// Post-rollback verifier: fails compile with the RESTORED tree's original
+/// diagnostic, i.e. a different failure than the admitted (post-edit) seed.
+struct RestoredTreeVerifier;
+
+#[async_trait]
+impl Verifier for RestoredTreeVerifier {
+    async fn verify(&self, _ctx: &NodeExecContext) -> Result<Verdict, AdapterError> {
+        Ok(Verdict {
+            outcome: VerdictOutcome::Fail,
+            diagnostics: vec![diag("original error: missing lifetime specifier")],
+            raw_artifact: None,
+        })
+    }
+}
+
+/// Read-only graph fake for the AM-0017-1 graph-channel seed: answers
+/// `Diagnostics` with the scripted run-start evidence (what the issue-#53
+/// `seed_graph_diagnostics` pass would have recorded), everything else
+/// empty; writes are `Disabled` like `NullProjectGraph`'s.
+struct SeededGraph {
+    diagnostics: Vec<DiagnosticEvent>,
+}
+
+#[async_trait]
+impl ProjectGraph for SeededGraph {
+    async fn rebuild(&self, _root: &std::path::Path) -> Result<GraphVersion, GraphError> {
+        Err(GraphError::Disabled)
+    }
+    async fn apply_incremental(&self, _changes: &[FileChange]) -> Result<GraphVersion, GraphError> {
+        Err(GraphError::Disabled)
+    }
+    async fn query(&self, q: GraphQuery) -> Result<GraphView, GraphError> {
+        let mut view = GraphView::empty(GraphVersion(1));
+        if matches!(q, GraphQuery::Diagnostics { .. }) {
+            view.diagnostics = self.diagnostics.clone();
+        }
+        Ok(view)
+    }
+    async fn record_diagnostic(&self, _d: DiagnosticEvent) -> Result<(), GraphError> {
+        Err(GraphError::Disabled)
+    }
+    async fn record_fix(&self, _f: FixEvent) -> Result<(), GraphError> {
+        Err(GraphError::Disabled)
+    }
+    async fn snapshot(&self) -> Result<GraphSnapshotId, GraphError> {
+        Err(GraphError::Disabled)
+    }
+}
+
 /// A decision log that always fails (AC 45 / GN12).
 struct FailingDecisionLog;
 
@@ -288,6 +392,14 @@ struct HarnessOptions {
     run_timeout: Duration,
     budget_policy: BudgetPolicy,
     failing_decisions: bool,
+    /// Wire the GN13 fakes (rollback-ok edit engine, grant-all perms,
+    /// restored-tree verifier) so `restore_workspace_and_reseed` replaces
+    /// the admitted seed instead of no-opping.
+    gn13_fakes: bool,
+    /// `Some` wires a [`SeededGraph`] holding these diagnostics as the
+    /// run-start graph-channel evidence; `None` wires the null handle
+    /// (graph absent — every pre-existing test's shape).
+    graph_diagnostics: Option<Vec<DiagnosticEvent>>,
 }
 
 impl Default for HarnessOptions {
@@ -297,6 +409,8 @@ impl Default for HarnessOptions {
             run_timeout: Duration::from_secs(30),
             budget_policy: BudgetPolicy::default(),
             failing_decisions: false,
+            gn13_fakes: false,
+            graph_diagnostics: None,
         }
     }
 }
@@ -364,9 +478,19 @@ impl Harness {
             policy: GenerationPolicy {
                 max_repair_generations: options.max_repair_generations,
             },
-            edit_engine: None,
-            worker_permissions: None,
-            verify_compile: None,
+            edit_engine: options
+                .gn13_fakes
+                .then(|| Arc::new(RollbackOkEditEngine) as _),
+            worker_permissions: options.gn13_fakes.then(|| Arc::new(GrantAllPerms) as _),
+            verify_compile: options
+                .gn13_fakes
+                .then(|| Arc::new(RestoredTreeVerifier) as _),
+            graph: match options.graph_diagnostics {
+                Some(diagnostics) => {
+                    GraphViewHandle::new(Arc::new(SeededGraph { diagnostics }) as _)
+                }
+                None => GraphViewHandle::null(),
+            },
         }));
         plane.set_executor(Arc::clone(&driver) as _);
         Self {
@@ -790,6 +914,339 @@ async fn ac23b_lineage_edit_model_may_bump() {
     h.close().await;
 }
 
+/// Live defect (E2 bucket A): a generation-1 `Edit(Model)` failure is the
+/// AM-0017-1 near-miss — admissible kind, admissible class, no in-run
+/// lineage seed — and its decline is deliberate (AC 23/23b). What must not
+/// happen is the measured silent exit: the run burned its whole edit
+/// budget, no repair generation was ever admitted, and nothing durable
+/// distinguished that from a repair that fought and lost. The §9.2 decline
+/// record must name the absent lineage and the unspent repair budget, and
+/// the terminal outcome's `FailureIr` must say no repair generation ran.
+#[tokio::test]
+async fn gen1_edit_model_decline_reports_absent_lineage_and_unspent_budget() {
+    let h = Harness::new(HarnessOptions::default()).await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [Step::Fail {
+            node: NodeSel::Edit,
+            class: ErrorClass::Model,
+            diags: 1,
+        }],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+
+    h.plane.runs().start(run).await.unwrap();
+
+    assert_eq!(sched.calls(), 1, "the decline admits nothing (AC 23)");
+    assert_eq!(h.run_state(run).await, "failed");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["admitted"], json!(false));
+    // AC 23b's reason vocabulary is retained; the near-miss is additive.
+    assert_eq!(decisions[0]["reason"], json!("kind"));
+    assert_eq!(decisions[0]["lineage"], json!("absent"));
+    assert_eq!(decisions[0]["bumps_used"], json!(0));
+    assert_eq!(decisions[0]["max_repair_generations"], json!(2));
+
+    // The durable terminal outcome names the declined repair instead of
+    // exiting shaped like an ordinary model failure — scheduler notes kept.
+    let notes = run_finished_failure_notes(&h, run).await;
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].contains("no repair generation was admitted"),
+        "terminal FailureIr must carry the decline note, got: {}",
+        notes[0]
+    );
+    assert!(
+        notes[0].contains("cargo check failed"),
+        "scheduler-authored notes must be preserved, got: {}",
+        notes[0]
+    );
+    h.close().await;
+}
+
+/// The near-miss annotation stays narrow. An exhausted lineage decline
+/// (GN5) keeps its `FailureIr` intact (GN11) and reports no `lineage`
+/// field; a generation-1 `Edit(Tool)` decline (wrong class, not a
+/// near-miss) reports neither — while every decline still carries the
+/// budget accounting.
+#[tokio::test]
+async fn non_near_miss_declines_keep_failure_ir_intact() {
+    // Bound 1: the verify Fail admits the only bump, then the lineage
+    // Edit(Model) failure declines "exhausted" with lineage present.
+    let h = Harness::new(HarnessOptions {
+        max_repair_generations: 1,
+        ..Default::default()
+    })
+    .await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            Step::Fail {
+                node: NodeSel::VerifyCompile,
+                class: ErrorClass::Compile,
+                diags: 1,
+            },
+            Step::Fail {
+                node: NodeSel::Edit,
+                class: ErrorClass::Model,
+                diags: 1,
+            },
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+    h.plane.runs().start(run).await.unwrap();
+
+    assert_eq!(h.run_state(run).await, "failed");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[1]["admitted"], json!(false));
+    assert_eq!(decisions[1]["reason"], json!("exhausted"));
+    assert!(
+        decisions[1].get("lineage").is_none_or(|v| v.is_null()),
+        "an exhausted decline with lineage present is not the near-miss"
+    );
+    assert_eq!(decisions[1]["bumps_used"], json!(1));
+    assert_eq!(decisions[1]["max_repair_generations"], json!(1));
+    let notes = run_finished_failure_notes(&h, run).await;
+    assert_eq!(
+        notes,
+        vec!["cargo check failed".to_owned()],
+        "GN11: an exhausted decline returns the FailureIr intact"
+    );
+    h.close().await;
+
+    // Generation-1 Edit(Tool): declines "kind" but is not the near-miss —
+    // no annotation, no lineage field.
+    let h = Harness::new(HarnessOptions::default()).await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [Step::Fail {
+            node: NodeSel::Edit,
+            class: ErrorClass::Tool,
+            diags: 1,
+        }],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+    h.plane.runs().start(run).await.unwrap();
+
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["reason"], json!("kind"));
+    assert!(
+        decisions[0].get("lineage").is_none_or(|v| v.is_null()),
+        "a wrong-class decline is not the near-miss"
+    );
+    let notes = run_finished_failure_notes(&h, run).await;
+    assert_eq!(notes, vec!["cargo check failed".to_owned()]);
+    h.close().await;
+}
+
+/// Fix B (E2 bucket A): a generation-1 `Edit(Model)` failure with run-start
+/// compile evidence in the graph channel (the issue-#53 seed pass) must
+/// replan from that evidence instead of dying with the whole repair budget
+/// unspent. The admission rides the normal GN3–GN7 rules; the decision
+/// records `seed_source: "graph"`, and the replanned generation's root is
+/// seeded (SD1–SD10) so generation 2 actually sees the compile errors.
+#[tokio::test]
+async fn gen1_edit_model_admits_replan_seeded_from_graph_channel() {
+    let h = Harness::new(HarnessOptions {
+        graph_diagnostics: Some(vec![diag("run-start: mismatched types")]),
+        ..HarnessOptions::default()
+    })
+    .await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            Step::Fail {
+                node: NodeSel::Edit,
+                class: ErrorClass::Model,
+                diags: 1,
+            },
+            Step::Succeed,
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+
+    h.plane.runs().start(run).await.unwrap();
+
+    assert_eq!(
+        sched.calls(),
+        2,
+        "graph-seeded replan dispatches generation 2"
+    );
+    assert_eq!(h.run_state(run).await, "succeeded");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["admitted"], json!(true));
+    assert_eq!(decisions[0]["seed_source"], json!("graph"));
+    assert_eq!(decisions[0]["to_generation"], json!(2));
+    assert!(
+        decisions[0]["diagnostic_count"].as_u64().unwrap() >= 1,
+        "the admitted decision reports the graph seed's diagnostics, not the empty Edit IR"
+    );
+    // The evidence rode the replan: generation 2's root is seeded.
+    let plans: Vec<PlanProducedPayload> = h
+        .session_events(session)
+        .await
+        .into_iter()
+        .filter(|e| e.type_ == SessionEventType::PlanProduced)
+        .map(|e| serde_json::from_value(e.payload).unwrap())
+        .collect();
+    assert_eq!(plans.len(), 2);
+    assert!(plans[1].replan);
+    assert_eq!(plans[1].seeded_root, Some(true));
+    let m = h.driver.metrics();
+    assert_eq!(m.replans_admitted, 1);
+    assert_eq!(m.generations_run, 2);
+    h.close().await;
+}
+
+/// What still stops a replan loop on hopeless errors, with graph evidence
+/// permanently available: (a) GN5 — the bump bound caps total generations
+/// at 1 + max_repair_generations even when EVERY generation fails
+/// Edit(Model) and the graph channel would admit again; (b) the kind/class
+/// gate — a non-Model Edit failure never consults the graph and still
+/// declines `kind` on the first generation.
+#[tokio::test]
+async fn graph_channel_admission_keeps_bound_and_kind_gate() {
+    // (a) Three Edit(Model) failures, bound 2: exactly three dispatches,
+    // then an "exhausted" decline — never a fourth generation.
+    let h = Harness::new(HarnessOptions {
+        graph_diagnostics: Some(vec![diag("run-start: mismatched types")]),
+        ..HarnessOptions::default()
+    })
+    .await;
+    let (session, run, _dag) = h.planned_run().await;
+    let fail_edit = Step::Fail {
+        node: NodeSel::Edit,
+        class: ErrorClass::Model,
+        diags: 1,
+    };
+    let sched = Scripted::new(&h.storage, [fail_edit, fail_edit, fail_edit]);
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+    h.plane.runs().start(run).await.unwrap();
+
+    assert_eq!(sched.calls(), 3, "GN5 bounds graph-fed Model failures");
+    assert_eq!(h.run_state(run).await, "failed");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 3);
+    assert_eq!(decisions[0]["admitted"], json!(true));
+    assert_eq!(decisions[0]["seed_source"], json!("graph"));
+    assert_eq!(decisions[1]["admitted"], json!(true));
+    assert_eq!(
+        decisions[1]["seed_source"],
+        json!("lineage"),
+        "after the graph admission the in-run lineage carries the seed"
+    );
+    assert_eq!(decisions[2]["admitted"], json!(false));
+    assert_eq!(decisions[2]["reason"], json!("exhausted"));
+    h.close().await;
+
+    // (b) Wrong class: Edit(Tool) with graph evidence present declines
+    // `kind` without dispatching a second generation.
+    let h = Harness::new(HarnessOptions {
+        graph_diagnostics: Some(vec![diag("run-start: mismatched types")]),
+        ..HarnessOptions::default()
+    })
+    .await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [Step::Fail {
+            node: NodeSel::Edit,
+            class: ErrorClass::Tool,
+            diags: 1,
+        }],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+    h.plane.runs().start(run).await.unwrap();
+
+    assert_eq!(
+        sched.calls(),
+        1,
+        "graph evidence never admits a non-Model class"
+    );
+    assert_eq!(h.run_state(run).await, "failed");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["admitted"], json!(false));
+    assert_eq!(decisions[0]["reason"], json!("kind"));
+    h.close().await;
+}
+
+/// A run that genuinely cannot proceed still fails honestly: when the
+/// run-start check left no error-level evidence (clean or warning-only
+/// workspace), the generation-1 Edit(Model) decline keeps the AM-0017-1
+/// near-miss shape — reason `kind`, `lineage: "absent"`, annotated terminal
+/// `FailureIr` — and dispatches nothing.
+#[tokio::test]
+async fn gen1_edit_model_without_run_start_errors_still_declines_honestly() {
+    let warning = {
+        let mut d = diag("unused variable: `x`");
+        d.level = DiagnosticLevel::Warning;
+        d
+    };
+    let h = Harness::new(HarnessOptions {
+        graph_diagnostics: Some(vec![warning]),
+        ..HarnessOptions::default()
+    })
+    .await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [Step::Fail {
+            node: NodeSel::Edit,
+            class: ErrorClass::Model,
+            diags: 1,
+        }],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+    h.plane.runs().start(run).await.unwrap();
+
+    assert_eq!(sched.calls(), 1, "warning-only evidence admits nothing");
+    assert_eq!(h.run_state(run).await, "failed");
+    let decisions = h.replan_decisions(session).await;
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0]["admitted"], json!(false));
+    assert_eq!(decisions[0]["reason"], json!("kind"));
+    assert_eq!(decisions[0]["lineage"], json!("absent"));
+    assert_eq!(decisions[0]["bumps_used"], json!(0));
+    let notes = run_finished_failure_notes(&h, run).await;
+    assert_eq!(notes.len(), 1);
+    assert!(
+        notes[0].contains("no repair generation was admitted"),
+        "terminal FailureIr must carry the decline note, got: {}",
+        notes[0]
+    );
+    h.close().await;
+}
+
+/// Terminal `RunFinished` failure notes for `run`, in emission order.
+async fn run_finished_failure_notes(h: &Harness, run: RunId) -> Vec<String> {
+    h.runtime_events()
+        .await
+        .into_iter()
+        .filter_map(|ev| match ev {
+            RuntimeEvent::RunFinished { run_id, outcome } if run_id == run => {
+                outcome.failure.map(|f| f.notes)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// AC 24 / GN5 / GN11: with the default bound of 2, the third verify Fail
 /// returns the final Failed outcome with its `FailureIr` intact and records
 /// `Replan{admitted:false, reason:"exhausted"}`.
@@ -1192,5 +1649,125 @@ async fn ac45_failing_decision_log_never_fails_a_generation() {
     let m = h.driver.metrics();
     assert_eq!(m.replans_admitted, 1);
     assert_eq!(m.generations_run, 2);
+    h.close().await;
+}
+
+/// E2 dev-loop fix: when GN13 replaces the admitted (post-edit) seed with
+/// the restored tree's verdict, the informative failure — what the
+/// rolled-back edit actually broke — must not be erased. The driver must
+/// record it as an `error` event with class `rollback` on the run, whose
+/// message names the discarded diagnostics and states the workspace was
+/// restored, so the context engine can promote it into generation N+1's
+/// `conversation:prior_failure` section. Measured motivation: 16/16
+/// two-plus-edit dev-loop runs never saw a post-edit diagnostic and 7/16
+/// re-emitted a byte-identical patch every generation.
+#[tokio::test]
+async fn gn13_reseed_records_the_discarded_post_edit_failure_as_a_rollback_note() {
+    let h = Harness::new(HarnessOptions {
+        gn13_fakes: true,
+        ..HarnessOptions::default()
+    })
+    .await;
+    let (session, run, _dag) = h.planned_run().await;
+
+    // Journal one applied edit so GN13 has a checkpoint to restore.
+    h.storage
+        .events()
+        .append_session(NewSessionEvent {
+            session_id: session,
+            run_id: Some(run),
+            type_: SessionEventType::EditApplied,
+            payload: json!({
+                "transaction_id": TransactionId::new().to_string(),
+                "files_touched": ["src/lib.rs"],
+            }),
+        })
+        .await
+        .unwrap();
+
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            // Generation 1 fails verify on the POST-EDIT tree ("mismatched
+            // types 0"). GN13 then rolls back and re-verifies; the fake
+            // verifier reports the restored tree's ORIGINAL diagnostic.
+            Step::Fail {
+                node: NodeSel::VerifyCompile,
+                class: ErrorClass::Compile,
+                diags: 1,
+            },
+            Step::Succeed,
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+
+    h.plane.runs().start(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, "succeeded");
+
+    let notes: Vec<alloy_runtime::SessionEvent> = h
+        .session_events(session)
+        .await
+        .into_iter()
+        .filter(|e| {
+            e.type_ == SessionEventType::Error && e.payload.get("class") == Some(&json!("rollback"))
+        })
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "exactly one rollback note for the one reseeded generation"
+    );
+    let note = &notes[0];
+    assert_eq!(note.run_id, Some(run), "the note must be run-attributed");
+    let message = note.payload["message"].as_str().expect("message present");
+    assert!(
+        message.contains("mismatched types 0"),
+        "the DISCARDED post-edit diagnostic must be quoted: {message}"
+    );
+    assert!(
+        message.contains("rolled back"),
+        "the note must state the workspace was rolled back: {message}"
+    );
+    assert!(
+        !message.contains("original error: missing lifetime"),
+        "the restored tree's diagnostic rides the replan seed, not the note: {message}"
+    );
+    h.close().await;
+}
+
+/// Control for the note above: without GN13 wiring the seed is never
+/// replaced, so no rollback note may appear — the note must never become
+/// ambient noise on ordinary replans.
+#[tokio::test]
+async fn no_rollback_note_when_gn13_leaves_the_seed_alone() {
+    let h = Harness::new(HarnessOptions::default()).await;
+    let (session, run, _dag) = h.planned_run().await;
+    let sched = Scripted::new(
+        &h.storage,
+        [
+            Step::Fail {
+                node: NodeSel::VerifyCompile,
+                class: ErrorClass::Compile,
+                diags: 1,
+            },
+            Step::Succeed,
+        ],
+    );
+    sched.track(run);
+    h.install(Arc::clone(&sched));
+
+    h.plane.runs().start(run).await.unwrap();
+    assert_eq!(h.run_state(run).await, "succeeded");
+
+    let rollbacks = h
+        .session_events(session)
+        .await
+        .into_iter()
+        .filter(|e| {
+            e.type_ == SessionEventType::Error && e.payload.get("class") == Some(&json!("rollback"))
+        })
+        .count();
+    assert_eq!(rollbacks, 0, "an untouched seed must record no note");
     h.close().await;
 }

@@ -516,14 +516,26 @@ pub async fn assemble_full_with(
         policy: GenerationPolicy {
             max_repair_generations: cfg.max_repair_generations,
         },
-        // GN13 impl is in GenerationDriver but left unwired: live REPS=3 on
-        // e0502_holdout_01 dropped 3/3 → 0/3 (honest reset removes the
-        // E0502→E0614 morph shortcut this local model was riding). Re-enable
-        // with `Some(edit_engine.clone())` / worker_perms / verify_compile
-        // when first-gen E0502 repair is solid without that crutch.
-        edit_engine: None,
-        worker_permissions: None,
-        verify_compile: None,
+        // GN13: restore the workspace between repair generations.
+        //
+        // This was previously left unwired because enabling it dropped
+        // e0502_holdout_01 from 3/3 to 0/3. That fixture's hidden oracle has
+        // since been shown to be unsatisfiable by any faithful repair — it
+        // demanded a sum the broken function never computes — so the "crutch"
+        // the reset removed was an E0502→E0614 morph on a test nothing could
+        // legitimately pass. The regression that justified disabling GN13 was
+        // measured against a broken oracle.
+        //
+        // Leaving it off is not neutral. Without a restore, each generation
+        // edits the previous generation's already-damaged file, and the damage
+        // accretes: measured over 144 live attempts, pass rate ran 71.2% after
+        // one applied edit, 33.3% after two, and 2.3% after three, with 55 of
+        // 67 multi-edit attempts growing the file.
+        edit_engine: edit_engine.clone(),
+        worker_permissions: Some(Arc::clone(&worker_perms)),
+        verify_compile: Some(Arc::clone(&verify_compile)),
+        // AM-0017-1: run-start compile evidence for the gen-1 replan seed.
+        graph: GraphViewHandle::new(Arc::clone(&graph) as Arc<dyn ProjectGraph>),
     });
     plane.set_executor(Arc::new(driver));
 

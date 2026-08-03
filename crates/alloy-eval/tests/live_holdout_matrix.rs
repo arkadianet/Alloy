@@ -278,7 +278,24 @@ fn arm_row(
 /// orchestration scripts, the profiles, and the holdout corpus. Unrelated
 /// documents are left deliberately uncommitted — a real operator's roadmap
 /// edits must never block a run.
-fn write_checkout(root: &Path) -> PathBuf {
+/// A fixture with a manifest but no workspace: run.sh dies on it, which is how
+/// a test forces an arm to fail *during execution* rather than at a preflight
+/// guard.
+fn write_unrunnable_fixture(root: &Path, id: &str) {
+    let fixture = root.join(id);
+    fs::create_dir_all(&fixture).unwrap();
+    fs::write(
+        fixture.join("manifest.toml"),
+        format!("naive_target_path = \"src/lib.rs\"\nid = \"{id}\"\n"),
+    )
+    .unwrap();
+}
+
+/// Extra fixtures must be planted before the first commit. The fixture root is
+/// one of the guarded harness paths, so a fixture added later is either
+/// uncommitted (tripping the cleanliness guard) or committed (moving HEAD off
+/// the bundle revision) — both abort before scheduling.
+fn write_checkout_with(root: &Path, extra_fixtures: &[&str], unrunnable: &[&str]) -> PathBuf {
     let repo = root.join("repo");
     let scripts = repo.join("eval/live-holdout");
     fs::create_dir_all(&scripts).unwrap();
@@ -288,6 +305,12 @@ fn write_checkout(root: &Path) -> PathBuf {
     }
     copy_tree(&repo_root().join("profiles"), &repo.join("profiles"));
     write_fixture(&repo.join(FIXTURES_RELPATH), "pass_fixture");
+    for id in extra_fixtures {
+        write_fixture(&repo.join(FIXTURES_RELPATH), id);
+    }
+    for id in unrunnable {
+        write_unrunnable_fixture(&repo.join(FIXTURES_RELPATH), id);
+    }
     fs::create_dir_all(repo.join("docs/roadmap")).unwrap();
     fs::write(repo.join("docs/roadmap/README.md"), "roadmap\n").unwrap();
     git(&repo, &["init", "-q"]);
@@ -308,9 +331,17 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_fixtures(&[], &[])
+    }
+
+    fn with_extra_fixtures(extra: &[&str]) -> Self {
+        Self::with_fixtures(extra, &[])
+    }
+
+    fn with_fixtures(extra: &[&str], unrunnable: &[&str]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_owned();
-        let repo = write_checkout(&root);
+        let repo = write_checkout_with(&root, extra, unrunnable);
         let revision = head_revision(&repo);
         // The bundle lives outside the checkout, as prepare.sh requires.
         let bundle = write_bundle(&root, &revision);
@@ -676,13 +707,199 @@ fn matrix_compares_two_generic_model_arms_from_one_bundle() {
     let expected = bundle_sha256(&harness.bundle);
     for arm in ["baseline", "hotter"] {
         let report = read_report(&out.join(format!("{arm}.report.json")));
-        assert_eq!(report.endpoint.harness.source_revision, harness.revision);
-        assert_eq!(report.endpoint.harness.binary_bundle_sha256, expected);
+        assert_eq!(report.treatment.build.source_revision, harness.revision);
+        assert_eq!(report.treatment.build.binary_bundle_sha256, expected);
         assert_eq!(report.overall.oracle.passes, 1, "{arm} strict oracle");
         assert_eq!(report.overall.oracle.attempts, 1, "{arm} attempts");
+        // Every arm was scored under one protocol — that is why they may be
+        // compared at all — and the comparison records which one.
+        assert_eq!(report.protocol, matrix.protocol, "{arm} protocol identity");
     }
+    assert_eq!(matrix.protocol.corpus_digest.len(), 64);
+    assert_eq!(matrix.protocol.evaluator_revision, harness.revision);
     assert_eq!(matrix.arms["baseline"].endpoint.model, "stub-model-a");
     assert_eq!(matrix.arms["hotter"].endpoint.model, "stub-model-b");
+    // Both arms run the default profile, so there is no autonomous comparison
+    // to make: it is absent rather than reported as a zero effect.
+    assert!(matrix.autonomous_vs_default.is_none());
+}
+
+/// Running whole arms back-to-back lets endpoint drift land unevenly across
+/// arms. The schedule interleaves them per (fixture, repetition) block and
+/// rotates who goes first, and it must be reproducible from the seed alone.
+#[test]
+fn matrix_interleaves_arms_by_block_with_a_reproducible_schedule() {
+    let harness = Harness::new();
+    let arms = arms_file(
+        harness.root(),
+        "arms.tsv",
+        &[
+            &arm_row("baseline", "alloy", "stub-model-a", "0.6", "default", "2"),
+            &arm_row("hotter", "alloy", "stub-model-b", "0.6", "default", "2"),
+        ],
+    );
+    let out = harness.root().join("out");
+
+    let output = harness.run("matrix.sh", &arms, &out);
+    assert!(output.status.success(), "{}", describe(&output));
+
+    let schedule = fs::read_to_string(out.join("schedule.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = schedule
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split('\t').collect())
+        .collect();
+    // One fixture x 2 repetitions x 2 arms.
+    assert_eq!(rows.len(), 4, "schedule:\n{schedule}");
+
+    // Each block runs every arm before the next block begins.
+    for block in ["0", "1"] {
+        let in_block: Vec<&str> = rows
+            .iter()
+            .filter(|row| row[0] == block)
+            .map(|row| row[3])
+            .collect();
+        assert_eq!(in_block.len(), 2, "block {block} in:\n{schedule}");
+        assert_ne!(in_block[0], in_block[1], "an arm ran twice in one block");
+    }
+
+    // Rotation: whoever leads block 0 must not lead block 1.
+    let first_of = |block: &str| {
+        rows.iter()
+            .find(|row| row[0] == block)
+            .map(|row| row[3].to_owned())
+            .unwrap()
+    };
+    assert_ne!(
+        first_of("0"),
+        first_of("1"),
+        "arm order must rotate between blocks:\n{schedule}"
+    );
+
+    // Interleaving must not change what each arm is credited with.
+    for arm in ["baseline", "hotter"] {
+        let report = read_report(&out.join(format!("{arm}.report.json")));
+        assert_eq!(report.overall.semantic.attempts, 2, "{arm} attempts");
+        assert_eq!(report.overall.semantic.passes, 2, "{arm} semantic");
+    }
+}
+
+/// The first pass must sweep the whole corpus. Fixture-major ordering would
+/// spend every repetition on the first fixture before touching the second, so
+/// a broken fixture late in the corpus would only surface near the end of a
+/// multi-hour run, and an interrupted run would hold a lopsided sample.
+#[test]
+fn schedule_is_repetition_major_so_the_first_pass_covers_every_fixture() {
+    let harness = Harness::with_extra_fixtures(&["zz_second_fixture"]);
+    let arms = arms_file(
+        harness.root(),
+        "arms.tsv",
+        &[
+            &arm_row("baseline", "alloy", "stub-model-a", "0.6", "default", "2"),
+            &arm_row("hotter", "alloy", "stub-model-b", "0.6", "default", "2"),
+        ],
+    );
+    let out = harness.root().join("out");
+    let output = harness.run("matrix.sh", &arms, &out);
+    assert!(output.status.success(), "{}", describe(&output));
+
+    let schedule = fs::read_to_string(out.join("schedule.tsv")).unwrap();
+    let rows: Vec<Vec<&str>> = schedule
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split('\t').collect())
+        .collect();
+    // 2 fixtures x 2 repetitions x 2 arms.
+    assert_eq!(rows.len(), 8, "schedule:\n{schedule}");
+
+    // Both fixtures must appear before any fixture reaches repetition 2.
+    let first_pass: Vec<&str> = rows
+        .iter()
+        .filter(|row| row[2] == "1")
+        .map(|row| row[1])
+        .collect();
+    let distinct: std::collections::BTreeSet<&&str> = first_pass.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        2,
+        "repetition 1 must cover every fixture:\n{schedule}"
+    );
+
+    // No repetition-2 block may be scheduled before every repetition-1 block.
+    let last_rep1 = rows.iter().rposition(|row| row[2] == "1").unwrap();
+    let first_rep2 = rows.iter().position(|row| row[2] == "2").unwrap();
+    assert!(
+        last_rep1 < first_rep2,
+        "repetition 2 started before repetition 1 finished:\n{schedule}"
+    );
+}
+
+/// A harness failure in one arm voids the comparison, so the matrix must stop
+/// before spending budget on arms that can no longer be compared. Previously
+/// it recorded the failure and carried on to the next arm.
+#[test]
+fn matrix_aborts_the_whole_run_when_one_arm_fails() {
+    // Sorts before "pass_fixture", so it is reached in the very first block.
+    // It is planted before the first commit so the abort is attributable to
+    // the arm rather than to a preflight guard.
+    let harness = Harness::with_fixtures(&[], &["aa_unrunnable_fixture"]);
+    let arms = arms_file(
+        harness.root(),
+        "arms.tsv",
+        &[
+            &arm_row("baseline", "alloy", "stub-model-a", "0.6", "default", "1"),
+            &arm_row("hotter", "alloy", "stub-model-b", "0.6", "default", "1"),
+        ],
+    );
+    let out = harness.root().join("out");
+
+    let output = harness.run("matrix.sh", &arms, &out);
+    assert!(
+        !output.status.success(),
+        "matrix must fail when an arm fails: {}",
+        describe(&output)
+    );
+    // The abort must come from the ARM, not from a preflight guard that never
+    // reaches scheduling — otherwise this test passes for the wrong reason.
+    assert!(
+        out.join("schedule.tsv").exists(),
+        "matrix aborted before scheduling, so this proves nothing about arm \
+         failure handling: {}",
+        describe(&output)
+    );
+    // The schedule holds 4 attempts (2 blocks x 2 arms). Exactly one may be
+    // dispatched: the matrix must stop at the first failure, not carry on
+    // through the remaining arms and blocks.
+    let scheduled = fs::read_to_string(out.join("schedule.tsv"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .count();
+    assert_eq!(scheduled, 4, "{}", describe(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let dispatched = stdout.lines().filter(|l| l.starts_with("BLOCK ")).count();
+    assert_eq!(
+        dispatched,
+        2,
+        "expected only the failing block's two arms to be dispatched, got \
+         {dispatched} of 4 scheduled\n{}",
+        describe(&output)
+    );
+    let blocks: std::collections::BTreeSet<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("BLOCK "))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .collect();
+    assert_eq!(
+        blocks.len(),
+        1,
+        "matrix continued past the failing block: {blocks:?}\n{}",
+        describe(&output)
+    );
+    assert!(
+        !out.join("matrix.report.json").exists(),
+        "a comparison was published from an aborted matrix"
+    );
 }
 
 #[test]
@@ -960,14 +1177,14 @@ fn e1_runs_exactly_three_equal_arms_through_the_generic_matrix() {
         ("alloy-autonomous", Some("autonomous")),
     ] {
         let report = read_report(&out.join(format!("{arm}.report.json")));
-        assert_eq!(report.endpoint.profile.as_deref(), profile, "{arm}");
+        assert_eq!(report.treatment.profile.as_deref(), profile, "{arm}");
         assert_eq!(report.endpoint.model, MODEL, "{arm}");
         assert_eq!(
-            report.endpoint.harness.source_revision, harness.revision,
+            report.treatment.build.source_revision, harness.revision,
             "{arm}"
         );
         assert_eq!(
-            report.endpoint.harness.binary_bundle_sha256, expected,
+            report.treatment.build.binary_bundle_sha256, expected,
             "{arm}"
         );
         // Every arm ran the shared oracle path, not just a report writer.
@@ -979,6 +1196,33 @@ fn e1_runs_exactly_three_equal_arms_through_the_generic_matrix() {
             "{arm} must retain independent test evidence"
         );
     }
+
+    // Naive is the baseline for the primary metric, so the two Alloy profiles
+    // are only ever compared to each other by the dedicated contrast.
+    assert_eq!(matrix.comparisons.len(), 2);
+    let contrast = matrix
+        .autonomous_vs_default
+        .as_ref()
+        .expect("one default arm and one autonomous arm ran");
+    assert_eq!(contrast.comparison.baseline, "alloy-default");
+    assert_eq!(contrast.comparison.arm, "alloy-autonomous");
+    // One fixture cannot bound a between-fixture effect, and "cannot bound"
+    // is never a pass.
+    assert_eq!(contrast.comparison.semantic_clustered.lower95, None);
+    assert!(!contrast.clears_gate, "{}", contrast.gate_basis);
+    assert!(!matrix.autonomous_uplift_is_claimable());
+    // The operator sees the verdict on the terminal, not only in the JSON.
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        printed.contains("autonomous_gate\talloy-autonomous\tvs\talloy-default\tblocked"),
+        "{}",
+        describe(&output)
+    );
+    assert!(
+        printed.contains("clustered_lower95_unbounded"),
+        "{}",
+        describe(&output)
+    );
 }
 
 /// A minimal committed repository carrying the real `prepare.sh`, so its

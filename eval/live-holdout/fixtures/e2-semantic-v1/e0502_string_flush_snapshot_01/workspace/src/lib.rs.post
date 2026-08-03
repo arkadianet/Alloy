@@ -1,0 +1,11 @@
+/// Flushes the pending log: returns everything the log held with `terminator`
+/// appended, and leaves the log empty.
+///
+/// An empty log and an empty terminator are both ordinary inputs.
+pub fn flush(log: &mut String, terminator: &str) -> String {
+    let pending = log.clone();
+    log.clear();
+    let mut flushed = pending.to_string();
+    flushed.push_str(terminator);
+    flushed
+}

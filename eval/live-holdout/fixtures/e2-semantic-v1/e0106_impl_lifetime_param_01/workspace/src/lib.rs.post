@@ -1,0 +1,38 @@
+/// A forward-only cursor over a borrowed byte buffer.
+///
+/// A `Reader` never owns its bytes: it borrows the caller's buffer and only
+/// tracks how much of it has been consumed.
+pub struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    /// Creates a reader positioned at the start of `bytes`.
+    pub fn new(bytes: &'a [u8]) -> Reader<'a> {
+        Reader { bytes, pos: 0 }
+    }
+
+    /// The bytes that have not been consumed yet, still borrowed from the
+    /// caller's buffer.
+    pub fn remaining(&self) -> &'a [u8] {
+        &self.bytes[self.pos..]
+    }
+
+    /// Consumes `n` further bytes.
+    ///
+    /// Callers must not advance past the end of the buffer.
+    pub fn advance(&mut self, n: usize) {
+        self.pos += n;
+    }
+
+    /// How many bytes have been consumed so far.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// True once every byte has been consumed.
+    pub fn is_done(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
+}
