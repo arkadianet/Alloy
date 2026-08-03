@@ -304,12 +304,23 @@ for attempt in "${attempts[@]}"; do
     case "$code" in
       124|126|127) ;;
       *)
+        # Scrub before injecting. `cp -a` MERGES, so any tests/ the driver
+        # left behind would survive alongside the hidden oracle and be run by
+        # a bare `cargo test` — letting a model's own tests decide the score
+        # in either direction. No driver writes tests today, which is why this
+        # has never fired; it is a hole, not a symptom.
+        rm -rf "$ws/tests" ||
+          die "could not clear staged tests for $id#$rep"
         mkdir -p "$ws/tests" ||
           die "could not stage semantic tests for $id#$rep"
         cp -a "$FIXTURES/$id/oracle-tests"/. "$ws/tests/" ||
           die "semantic test copy failed for $id#$rep"
+        # Score the oracle target by name rather than everything cargo finds.
+        # No fixture ships inline `#[cfg(test)]` (verified across the corpus),
+        # so this is behaviour-preserving today and stays honest if one ever
+        # does.
         if (cd "$ws" && CARGO_TARGET_DIR="$ws/target" timeout "$TIMEOUT" \
-          cargo test --offline --quiet) \
+          cargo test --offline --quiet --test semantic) \
           >"$evidence/cargo-test.log" 2>&1; then
           tests_pass=true
           cargo_test_exit=0
